@@ -89,13 +89,25 @@ export interface DecisionToolActivation {
 	/** Registers the pair once for this Pi extension attachment. */
 	readonly registerDecisionTools: () => void;
 	/**
+	 * Removes registered decision tools from the current active set.
+	 *
+	 * Pi makes registered tools active by default. Runtime wiring MUST invoke this
+	 * for every attachment, main and non-main, from `session_start` after Pi has
+	 * bound its active-tool APIs and before that session's first model request.
+	 * Slice 5 deliberately installs no lifecycle hook itself. A thrown Pi API call
+	 * leaves initialization incomplete so the later lifecycle callback can retry.
+	 */
+	readonly initializeDecisionToolsInactive: () => boolean;
+	/**
 	 * Snapshot currently active normal tools and replace them with exactly the pair.
-	 * Non-main attachments and a duplicate active entry are intentionally inert.
+	 * This is inert until initialization succeeds; non-main attachments and a
+	 * duplicate active entry are also intentionally inert.
 	 */
 	readonly activateDecisionTools: () => boolean;
 	/**
-	 * Restore the exact prior active set. This remains available after demotion so
-	 * lifecycle cleanup cannot strand the decision pair as the active set.
+	 * Restore the exact prior normal-tool set. This remains available after demotion
+	 * so lifecycle cleanup cannot strand the decision pair as the active set. A
+	 * thrown Pi API call leaves the capture intact for a later retry.
 	 */
 	readonly restoreDecisionTools: () => boolean;
 	readonly isActive: () => boolean;
@@ -157,7 +169,8 @@ export function createDecisionToolActivation(
 	options: DecisionToolActivationOptions,
 ): DecisionToolActivation {
 	let registered = false;
-	let capturedActiveTools: string[] | null = null;
+	let initialized = false;
+	let capturedActiveTools: readonly string[] | null = null;
 
 	const registerDecisionTools = (): void => {
 		if (registered) return;
@@ -170,7 +183,11 @@ export function createDecisionToolActivation(
 			promptSnippet: CONTINUE_WATCHDOG_PROMPT_SNIPPET,
 			parameters: CONTINUE_WATCHDOG_PARAMETERS,
 			async execute(toolCallId, _params, _signal, _onUpdate, ctx) {
-				if (!options.isCurrentMain() || capturedActiveTools === null) {
+				if (
+					!initialized ||
+					!options.isCurrentMain() ||
+					capturedActiveTools === null
+				) {
 					return staleDecisionToolResult();
 				}
 				return options.executeContinue(toolCallId, ctx);
@@ -183,7 +200,11 @@ export function createDecisionToolActivation(
 			promptSnippet: UNLOCK_CONTINUE_WATCHDOG_PROMPT_SNIPPET,
 			parameters: UNLOCK_CONTINUE_WATCHDOG_PARAMETERS,
 			async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-				if (!options.isCurrentMain() || capturedActiveTools === null) {
+				if (
+					!initialized ||
+					!options.isCurrentMain() ||
+					capturedActiveTools === null
+				) {
 					return staleDecisionToolResult();
 				}
 				return options.executeUnlock(toolCallId, params.reason, ctx);
@@ -195,25 +216,54 @@ export function createDecisionToolActivation(
 
 	return Object.freeze({
 		registerDecisionTools,
-		activateDecisionTools(): boolean {
-			if (!options.isCurrentMain() || capturedActiveTools !== null)
-				return false;
+		initializeDecisionToolsInactive(): boolean {
+			if (initialized) return false;
 
 			// Copy now: a host implementation may retain/mutate its returned array.
-			capturedActiveTools = [...pi.getActiveTools()];
+			const activeTools = [...pi.getActiveTools()];
+			const inactiveTools = activeTools.filter(
+				(name) =>
+					name !== CONTINUE_WATCHDOG_TOOL_NAME &&
+					name !== UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
+			);
+			if (inactiveTools.length !== activeTools.length) {
+				pi.setActiveTools(inactiveTools);
+			}
+			initialized = true;
+			return true;
+		},
+		activateDecisionTools(): boolean {
+			if (
+				!initialized ||
+				!options.isCurrentMain() ||
+				capturedActiveTools !== null
+			)
+				return false;
+
+			// Filter defensively: Pi keeps definitions registered, but they are never
+			// part of a restored normal-tool baseline, even if another caller reactivated
+			// either definition between this attachment's lifecycle callbacks.
+			const baseline = Object.freeze(
+				[...pi.getActiveTools()].filter(
+					(name) =>
+						name !== CONTINUE_WATCHDOG_TOOL_NAME &&
+						name !== UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
+				),
+			);
 			pi.setActiveTools([...DECISION_TOOL_NAMES]);
+			capturedActiveTools = baseline;
 			return true;
 		},
 		restoreDecisionTools(): boolean {
 			if (capturedActiveTools === null) return false;
 
 			const activeTools = capturedActiveTools;
-			capturedActiveTools = null;
 			pi.setActiveTools([...activeTools]);
+			capturedActiveTools = null;
 			return true;
 		},
 		isActive(): boolean {
-			return capturedActiveTools !== null;
+			return initialized && capturedActiveTools !== null;
 		},
 		getCapturedActiveTools(): readonly string[] | null {
 			return capturedActiveTools === null ? null : [...capturedActiveTools];

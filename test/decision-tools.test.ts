@@ -36,15 +36,22 @@ interface Harness {
 	readonly activation: DecisionToolActivation;
 	setCurrentMain(current: boolean): void;
 	setActiveTools(activeTools: readonly string[]): void;
+	throwNextGetActiveTools(): void;
+	throwNextSetActiveTools(): void;
 	activeTools(): readonly string[];
 }
 
-function createHarness(initialActiveTools = ["read", "bash", "edit"]): Harness {
+function createHarness(
+	initialActiveTools = ["read", "bash", "edit"],
+	activateRegisteredTools = true,
+): Harness {
 	const tools = new Map<string, RegisteredDecisionTool>();
 	const setActiveCalls: string[][] = [];
 	const delegated: DecisionToolCall[] = [];
 	let activeTools = [...initialActiveTools];
 	let currentMain = true;
+	let throwGetActiveTools = false;
+	let throwSetActiveTools = false;
 
 	const continueResult: AgentToolResult<DecisionDetails> = {
 		content: [{ type: "text", text: "continue result" }],
@@ -58,12 +65,25 @@ function createHarness(initialActiveTools = ["read", "bash", "edit"]): Harness {
 	const pi = {
 		registerTool(tool: RegisteredDecisionTool): void {
 			tools.set(tool.name, tool);
+			// Stock Pi registers custom definitions into the initial active set. The
+			// manager must later remove its two definitions through setActiveTools.
+			if (activateRegisteredTools && !activeTools.includes(tool.name)) {
+				activeTools.push(tool.name);
+			}
 		},
 		getActiveTools(): string[] {
+			if (throwGetActiveTools) {
+				throwGetActiveTools = false;
+				throw new Error("getActiveTools failed");
+			}
 			return [...activeTools];
 		},
 		setActiveTools(toolNames: string[]): void {
 			setActiveCalls.push([...toolNames]);
+			if (throwSetActiveTools) {
+				throwSetActiveTools = false;
+				throw new Error("setActiveTools failed");
+			}
 			activeTools = [...toolNames];
 		},
 	} as unknown as ExtensionAPI;
@@ -93,6 +113,12 @@ function createHarness(initialActiveTools = ["read", "bash", "edit"]): Harness {
 		setActiveTools(nextActiveTools: readonly string[]): void {
 			activeTools = [...nextActiveTools];
 		},
+		throwNextGetActiveTools(): void {
+			throwGetActiveTools = true;
+		},
+		throwNextSetActiveTools(): void {
+			throwSetActiveTools = true;
+		},
 		activeTools(): readonly string[] {
 			return [...activeTools];
 		},
@@ -112,16 +138,31 @@ function schemaJson(tool: RegisteredDecisionTool): unknown {
 	return JSON.parse(JSON.stringify(tool.parameters));
 }
 
-test("Slice 5 RED: registers exactly the inactive decision-pair definitions once per attachment", () => {
+function initializeDecisionTools(harness: Harness): void {
+	assert.equal(harness.activation.initializeDecisionToolsInactive(), true);
+}
+
+test("Slice 5 RED: registers definitions into Pi's default active set, then lifecycle initialization removes exactly the decision pair", () => {
 	const harness = createHarness();
 
 	assert.deepEqual(
 		[...harness.tools.keys()],
 		[CONTINUE_WATCHDOG_TOOL_NAME, UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME],
 	);
-	assert.deepEqual(harness.activeTools(), ["read", "bash", "edit"]);
+	assert.deepEqual(harness.activeTools(), [
+		"read",
+		"bash",
+		"edit",
+		...DECISION_TOOL_NAMES,
+	]);
 	assert.equal(harness.activation.isActive(), false);
 	assert.deepEqual(harness.setActiveCalls, []);
+
+	initializeDecisionTools(harness);
+	assert.deepEqual(harness.activeTools(), ["read", "bash", "edit"]);
+	assert.deepEqual(harness.setActiveCalls, [["read", "bash", "edit"]]);
+	assert.equal(harness.activation.initializeDecisionToolsInactive(), false);
+	assert.deepEqual(harness.setActiveCalls, [["read", "bash", "edit"]]);
 
 	assert.equal(Object.isFrozen(DECISION_TOOL_NAMES), true);
 	assert.deepEqual(DECISION_TOOL_NAMES, [
@@ -175,49 +216,55 @@ test("Slice 5 RED: decision schemas, descriptions, and prompt snippets define on
 	});
 });
 
-test("Slice 5 RED: activation snapshots once, replaces active tools with only the immutable decision pair, and restores the exact ordered snapshot", () => {
-	const initial = [
-		"read",
-		CONTINUE_WATCHDOG_TOOL_NAME,
-		"bash",
-		UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
-		"read",
-	];
+test("Slice 5 RED: activation only follows lifecycle initialization and restores an ordered normal-only baseline", () => {
+	const initial = ["read", "bash", "read"];
 	const harness = createHarness(initial);
+
+	assert.equal(harness.activation.activateDecisionTools(), false);
+	assert.equal(harness.activation.isActive(), false);
+	initializeDecisionTools(harness);
+	assert.deepEqual(harness.activeTools(), initial);
+	assert.deepEqual(harness.setActiveCalls, [initial]);
 
 	assert.equal(harness.activation.activateDecisionTools(), true);
 	assert.equal(harness.activation.isActive(), true);
 	assert.deepEqual(harness.activeTools(), [...DECISION_TOOL_NAMES]);
 	assert.deepEqual(harness.activation.getCapturedActiveTools(), initial);
-	assert.deepEqual(harness.setActiveCalls, [[...DECISION_TOOL_NAMES]]);
+	assert.deepEqual(harness.setActiveCalls, [initial, [...DECISION_TOOL_NAMES]]);
 
 	// A repeated decision entry must not overwrite the normal-tool snapshot.
 	harness.setActiveTools(["hostile-normal-tool"]);
 	assert.equal(harness.activation.activateDecisionTools(), false);
-	assert.deepEqual(harness.setActiveCalls, [[...DECISION_TOOL_NAMES]]);
+	assert.deepEqual(harness.setActiveCalls, [initial, [...DECISION_TOOL_NAMES]]);
 	assert.deepEqual(harness.activation.getCapturedActiveTools(), initial);
 
 	assert.equal(harness.activation.restoreDecisionTools(), true);
 	assert.equal(harness.activation.isActive(), false);
 	assert.deepEqual(harness.activeTools(), initial);
-	assert.deepEqual(harness.setActiveCalls, [[...DECISION_TOOL_NAMES], initial]);
+	assert.deepEqual(harness.setActiveCalls, [
+		initial,
+		[...DECISION_TOOL_NAMES],
+		initial,
+	]);
 	assert.equal(harness.activation.getCapturedActiveTools(), null);
 	assert.equal(harness.activation.restoreDecisionTools(), false);
 });
 
-test("Slice 5 RED: a non-main attachment never captures or activates decision controls", () => {
+test("Slice 5 RED: lifecycle initialization removes the pair for a non-main attachment, which still cannot activate controls", () => {
 	const harness = createHarness(["read", "bash"]);
 	harness.setCurrentMain(false);
 
+	initializeDecisionTools(harness);
 	assert.equal(harness.activation.activateDecisionTools(), false);
 	assert.equal(harness.activation.isActive(), false);
 	assert.deepEqual(harness.activeTools(), ["read", "bash"]);
-	assert.deepEqual(harness.setActiveCalls, []);
+	assert.deepEqual(harness.setActiveCalls, [["read", "bash"]]);
 	assert.equal(harness.activation.getCapturedActiveTools(), null);
 });
 
 test("Slice 5 RED: a demoted active attachment restores its original normal set without requiring current-main ownership", () => {
 	const harness = createHarness(["read", "bash"]);
+	initializeDecisionTools(harness);
 	assert.equal(harness.activation.activateDecisionTools(), true);
 	harness.setCurrentMain(false);
 
@@ -225,6 +272,7 @@ test("Slice 5 RED: a demoted active attachment restores its original normal set 
 	assert.equal(harness.activation.isActive(), false);
 	assert.deepEqual(harness.activeTools(), ["read", "bash"]);
 	assert.deepEqual(harness.setActiveCalls, [
+		["read", "bash"],
 		[...DECISION_TOOL_NAMES],
 		["read", "bash"],
 	]);
@@ -239,6 +287,7 @@ test("Slice 5 RED: each active main decision tool delegates the exact validated 
 		UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
 	);
 
+	initializeDecisionTools(harness);
 	assert.equal(harness.activation.activateDecisionTools(), true);
 	const continueResult = await continueTool.execute(
 		"continue-call",
@@ -272,11 +321,26 @@ test("Slice 5 RED: each active main decision tool delegates the exact validated 
 	]);
 });
 
-test("Slice 5 RED: inactive or demoted tool execution cannot delegate decision control and returns the fixed terminating stale result", async () => {
+test("Slice 5 RED: uninitialized, inactive, or demoted tool execution cannot delegate decision control and returns the fixed terminating stale result", async () => {
 	const harness = createHarness();
 	const context = {} as ExtensionContext;
 	const continueTool = registeredTool(harness, CONTINUE_WATCHDOG_TOOL_NAME);
 
+	const uninitialized = await continueTool.execute(
+		"uninitialized-call",
+		{},
+		undefined,
+		undefined,
+		context,
+	);
+	assert.deepEqual(uninitialized, {
+		content: [{ type: "text", text: STALE_DECISION_TOOL_MESSAGE }],
+		details: { kind: "stale-decision-tool" },
+		terminate: true,
+	});
+	assert.deepEqual(harness.delegated, []);
+
+	initializeDecisionTools(harness);
 	const inactive = await continueTool.execute(
 		"inactive-call",
 		{},
@@ -284,11 +348,7 @@ test("Slice 5 RED: inactive or demoted tool execution cannot delegate decision c
 		undefined,
 		context,
 	);
-	assert.deepEqual(inactive, {
-		content: [{ type: "text", text: STALE_DECISION_TOOL_MESSAGE }],
-		details: { kind: "stale-decision-tool" },
-		terminate: true,
-	});
+	assert.deepEqual(inactive, uninitialized);
 	assert.deepEqual(harness.delegated, []);
 
 	assert.equal(harness.activation.activateDecisionTools(), true);
@@ -302,4 +362,98 @@ test("Slice 5 RED: inactive or demoted tool execution cannot delegate decision c
 	);
 	assert.deepEqual(demoted, inactive);
 	assert.deepEqual(harness.delegated, []);
+});
+
+test("Slice 5 RED: initialization is idempotent and skips setActiveTools when both definitions are already inactive", () => {
+	const harness = createHarness(["read", "bash"], false);
+
+	initializeDecisionTools(harness);
+	assert.deepEqual(harness.activeTools(), ["read", "bash"]);
+	assert.deepEqual(harness.setActiveCalls, []);
+	assert.equal(harness.activation.initializeDecisionToolsInactive(), false);
+	assert.deepEqual(harness.setActiveCalls, []);
+});
+
+test("Slice 5 RED: initialization retries after Pi active-tool API failures without exposing a partially initialized state", () => {
+	const harness = createHarness();
+
+	harness.throwNextGetActiveTools();
+	assert.throws(
+		() => harness.activation.initializeDecisionToolsInactive(),
+		/getActiveTools failed/,
+	);
+	assert.equal(harness.activation.activateDecisionTools(), false);
+	assert.deepEqual(harness.activeTools(), [
+		"read",
+		"bash",
+		"edit",
+		...DECISION_TOOL_NAMES,
+	]);
+
+	harness.throwNextSetActiveTools();
+	assert.throws(
+		() => harness.activation.initializeDecisionToolsInactive(),
+		/setActiveTools failed/,
+	);
+	assert.equal(harness.activation.activateDecisionTools(), false);
+	assert.deepEqual(harness.activeTools(), [
+		"read",
+		"bash",
+		"edit",
+		...DECISION_TOOL_NAMES,
+	]);
+
+	initializeDecisionTools(harness);
+	assert.deepEqual(harness.activeTools(), ["read", "bash", "edit"]);
+});
+
+test("Slice 5 RED: activation does not capture a baseline until Pi replaces the active set, then retries cleanly", () => {
+	const harness = createHarness();
+	initializeDecisionTools(harness);
+
+	harness.setActiveTools([
+		"read",
+		CONTINUE_WATCHDOG_TOOL_NAME,
+		"bash",
+		UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
+		"read",
+	]);
+	harness.throwNextSetActiveTools();
+	assert.throws(
+		() => harness.activation.activateDecisionTools(),
+		/setActiveTools failed/,
+	);
+	assert.equal(harness.activation.isActive(), false);
+	assert.equal(harness.activation.getCapturedActiveTools(), null);
+
+	assert.equal(harness.activation.activateDecisionTools(), true);
+	assert.deepEqual(harness.activeTools(), [...DECISION_TOOL_NAMES]);
+	assert.deepEqual(harness.activation.getCapturedActiveTools(), [
+		"read",
+		"bash",
+		"read",
+	]);
+});
+
+test("Slice 5 RED: restoration clears its captured baseline only after Pi accepts it, so a failed restore is retryable", () => {
+	const harness = createHarness();
+	initializeDecisionTools(harness);
+	assert.equal(harness.activation.activateDecisionTools(), true);
+
+	harness.throwNextSetActiveTools();
+	assert.throws(
+		() => harness.activation.restoreDecisionTools(),
+		/setActiveTools failed/,
+	);
+	assert.equal(harness.activation.isActive(), true);
+	assert.deepEqual(harness.activation.getCapturedActiveTools(), [
+		"read",
+		"bash",
+		"edit",
+	]);
+	assert.deepEqual(harness.activeTools(), [...DECISION_TOOL_NAMES]);
+
+	assert.equal(harness.activation.restoreDecisionTools(), true);
+	assert.equal(harness.activation.isActive(), false);
+	assert.deepEqual(harness.activeTools(), ["read", "bash", "edit"]);
 });
