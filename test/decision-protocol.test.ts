@@ -19,6 +19,7 @@ import {
 	NO_DECISION_TOOL_ERROR,
 	normalizeAssistantDecisionResponse,
 	PROSE_DECISION_RESPONSE_ERROR,
+	STALE_DECISION_TOOL_RESULT_MESSAGE,
 	UNKNOWN_DECISION_TOOL_ERROR,
 	UNSUPPORTED_DECISION_CONTENT_ERROR,
 	validateDecisionResponse,
@@ -78,6 +79,19 @@ function openDecision() {
 			decisionPrompt: DECISION_PROMPT,
 		}),
 	};
+}
+
+function finalizeCurrent(
+	protocol: ReturnType<typeof createDecisionProtocolSession>,
+	decisionResponse: DecisionResponse,
+) {
+	return protocol.finalizeResponse(protocol.currentCycleId, decisionResponse);
+}
+
+function advanceReask(
+	protocol: ReturnType<typeof createDecisionProtocolSession>,
+): void {
+	assert.equal(protocol.advanceAfterReask(protocol.currentCycleId), true);
 }
 
 test("Slice 6 RED: validator accepts exactly one reasonless continue or one trimmed unlock reason, while ignoring private thinking", () => {
@@ -322,7 +336,8 @@ test("Slice 6 RED: executor records neutral terminating results and applies vali
 	assert.equal(controller.snapshot.attempt, 0);
 	assert.equal(controller.snapshot.decisionOpen, true);
 
-	const finalized = protocol.finalize(
+	const finalized = finalizeCurrent(
+		protocol,
 		normalizeAssistantDecisionResponse({
 			role: "assistant",
 			content: [
@@ -343,21 +358,26 @@ test("Slice 6 RED: executor records neutral terminating results and applies vali
 	assert.equal(controller.snapshot.invalidDecisionAttempts, 0);
 	assert.equal(controller.snapshot.decisionOpen, false);
 
-	const duplicate = protocol.finalize(response([continueCall("continue-1")]));
+	const duplicate = finalizeCurrent(
+		protocol,
+		response([continueCall("continue-1")]),
+	);
 	assert.equal(duplicate, finalized);
 	assert.equal(controller.snapshot.attempt, 1);
+	assert.equal(protocol.advanceAfterReask(protocol.currentCycleId), false);
 });
 
 test("Slice 6 RED: invalid decisions immediately re-ask with controller's exact error, retain the window, and do not consume a valid continue retry", () => {
 	const { controller, protocol } = openDecision();
 
-	const invalid = protocol.finalize(
+	const invalid = finalizeCurrent(
+		protocol,
 		response([{ type: "text", text: "I'll wait." }]),
 	);
 	assert.equal(invalid.outcome, "reask");
 	assert.equal(invalid.error, PROSE_DECISION_RESPONSE_ERROR);
 	assert.equal(
-		invalid.prompt,
+		invalid.reaskPrompt,
 		buildDecisionReaskPrompt(DECISION_PROMPT, PROSE_DECISION_RESPONSE_ERROR),
 	);
 	assert.deepEqual(invalid.transition.effects, [
@@ -372,12 +392,14 @@ test("Slice 6 RED: invalid decisions immediately re-ask with controller's exact 
 	assert.equal(controller.snapshot.invalidDecisionAttempts, 1);
 	assert.equal(controller.snapshot.decisionOpen, true);
 
+	advanceReask(protocol);
 	protocol.onDecisionToolCall({
 		kind: "continue",
 		toolCallId: "continue-after-invalid",
 		ctx: CONTEXT,
 	});
-	const valid = protocol.finalize(
+	const valid = finalizeCurrent(
+		protocol,
 		response([continueCall("continue-after-invalid")]),
 	);
 	assert.equal(valid.outcome, "continue");
@@ -385,14 +407,175 @@ test("Slice 6 RED: invalid decisions immediately re-ask with controller's exact 
 	assert.equal(controller.snapshot.invalidDecisionAttempts, 0);
 });
 
+test("I1 RED: finalization caches each explicit response cycle, rejects stale work, and only advances after runtime acknowledgement", () => {
+	const { controller, protocol } = openDecision();
+	const firstCycleId = protocol.currentCycleId;
+	const invalidResponse = response([{ type: "text", text: "I will wait." }]);
+
+	const first = protocol.finalizeResponse(firstCycleId, invalidResponse);
+	assert.equal(first.outcome, "reask");
+	assert.equal(controller.snapshot.invalidDecisionAttempts, 1);
+	assert.equal(Object.isFrozen(first), true);
+	for (let repeat = 0; repeat < 3; repeat += 1) {
+		assert.equal(
+			protocol.finalizeResponse(
+				firstCycleId,
+				response([{ type: "text", text: "I will wait." }]),
+			),
+			first,
+			"duplicate callbacks for either response identity must receive the cached result",
+		);
+	}
+	assert.equal(controller.snapshot.invalidDecisionAttempts, 1);
+
+	assert.deepEqual(
+		protocol.onDecisionToolCall({
+			kind: "continue",
+			toolCallId: "late-before-advance",
+			ctx: CONTEXT,
+		}),
+		{
+			content: [{ type: "text", text: STALE_DECISION_TOOL_RESULT_MESSAGE }],
+			details: { kind: "stale-decision-tool" },
+			terminate: true,
+		},
+	);
+	assert.equal(protocol.advanceAfterReask(firstCycleId + 1), false);
+	assert.equal(protocol.advanceAfterReask(firstCycleId), true);
+	assert.equal(protocol.currentCycleId, firstCycleId + 1);
+	assert.equal(protocol.advanceAfterReask(firstCycleId), false);
+
+	const staleFinalize = protocol.finalizeResponse(
+		firstCycleId,
+		invalidResponse,
+	);
+	assert.equal(staleFinalize.outcome, "ignored");
+	assert.equal(staleFinalize.transition.applied, false);
+	assert.equal(controller.snapshot.invalidDecisionAttempts, 1);
+
+	const second = finalizeCurrent(
+		protocol,
+		response([continueCall("late-before-advance")]),
+	);
+	assert.equal(second.outcome, "reask");
+	assert.equal(second.error, DECISION_TOOL_NOT_EXECUTED_ERROR);
+	assert.equal(controller.snapshot.invalidDecisionAttempts, 2);
+	advanceReask(protocol);
+
+	const third = finalizeCurrent(
+		protocol,
+		response([{ type: "text", text: "Still waiting." }]),
+	);
+	assert.equal(third.outcome, "decision-failed");
+	assert.equal(controller.snapshot.invalidDecisionAttempts, 3);
+});
+
+test("I2 RED: hostile decision values always normalize or validate to the fixed malformed error", () => {
+	const malformed = {
+		valid: false as const,
+		error: MALFORMED_DECISION_RESPONSE_ERROR,
+	};
+	const validRawContent = [
+		{
+			type: "toolCall",
+			id: "continue-1",
+			name: "continue_watchdog",
+			arguments: {},
+		},
+	];
+	const revoked = Proxy.revocable(validRawContent, {});
+	revoked.revoke();
+	const lengthThrowing = new Proxy(validRawContent, {
+		get(target, key, receiver) {
+			if (key === "length" || key === "0") {
+				throw new Error("do not read hostile array data");
+			}
+			return Reflect.get(target, key, receiver);
+		},
+	});
+	const iteratorThrowing = new Proxy(validRawContent, {
+		get(target, key, receiver) {
+			if (key === Symbol.iterator) {
+				throw new Error("do not use untrusted iterators");
+			}
+			return Reflect.get(target, key, receiver);
+		},
+	});
+	const accessorElement: unknown[] = [];
+	Object.defineProperty(accessorElement, "0", {
+		get() {
+			throw new Error("do not invoke element accessors");
+		},
+	});
+	accessorElement.length = 1;
+
+	for (const content of [revoked.proxy, lengthThrowing, accessorElement]) {
+		assert.doesNotThrow(() =>
+			normalizeAssistantDecisionResponse({ role: "assistant", content }),
+		);
+		assert.deepEqual(
+			validateDecisionResponse(
+				normalizeAssistantDecisionResponse({ role: "assistant", content }),
+			),
+			malformed,
+		);
+	}
+
+	assert.deepEqual(
+		validateDecisionResponse(
+			normalizeAssistantDecisionResponse({
+				role: "assistant",
+				content: iteratorThrowing,
+			}),
+		),
+		{
+			valid: true,
+			decision: { kind: "continue", toolCallId: "continue-1" },
+		},
+		"normalization must not iterate an untrusted array",
+	);
+
+	const throwingContentResponse = Object.create(null) as Record<
+		string,
+		unknown
+	>;
+	Object.defineProperty(throwingContentResponse, "content", {
+		get() {
+			throw new Error("do not invoke response getters");
+		},
+	});
+	assert.doesNotThrow(() =>
+		validateDecisionResponse(
+			throwingContentResponse as unknown as DecisionResponse,
+		),
+	);
+	assert.deepEqual(
+		validateDecisionResponse(
+			throwingContentResponse as unknown as DecisionResponse,
+		),
+		malformed,
+	);
+});
+
 test("Slice 6 RED: third invalid response takes the controller decision-failed path without advancing retries", () => {
 	const { controller, protocol } = openDecision();
 
-	const first = protocol.finalize(response([{ type: "text", text: "one" }]));
+	const first = finalizeCurrent(
+		protocol,
+		response([{ type: "text", text: "one" }]),
+	);
 	assert.equal(first.outcome, "reask");
-	const second = protocol.finalize(response([{ type: "text", text: "two" }]));
+	advanceReask(protocol);
+	const second = finalizeCurrent(
+		protocol,
+		response([{ type: "text", text: "two" }]),
+	);
 	assert.equal(second.outcome, "reask");
-	const third = protocol.finalize(response([{ type: "text", text: "three" }]));
+	advanceReask(protocol);
+	const third = finalizeCurrent(
+		protocol,
+		response([{ type: "text", text: "three" }]),
+	);
 
 	assert.equal(third.outcome, "decision-failed");
 	assert.equal(third.error, PROSE_DECISION_RESPONSE_ERROR);
@@ -413,11 +596,13 @@ test("Slice 6 RED: third invalid response takes the controller decision-failed p
 	assert.equal(controller.snapshot.invalidDecisionAttempts, 3);
 	assert.equal(controller.snapshot.decisionFailed, true);
 	assert.equal(controller.snapshot.decisionOpen, false);
+	assert.equal(protocol.advanceAfterReask(protocol.currentCycleId), false);
 });
 
 test("Slice 6 RED: validation requires the collected execution to match the complete assistant tool call before changing controller state", () => {
 	const missing = openDecision();
-	const missingExecution = missing.protocol.finalize(
+	const missingExecution = finalizeCurrent(
+		missing.protocol,
 		response([continueCall("not-executed")]),
 	);
 	assert.equal(missingExecution.outcome, "reask");
@@ -431,7 +616,8 @@ test("Slice 6 RED: validation requires the collected execution to match the comp
 		reason: "Done.",
 		ctx: CONTEXT,
 	});
-	const mismatchedExecution = mismatch.protocol.finalize(
+	const mismatchedExecution = finalizeCurrent(
+		mismatch.protocol,
 		response([continueCall("right-call")]),
 	);
 	assert.equal(mismatchedExecution.outcome, "reask");
@@ -448,7 +634,8 @@ test("Slice 6 RED: valid unlock reports its normalized reason only after matchin
 		ctx: CONTEXT,
 	});
 
-	const finalized = protocol.finalize(
+	const finalized = finalizeCurrent(
+		protocol,
 		response([unlockCall("unlock-1", " \nWaiting for user confirmation.\n ")]),
 	);
 	assert.equal(finalized.outcome, "unlock");
@@ -469,7 +656,8 @@ test("Slice 6 RED: collector rejects an executed unlock whose raw reason differs
 		ctx: CONTEXT,
 	});
 
-	const finalized = protocol.finalize(
+	const finalized = finalizeCurrent(
+		protocol,
 		response([unlockCall("unlock-1", "Different reason.")]),
 	);
 	assert.equal(finalized.outcome, "reask");
@@ -481,12 +669,14 @@ test("Slice 6 RED: collector rejects an executed unlock whose raw reason differs
 test("Slice 6 RED: a third collector mismatch is a decision failure rather than retry-budget consumption", () => {
 	const { controller, protocol } = openDecision();
 	for (let attempt = 1; attempt <= 3; attempt += 1) {
-		const result = protocol.finalize(
+		const result = finalizeCurrent(
+			protocol,
 			response([continueCall(`missing-${attempt}`)]),
 		);
 		if (attempt < 3) {
 			assert.equal(result.outcome, "reask");
 			assert.equal(result.error, DECISION_TOOL_NOT_EXECUTED_ERROR);
+			advanceReask(protocol);
 		} else {
 			assert.equal(result.outcome, "decision-failed");
 			assert.equal(result.error, DECISION_TOOL_NOT_EXECUTED_ERROR);

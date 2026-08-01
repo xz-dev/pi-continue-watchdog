@@ -15,6 +15,10 @@ export const DECISION_INVALID_ATTEMPT_LIMIT = 3;
 /** Minimal model-visible result recorded while the whole response is validated. */
 export const DECISION_TOOL_RESULT_MESSAGE = "Decision recorded.";
 
+/** Fixed neutral result for a tool call arriving after a cycle was finalized. */
+export const STALE_DECISION_TOOL_RESULT_MESSAGE =
+	"This pi-continue-watchdog decision response has already been finalized.";
+
 export const NO_DECISION_TOOL_ERROR = "Call exactly one decision tool.";
 export const MULTIPLE_DECISION_TOOLS_ERROR =
 	"Call exactly one decision tool; multiple decision tools were called.";
@@ -93,7 +97,8 @@ export interface DecisionProtocolFinalization {
 	readonly outcome: DecisionProtocolOutcome;
 	readonly transition: ControllerTransition;
 	readonly error?: string;
-	readonly prompt?: string;
+	/** Present only for a re-ask, before the runtime dispatches its hidden prompt. */
+	readonly reaskPrompt?: string;
 	readonly reason?: string;
 	readonly notification?: string;
 }
@@ -111,9 +116,23 @@ export interface DecisionProtocolSessionOptions {
  * completed assistant response as a whole.
  */
 export interface DecisionProtocolSession extends DecisionToolExecutor {
-	readonly finalize: (
+	/** Monotonically increasing response-cycle token captured by runtime callbacks. */
+	readonly currentCycleId: number;
+	/**
+	 * Finalize exactly one completed response for `cycleId`. A duplicate callback
+	 * for the current cycle receives the same frozen result; another cycle's
+	 * callback is ignored without changing controller state.
+	 */
+	readonly finalizeResponse: (
+		cycleId: number,
 		response: DecisionResponse,
 	) => DecisionProtocolFinalization;
+	/**
+	 * Acknowledge a cached re-ask. Runtime code must call this immediately before
+	 * it dispatches that re-ask's hidden prompt, so a synchronous next response
+	 * is collected in the new cycle rather than rejected as stale.
+	 */
+	readonly advanceAfterReask: (cycleId: number) => boolean;
 }
 
 type OwnDataProperty =
@@ -122,6 +141,7 @@ type OwnDataProperty =
 	| { readonly kind: "non-data" };
 
 interface RecordedDecisionToolCall {
+	readonly cycleId: number;
 	readonly kind: "continue" | "unlock";
 	readonly toolCallId: string;
 	readonly reason?: string | null;
@@ -248,46 +268,55 @@ function validateToolCall(
 export function validateDecisionResponse(
 	response: DecisionResponse,
 ): DecisionValidation {
-	const toolCalls: DecisionToolCallContent[] = [];
-
-	for (const content of response.content) {
-		if (content.type === "thinking") continue;
-		if (content.type === "text") {
-			if (!isWhitespaceOnlyText(content)) {
-				return { valid: false, error: PROSE_DECISION_RESPONSE_ERROR };
-			}
-			continue;
-		}
-		if (content.type === "toolCall") {
-			toolCalls.push(content);
-			continue;
-		}
-		if (content.type === "malformed") {
+	try {
+		const toolCalls: DecisionToolCallContent[] = [];
+		const content = response.content;
+		if (!Array.isArray(content)) {
 			return { valid: false, error: MALFORMED_DECISION_RESPONSE_ERROR };
 		}
-		return { valid: false, error: UNSUPPORTED_DECISION_CONTENT_ERROR };
-	}
 
-	if (toolCalls.length === 0) {
-		return { valid: false, error: NO_DECISION_TOOL_ERROR };
+		for (let index = 0; index < content.length; index += 1) {
+			const block = content[index];
+			if (block === undefined || block.type === "thinking") continue;
+			if (block.type === "text") {
+				if (!isWhitespaceOnlyText(block)) {
+					return { valid: false, error: PROSE_DECISION_RESPONSE_ERROR };
+				}
+				continue;
+			}
+			if (block.type === "toolCall") {
+				toolCalls.push(block);
+				continue;
+			}
+			if (block.type === "malformed") {
+				return { valid: false, error: MALFORMED_DECISION_RESPONSE_ERROR };
+			}
+			return { valid: false, error: UNSUPPORTED_DECISION_CONTENT_ERROR };
+		}
+
+		if (toolCalls.length === 0) {
+			return { valid: false, error: NO_DECISION_TOOL_ERROR };
+		}
+		if (
+			toolCalls.some(
+				(toolCall) =>
+					toolCall.name !== "continue_watchdog" &&
+					toolCall.name !== "unlock_continue_watchdog",
+			)
+		) {
+			return { valid: false, error: UNKNOWN_DECISION_TOOL_ERROR };
+		}
+		if (toolCalls.length > 1) {
+			return { valid: false, error: MULTIPLE_DECISION_TOOLS_ERROR };
+		}
+		const toolCall = toolCalls[0];
+		if (toolCall === undefined) {
+			return { valid: false, error: NO_DECISION_TOOL_ERROR };
+		}
+		return validateToolCall(toolCall);
+	} catch {
+		return { valid: false, error: MALFORMED_DECISION_RESPONSE_ERROR };
 	}
-	if (
-		toolCalls.some(
-			(toolCall) =>
-				toolCall.name !== "continue_watchdog" &&
-				toolCall.name !== "unlock_continue_watchdog",
-		)
-	) {
-		return { valid: false, error: UNKNOWN_DECISION_TOOL_ERROR };
-	}
-	if (toolCalls.length > 1) {
-		return { valid: false, error: MULTIPLE_DECISION_TOOLS_ERROR };
-	}
-	const toolCall = toolCalls[0];
-	if (toolCall === undefined) {
-		return { valid: false, error: NO_DECISION_TOOL_ERROR };
-	}
-	return validateToolCall(toolCall);
 }
 
 function malformedResponse(): DecisionResponse {
@@ -342,22 +371,26 @@ function normalizeAssistantContentBlock(
 export function normalizeAssistantDecisionResponse(
 	message: unknown,
 ): DecisionResponse {
-	const role = readOwnDataProperty(message, "role");
-	const content = readOwnDataProperty(message, "content");
-	if (
-		role.kind !== "data" ||
-		role.value !== "assistant" ||
-		content.kind !== "data" ||
-		!Array.isArray(content.value)
-	) {
+	try {
+		const role = readOwnDataProperty(message, "role");
+		const content = readOwnDataProperty(message, "content");
+		if (
+			role.kind !== "data" ||
+			role.value !== "assistant" ||
+			content.kind !== "data" ||
+			!Array.isArray(content.value)
+		) {
+			return malformedResponse();
+		}
+
+		const normalized: DecisionResponseContent[] = [];
+		for (let index = 0; index < content.value.length; index += 1) {
+			normalized.push(normalizeAssistantContentBlock(content.value[index]));
+		}
+		return Object.freeze({ content: Object.freeze(normalized) });
+	} catch {
 		return malformedResponse();
 	}
-
-	const normalized: DecisionResponseContent[] = [];
-	for (const block of content.value) {
-		normalized.push(normalizeAssistantContentBlock(block));
-	}
-	return Object.freeze({ content: Object.freeze(normalized) });
 }
 
 /** Build the hidden immediate re-ask body from a safe fixed validator error. */
@@ -383,8 +416,19 @@ function recordedDecisionToolResult(): AgentToolResult<{
 	};
 }
 
+function staleDecisionToolResult(): AgentToolResult<{
+	readonly kind: "stale-decision-tool";
+}> {
+	return {
+		content: [{ type: "text", text: STALE_DECISION_TOOL_RESULT_MESSAGE }],
+		details: { kind: "stale-decision-tool" },
+		terminate: true,
+	};
+}
+
 function matchesRecordedTool(
 	decision: ValidDecision,
+	cycleId: number,
 	recorded: readonly RecordedDecisionToolCall[],
 ): string | null {
 	if (recorded.length === 0) return DECISION_TOOL_NOT_EXECUTED_ERROR;
@@ -392,6 +436,7 @@ function matchesRecordedTool(
 	if (
 		recorded.length !== 1 ||
 		recordedCall === undefined ||
+		recordedCall.cycleId !== cycleId ||
 		recordedCall.kind !== decision.kind ||
 		recordedCall.toolCallId !== decision.toolCallId ||
 		(decision.kind === "unlock" && recordedCall.reason !== decision.reason)
@@ -410,90 +455,81 @@ function matchesRecordedTool(
 export function createDecisionProtocolSession(
 	options: DecisionProtocolSessionOptions,
 ): DecisionProtocolSession {
+	let cycleId = 1;
 	let recorded: RecordedDecisionToolCall[] = [];
 	let finalized: DecisionProtocolFinalization | null = null;
+
+	const ignoredFinalization = (): DecisionProtocolFinalization =>
+		Object.freeze({
+			outcome: "ignored",
+			transition: Object.freeze({
+				applied: false,
+				snapshot: options.controller.snapshot,
+				effects: Object.freeze([]),
+			}),
+		});
+
+	const finalizeInvalid = (error: string): DecisionProtocolFinalization => {
+		const transition = options.controller.recordInvalidDecision(
+			options.decisionId,
+			error,
+		);
+		if (!transition.applied) {
+			return Object.freeze({ outcome: "ignored", transition });
+		}
+		if (transition.snapshot.decisionFailed) {
+			return Object.freeze({
+				outcome: "decision-failed",
+				transition,
+				error,
+				notification: formatDecisionFailedNotification(error),
+			});
+		}
+		return Object.freeze({
+			outcome: "reask",
+			transition,
+			error,
+			reaskPrompt: buildDecisionReaskPrompt(options.decisionPrompt, error),
+		});
+	};
 
 	const onDecisionToolCall = (
 		call: DecisionToolCall,
 	): AgentToolResult<unknown> => {
-		if (finalized === null) {
-			recorded.push({
-				kind: call.kind,
-				toolCallId: call.toolCallId,
-				reason:
-					call.kind === "unlock"
-						? normalizeDecisionUnlockReason(call.reason)
-						: undefined,
-			});
-		}
+		if (finalized !== null) return staleDecisionToolResult();
+		recorded.push({
+			cycleId,
+			kind: call.kind,
+			toolCallId: call.toolCallId,
+			reason:
+				call.kind === "unlock"
+					? normalizeDecisionUnlockReason(call.reason)
+					: undefined,
+		});
 		return recordedDecisionToolResult();
 	};
 
-	const finalize = (
+	const finalizeResponse = (
+		expectedCycleId: number,
 		response: DecisionResponse,
 	): DecisionProtocolFinalization => {
+		if (expectedCycleId !== cycleId) return ignoredFinalization();
 		if (finalized !== null) return finalized;
 
 		const validation = validateDecisionResponse(response);
 		if (!validation.valid) {
-			const transition = options.controller.recordInvalidDecision(
-				options.decisionId,
-				validation.error,
-			);
-			recorded = [];
-			if (!transition.applied) {
-				finalized = Object.freeze({ outcome: "ignored", transition });
-				return finalized;
-			}
-			if (transition.snapshot.decisionFailed) {
-				finalized = Object.freeze({
-					outcome: "decision-failed",
-					transition,
-					error: validation.error,
-					notification: formatDecisionFailedNotification(validation.error),
-				});
-				return finalized;
-			}
-			return Object.freeze({
-				outcome: "reask",
-				transition,
-				error: validation.error,
-				prompt: buildDecisionReaskPrompt(
-					options.decisionPrompt,
-					validation.error,
-				),
-			});
+			finalized = finalizeInvalid(validation.error);
+			return finalized;
 		}
 
-		const collectorError = matchesRecordedTool(validation.decision, recorded);
+		const collectorError = matchesRecordedTool(
+			validation.decision,
+			cycleId,
+			recorded,
+		);
 		if (collectorError !== null) {
-			const transition = options.controller.recordInvalidDecision(
-				options.decisionId,
-				collectorError,
-			);
-			recorded = [];
-			if (!transition.applied) {
-				finalized = Object.freeze({ outcome: "ignored", transition });
-				return finalized;
-			}
-			if (transition.snapshot.decisionFailed) {
-				finalized = Object.freeze({
-					outcome: "decision-failed",
-					transition,
-					error: collectorError,
-					notification: formatDecisionFailedNotification(collectorError),
-				});
-				return finalized;
-			}
-			return Object.freeze({
-				outcome: "reask",
-				transition,
-				error: collectorError,
-				prompt: buildDecisionReaskPrompt(
-					options.decisionPrompt,
-					collectorError,
-				),
-			});
+			finalized = finalizeInvalid(collectorError);
+			return finalized;
 		}
 
 		const transition =
@@ -516,5 +552,26 @@ export function createDecisionProtocolSession(
 		return finalized;
 	};
 
-	return Object.freeze({ onDecisionToolCall, finalize });
+	const advanceAfterReask = (expectedCycleId: number): boolean => {
+		if (
+			expectedCycleId !== cycleId ||
+			finalized?.outcome !== "reask" ||
+			!options.controller.snapshot.decisionOpen
+		) {
+			return false;
+		}
+		recorded = [];
+		finalized = null;
+		cycleId += 1;
+		return true;
+	};
+
+	return Object.freeze({
+		get currentCycleId(): number {
+			return cycleId;
+		},
+		onDecisionToolCall,
+		finalizeResponse,
+		advanceAfterReask,
+	});
 }
