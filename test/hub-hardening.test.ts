@@ -184,6 +184,92 @@ test("I1 RED: invalid and throwing bind inputs are deterministic, secret-free no
 	assert.equal(root.created, true);
 });
 
+test("I1 RED: bind accepts only one stable own data attachment-instance kind marker", () => {
+	const state = createObservableAgentHub();
+	const before = state.snapshot;
+	const marker = "pi-continue-watchdog:hub-attachment-instance:v1";
+	const factoryInstance = createHubAttachmentInstance();
+	const factoryKind = Object.getOwnPropertyDescriptor(factoryInstance, "kind");
+	assert.deepEqual(factoryKind, {
+		value: marker,
+		writable: false,
+		enumerable: true,
+		configurable: false,
+	});
+
+	let proxyDescriptorReads = 0;
+	const exactMarkerProxy = new Proxy(factoryInstance, {
+		getOwnPropertyDescriptor(target, property) {
+			if (property === "kind") {
+				proxyDescriptorReads += 1;
+				if (proxyDescriptorReads > 1) throw new Error("kind inspected twice");
+			}
+			return Reflect.getOwnPropertyDescriptor(target, property);
+		},
+	});
+	const valid = state.bind({
+		instance: exactMarkerProxy,
+		sessionId: "valid",
+		hasUI: true,
+	});
+	assert.equal(valid.error, null);
+	assert.equal(proxyDescriptorReads, 1);
+
+	let accessorReads = 0;
+	const accessorKind = {};
+	Object.defineProperty(accessorKind, "kind", {
+		get() {
+			accessorReads += 1;
+			return marker;
+		},
+		enumerable: true,
+		configurable: false,
+	});
+	let changingGetterReads = 0;
+	const changingGetterKind = {};
+	Object.defineProperty(changingGetterKind, "kind", {
+		get() {
+			changingGetterReads += 1;
+			return changingGetterReads === 1 ? marker : "changed";
+		},
+		enumerable: true,
+		configurable: false,
+	});
+	const inheritedKind = Object.create({ kind: marker });
+	const wrongKind = Object.freeze({ kind: "not-the-factory-marker" });
+	const missingKind = Object.freeze({});
+	const secret = "must-not-leak-kind-proxy-secret";
+	const throwingKindProxy = new Proxy(
+		{},
+		{
+			getOwnPropertyDescriptor() {
+				throw new Error(secret);
+			},
+		},
+	);
+
+	for (const instance of [
+		wrongKind,
+		missingKind,
+		inheritedKind,
+		accessorKind,
+		changingGetterKind,
+		throwingKindProxy,
+	]) {
+		const result = state.bind({
+			instance: instance as BindAttachmentInput["instance"],
+			sessionId: "invalid",
+			hasUI: false,
+		});
+		invalidResult(result);
+		assert.equal(JSON.stringify(result).includes(secret), false);
+		assert.deepEqual(state.snapshot, valid.transition.snapshot);
+	}
+	assert.equal(accessorReads, 0);
+	assert.equal(changingGetterReads, 0);
+	assert.notDeepEqual(state.snapshot, before);
+});
+
 test("I2 RED: detached attachment instances retain inactive weak tombstones and never resurrect", () => {
 	const state = createObservableAgentHub();
 	const instance = createHubAttachmentInstance();
@@ -281,6 +367,8 @@ test("I3 and I4 RED: physical module copies have compatible types and one harden
 				"const first = firstCopy.getProcessObservableAgentHub();",
 				"const second = secondCopy.getProcessObservableAgentHub();",
 				"assert.equal(first, second);",
+				'assert.equal(second.bind({ instance: firstCopy.createHubAttachmentInstance(), sessionId: "from-a", hasUI: false }).error, null);',
+				'assert.equal(first.bind({ instance: secondCopy.createHubAttachmentInstance(), sessionId: "from-b", hasUI: false }).error, null);',
 				`const key = Object.getOwnPropertySymbols(globalThis).find((symbol) => Symbol.keyFor(symbol) === ${JSON.stringify(hubGlobalKey)});`,
 				"assert.ok(key);",
 				"const descriptor = Object.getOwnPropertyDescriptor(globalThis, key);",
@@ -299,6 +387,45 @@ test("I3 and I4 RED: physical module copies have compatible types and one harden
 			[tsxCli, join(directory, "singleton.ts"), directory],
 			"physical-copy singleton runtime",
 		);
+	});
+});
+
+test("I2 RED: fixed branded global hubs require the prototype snapshot getter without invoking it", () => {
+	withPhysicalHubCopies((directory) => {
+		for (const scenario of ["no-snapshot", "own-snapshot-accessor"] as const) {
+			writeFileSync(
+				join(directory, `${scenario}.ts`),
+				[
+					'import assert from "node:assert/strict";',
+					'import { join } from "node:path";',
+					'import { pathToFileURL } from "node:url";',
+					`const key = Symbol.for(${JSON.stringify(hubGlobalKey)});`,
+					'const brand = Symbol.for("pi-continue-watchdog:hub-brand:v1");',
+					"const candidate: Record<PropertyKey, unknown> = {};",
+					'Object.defineProperty(candidate, brand, { value: "pi-continue-watchdog:hub:v1", writable: false, configurable: false, enumerable: false });',
+					'for (const name of ["bind", "markBusy", "markIdle", "detach", "reclaimMain", "mainClaimFor", "isCurrentMain"]) Object.defineProperty(candidate, name, { value() {}, configurable: true });',
+					scenario === "own-snapshot-accessor"
+						? 'let snapshotReads = 0; Object.defineProperty(candidate, "snapshot", { get() { snapshotReads += 1; throw new Error("snapshot getter must not run"); }, configurable: false });'
+						: "",
+					"Object.defineProperty(globalThis, key, { value: candidate, writable: false, configurable: false, enumerable: false });",
+					"void (async () => {",
+					"const directory = process.argv[2];",
+					"assert.ok(directory);",
+					'const copy = await import(pathToFileURL(join(directory, "copy-a", "hub.ts")).href);',
+					"assert.throws(() => copy.getProcessObservableAgentHub(), (error: unknown) => error instanceof TypeError && error.message === 'Invalid process observable agent hub');",
+					"assert.equal(Object.getOwnPropertyDescriptor(globalThis, key)?.value, candidate);",
+					scenario === "own-snapshot-accessor"
+						? "assert.equal(snapshotReads, 0);"
+						: "",
+					"})().catch((error: unknown) => { throw error; });",
+				].join("\n"),
+			);
+			runBounded(
+				process.execPath,
+				[tsxCli, join(directory, `${scenario}.ts`), directory],
+				`global ${scenario} snapshot validation`,
+			);
+		}
 	});
 });
 

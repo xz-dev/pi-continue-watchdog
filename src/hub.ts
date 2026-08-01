@@ -14,6 +14,10 @@ const PROCESS_HUB_BRAND = Symbol.for("pi-continue-watchdog:hub-brand:v1");
 const PROCESS_HUB_VERSION = "pi-continue-watchdog:hub:v1";
 const INVALID_PROCESS_HUB_MESSAGE = "Invalid process observable agent hub";
 
+/** Structural cross-copy marker for a factory-created attachment instance. */
+export const HUB_ATTACHMENT_INSTANCE_KIND =
+	"pi-continue-watchdog:hub-attachment-instance:v1" as const;
+
 /**
  * Opaque per-runtime-attachment identity. Create one when an extension instance
  * attaches, retain it for that instance's complete lifecycle, and bind only once.
@@ -24,14 +28,12 @@ const INVALID_PROCESS_HUB_MESSAGE = "Invalid process observable agent hub";
  * Runtime authority still comes exclusively from WeakMap object identity.
  */
 export interface HubAttachmentInstance {
-	readonly kind: "pi-continue-watchdog:hub-attachment-instance:v1";
+	readonly kind: typeof HUB_ATTACHMENT_INSTANCE_KIND;
 }
 
 /** Creates one opaque identity for a single runtime extension attachment. */
 export function createHubAttachmentInstance(): HubAttachmentInstance {
-	return Object.freeze({
-		kind: "pi-continue-watchdog:hub-attachment-instance:v1",
-	} as const);
+	return Object.freeze({ kind: HUB_ATTACHMENT_INSTANCE_KIND });
 }
 
 export interface HubAttachmentIdentity {
@@ -196,6 +198,7 @@ function captureBindInput(
 		if (
 			typeof instance !== "object" ||
 			instance === null ||
+			!isValidHubAttachmentInstance(instance) ||
 			typeof sessionId !== "string" ||
 			typeof hasUI !== "boolean" ||
 			(initialBusy !== undefined && typeof initialBusy !== "boolean")
@@ -498,6 +501,21 @@ function dataDescriptorValue(
 		: null;
 }
 
+function isValidHubAttachmentInstance(
+	candidate: object,
+): candidate is HubAttachmentInstance {
+	const marker = safelyGetOwnDescriptor(candidate, "kind");
+	if (marker.kind !== "descriptor") return false;
+	const markerValue = dataDescriptorValue(marker.descriptor);
+	return (
+		markerValue !== null &&
+		markerValue.value === HUB_ATTACHMENT_INSTANCE_KIND &&
+		marker.descriptor.writable === false &&
+		marker.descriptor.configurable === false &&
+		marker.descriptor.enumerable === true
+	);
+}
+
 function hasOwnCallableSurface(
 	candidate: object,
 	name: keyof Omit<ObservableAgentHub, "snapshot">,
@@ -508,6 +526,35 @@ function hasOwnCallableSurface(
 		if (read.kind === "failed") return false;
 		if (read.kind === "descriptor") {
 			return typeof dataDescriptorValue(read.descriptor)?.value === "function";
+		}
+		try {
+			current = Object.getPrototypeOf(current);
+		} catch {
+			return false;
+		}
+	}
+	return false;
+}
+
+function hasPrototypeSnapshotGetter(candidate: object): boolean {
+	const ownSnapshot = safelyGetOwnDescriptor(candidate, "snapshot");
+	if (ownSnapshot.kind !== "missing") return false;
+
+	let current: object | null;
+	try {
+		current = Object.getPrototypeOf(candidate);
+	} catch {
+		return false;
+	}
+	while (current !== null) {
+		const read = safelyGetOwnDescriptor(current, "snapshot");
+		if (read.kind === "failed") return false;
+		if (read.kind === "descriptor") {
+			return (
+				!Object.hasOwn(read.descriptor, "value") &&
+				Object.hasOwn(read.descriptor, "get") &&
+				typeof read.descriptor.get === "function"
+			);
 		}
 		try {
 			current = Object.getPrototypeOf(current);
@@ -535,6 +582,7 @@ function isValidProcessHub(
 		return false;
 	}
 	return (
+		hasPrototypeSnapshotGetter(candidate) &&
 		hasOwnCallableSurface(candidate, "bind") &&
 		hasOwnCallableSurface(candidate, "markBusy") &&
 		hasOwnCallableSurface(candidate, "markIdle") &&
