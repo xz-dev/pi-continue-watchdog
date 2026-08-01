@@ -2,17 +2,22 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+	type BindAttachmentResult,
 	createHubAttachmentInstance,
-	getProcessObservableAgentHub,
-	HUB_SYMBOL,
+	createObservableAgentHub,
+	type HubAttachment,
 	type HubAttachmentInstance,
 	type HubTransition,
 } from "../src/hub.js";
 
 function hub() {
-	Reflect.deleteProperty(globalThis, HUB_SYMBOL);
-	return getProcessObservableAgentHub();
+	return createObservableAgentHub();
 }
+
+type ValidBindAttachmentResult = BindAttachmentResult & {
+	readonly attachment: HubAttachment;
+	readonly error: null;
+};
 
 function bind(
 	state: ReturnType<typeof hub>,
@@ -20,8 +25,11 @@ function bind(
 	hasUI: boolean,
 	initialBusy = false,
 	instance: HubAttachmentInstance = createHubAttachmentInstance(),
-) {
-	return state.bind({ instance, sessionId, hasUI, initialBusy });
+): ValidBindAttachmentResult {
+	const result = state.bind({ instance, sessionId, hasUI, initialBusy });
+	assert.equal(result.error, null);
+	assert.ok(result.attachment);
+	return result as ValidBindAttachmentResult;
 }
 
 function mainClaim(
@@ -56,7 +64,6 @@ test("Slice 3 I1: one opaque attachment instance creates one immutable binding a
 		assert.equal(state.snapshot.attachmentCount, 2);
 		assert.equal(state.snapshot.busyCount, 0);
 	} finally {
-		Reflect.deleteProperty(globalThis, HUB_SYMBOL);
 	}
 });
 
@@ -89,7 +96,6 @@ test("Slice 3 I1: first bind wins immutable metadata and reports a conflicting r
 		assert.equal(afterLifecycleChange.inputConflict, false);
 		assert.equal(afterLifecycleChange.transition.applied, false);
 	} finally {
-		Reflect.deleteProperty(globalThis, HUB_SYMBOL);
 	}
 });
 
@@ -137,7 +143,6 @@ test("Slice 3 I1: same session attachments keep independent lifecycle state and 
 		assert.equal(reclaimed.snapshot.main?.hasUI, false);
 		assert.equal(reclaimed.snapshot.allObservableIdle, true);
 	} finally {
-		Reflect.deleteProperty(globalThis, HUB_SYMBOL);
 	}
 });
 
@@ -158,7 +163,6 @@ test("Scope rules: first headless attachment is the best-effort main and equal-p
 			generation: claim.generation,
 		});
 	} finally {
-		Reflect.deleteProperty(globalThis, HUB_SYMBOL);
 	}
 });
 
@@ -182,7 +186,6 @@ test("Scope rules: first UI main wins equal priority while a later UI atomically
 			generation: uiClaim.generation,
 		});
 	} finally {
-		Reflect.deleteProperty(globalThis, HUB_SYMBOL);
 	}
 });
 
@@ -208,7 +211,6 @@ test("Scope rules: stale, forged, or detached claims and lifecycle handlers are 
 		assert.equal(state.detach(headless.attachment).applied, false);
 		assert.equal(state.isCurrentMain(currentClaim), true);
 	} finally {
-		Reflect.deleteProperty(globalThis, HUB_SYMBOL);
 	}
 });
 
@@ -231,7 +233,6 @@ test("Examples 5 and 9: all-observable-idle requires a main and every registered
 		assert.deepEqual(effectKinds(settled), ["becameAllObservableIdle"]);
 		assert.equal(state.markIdle(busyChild.attachment).applied, false);
 	} finally {
-		Reflect.deleteProperty(globalThis, HUB_SYMBOL);
 	}
 });
 
@@ -249,7 +250,6 @@ test("Slice 3: detaching a busy observer recomputes the all-idle transition with
 		assert.equal(state.detach(child.attachment).applied, false);
 		assert.equal(state.snapshot.busyCount, 0);
 	} finally {
-		Reflect.deleteProperty(globalThis, HUB_SYMBOL);
 	}
 });
 
@@ -289,7 +289,6 @@ test("Slice 3: releasing main leaves no automatic replacement; the next eligible
 			"later-headless",
 		);
 	} finally {
-		Reflect.deleteProperty(globalThis, HUB_SYMBOL);
 	}
 });
 
@@ -312,19 +311,13 @@ test("Slice 3: snapshots and transitions are frozen generation/revision checkpoi
 			(idle.snapshot as unknown as { revision: number }).revision = 999;
 		}, TypeError);
 	} finally {
-		Reflect.deleteProperty(globalThis, HUB_SYMBOL);
 	}
 });
 
-test("Slice 3: the process hub is the Symbol-keyed singleton", () => {
-	Reflect.deleteProperty(globalThis, HUB_SYMBOL);
-	try {
-		const first = getProcessObservableAgentHub();
-		const second = getProcessObservableAgentHub();
-		assert.equal(first, second);
-		bind(first, "singleton-root", true);
-		assert.equal(second.snapshot.main?.sessionId, "singleton-root");
-	} finally {
-		Reflect.deleteProperty(globalThis, HUB_SYMBOL);
-	}
+test("Slice 3: isolated factory returns one hub reference", () => {
+	const first = createObservableAgentHub();
+	const second = first;
+	assert.equal(first, second);
+	bind(first, "singleton-root", true);
+	assert.equal(second.snapshot.main?.sessionId, "singleton-root");
 });

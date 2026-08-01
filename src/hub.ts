@@ -9,25 +9,29 @@ import { randomUUID } from "node:crypto";
  * Coverage is limited to same-process attachments that loaded this extension.
  */
 
-export const HUB_SYMBOL = Symbol.for("pi-continue-watchdog:hub:v1");
-
-const HUB_ATTACHMENT_INSTANCE = Symbol(
-	"pi-continue-watchdog:hub-attachment-instance",
-);
+const PROCESS_HUB_KEY = Symbol.for("pi-continue-watchdog:hub:v1");
+const PROCESS_HUB_BRAND = Symbol.for("pi-continue-watchdog:hub-brand:v1");
+const PROCESS_HUB_VERSION = "pi-continue-watchdog:hub:v1";
+const INVALID_PROCESS_HUB_MESSAGE = "Invalid process observable agent hub";
 
 /**
  * Opaque per-runtime-attachment identity. Create one when an extension instance
  * attaches, retain it for that instance's complete lifecycle, and bind only once.
  * It is deliberately distinct from the informational sessionId: simultaneous
  * attachments can legitimately report the same sessionId.
+ *
+ * The structural marker intentionally works across physical copies of this module.
+ * Runtime authority still comes exclusively from WeakMap object identity.
  */
 export interface HubAttachmentInstance {
-	readonly [HUB_ATTACHMENT_INSTANCE]: true;
+	readonly kind: "pi-continue-watchdog:hub-attachment-instance:v1";
 }
 
 /** Creates one opaque identity for a single runtime extension attachment. */
 export function createHubAttachmentInstance(): HubAttachmentInstance {
-	return Object.freeze({ [HUB_ATTACHMENT_INSTANCE]: true } as const);
+	return Object.freeze({
+		kind: "pi-continue-watchdog:hub-attachment-instance:v1",
+	} as const);
 }
 
 export interface HubAttachmentIdentity {
@@ -98,9 +102,12 @@ export interface BindAttachmentResult {
 	 * The original attachment and metadata always win; no transition is applied.
 	 */
 	readonly inputConflict: boolean;
-	readonly attachment: HubAttachment;
+	/** Null only for an invalid hostile or malformed bind input. */
+	readonly attachment: HubAttachment | null;
 	/** Present only when this bind won a new or promoted main ownership claim. */
 	readonly mainClaim: HubMainClaim | null;
+	/** A fixed result code that keeps invalid lifecycle input non-throwing. */
+	readonly error: "invalidInput" | null;
 	readonly transition: HubTransition;
 }
 
@@ -119,12 +126,19 @@ export interface ObservableAgentHub {
 	isCurrentMain(claim: HubMainClaim): boolean;
 }
 
-interface RegisteredAttachment {
+interface CapturedBindAttachmentInput {
 	readonly instance: HubAttachmentInstance;
+	readonly sessionId: string;
+	readonly hasUI: boolean;
+	readonly initialBusy: boolean;
+}
+
+interface RegisteredAttachment {
 	readonly attachment: HubAttachment;
 	readonly order: number;
 	/** Immutable bind input retained to report duplicate metadata conflicts. */
 	readonly initialBusy: boolean;
+	active: boolean;
 	busy: boolean;
 }
 
@@ -166,6 +180,34 @@ function freezeEffect(effect: HubEffect): HubEffect {
 	});
 }
 
+/**
+ * Captures every public bind property once before any registry access. This keeps
+ * lifecycle routing deterministic even when callers accidentally pass a Proxy or
+ * an object with hostile getters.
+ */
+function captureBindInput(
+	input: BindAttachmentInput,
+): CapturedBindAttachmentInput | null {
+	try {
+		const instance = input.instance;
+		const sessionId = input.sessionId;
+		const hasUI = input.hasUI;
+		const initialBusy = input.initialBusy;
+		if (
+			typeof instance !== "object" ||
+			instance === null ||
+			typeof sessionId !== "string" ||
+			typeof hasUI !== "boolean" ||
+			(initialBusy !== undefined && typeof initialBusy !== "boolean")
+		) {
+			return null;
+		}
+		return { instance, sessionId, hasUI, initialBusy: initialBusy === true };
+	} catch {
+		return null;
+	}
+}
+
 class ProcessObservableAgentHub implements ObservableAgentHub {
 	private readonly attachmentsByInstance = new WeakMap<
 		HubAttachmentInstance,
@@ -177,36 +219,49 @@ class ProcessObservableAgentHub implements ObservableAgentHub {
 	private revision = 0;
 	private main: CurrentMain | undefined;
 
+	public constructor() {
+		Object.defineProperty(this, PROCESS_HUB_BRAND, {
+			value: PROCESS_HUB_VERSION,
+			writable: false,
+			configurable: false,
+			enumerable: false,
+		});
+	}
+
 	public get snapshot(): ObservableAgentHubSnapshot {
 		return this.freezeSnapshot();
 	}
 
 	public bind(input: BindAttachmentInput): BindAttachmentResult {
-		const existing = this.attachmentsByInstance.get(input.instance);
+		const captured = captureBindInput(input);
+		if (captured === null) return this.invalidBind();
+
+		const existing = this.attachmentsByInstance.get(captured.instance);
 		if (existing !== undefined) {
 			return Object.freeze({
 				created: false,
-				inputConflict: this.inputConflicts(existing, input),
+				inputConflict: this.inputConflicts(existing, captured),
 				attachment: existing.attachment,
 				mainClaim: null,
+				error: null,
 				transition: this.noop(),
 			});
 		}
 
 		const wasAllObservableIdle = this.allObservableIdle();
 		const attachment = freezeAttachment(
-			input.sessionId,
-			input.hasUI,
+			captured.sessionId,
+			captured.hasUI,
 			randomUUID(),
 		);
 		const registered: RegisteredAttachment = {
-			instance: input.instance,
 			attachment,
 			order: this.nextAttachmentOrder++,
-			initialBusy: input.initialBusy === true,
-			busy: input.initialBusy === true,
+			initialBusy: captured.initialBusy,
+			active: true,
+			busy: captured.initialBusy,
 		};
-		this.attachmentsByInstance.set(input.instance, registered);
+		this.attachmentsByInstance.set(captured.instance, registered);
 		this.attachmentsByToken.set(attachment.token, registered);
 
 		const effects: HubEffect[] = [];
@@ -225,6 +280,7 @@ class ProcessObservableAgentHub implements ObservableAgentHub {
 			inputConflict: false,
 			attachment,
 			mainClaim,
+			error: null,
 			transition: this.complete(wasAllObservableIdle, effects),
 		});
 	}
@@ -258,7 +314,7 @@ class ProcessObservableAgentHub implements ObservableAgentHub {
 			this.main = undefined;
 			effects.push({ kind: "mainChanged", previous, main: null });
 		}
-		this.attachmentsByInstance.delete(registered.instance);
+		registered.active = false;
 		this.attachmentsByToken.delete(registered.attachment.token);
 		return this.complete(wasAllObservableIdle, effects);
 	}
@@ -325,12 +381,12 @@ class ProcessObservableAgentHub implements ObservableAgentHub {
 
 	private inputConflicts(
 		existing: RegisteredAttachment,
-		input: BindAttachmentInput,
+		input: CapturedBindAttachmentInput,
 	): boolean {
 		return (
 			existing.attachment.identity.sessionId !== input.sessionId ||
 			existing.attachment.identity.hasUI !== input.hasUI ||
-			existing.initialBusy !== (input.initialBusy === true)
+			existing.initialBusy !== input.initialBusy
 		);
 	}
 
@@ -360,6 +416,17 @@ class ProcessObservableAgentHub implements ObservableAgentHub {
 			applied: true,
 			snapshot: this.freezeSnapshot(),
 			effects: Object.freeze(effects.map(freezeEffect)),
+		});
+	}
+
+	private invalidBind(): BindAttachmentResult {
+		return Object.freeze({
+			created: false,
+			inputConflict: false,
+			attachment: null,
+			mainClaim: null,
+			error: "invalidInput",
+			transition: this.noop(),
 		});
 	}
 
@@ -395,11 +462,120 @@ class ProcessObservableAgentHub implements ObservableAgentHub {
 	}
 }
 
-/** Returns the sole process-local hub shared by every loaded extension attachment. */
+/** Creates an isolated hub for tests or other in-process lifecycle boundaries. */
+export function createObservableAgentHub(): ObservableAgentHub {
+	return new ProcessObservableAgentHub();
+}
+
+function invalidProcessHub(): never {
+	throw new TypeError(INVALID_PROCESS_HUB_MESSAGE);
+}
+
+type OwnDescriptorRead =
+	| { readonly kind: "missing" }
+	| { readonly kind: "descriptor"; readonly descriptor: PropertyDescriptor }
+	| { readonly kind: "failed" };
+
+function safelyGetOwnDescriptor(
+	target: object,
+	key: PropertyKey,
+): OwnDescriptorRead {
+	try {
+		const descriptor = Object.getOwnPropertyDescriptor(target, key);
+		return descriptor === undefined
+			? { kind: "missing" }
+			: { kind: "descriptor", descriptor };
+	} catch {
+		return { kind: "failed" };
+	}
+}
+
+function dataDescriptorValue(
+	descriptor: PropertyDescriptor,
+): { readonly kind: "value"; readonly value: unknown } | null {
+	return Object.hasOwn(descriptor, "value")
+		? { kind: "value", value: descriptor.value }
+		: null;
+}
+
+function hasOwnCallableSurface(
+	candidate: object,
+	name: keyof Omit<ObservableAgentHub, "snapshot">,
+): boolean {
+	let current: object | null = candidate;
+	while (current !== null) {
+		const read = safelyGetOwnDescriptor(current, name);
+		if (read.kind === "failed") return false;
+		if (read.kind === "descriptor") {
+			return typeof dataDescriptorValue(read.descriptor)?.value === "function";
+		}
+		try {
+			current = Object.getPrototypeOf(current);
+		} catch {
+			return false;
+		}
+	}
+	return false;
+}
+
+function isValidProcessHub(
+	candidate: unknown,
+): candidate is ObservableAgentHub {
+	if (typeof candidate !== "object" || candidate === null) return false;
+	const brand = safelyGetOwnDescriptor(candidate, PROCESS_HUB_BRAND);
+	if (brand.kind !== "descriptor") return false;
+	const brandValue = dataDescriptorValue(brand.descriptor);
+	if (
+		brandValue === null ||
+		brandValue.value !== PROCESS_HUB_VERSION ||
+		brand.descriptor.writable !== false ||
+		brand.descriptor.configurable !== false ||
+		brand.descriptor.enumerable !== false
+	) {
+		return false;
+	}
+	return (
+		hasOwnCallableSurface(candidate, "bind") &&
+		hasOwnCallableSurface(candidate, "markBusy") &&
+		hasOwnCallableSurface(candidate, "markIdle") &&
+		hasOwnCallableSurface(candidate, "detach") &&
+		hasOwnCallableSurface(candidate, "reclaimMain") &&
+		hasOwnCallableSurface(candidate, "mainClaimFor") &&
+		hasOwnCallableSurface(candidate, "isCurrentMain")
+	);
+}
+
+/**
+ * Returns the sole hardened process-local hub shared by every loaded extension
+ * copy. A pre-existing malformed or accessor-backed global is rejected without
+ * invoking it or replacing it.
+ */
 export function getProcessObservableAgentHub(): ObservableAgentHub {
-	const globalState = globalThis as typeof globalThis & {
-		[HUB_SYMBOL]?: ObservableAgentHub;
-	};
-	globalState[HUB_SYMBOL] ??= new ProcessObservableAgentHub();
-	return globalState[HUB_SYMBOL];
+	const existing = safelyGetOwnDescriptor(globalThis, PROCESS_HUB_KEY);
+	if (existing.kind === "failed") return invalidProcessHub();
+	if (existing.kind === "missing") {
+		const hub = createObservableAgentHub();
+		try {
+			Object.defineProperty(globalThis, PROCESS_HUB_KEY, {
+				value: hub,
+				writable: false,
+				configurable: false,
+				enumerable: false,
+			});
+			return hub;
+		} catch {
+			return invalidProcessHub();
+		}
+	}
+	const existingValue = dataDescriptorValue(existing.descriptor);
+	if (
+		existingValue === null ||
+		existing.descriptor.writable !== false ||
+		existing.descriptor.configurable !== false ||
+		existing.descriptor.enumerable !== false ||
+		!isValidProcessHub(existingValue.value)
+	) {
+		return invalidProcessHub();
+	}
+	return existingValue.value;
 }
