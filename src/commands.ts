@@ -50,10 +50,59 @@ interface StaticTextComponent {
 	invalidate(): void;
 }
 
+const graphemeSegmenter = new Intl.Segmenter(undefined, {
+	granularity: "grapheme",
+});
+
+function sanitizeTuiText(text: string): string {
+	return Array.from(text, (character) =>
+		character !== "\n" && /[\p{Cc}\p{Cs}]/u.test(character) ? "?" : character,
+	).join("");
+}
+
+function displayWidth(grapheme: string): number {
+	return /^[\x20-\x7e]$/u.test(grapheme) ? 1 : 2;
+}
+
+function renderableGrapheme(grapheme: string, maxWidth: number): string {
+	return displayWidth(grapheme) <= maxWidth ? grapheme : "?";
+}
+
+/**
+ * Wrap terminal-safe text conservatively. Non-ASCII graphemes count as two
+ * columns, which may underfill a line but cannot overflow it. A one-column
+ * terminal renders a wide grapheme as `?`, since preserving it would overflow.
+ */
+export function wrapTuiText(text: string, width: number): string[] {
+	const maxWidth = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
+	const lines: string[] = [];
+
+	for (const sourceLine of sanitizeTuiText(text).split("\n")) {
+		let line = "";
+		let lineWidth = 0;
+
+		for (const { segment } of graphemeSegmenter.segment(sourceLine)) {
+			const grapheme = renderableGrapheme(segment, maxWidth);
+			const graphemeWidth = displayWidth(grapheme);
+			if (lineWidth > 0 && lineWidth + graphemeWidth > maxWidth) {
+				lines.push(line);
+				line = "";
+				lineWidth = 0;
+			}
+			line += grapheme;
+			lineWidth += graphemeWidth;
+		}
+
+		lines.push(line);
+	}
+
+	return lines;
+}
+
 function createStaticTextComponent(text: string): StaticTextComponent {
 	return {
-		render(_width: number): string[] {
-			return text.split("\n");
+		render(width: number): string[] {
+			return wrapTuiText(text, width);
 		},
 		invalidate(): void {
 			// This immutable component has no cached render state.
@@ -61,10 +110,18 @@ function createStaticTextComponent(text: string): StaticTextComponent {
 	};
 }
 
-function getHumanUnlockReason(entry: HumanUnlockEntry | undefined): string {
-	return typeof entry?.reason === "string" && entry.reason.length > 0
-		? entry.reason
-		: "";
+function getHumanUnlockReason(entry: unknown): string {
+	if (typeof entry !== "object" || entry === null) return "";
+
+	try {
+		const data = (entry as { readonly data?: unknown }).data;
+		if (typeof data !== "object" || data === null) return "";
+
+		const reason = (data as { readonly reason?: unknown }).reason;
+		return typeof reason === "string" && reason.length > 0 ? reason : "";
+	} catch {
+		return "";
+	}
 }
 
 /**
@@ -73,7 +130,7 @@ function getHumanUnlockReason(entry: HumanUnlockEntry | undefined): string {
  */
 export function createHumanUnlockEntryRenderer(): EntryRenderer<HumanUnlockEntry> {
 	return (entry) => {
-		const reason = getHumanUnlockReason(entry.data);
+		const reason = getHumanUnlockReason(entry);
 		const text = reason
 			? `Continue watchdog unlocked: ${reason}`
 			: "Continue watchdog unlocked";

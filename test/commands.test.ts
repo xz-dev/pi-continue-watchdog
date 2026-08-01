@@ -157,6 +157,27 @@ function armDecision(
 	return decision.decisionId;
 }
 
+const graphemeSegmenter = new Intl.Segmenter(undefined, {
+	granularity: "grapheme",
+});
+
+function conservativeDisplayWidth(text: string): number {
+	return [...graphemeSegmenter.segment(text)].reduce(
+		(width, { segment }) => width + (/^[\x20-\x7e]$/u.test(segment) ? 1 : 2),
+		0,
+	);
+}
+
+function renderHumanUnlockEntry(data: unknown, width: number): string[] {
+	const component = createHumanUnlockEntryRenderer()(
+		{ data } as never,
+		{ expanded: false } as never,
+		{} as never,
+	);
+	assert.ok(component);
+	return component.render(width);
+}
+
 test("Slice 4 RED: registers the exact human command names, descriptions, and TUI-only unlock entry renderer", () => {
 	const harness = createHarness();
 
@@ -317,6 +338,53 @@ test("Example 3 RED: human reason preserves internal multiline content", async (
 			?.render(10_000)
 			.join("\n"),
 		`Continue watchdog unlocked: ${reason}`,
+	);
+});
+
+test("Slice 4 RED: unlock-reason entry wraps ASCII text to the current terminal width", () => {
+	assert.deepEqual(renderHumanUnlockEntry({ reason: "alpha" }, 12), [
+		"Continue wat",
+		"chdog unlock",
+		"ed: alpha",
+	]);
+});
+
+test("Slice 4 RED: unlock-reason entry never overflows narrow widths for emoji or combining graphemes", () => {
+	const reason = `${"🙂".repeat(500)}${"e\u0301".repeat(500)}`;
+
+	for (const width of [1, 10]) {
+		const lines = renderHumanUnlockEntry({ reason }, width);
+		assert.ok(lines.length > 1);
+		assert.ok(
+			lines.every(
+				(line) => conservativeDisplayWidth(line) <= Math.max(1, width),
+			),
+		);
+		assert.ok(lines.every((line) => !/^\p{Mark}/u.test(line)));
+	}
+});
+
+test("Slice 4 RED: unlock-reason entry preserves multiline empty lines while wrapping", () => {
+	assert.deepEqual(renderHumanUnlockEntry({ reason: "first\n\nthird" }, 10), [
+		"Continue w",
+		"atchdog un",
+		"locked: fi",
+		"rst",
+		"",
+		"third",
+	]);
+});
+
+test("Slice 4 RED: unlock-reason entry safely falls back for malformed data and sanitizes terminal controls", () => {
+	for (const data of [undefined, null, {}, { reason: null }, { reason: 42 }]) {
+		assert.deepEqual(renderHumanUnlockEntry(data, 10_000), [
+			"Continue watchdog unlocked",
+		]);
+	}
+
+	assert.deepEqual(
+		renderHumanUnlockEntry({ reason: "safe\u001b[31mred\u0007\t" }, 10_000),
+		["Continue watchdog unlocked: safe?[31mred??"],
 	);
 });
 
