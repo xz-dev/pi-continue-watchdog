@@ -124,6 +124,14 @@ test("Examples 3 and 7 state seam: unlock is unconditional and resets/cancels/re
 		{ kind: "restoreDecisionTools", decisionId: openDecisionId },
 		{ kind: "notify", notification: "unlocked" },
 	]);
+
+	state.lock();
+	const { decisionId: validUnlockDecisionId } = openDecision(state);
+	const validUnlock = state.recordValidUnlock(validUnlockDecisionId);
+	assert.deepEqual(validUnlock.effects, [
+		{ kind: "restoreDecisionTools", decisionId: validUnlockDecisionId },
+		{ kind: "notify", notification: "unlocked" },
+	]);
 	assert.deepEqual(state.snapshot, {
 		locked: false,
 		attempt: 0,
@@ -263,8 +271,9 @@ test("Example 8: invalids re-ask twice without retry consumption, then enter loc
 	assert.equal(state.snapshot.idleTimer, null);
 	assert.equal(state.onAllObservableIdle().applied, false);
 
-	const reset = state.lock();
+	const reset = state.onMainUserMessageStart();
 	assert.equal(reset.applied, true);
+	assert.deepEqual(reset.effects, [{ kind: "notify", notification: "locked" }]);
 	assert.equal(state.snapshot.decisionFailed, false);
 	assert.equal(state.snapshot.invalidDecisionAttempts, 0);
 	assert.equal(state.snapshot.attempt, 0);
