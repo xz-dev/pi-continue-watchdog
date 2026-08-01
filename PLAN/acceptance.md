@@ -1,10 +1,23 @@
 # Acceptance contract — pi-continue-watchdog
 
-**Status:** Accepted by product authority (2026-08-01)  
-**Project:** public English `xz-dev/pi-continue-watchdog`  
-**License:** BSD-3-Clause  
+**Status:** Accepted product contract for the **two-stage decision-flow** redesign (2026-08-01)
+**Project:** public English `xz-dev/pi-continue-watchdog`
+**License:** BSD-3-Clause
 
 This document is the human-accepted ATDD contract. Implementation must satisfy these externally observable examples. Passing tests alone do not re-authorize product changes; any behavioral change requires re-agreement here first.
+
+## Supersession notice (authoritative)
+
+This contract **supersedes and rejects** the prior accepted **direct-continuation** design (idle → steer a continue custom message while a persistent always-active `unlock_continue_watchdog` tool remained in the normal tool set).
+
+| Prior design (rejected) | Current design (required) |
+|---|---|
+| After idle delay, send a model-visible continue custom message and let the main agent keep its normal tools | After idle delay, **temporarily replace** active tools with exactly two decision tools, then send a **hidden** decision custom message |
+| Persistent always-active unlock tool in ordinary turns | Decision tools exist **only** during the decision request window |
+| Unlock result alone was the durable “stop” signal in ordinary LLM context | Valid unlock/continue **fold out** of future model-bound context via a context hook; raw session may still retain protocol records |
+| Default continue prompt told the model to call unlock while continuing work | Default **decision** prompt requires exactly one decision tool and forbids prose; default **continue** prompt is a compact post-fold instruction only |
+
+Any acceptance text, test name, README, or implementation that still requires the rejected direct-continuation path is **stale** and must not be treated as in-scope for v1 under this contract.
 
 ---
 
@@ -13,26 +26,42 @@ This document is the human-accepted ATDD contract. Implementation must satisfy t
 | | |
 |---|---|
 | **Actor** | A human driving Pi with a main (root) agent that may open same-process child/subagent sessions |
-| **Need** | Keep the main agent continuing long multi-step work after all observable agents go idle, without the human retyping “continue”, while still letting the human or AI stop auto-continue when intentionally waiting or done |
-| **Value** | Reduces stalled sessions after subagents finish; makes unlock intentional and visible |
-| **In scope (v1)** | Runtime lock, auto-lock on actual main user work, manual lock/unlock, main-only AI unlock tool, all-observable-idle exponential continue, config, packaging/CI/publication |
-| **Out of scope (v1)** | Durable lock across reload/new/resume/restart; cross-process child coverage; depending on pi-subagents or any other plugin; replacing Pi footer; wall-clock or loop-count watchdogs (those belong to pi-watchdog) |
+| **Need** | After all observable agents go idle, ask the main agent—using a **temporary decision-only tool set**—whether work should continue or unlock, without polluting later LLM context with the decision exchange, and without the human retyping “continue” |
+| **Value** | Reduces stalled sessions after subagents finish; makes unlock intentional, reason-visible in TUI, and free of long-lived unlock-tool pollution in ordinary model context |
+| **In scope (v1)** | Runtime lock; auto-lock on actual main user work; manual lock/unlock (optional reason); automatic unlock when the main run is observably aborted; temporary decision tools; decision validation + 3 re-asks; context folding + compact continue prompt; exponential idle delays; config; packaging/CI/publication |
+| **Out of scope (v1)** | Durable lock across reload/new/resume/restart; cross-process child coverage; depending on pi-subagents or any other plugin; replacing Pi footer; wall-clock or loop-count watchdogs (those belong to pi-watchdog); direct idle continuation without a decision stage |
 
 ---
 
 ## Product surface (fixed names)
 
-| Surface | Exact name | Who |
+| Surface | Exact name / text | Who / channel |
 |---|---|---|
 | Lock command | `/lock-continue-watchdog` | Human (TUI) |
-| Unlock command | `/unlock-continue-watchdog` | Human (TUI) |
-| Unlock tool | `unlock_continue_watchdog` | Main/root agent only |
-| Unlock tool result | `Continue watchdog unlocked` | One-line model-visible result; no state dump |
-| Default continue prompt | `Continue the task. If you are intentionally waiting for the user or all tasks are complete, call unlock_continue_watchdog.` | Model-visible custom message |
+| Unlock command | `/unlock-continue-watchdog [reason]` | Human (TUI); reason optional |
+| Continue decision tool | `continue_watchdog` | Main/root only; **decision window only**; empty/minimal args `{}` |
+| Unlock decision tool | `unlock_continue_watchdog` | Main/root only; **decision window only**; required `{ reason: string }` |
+| Default `decisionPrompt` | see exact default below | Hidden custom message during decision window |
+| Default `continuePrompt` | `Continue until all jobs are done.` | Compact model-visible replacement after valid continue fold |
 | Lock TUI notify | `Continue watchdog locked` | User-only TUI notify |
-| Unlock TUI notify | `Continue watchdog unlocked` | User-only TUI notify |
+| Unlock TUI notify (no reason) | `Continue watchdog unlocked` | User-only TUI notify |
+| Unlock TUI notify (with reason) | `Continue watchdog unlocked: <reason>` | User-only TUI notify |
+| Decision-failed TUI warning | `Continue watchdog decision failed after 3 attempts: <last error>` | User-only TUI notify/warning |
+| Observable main-run abort unlock | same behavior as reasonless `/unlock-continue-watchdog` | Automatic on the best-effort interactive Escape-abort path defined below |
 
 Correct all accidental `cointinue` spellings; public names use `continue` only.
+
+### Exact default `decisionPrompt`
+
+```text
+Decide whether work should continue. Call unlock_continue_watchdog with a concise reason if you are intentionally waiting for the user or all tasks are complete. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.
+```
+
+### Exact default `continuePrompt`
+
+```text
+Continue until all jobs are done.
+```
 
 ---
 
@@ -42,9 +71,10 @@ Correct all accidental `cointinue` spellings; public names use `continue` only.
 2. **Main/root election** (process-local, no other plugin):
    - UI-bound session wins main when present.
    - Pure headless: first-bound attachment is documented best-effort main; later attachments are treated as non-main.
-3. **Only main** registers and may invoke `unlock_continue_watchdog`. Non-main attachments must not expose the tool as a usable main control.
+3. **Only main** may enter the decision window and receive decision tools. Non-main attachments must not expose decision tools as usable main controls.
 4. **Zero external-plugin dependencies.** Use only Pi public extension APIs plus this plugin’s own hub.
 5. **Lock state is runtime-only** for the current process/session attachment lifecycle. Not written to disk. Not restored on reload/new/resume/restart/shutdown.
+6. **Abort provenance boundary.** Pi's public `agent_end` / `agent_settled` extension events do not expose an abort cause. In interactive TUI mode, Pi's public `ctx.ui.onTerminalInput` can observe Escape before Pi handles it, while `ctx.isIdle()` distinguishes an active main run. Therefore v1 treats an unconsumed Escape observed while the UI-bound main is non-idle as a best-effort user-abort request: unlock first, return the input unchanged so Pi still performs its normal abort. Headless/RPC/programmatic aborts and Escape consumed by overlays or earlier listeners may be unobservable; never infer abort from ordinary `agent_settled`.
 
 ---
 
@@ -52,25 +82,28 @@ Correct all accidental `cointinue` spellings; public names use `continue` only.
 
 | Key | Default | Notes |
 |---|---|---|
-| `idleDelaySeconds` | `10` | Base delay in seconds; must be a positive finite number accepted by config validation |
-| `maxRetries` | `10` | Maximum automatic continue messages per lock cycle |
-| `continuePrompt` | exact default above | Configurable string; AI tool description must carry the same unlock guidance |
+| `idleDelaySeconds` | `3` | Base delay in seconds; positive finite number |
+| `maxRetries` | `10` | Maximum **valid continue** decisions per lock cycle (not invalid re-asks) |
+| `decisionPrompt` | exact default above | Hidden decision custom-message body |
+| `continuePrompt` | exact default above | Compact fold-in after valid continue |
 
 **Config locations and precedence** (same pattern as sibling Pi plugins):
 
-1. Built-in defaults  
-2. Global: `$PI_CODING_AGENT_DIR/pi-continue-watchdog.json` (default `~/.pi/agent/pi-continue-watchdog.json`)  
-3. Trusted project only: `<cwd>/.pi/pi-continue-watchdog.json` when `ctx.isProjectTrusted()` is true  
+1. Built-in defaults
+2. Global: `$PI_CODING_AGENT_DIR/pi-continue-watchdog.json` (default `~/.pi/agent/pi-continue-watchdog.json`)
+3. Trusted project only: `<cwd>/.pi/pi-continue-watchdog.json` when `ctx.isProjectTrusted()` is true
 
-Trusted-project fields override global field-by-field. Invalid high-precedence values must not erase valid lower-precedence values; emit bounded diagnostics. Missing files are silent.
+Trusted-project fields override global field-by-field (`builtins < global < trusted project`). Invalid high-precedence values must not erase valid lower-precedence values; emit bounded diagnostics. Missing files are silent.
 
-**Retry delay formula** for attempt `N` (1-based):
+**Retry delay formula** for continue attempt `N` (1-based; advances only on **valid continue**):
 
 ```text
 delaySeconds(N) = idleDelaySeconds × 2^(N - 1)
 ```
 
-With defaults: 10s, 20s, 40s, … for attempts 1…`maxRetries`.
+With defaults: 3s, 6s, 12s, 24s, … for attempts 1…`maxRetries`.
+
+**Non-configurable:** invalid decision re-ask budget is fixed at **3** attempts (not a config key).
 
 ---
 
@@ -78,147 +111,288 @@ With defaults: 10s, 20s, 40s, … for attempts 1…`maxRetries`.
 
 Per main ownership generation / lock cycle, at least:
 
-| Field | Meaning |
+| Field / phase | Meaning |
 |---|---|
-| `locked` | Whether auto-continue is armed |
-| `attempt` | Next automatic continue attempt index (0 after reset; after send, progress toward `maxRetries`) |
-| `exhausted` | `locked && attempt` has already delivered `maxRetries` continues; no timer until reset |
+| `locked` | Whether auto decision-after-idle is armed |
+| `attempt` | Next automatic decision cycle index after idle (0 after reset; advances only on **valid continue**) |
+| `exhausted` | `locked` and `maxRetries` valid continues already consumed; no idle timer until reset |
+| `decisionFailed` | After 3 invalid decision attempts; locked remains true; no timer until reset |
 | pending idle timer | One-shot timer for the current attempt; generation-guarded |
+| decision window | Temporary tool set + hidden decision prompt in flight / re-ask |
 
-**Unconditional assignment:** manual lock/unlock and AI unlock **never** no-op on same-state. They always assign the target state and always emit the corresponding TUI notification. No “already locked/unlocked” short-circuit that suppresses notify.
+**Unconditional assignment:** manual lock/unlock **never** no-op on same-state. They always assign the target state and always emit the corresponding TUI notification. No “already locked/unlocked” short-circuit that suppresses notify.
 
-**What resets attempt to 0 and clears exhaustion:**
+**What resets attempt to 0, clears exhaustion and decision-failed, and (re)arms lock:**
 
 - Actual main user-role `message_start` (auto-lock)
 - Manual `/lock-continue-watchdog`
 
-**What unlocks (`locked=false`), cancels timers, resets attempts:**
+**What unlocks (`locked=false`), cancels timers, resets attempts/failures:**
 
-- `/unlock-continue-watchdog`
-- Main AI `unlock_continue_watchdog`
+- `/unlock-continue-watchdog [reason]`
+- Valid decision-window `unlock_continue_watchdog({ reason })`
+- Best-effort interactive user-abort request: an unconsumed Escape observed while the UI-bound main is non-idle; this is reasonless, pass-through, and must not be inferred later from settle
 
 **What does not auto-lock / does not reset the main cycle:**
 
 - Merely queued main input (`input` before processing)
 - Child/subagent user-role messages
 - Threshold-style side effects that are not listed above
+- Invalid decision re-asks (they do **not** consume exponential continue retries)
 
 ---
 
-## Confirmed 11 acceptance examples
+## Decision window protocol
 
-These eleven examples are the accepted product contract. Each is externally observable through public commands, TUI notifies, model-visible custom messages, timers, and install/CI artifacts.
+### Entry
+
+**Given** main is locked, not exhausted, not decision-failed, and every observable same-process session is idle
+**When** idle remains continuous for `idleDelaySeconds × 2^(N-1)` for the current continue attempt `N`
+**Then** the plugin:
+
+1. Temporarily sets the main agent’s **active tools** to **exactly**:
+   - `continue_watchdog` with empty/minimal input schema `{}`
+   - `unlock_continue_watchdog` with required `reason: string`
+     Tool description for unlock must say the reason is a **concise single-sentence** reason (validation rules below).
+2. Sends a **hidden** configurable custom message whose model-visible body is the configured `decisionPrompt` (exact default above).
+3. Does **not** send the rejected direct-continuation “keep working / call unlock while tools remain normal” message as the idle wake path.
+
+The decision model turn **reads existing task context** already present in the session; the decision prompt does not need to restate the full task.
+
+### Validity rules (exactly one valid decision)
+
+A decision response is **valid** only if it contains **exactly one** accepted decision tool call and **no** prose answer requirement is violated as follows:
+
+| Outcome | Requirements |
+|---|---|
+| Valid **continue** | Exactly one `continue_watchdog` call; no unlock call; no extra/unknown tools; no prose-only answer |
+| Valid **unlock** | Exactly one `unlock_continue_watchdog` call with a **valid reason**; no continue call; no extra/unknown tools; no prose-only answer |
+
+**Unlock reason validation (AI tool path):**
+
+- After trim, reason must be **non-empty**
+- Length ≤ **500 Unicode characters** (count Unicode code points / characters as implemented consistently and tested)
+- May technically contain newlines
+- Empty/blank or overlong reasons are **invalid**
+
+**Invalid includes:** no tool call; both/multiple decision tools; extra or unknown tool; prose-only / no accepted tool; invalid reason.
+
+### Invalid → re-ask (fixed 3)
+
+On invalid decision:
+
+1. Immediately re-ask with another hidden decision prompt.
+2. The next hidden prompt includes the **exact previous error** and explains why the response was invalid.
+3. Re-asks use the same temporary decision-only tool set.
+4. Invalid checks **do not** consume exponential `maxRetries` continue budget.
+5. After the **third** invalid attempt:
+   - restore **normal** tools
+   - remain **locked** and enter **decision-failed** (no idle timer)
+   - TUI warning exactly:
+     `Continue watchdog decision failed after 3 attempts: <last error>`
+   - New actual root user `message_start` or manual `/lock-continue-watchdog` resets failures/attempts and re-arms the cycle
+
+### Valid unlock
+
+**When** the decision is a valid unlock:
+
+- Restore normal tools
+- Set unlocked; cancel timers; reset attempts/failures
+- TUI notify exactly: `Continue watchdog unlocked: <reason>`
+- Append a **persisted TUI-only** reason entry (user-visible history, not model-bound as ordinary assistant prose)
+- Tool result uses Pi `terminate: true` so no further model request is required for a final standalone unlock in that batch
+- **Future LLM context hook** removes the **entire** decision exchange (decision prompt, model reply, tool call(s), tool result(s)) and **inserts nothing** in its place
+- Raw session may still preserve protocol records; folding is model-bound context only
+
+### Valid continue
+
+**When** the decision is a valid continue:
+
+- Reasonless (no reason field required or used)
+- Restore normal tools
+- Work continues **immediately** (not `terminate`)
+- Context hook removes the complete decision prompt / reply / tool call / results and replaces them with **one** compact custom message containing the configured `continuePrompt` (exact default: `Continue until all jobs are done.`)
+- Custom tool renderer folds the continue tool call/result into **one compact TUI line** that surfaces the `continuePrompt` text
+- Consumes **one** exponential retry (attempt advances)
+- Next settle + all-observable-idle uses the next exponential delay
+- After `maxRetries` valid continues, remain locked/exhausted with no timer until reset
+
+### Human `/unlock-continue-watchdog [reason]`
+
+Always assigns unlocked, cancels timers, resets attempts/failures, and notifies—even if already unlocked.
+
+| Human reason input | TUI notify | TUI-only reason entry |
+|---|---|---|
+| Empty / blank / omitted | exactly `Continue watchdog unlocked` | none (no reason) |
+| Nonblank | trim; **automatically truncate** to first **500** Unicode characters (may be multiline); notify `Continue watchdog unlocked: <reason>` | append TUI-only entry with that reason |
+
+Human unlock is **not** subject to the AI decision-window invalid re-ask protocol.
+
+---
+
+## Confirmed acceptance examples
+
+These examples are the accepted product contract. Each is externally observable through public commands, TUI notifies, tool registration, model-bound context after folding, timers, and install/CI artifacts.
 
 ### Example 1 — Actual main user message auto-locks
 
-**Given** the main session is unlocked or already locked (any prior attempt count)  
-**When** a **user-role** message actually starts processing on main (`message_start` for that user message—not mere queueing via `input`)  
+**Given** the main session is unlocked or already locked (any prior attempt, exhaustion, or decision-failed state)
+**When** a **user-role** message actually starts processing on main (`message_start` for that user message—not mere queueing via `input`)
 **Then**
 
-- `locked` is set to `true` (unconditionally, no prior-state check)
-- attempt counter resets to `0` / cycle rearmed from the start
+- `locked` is set to `true` (unconditionally)
+- attempt counter resets to `0`; exhaustion and decision-failed clear; cycle rearmed
 - child-session user messages do **not** change main lock or attempts
 - merely queued (not yet started) main input does **not** lock or reset
 
 ### Example 2 — Manual lock always assigns and notifies
 
-**Given** main is locked or unlocked  
-**When** the human runs `/lock-continue-watchdog`  
+**Given** main is locked or unlocked
+**When** the human runs `/lock-continue-watchdog`
 **Then**
 
 - `locked` is set to `true`
-- attempts reset (new lock cycle)
+- attempts reset; exhaustion and decision-failed clear (new lock cycle)
 - TUI notifies exactly: `Continue watchdog locked`
 - same-state lock (already locked) still assigns and still notifies the same text
 
-### Example 3 — Manual unlock and AI unlock always assign and notify
+### Example 3 — Manual unlock with optional reason
 
-**Given** main is locked or unlocked, with or without a pending idle timer  
-**When** the human runs `/unlock-continue-watchdog` **or** the main agent successfully calls `unlock_continue_watchdog`  
+**Given** main is locked or unlocked, with or without a pending idle timer or decision window
+**When** the human runs `/unlock-continue-watchdog` with empty/blank reason
 **Then**
 
-- `locked` is set to `false`
-- pending idle timers are cancelled
-- attempts reset
+- unlocked; timers cancelled; attempts/failures reset
 - TUI notifies exactly: `Continue watchdog unlocked`
-- same-state unlock (already unlocked) still assigns and still notifies the same text
-- unlock notifications are user-only TUI notify, not model-context user messages
-- the AI tool returns only the one-line model-visible result `Continue watchdog unlocked`, with no full state/config/details dump
-- the AI tool returns Pi's `terminate: true` hint so a final standalone unlock call does not force a redundant follow-up LLM request; Pi only terminates early when every tool result in the same batch opts in
+- no TUI-only reason entry
 
-### Example 4 — Locked + all observable idle → exponential delayed continue
-
-**Given** main is locked, not exhausted, and every observable same-process session is idle  
-**When** idle remains continuous for `idleDelaySeconds × 2^(N-1)` for the current attempt `N`  
-**Then** exactly one automatic continue is delivered for that attempt  
-
-With defaults, delays for successive attempts begin **10s, 20s, 40s, …**
-
-### Example 5 — Continue message content and safe delivery
-
-**When** an automatic continue fires  
+**When** the human runs `/unlock-continue-watchdog` with a nonblank reason
 **Then**
 
-- the message is a **visible non-user custom** message to **main**
-- delivery uses Pi custom-message **steer** with **triggerTurn** so main reflects after the current tool batch, without cancelling in-flight tools
-- model-visible text is exactly the configured `continuePrompt`, defaulting to:
+- unlocked as above
+- reason is trimmed and truncated to the first 500 Unicode characters if longer
+- TUI notifies exactly: `Continue watchdog unlocked: <reason>`
+- a TUI-only reason entry is appended
+- same-state unlock still assigns and still notifies
 
-  ```text
-  Continue the task. If you are intentionally waiting for the user or all tasks are complete, call unlock_continue_watchdog.
-  ```
+### Example 4 — Active-main Escape automatically unlocks without swallowing abort
 
-- the AI tool description for `unlock_continue_watchdog` carries the same guidance: call unlock when intentionally waiting for the user or when all tasks are complete
+**Given** the UI-bound main is non-idle and the continue watchdog is locked or already unlocked
+**When** the plugin's public terminal-input listener observes an unconsumed Escape key
+**Then**
 
-### Example 6 — Activity during delay cancels and full delay restarts
+- apply the same unconditional state transition as reasonless `/unlock-continue-watchdog`: unlocked; timers/decision state cancelled; attempts/failures reset; prior normal tools restored
+- TUI notifies exactly `Continue watchdog unlocked`, even when already unlocked
+- no unlock reason entry is appended
+- return/pass Escape through unchanged; the plugin must not consume it, so Pi retains authority to abort the run
+- a later ordinary `agent_settled` must not create a second unlock notification
 
-**Given** a pending idle timer for the current attempt  
-**When** any observable session becomes busy (e.g. `agent_start` / non-idle) before the timer fires  
-**Then** that timer is cancelled and must not wake main  
+**And when** main is idle (for example Escape closes a selector, cancels an editor, or participates in double-Escape navigation), the listener does not change watchdog state.
 
-**When** all observable sessions are idle again  
-**Then** the **full** delay for the **same** current attempt restarts from zero  
+**Public-API limitation:** this is truthful best-effort coverage of the interactive user Escape abort path, not a claim that every Pi abort source is observable. The plugin must not infer abort from settle alone.
 
-Stale timer callbacks (wrong generation/epoch/ownership) must not wake main.
+### Example 5 — Locked + all observable idle → exponential delayed **decision entry**
 
-### Example 7 — Still locked after continue → next exponential attempt
+**Given** main is locked, not exhausted, not decision-failed, and every observable same-process session is idle
+**When** idle remains continuous for `idleDelaySeconds × 2^(N-1)` for the current attempt `N`
+**Then**
 
-**Given** an automatic continue was delivered (attempt counted)  
-**When** the continued main run settles and main is still locked, and all observable sessions are idle again  
-**Then** arm the next exponential attempt  
+- exactly one decision window is opened for that attempt (not a direct continue custom message)
+- active tools are temporarily replaced with exactly `continue_watchdog` and `unlock_continue_watchdog`
+- a **hidden** decision custom message uses configured `decisionPrompt` (exact default in Product surface)
+- the rejected direct-continuation default
+  `Continue the task. If you are intentionally waiting for the user or all tasks are complete, call unlock_continue_watchdog.`
+  is **not** used as the idle wake message
 
-Default `maxRetries = 10` means **at most 10** automatic continue messages per lock cycle.
+With defaults, delays for successive continue attempts begin **3s, 6s, 12s, 24s, …**
 
-### Example 8 — Exhaustion after max retries
+### Example 6 — Valid continue: fold, compact prompt, retry consumption
 
-**Given** default `maxRetries = 10` and 10 automatic continues have already been delivered in this lock cycle  
-**When** main remains locked and all observable sessions become idle again  
+**Given** a decision window is open
+**When** the main agent returns a valid `continue_watchdog` decision
+**Then**
+
+- normal tools are restored
+- model-bound context removes the full decision exchange and inserts one compact custom message equal to configured `continuePrompt` (default `Continue until all jobs are done.`)
+- TUI shows a compact single-line rendering for the continue tool call/result including that continue prompt
+- one exponential retry is consumed
+- the agent continues work without `terminate` on the continue tool
+- after settle, if still locked and all observable idle, the **next** exponential delay arms
+
+### Example 7 — Valid unlock: reason notify, fold to nothing, terminate
+
+**Given** a decision window is open
+**When** the main agent returns a valid `unlock_continue_watchdog` with reason e.g. `Waiting for user confirmation on deploy.`
+**Then**
+
+- normal tools restored; unlocked; timers cancelled; attempts/failures reset
+- TUI notifies exactly: `Continue watchdog unlocked: Waiting for user confirmation on deploy.`
+- TUI-only reason entry appended
+- tool returns with `terminate: true` (no further model request for a final standalone unlock batch)
+- future model-bound context removes the entire decision exchange and inserts **nothing**
+- raw session may still contain protocol tool records
+
+### Example 8 — Invalid decision re-asks then decision-failed
+
+**Given** a decision window is open
+**When** the model responds invalidly (no tool, both tools, unknown tool, prose-only, empty reason, reason > 500 Unicode characters)
+**Then**
+
+- immediately re-ask with a hidden prompt that includes the exact previous error and explains invalidity
+- temporary decision-only tools remain
+- invalid re-asks do **not** advance exponential continue attempt / do not count toward `maxRetries`
+
+**When** the third consecutive invalid decision occurs
+**Then**
+
+- restore normal tools
+- remain locked; decision-failed; no idle timer
+- TUI warning exactly: `Continue watchdog decision failed after 3 attempts: <last error>`
+- only actual main user `message_start` or `/lock-continue-watchdog` clears decision-failed and resets the cycle
+
+### Example 9 — Activity during delay cancels; full delay restarts
+
+**Given** a pending idle timer for the current attempt
+**When** any observable session becomes busy before the timer fires
+**Then** that timer is cancelled and must not open a decision window
+
+**When** all observable sessions are idle again
+**Then** the **full** delay for the **same** current attempt restarts from zero
+
+Stale timer callbacks (wrong generation/epoch/ownership) must not open a decision window or wake main.
+
+### Example 10 — Exhaustion after max valid continues
+
+**Given** default `maxRetries = 10` and 10 **valid continue** decisions have already been consumed in this lock cycle
+**When** main remains locked and all observable sessions become idle again
 **Then**
 
 - no further idle timer is scheduled
 - state remains **locked and exhausted**
-- a new **actual main user** `message_start` **or** manual `/lock-continue-watchdog` resets attempts and clears exhaustion (and keeps/sets locked as those operations require)
-- unlock still works and notifies as in Example 3
+- a new actual main user `message_start` or manual `/lock-continue-watchdog` resets attempts and clears exhaustion
+- human unlock and (after a future re-arm) decision unlock still work per Examples 3 and 7
 
-### Example 9 — Runtime-only lock; clean unlocked on session lifecycle edges
+### Example 11 — Runtime-only lock; clean unlocked on session lifecycle edges
 
-**When** Pi reloads extensions, starts a new session, resumes, restarts, or shuts the attachment down  
+**When** Pi reloads extensions, starts a new session, resumes, restarts, or shuts the attachment down
 **Then**
 
 - lock state is **not** restored from disk
 - effective state starts **unlocked**
-- timers are cleaned
+- timers and decision windows are cleaned
+- normal tools are not left permanently replaced by decision tools after demotion/shutdown
 - no orphaned wakes after demotion/shutdown
 
-### Example 10 — Trusted config overrides with safe fallback
+### Example 12 — Trusted config overrides with safe fallback
 
-**Given** global and/or trusted-project `pi-continue-watchdog.json`  
-**When** valid `idleDelaySeconds`, `maxRetries`, and/or `continuePrompt` are provided  
-**Then** effective config uses field-level override (trusted project over global over defaults)  
+**Given** global and/or trusted-project `pi-continue-watchdog.json`
+**When** valid `idleDelaySeconds`, `maxRetries`, `decisionPrompt`, and/or `continuePrompt` are provided
+**Then** effective config uses field-level override (trusted project over global over defaults)
 
-**When** values are missing, unreadable, or invalid  
+**When** values are missing, unreadable, or invalid
 **Then** retain valid lower-precedence values / defaults and emit bounded diagnostics (no crash, no silent use of nonsense numbers that would fire immediately in an unbounded way)
 
-### Example 11 — Publication, language, packaging, CI
+### Example 13 — Publication, language, packaging, CI
 
 **Then** the shipped project:
 
@@ -231,28 +405,51 @@ Default `maxRetries = 10` means **at most 10** automatic continue messages per l
 
 ---
 
+## Pi API facts and limitations (must document)
+
+These are product/engineering constraints, not optional polish:
+
+| Fact | Implication for this plugin |
+|---|---|
+| Context hooks can change **model-bound** context non-destructively | Decision folding removes/replaces what the next LLM request sees; raw session may still store protocol records |
+| `setActiveTools` controls the **next** request’s tool set | Decision tools must be set before the decision turn; normal tools restored before continued work or after failure/unlock |
+| `terminate: true` only ends early if **every** tool result in the same batch opts in | Unlock path documents this limitation; mixed batches may still trigger a model turn |
+| Raw session retains paired tool call/result records | Even after context folding, protocol history may exist on disk / in session file |
+| Decision-only tool set | Prevents other tools from being offered in the decision request; validity still rejects unknown/extra tools if they appear |
+
+---
+
 ## Delivery and safety invariants (cross-cutting)
 
 | Invariant | Requirement |
 |---|---|
-| No tool cancellation | Continue delivery must not abort in-flight tools |
+| No tool cancellation | Decision entry / continue delivery must not abort in-flight tools already running when idle is detected (steer waits for current batch where Pi requires it) |
 | No false “all agents” claims | Docs and diagnostics say **observable** same-process coverage |
 | Generation-safe timers | `clearTimeout` alone is insufficient; callbacks check ownership/generation |
-| Command demotion safety | If main demotes, stale command handlers must be inert; no reliance on command unregistration |
-| Notify channel | Lock/unlock notifies are TUI user-only; they must not be injected as user-role conversation turns |
-| Minimal tool context | Unlock returns only `Continue watchdog unlocked`; omit state/config/details and request `terminate: true`. The paired tool call/result remains in session history and may appear in later model context, as required by Pi/provider tool protocols. |
+| Command demotion safety | If main demotes, stale command handlers must be inert |
+| Notify channel | Lock/unlock/decision-failed notifies are TUI user-only; not injected as user-role conversation turns |
+| Abort truthfulness | Interactive active-main Escape unlock is best-effort and pass-through. Never claim programmatic/headless abort coverage or infer abort from plain settle because Pi public lifecycle events expose no abort provenance. |
+| No context pollution from decisions | Future model-bound context never keeps the raw decision exchange after valid unlock/continue handling |
+| No persistent unlock tool | Outside the decision window, `unlock_continue_watchdog` / `continue_watchdog` are not part of the normal always-on tool set |
 | No other-plugin coupling | No imports or runtime detection of pi-subagents / pi-watchdog / pi-notify |
 
 ---
 
 ## Explicit non-examples (do not implement as v1)
 
-- Auto-unlock when the model says “done” without calling the tool  
-- Inferring main from package names or foreign plugin state  
-- Persisting lock in session JSON / disk  
-- Counting only root idle and ignoring observable children (or the reverse)  
-- Using `followUp` delivery that waits until the entire active tool flow stops if steer+triggerTurn is the accepted safe wake  
+- **Rejected prior design:** idle → visible continue custom message while normal tools remain and unlock stays always registered
+- Auto-unlock when the model says “done” in prose without a valid unlock tool call
+- Inferring main from package names or foreign plugin state
+- Persisting lock in session JSON / disk
+- Counting only root idle and ignoring observable children (or the reverse)
+- Using `followUp` delivery that waits until the entire active tool flow stops if steer+triggerTurn is the accepted safe wake
 - Silent same-state lock/unlock (no TUI notify)
+- Consuming Escape after unlocking, preventing Pi from performing its normal abort
+- Unlocking on every Escape while main is idle (selectors, editors, double-Escape navigation)
+- Treating every ordinary `agent_settled` as aborted, or claiming public API coverage of headless/programmatic abort sources
+- Configurable invalid re-ask budget (must stay fixed at 3)
+- Counting invalid re-asks against `maxRetries`
+- Leaving decision tools active after unlock, continue, decision-failed, demote, or shutdown
 
 ---
 
@@ -260,6 +457,8 @@ Default `maxRetries = 10` means **at most 10** automatic continue messages per l
 
 For each example above, implementation slices must leave evidence that can be re-run:
 
-- **Unit / component:** pure state machine, config precedence, timer cancel/restart, generation guards  
-- **Integration / E2E (stock Pi, packed install):** auto-lock on real user `message_start`, command/tool notifies, at least one real timed continue path, exhaustion or multi-attempt math covered by tests (real clock or injected clock as appropriate and documented)  
+- **Unit / component:** pure state machine (including decision-failed and attempt advancement rules), config precedence, reason trim/truncate/length, timer cancel/restart, generation guards, decision validity matrix
+- **Integration / E2E (stock Pi, packed install):** auto-lock on real user `message_start`; command lock/unlock notifies and optional reason; temporary tool replacement; at least one real timed path into a decision window; continue fold vs unlock fold; third-invalid decision-failed warning; exhaustion or multi-attempt math (real or injected clock, documented)
 - **Human accept:** product authority reviews evidence against this file; AI does not self-accept
+
+**Implementation status:** this contract does **not** claim any production implementation is complete.

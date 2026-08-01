@@ -1,19 +1,23 @@
 # Implementation plan — pi-continue-watchdog
 
-**Status:** Ready to implement after accepted contract in `PLAN/acceptance.md`  
-**Method:** One vertical behavior slice per branch; RED → GREEN → review (when functional) → merge → next branch  
-**Language:** English only for all project artifacts  
+**Status:** Ready to implement after accepted **two-stage decision-flow** contract in `PLAN/acceptance.md`
+**Method:** One vertical behavior slice per branch; RED → GREEN → review (when functional) → merge → next branch
+**Language:** English only for all project artifacts
 
 Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would change observable behavior, stop and update the acceptance contract with the human first.
+
+**Supersession:** This plan implements the decision-flow redesign. It does **not** implement the rejected direct-continuation design (idle → steer continue custom message + persistent always-on unlock tool). Do not reintroduce that path.
+
+**Implementation status:** No production code is claimed complete by this plan. Checkboxes below track planning only until slices land.
 
 ---
 
 ## Goals
 
-1. Implement the accepted 11-example contract with unconditional same-state TUI notifications.
+1. Implement the accepted examples in `PLAN/acceptance.md` (auto-lock, commands, observable active-main Escape unlock, temporary decision tools, validator + 3 re-asks, context folding, exponential continues, exhaustion, packaging/CI).
 2. Keep each branch small enough to review: one user-visible or install-visible behavior seam.
 3. Prefer test-first (ATDD outer / TDD inner) for functional slices.
-4. Mirror proven patterns from **pi-watchdog** (hub, trust-gated config, generation-safe timers, packed stock-Pi E2E, BSD-3-Clause) without copying unrelated product features.
+4. Mirror proven patterns from **pi-watchdog** (hub, trust-gated config, generation-safe timers, packed stock-Pi E2E, BSD-3-Clause) without copying unrelated product features or the rejected continue-watchdog v0 path.
 
 ---
 
@@ -22,8 +26,8 @@ Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would ch
 | Source | Takeaway for this plugin |
 |---|---|
 | pi-watchdog | Process-global hub, UI-first root election, trust-gated config merge, generation/epoch timer guards, source + release install shapes, packed isolated stock-Pi CI |
-| pi-notify | Trust-gated global/project config precedence; **not** a model for idle aggregation or auto-lock (lacks hub/busy counts/timers) |
-| Pi public APIs | Auto-lock on user-role `message_start` (not `input`); settle on `agent_settled`; wake via custom message **steer + triggerTurn**; `hasUI` for root priority |
+| pi-notify | Trust-gated global/project config precedence; **not** a model for decision tools or context folding |
+| Pi public APIs | Auto-lock on user-role `message_start` (not `input`); settle on `agent_settled`; wake via custom message **steer + triggerTurn**; `hasUI` for root priority; `setActiveTools` for next request; context hooks for non-destructive model-bound edits; `terminate: true` batch limitation; `ctx.ui.onTerminalInput` + TUI `ctx.isIdle()` for best-effort active-main Escape unlock. Public agent lifecycle events do not expose abort provenance, so never infer abort from settle. |
 
 ---
 
@@ -35,18 +39,21 @@ Keep modules deep and small. Exact filenames may adjust if a slice needs a tight
 |---|---|
 | `package.json` / entry | Source-installable `pi.extensions` entry; scripts for check/test/e2e |
 | `src/hub.ts` | Process-global attachment registry, main election, busy/idle snapshots |
-| `src/config.ts` + loader | Defaults, validation, global + trusted-project merge |
-| `src/controller.ts` | Lock/attempt/exhaustion state machine; pure decisions preferred |
-| `src/extension.ts` | Pi hooks, commands, tool, wiring, generation-safe timers, TUI notify |
+| `src/config.ts` + loader | Defaults (`idleDelaySeconds`, `maxRetries`, `decisionPrompt`, `continuePrompt`), validation, global + trusted-project merge |
+| `src/controller.ts` | Lock/attempt/exhaustion/decision-failed state machine; pure decisions preferred |
+| `src/decision.ts` | Validity rules, re-ask error text, reason validation (trim, nonempty, ≤500 Unicode chars) |
+| `src/context-fold.ts` | Model-bound removal/replacement of decision exchanges (unlock → nothing; continue → compact `continuePrompt`) |
+| `src/render.ts` | Compact TUI tool rendering for continue (and related decision UI seams) |
+| `src/extension.ts` | Pi hooks, commands, temporary tools, wiring, generation-safe timers, TUI notify |
 | `test/**` | Unit + stock-Pi E2E |
 | `scripts/**` | Pack/isolate E2E harness; optional release generator only if needed (never run destructive generators on repo root) |
-| `README.md` / `LICENSE` | English docs; BSD-3-Clause; observable-coverage limitations |
+| `README.md` / `LICENSE` | English docs; BSD-3-Clause; observable-coverage and Pi API limitations |
 
 ---
 
 ## Branch workflow (every functional slice)
 
-1. Create branch `slice/<short-name>` from current `master` (after repo init).
+1. Create branch `slice/<short-name>` from current `master`.
 2. **RED:** add or extend the failing acceptance/unit test for **this slice only**.
 3. **GREEN:** implement the minimum code to pass that slice’s tests and relevant checks.
 4. Run focused checks for the slice; run broader suite when wiring or E2E is touched.
@@ -56,7 +63,7 @@ Keep modules deep and small. Exact filenames may adjust if a slice needs a tight
 
 **Commit discipline:** one logical commit per slice preferred; no unrelated files; docs for the slice may land with the slice if they describe shipped behavior, otherwise a follow-up docs-only commit.
 
-**Do not:** initialize Git or install dependencies until the first implementation slice that needs them (slice 0). This planning task only wrote `PLAN/`.
+**Do not:** install dependencies until the first implementation slice that needs them (Slice 0). The repository and `master` already exist; do not reinitialize Git.
 
 ---
 
@@ -66,59 +73,61 @@ Order is dependency-aware. Each slice must leave `master` installable/testable f
 
 ### Slice 0 — Repository skeleton
 
-**Branch:** `slice/repo-skeleton`  
-**Examples touched:** 11 (packaging foundation only)  
+**Branch:** `slice/repo-skeleton`
+**Examples touched:** 13 (packaging foundation only)
 **Deliver:**
 
-- Git init when implementation starts (not during planning)
+- Start from the existing Git repository and `master`; do not run `git init`
 - `package.json`, TypeScript setup, BSD-3-Clause `LICENSE`, minimal README stub
 - Source entry loadable by Pi (`pi.extensions` → `./src/extension.ts` or agreed path)
 - `npm` test runner scripts (node:test + tsx or project-chosen equivalent consistent with sibling plugins)
 - Empty/no-op extension that loads without error
 
-**RED/GREEN:** package scripts + load smoke (extension factory returns without throw).  
+**RED/GREEN:** package scripts + load smoke (extension factory returns without throw).
 **Review:** optional if pure scaffold; still keep the branch small.
 
 ---
 
 ### Slice 1 — Config load and trusted-project precedence
 
-**Branch:** `slice/config`  
-**Examples:** 10  
+**Branch:** `slice/config`
+**Examples:** 12
 
 **Deliver:**
 
-- Defaults: `idleDelaySeconds=10`, `maxRetries=10`, exact default `continuePrompt`
+- Defaults: `idleDelaySeconds=3`, `maxRetries=10`, exact default `decisionPrompt`, exact default `continuePrompt` (`Continue until all jobs are done.`)
 - Global + trusted-project field merge; untrusted project ignored
 - Invalid values fall back safely with bounded diagnostics
+- Do **not** ship or default the rejected direct-continuation reminder string
 
-**RED:** unit tests for defaults, override, invalid, untrusted project.  
+**RED:** unit tests for defaults, override, invalid, untrusted project, exact default prompt strings.
 **GREEN:** config module + loader only; extension may read config at start without full lock behavior.
 
 ---
 
-### Slice 2 — Lock state machine (pure)
+### Slice 2 — Lock / decision state machine (pure)
 
-**Branch:** `slice/lock-state`  
-**Examples:** 1–3 (state outcomes), 7–8 (attempt/exhaustion math), partial 9 (reset to unlocked)
+**Branch:** `slice/lock-state`
+**Examples:** 1–4, 8–10 (state outcomes), partial 11 (reset to unlocked)
 
 **Deliver pure controller API, e.g.:**
 
-- `lock()` → locked, attempt 0, clear exhausted, always “notify lock”
-- `unlock()` → unlocked, cancel-timer intent, attempt 0, always “notify unlock”
+- `lock()` → locked, attempt 0, clear exhausted/decision-failed, always “notify lock”
+- `unlock()` → unlocked, cancel-timer intent, attempt 0, clear decision-failed, always “notify unlock”
 - `onMainUserMessageStart()` → same as lock assignment/reset (auto-lock)
-- `onAllObservableIdle(now)` / `onObservableBusy()` / `onContinueSettledStillLocked()` → timer arm/cancel/rearm and attempt advancement per examples 4–8
-- Delay: `idleDelaySeconds * 2^(attempt-1)` with attempt indexing documented in tests
+- `onAllObservableIdle(now)` / `onObservableBusy()` → timer arm/cancel/rearm; no timer when unlocked/exhausted/decision-failed
+- `beginDecision()` / `recordInvalidDecision(error)` / `recordValidContinue()` / `recordValidUnlock()` → re-ask budget (fixed 3), decision-failed, attempt advance only on valid continue
+- Delay for zero-based `attempt`: `idleDelaySeconds * 2^attempt` (equivalently one-based `N = attempt + 1` and `idleDelaySeconds * 2^(N-1)`), documented in tests
 
-**RED:** table-driven unit tests for same-state assign, exponential delays, maxRetries exhaustion, no timer when unlocked/exhausted.  
+**RED:** table-driven unit tests for same-state assign, exponential delays, maxRetries exhaustion, invalid re-asks not consuming retries, decision-failed after 3, no timer when unlocked/exhausted/decision-failed.
 **GREEN:** no Pi hooks yet if possible—keep pure.
 
 ---
 
 ### Slice 3 — Process hub: main election + observable busy
 
-**Branch:** `slice/hub`  
-**Examples:** scope rules for 4–6; classification for tool visibility  
+**Branch:** `slice/hub`
+**Examples:** scope rules for 5, 9; classification for tool visibility
 
 **Deliver:**
 
@@ -128,127 +137,178 @@ Order is dependency-aware. Each slice must leave `master` installable/testable f
 - Busy/idle tracking from public lifecycle (`agent_start` / `agent_settled` or equivalent documented idle seam)
 - Snapshot: all observable idle vs not
 
-**RED:** unit tests with fake attachments (UI steals main, demotion, busy counts, stale generation).  
+**RED:** unit tests with fake attachments (UI steals main, demotion, busy counts, stale generation).
 **GREEN:** hub module + thin extension wiring for lifecycle only.
 
 ---
 
-### Slice 4 — Commands and TUI notifications
+### Slice 4 — Commands, optional reason, TUI-only reason entry
 
-**Branch:** `slice/commands-notify`  
-**Examples:** 2, 3 (command paths), unconditional notify texts  
+**Branch:** `slice/commands-notify`
+**Examples:** 2, 3
 
 **Deliver:**
 
 - `/lock-continue-watchdog` → controller.lock + TUI notify `Continue watchdog locked`
-- `/unlock-continue-watchdog` → controller.unlock + TUI notify `Continue watchdog unlocked`
+- `/unlock-continue-watchdog [reason]`:
+  - empty/blank → `Continue watchdog unlocked`, no reason entry
+  - nonblank → trim + truncate to 500 Unicode characters; notify `Continue watchdog unlocked: <reason>`; append persisted TUI-only reason entry
 - Same-state still notifies
 - Handlers inert when not current main / wrong session identity (demotion-safe)
 
-**RED:** handler tests with fake `pi` notify/command APIs.  
-**GREEN:** register commands on main claim; keep tool for next slice if cleaner.
+**RED:** handler tests with fake `pi` notify/command APIs; reason empty/long/multiline cases.
+**GREEN:** register commands on main claim; decision tools come in later slices.
 
 ---
 
-### Slice 5 — Main-only AI unlock tool
+### Slice 5 — Temporary decision tools (registration only)
 
-**Branch:** `slice/unlock-tool`  
-**Examples:** 3 (tool path), 5 (tool description guidance)  
+**Branch:** `slice/decision-tools`
+**Examples:** 5 (tool set shape), 7 (unlock schema/description), 6 (continue empty schema)
 
 **Deliver:**
 
-- Register `unlock_continue_watchdog` only for main
-- Description tells model to call it when intentionally waiting for the user or all tasks are complete
-- On invoke: unlock + TUI `Continue watchdog unlocked` (always)
-- Return only model-visible `Continue watchdog unlocked`; do not return state, config, or structured details
-- Return Pi's `terminate: true` hint so a final standalone unlock call skips the redundant post-tool model turn; test/document the all-results-in-batch limitation
-- Non-main must not successfully act as main unlock
+- Registered definitions for `continue_watchdog({})` and `unlock_continue_watchdog({ reason: string })`; Pi exposes no public unregister API
+- Unlock tool description states concise single-sentence reason guidance (validation still in decision module)
+- Capture the prior active tool-name set; **activate** exactly these two for the main decision request; restore the captured set on continue, unlock, invalid×3, Escape unlock, demotion, reload, and shutdown
+- Definitions may remain registered but are inactive/model-invisible outside a decision window; do not describe registration as temporary
+- Non-main must never activate them as main controls
 
-**RED:** tool registration/visibility and invoke notify/state tests.  
-**GREEN:** tool wiring on claim; remove/inert on demote.
+**RED:** registration/restore tests; assert normal tool set does not permanently include decision tools.
+**GREEN:** tool modules + setActiveTools wiring helpers; full idle entry may still be stubbed until later slices.
 
 ---
 
-### Slice 6 — Auto-lock on actual main user `message_start`
+### Slice 6 — Protocol validator + 3 re-asks
 
-**Branch:** `slice/auto-lock`  
-**Examples:** 1  
+**Branch:** `slice/decision-validator`
+**Examples:** 8; reason rules for 7
 
 **Deliver:**
 
-- On main user-role `message_start`: unconditional lock + attempt reset
+- Pure validator: exactly one valid decision tool; reject no tool, both/multiple, extra/unknown, prose-only, invalid reason
+- Reason: trim, nonempty, ≤500 Unicode characters, newlines allowed
+- On invalid: produce exact previous-error text for the next hidden re-ask prompt
+- After 3 invalids: signal decision-failed; restore tools; emit exact TUI warning
+  `Continue watchdog decision failed after 3 attempts: <last error>`
+- Invalid path does not advance exponential continue attempt
+
+**RED:** matrix tests for all invalid classes + third-failure warning text.
+**GREEN:** decision module + controller integration; extension may drive re-ask with fakes.
+
+---
+
+### Slice 7 — Context folding + custom continue rendering
+
+**Branch:** `slice/context-fold-render`
+**Examples:** 6, 7
+
+**Deliver:**
+
+- On valid unlock: context hook removes entire decision exchange; inserts **nothing**; TUI reason notify + TUI-only entry already from unlock path; `terminate: true` on unlock result
+- On valid continue: context hook removes decision prompt/reply/tool call/results and inserts one compact custom message = configured `continuePrompt`
+- Custom tool renderer folds continue call/result into one compact TUI line showing `continuePrompt`
+- Document Pi limitations: non-destructive model-bound edits; raw session may retain protocol records; terminate only if all batch results terminate
+
+**RED:** fold unit tests (unlock empty replacement vs continue compact prompt); renderer snapshot tests.
+**GREEN:** context hook + renderer wiring without full timer path if still isolated.
+
+---
+
+### Slice 8 — Auto-lock on actual main user `message_start`
+
+**Branch:** `slice/auto-lock`
+**Examples:** 1
+
+**Deliver:**
+
+- On main user-role `message_start`: unconditional lock + attempt/failure reset
 - Ignore child user messages and mere `input` queueing
-- Document hook choice in README
+- Document hook choice in README when docs slice lands
 
-**RED:** lifecycle tests distinguishing `input` vs user `message_start` vs child session.  
+**RED:** lifecycle tests distinguishing `input` vs user `message_start` vs child session.
 **GREEN:** hook wiring to controller.
 
 ---
 
-### Slice 7 — Idle timer, cancel/restart, continue delivery
+### Slice 9 — Observable active-main Escape unlock
 
-**Branch:** `slice/idle-continue`  
-**Examples:** 4, 5, 6, 7  
+**Branch:** `slice/escape-abort-unlock`
+**Examples:** 4
+
+**Deliver:**
+
+- In interactive TUI main only, register a public `ctx.ui.onTerminalInput` listener and match Escape using Pi TUI key utilities
+- If main is non-idle, apply unconditional reasonless unlock before Pi handles input: cancel timers/decision state, restore normal tools, reset attempts/failures, and notify exactly `Continue watchdog unlocked`
+- Return Escape unchanged and never consume it; Pi remains responsible for aborting the run
+- Ignore Escape while main is idle so selector/editor cancellation and double-Escape navigation do not unlock
+- Do not infer abort from `agent_settled`; document that headless/RPC/programmatic aborts and input consumed before this listener are outside truthful public-API coverage
+- Dispose the terminal listener on demote/reload/shutdown
+
+**RED:** terminal-input tests for active Escape unlock + pass-through, same-state notification, idle Escape no-op, no duplicate notification on settle, and listener cleanup.
+**GREEN:** thin UI input adapter to the existing unconditional unlock controller path.
+
+---
+
+### Slice 10 — Idle timer, decision entry, continue/exhaustion lifecycle
+
+**Branch:** `slice/idle-decision-cycle`
+**Examples:** 5, 6, 7, 9, 10, 11
 
 **Deliver:**
 
 - When locked and all observable idle → arm one-shot timer for current attempt delay
 - Busy → cancel; idle again → full delay restart for same attempt
-- Fire → send visible custom non-user message to main with **steer + triggerTurn**, exact/default prompt
-- Generation guards on callback; `unref` timers; no tool cancel
-- After continue run settles still locked → next attempt (example 7)
+- Fire → enter decision window: `setActiveTools` to decision pair; send **hidden** `decisionPrompt` via steer+triggerTurn (or documented equivalent that does not cancel in-flight tools)
+- Wire valid continue → restore tools, fold, advance attempt, allow next idle cycle
+- Wire valid unlock → restore tools, fold to nothing, unlock notify/reason
+- After `maxRetries` valid continues → exhausted, no timer
+- session shutdown / demote / reload: unlock clean, clear timers, restore tools, no durable restore
+- Generation guards on callbacks; `unref` timers
 
-**RED:** fake clock/timer tests for cancel/restart/stale callback; message shape/delivery options asserted at the seam.  
-**GREEN:** timer + `sendMessage` wiring.
-
----
-
-### Slice 8 — Exhaustion and lifecycle cleanup
-
-**Branch:** `slice/exhaustion-lifecycle`  
-**Examples:** 8, 9  
-
-**Deliver:**
-
-- After `maxRetries` continues, remain locked/exhausted with no timer
-- Reset paths: main user `message_start`, manual lock
-- session shutdown / demote / reload path: unlock clean, clear timers, no durable restore
-
-**RED:** exhaustion + shutdown/demote tests.  
-**GREEN:** cleanup on `session_shutdown` and main loss.
+**RED:** fake clock/timer tests for cancel/restart/stale callback; decision entry asserts no rejected direct-continuation default string; exhaustion + shutdown/demote tests.
+**GREEN:** full extension wiring of hub + controller + decision + fold.
 
 ---
 
-### Slice 9 — README product docs (English)
+### Slice 11 — Packed isolated stock-Pi E2E + CI
 
-**Branch:** `slice/readme`  
-**Examples:** documentation of all 11; limitations  
-
-**Deliver:** user-facing install, commands, tool, config sample, defaults, exponential policy, observable-coverage warning, BSD license blurb.  
-**Review:** docs-only → reviewer optional unless product wording is sensitive (prefer quick human skim).
-
----
-
-### Slice 10 — Packed isolated stock-Pi E2E + CI
-
-**Branch:** `slice/e2e-ci`  
-**Examples:** 11; end-to-end smoke for 1–5 as feasible  
+**Branch:** `slice/e2e-ci`
+**Examples:** 13; end-to-end smoke for 1–8 as feasible, including active-main Escape pass-through unlock
 
 **Deliver:**
 
 - Pack extension → install into isolated `HOME` / agent dir → stock Pi
-- E2E: load, command lock/unlock notify path, auto-lock seam, at least one real or harness-accelerated continue delivery
+- E2E: load, command lock/unlock (± reason), auto-lock seam, at least one real or harness-accelerated path into decision tools + valid continue or unlock fold
+- Prefer coverage of third-invalid decision-failed warning when harness allows
 - GitHub Actions: lint/typecheck/unit + E2E on PR/push to `master`
 - Safety: no destructive release generator aimed at repo root
 
-**RED:** E2E fails before feature complete; then green on `master` after merge.  
+**RED:** E2E fails before feature complete; then green on `master` after merge.
 **Review:** required (CI and isolation are high-risk).
 
 ---
 
-### Slice 11 — Publication readiness
+### Slice 12 — README product docs (English)
 
-**Branch:** `slice/publish-prep` or direct release checklist on `master` after human authority  
+**Branch:** `slice/readme`
+**Examples:** documentation of all accepted examples; limitations
+
+**Deliver:**
+
+- User-facing install, commands, decision tools, config sample, defaults, exponential policy
+- Explicit supersession note: prior direct-continuation design rejected
+- Observable-coverage warning
+- Pi API limitations table (context hook, setActiveTools, terminate batch rule, raw session retention)
+- BSD license blurb
+
+**Review:** docs-only → reviewer optional unless product wording is sensitive (prefer quick human skim).
+
+---
+
+### Slice 13 — Publication readiness
+
+**Branch:** `slice/publish-prep` or direct release checklist on `master` after human authority
 
 **Deliver:**
 
@@ -257,7 +317,7 @@ Order is dependency-aware. Each slice must leave `master` installable/testable f
 - No tags/npm unless later authorized
 - Human confirmation before `gh repo create` / first push
 
-**Not authorized by this plan alone:** creating the GitHub repo or pushing. Wait for explicit publish authority (task “Verify and publish project”).
+**Not authorized by this plan alone:** creating the GitHub repo or pushing. Wait for explicit publish authority.
 
 ---
 
@@ -265,12 +325,18 @@ Order is dependency-aware. Each slice must leave `master` installable/testable f
 
 | Layer | What |
 |---|---|
-| Pure unit | Config, controller delays/attempts, hub election, generation guards |
-| Extension unit | Commands, tool, hooks with fake Pi context |
+| Pure unit | Config, controller delays/attempts/decision-failed, reason validation, decision validity matrix, hub election, generation guards, context fold replacements |
+| Extension unit | Commands, temporary tools, hooks, re-ask prompts with fake Pi context |
 | E2E | Packed artifact + stock Pi; isolated dirs; process-group cleanup |
-| ATDD traceability | Each automated test names the acceptance example ID (1–11) it protects |
+| ATDD traceability | Each automated test names the acceptance example ID it protects |
 
 Break implementations deliberately once per critical test to prove failure mode (not tautologies).
+
+**Stale-string guard:** tests and docs search must fail if the rejected default direct reminder reappears:
+
+```text
+Continue the task. If you are intentionally waiting for the user or all tasks are complete, call unlock_continue_watchdog.
+```
 
 ---
 
@@ -278,8 +344,8 @@ Break implementations deliberately once per critical test to prove failure mode 
 
 | Change type | Reviewer | Merge when |
 |---|---|---|
-| Functional slices 1–8, 10 | Required | Approved + checks green |
-| Scaffold 0, docs 9 | Optional | Checks green; human may still skim README |
+| Functional slices 1–11 | Required | Approved + checks green |
+| Scaffold 0, docs 12 | Optional | Checks green; human may still skim README |
 | Publish | Human product authority | Explicit yes |
 
 Independent review contract for functional merges: Critical/Important/Minor findings; end with `APPROVED` or `CHANGES REQUIRED`.
@@ -290,11 +356,15 @@ Independent review contract for functional merges: Critical/Important/Minor find
 
 | Risk | Mitigation |
 |---|---|
-| Stale timers wake after unlock/demote | Generation + epoch on every callback (pi-watchdog pattern) |
+| Reintroducing rejected direct continue | Acceptance supersession + stale-string guard in tests/docs |
+| Stale timers open decision after unlock/demote | Generation + epoch on every callback |
+| False abort attribution | Use only active-main TUI Escape as a documented best-effort abort request; pass it through unchanged; never infer abort from settle or claim headless/programmatic coverage |
+| Decision tools stuck active | Always restore on unlock/continue/decision-failed/demote/shutdown; tests assert restore |
 | Over-claiming “all agents” | Docs + diagnostics: observable same-process only |
 | Queued vs actual user message | Auto-lock only on user-role `message_start` |
 | Same-state silent commands | Unconditional assign + exact TUI strings in tests |
-| Unlock triggers redundant full LLM request | Minimal one-line result plus `terminate: true`; document that the paired call/result remains in later history and mixed tool batches only terminate when every result opts in |
+| Context pollution | Fold unlock → nothing; continue → compact `continuePrompt` only |
+| `terminate: true` ignored in mixed batches | Document Pi limitation; prefer unlock as sole tool in its batch |
 | Destructive packaging scripts | Never default output to repo root; sentinel-owned dirs only |
 | Scope creep (footer, wall clock, other plugins) | Reject; point to acceptance non-examples |
 
@@ -302,25 +372,29 @@ Independent review contract for functional merges: Critical/Important/Minor find
 
 ## Immediate next action after this plan
 
-1. Human (or root agent with authority) starts **Slice 0** on a new branch: initialize Git and minimal package **only when coding begins**.  
-2. Proceed slice-by-slice; do not open parallel feature branches that edit the same extension wiring without a clear ownership split.  
+1. Human (or root agent with authority) starts **Slice 0** on a new branch from the existing repository and adds the minimal package.
+2. Proceed slice-by-slice; do not open parallel feature branches that edit the same extension wiring without a clear ownership split.
 3. Keep `PLAN/acceptance.md` authoritative; update it only with human confirmation.
 
 ---
 
 ## Checklist (progress)
 
-- [x] Acceptance contract with 11 examples + unconditional TUI notifies (`PLAN/acceptance.md`)
-- [x] Implementation slice map (`PLAN/implementation.md`)
+- [x] Acceptance contract rewritten for two-stage decision-flow (`PLAN/acceptance.md`)
+- [x] Implementation slice map rewritten for decision-flow (`PLAN/implementation.md`)
 - [ ] Slice 0 skeleton
 - [ ] Slice 1 config
-- [ ] Slice 2 lock state
+- [ ] Slice 2 lock/decision state
 - [ ] Slice 3 hub
-- [ ] Slice 4 commands/notify
-- [ ] Slice 5 unlock tool
-- [ ] Slice 6 auto-lock
-- [ ] Slice 7 idle continue
-- [ ] Slice 8 exhaustion/lifecycle
-- [ ] Slice 9 README
-- [ ] Slice 10 E2E/CI
-- [ ] Slice 11 publish (human-gated)
+- [ ] Slice 4 commands / reason entry
+- [ ] Slice 5 temporary decision tools
+- [ ] Slice 6 protocol validator + 3 re-asks
+- [ ] Slice 7 context folding + custom rendering
+- [ ] Slice 8 auto-lock
+- [ ] Slice 9 active-main Escape unlock
+- [ ] Slice 10 idle timer / decision cycle / exhaustion
+- [ ] Slice 11 E2E/CI
+- [ ] Slice 12 README
+- [ ] Slice 13 publish (human-gated)
+
+**Note:** Implementation is **not** complete. Only planning artifacts exist for this redesign until slices merge.
