@@ -6,6 +6,7 @@ import type {
 	ExtensionCommandContext,
 	ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 import {
 	type CommandRuntimeEffect,
@@ -155,17 +156,6 @@ function armDecision(
 		);
 	assert.ok(decision, "expected a decision window");
 	return decision.decisionId;
-}
-
-const graphemeSegmenter = new Intl.Segmenter(undefined, {
-	granularity: "grapheme",
-});
-
-function conservativeDisplayWidth(text: string): number {
-	return [...graphemeSegmenter.segment(text)].reduce(
-		(width, { segment }) => width + (/^[\x20-\x7e]$/u.test(segment) ? 1 : 2),
-		0,
-	);
 }
 
 function renderHumanUnlockEntry(data: unknown, width: number): string[] {
@@ -355,12 +345,27 @@ test("Slice 4 RED: unlock-reason entry never overflows narrow widths for emoji o
 	for (const width of [1, 10]) {
 		const lines = renderHumanUnlockEntry({ reason }, width);
 		assert.ok(lines.length > 1);
-		assert.ok(
-			lines.every(
-				(line) => conservativeDisplayWidth(line) <= Math.max(1, width),
-			),
-		);
+		assert.ok(lines.every((line) => visibleWidth(line) <= Math.max(1, width)));
 		assert.ok(lines.every((line) => !/^\p{Mark}/u.test(line)));
+	}
+});
+
+test("I1 RED: unlock-reason entry uses Pi widths for multi-spacing-mark Thai, Lao, and halfwidth graphemes", () => {
+	for (const reason of ["กำำ", "ກຳຳ", "ｶﾞﾞ"]) {
+		assert.equal(visibleWidth(reason), 3);
+
+		for (const width of [1, 2, 3]) {
+			const lines = renderHumanUnlockEntry({ reason }, width);
+			assert.ok(
+				lines.every((line) => visibleWidth(line) <= width),
+				`${JSON.stringify(reason)} overflowed width ${width}: ${JSON.stringify(lines)}`,
+			);
+			assert.equal(
+				lines.some((line) => line.includes(reason)),
+				width === 3,
+				`${JSON.stringify(reason)} should only fit at width 3`,
+			);
+		}
 	}
 });
 

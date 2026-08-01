@@ -3,6 +3,7 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 import type { ControllerEffect, LockDecisionController } from "./controller.js";
 
@@ -60,18 +61,10 @@ function sanitizeTuiText(text: string): string {
 	).join("");
 }
 
-function displayWidth(grapheme: string): number {
-	return /^[\x20-\x7e]$/u.test(grapheme) ? 1 : 2;
-}
-
-function renderableGrapheme(grapheme: string, maxWidth: number): string {
-	return displayWidth(grapheme) <= maxWidth ? grapheme : "?";
-}
-
 /**
- * Wrap terminal-safe text conservatively. Non-ASCII graphemes count as two
- * columns, which may underfill a line but cannot overflow it. A one-column
- * terminal renders a wide grapheme as `?`, since preserving it would overflow.
+ * Wrap terminal-safe text on grapheme boundaries using Pi's public terminal
+ * width measurement. A grapheme wider than the current terminal falls back to
+ * `?`, because it cannot be split without corrupting the user-provided reason.
  */
 export function wrapTuiText(text: string, width: number): string[] {
 	const maxWidth = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
@@ -82,8 +75,8 @@ export function wrapTuiText(text: string, width: number): string[] {
 		let lineWidth = 0;
 
 		for (const { segment } of graphemeSegmenter.segment(sourceLine)) {
-			const grapheme = renderableGrapheme(segment, maxWidth);
-			const graphemeWidth = displayWidth(grapheme);
+			const grapheme = visibleWidth(segment) <= maxWidth ? segment : "?";
+			const graphemeWidth = visibleWidth(grapheme);
 			if (lineWidth > 0 && lineWidth + graphemeWidth > maxWidth) {
 				lines.push(line);
 				line = "";
