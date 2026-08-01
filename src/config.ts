@@ -69,6 +69,7 @@ export const BUILT_IN_CONFIG: Readonly<ContinueWatchdogConfig> = Object.freeze({
 });
 
 const MAX_DIAGNOSTIC_LENGTH = 240;
+const INVALID_CONFIG_MESSAGE = "configuration is invalid";
 
 const KNOWN_KEYS = [
 	"idleDelaySeconds",
@@ -79,6 +80,39 @@ const KNOWN_KEYS = [
 
 function diagnostic(source: string, message: string): ConfigDiagnostic {
 	return { source, message: message.slice(0, MAX_DIAGNOSTIC_LENGTH) };
+}
+
+type OwnDataRead =
+	| { kind: "missing" }
+	| { kind: "data"; value: unknown }
+	| { kind: "non_data" };
+
+/**
+ * Read an own data property without invoking accessors.
+ * - missing/inherited-only → missing
+ * - own data descriptor (`"value" in descriptor`) → data
+ * - own accessor / non-data descriptor → non_data (never invoke getter)
+ * Descriptor inspection traps may throw (hostile proxy).
+ */
+function readOwnDataProperty(object: object, key: string): OwnDataRead {
+	const descriptor = Object.getOwnPropertyDescriptor(object, key);
+	if (descriptor === undefined) {
+		return { kind: "missing" };
+	}
+	if (!("value" in descriptor)) {
+		return { kind: "non_data" };
+	}
+	return { kind: "data", value: descriptor.value };
+}
+
+/**
+ * Enumerate own property names without relying on unguarded Object.keys alone.
+ * Throws when enumeration traps throw (hostile proxy).
+ */
+function listOwnKeys(object: object): string[] {
+	return Reflect.ownKeys(object).filter(
+		(key): key is string => typeof key === "string",
+	);
 }
 
 /**
@@ -121,73 +155,111 @@ function nonEmptyString(value: unknown): value is string {
 export function validateConfig(source: string, value: unknown): ConfigResult {
 	if (value === null || typeof value !== "object" || Array.isArray(value)) {
 		return {
-			config: {},
+			config: Object.create(null),
 			diagnostics: [diagnostic(source, "configuration must be an object")],
 		};
 	}
 
-	const input = value as ConfigInput;
-	const config: Partial<ContinueWatchdogConfig> = {};
+	const input = value as object;
+	// null-prototype so missing fields never read ambient Object.prototype pollution.
+	const config: Partial<ContinueWatchdogConfig> = Object.create(null);
 	const diagnostics: ConfigDiagnostic[] = [];
 
-	if (input.idleDelaySeconds !== undefined) {
-		if (validIdleDelaySeconds(input.idleDelaySeconds)) {
-			config.idleDelaySeconds = input.idleDelaySeconds;
-		} else {
-			diagnostics.push(
-				diagnostic(
-					source,
-					"idleDelaySeconds must be a safe integer between 1 and 3600",
-				),
-			);
+	try {
+		const idle = readOwnDataProperty(input, "idleDelaySeconds");
+		if (idle.kind === "non_data") {
+			return {
+				config: Object.create(null),
+				diagnostics: [diagnostic(source, INVALID_CONFIG_MESSAGE)],
+			};
 		}
-	}
-
-	if (input.maxRetries !== undefined) {
-		if (validMaxRetries(input.maxRetries)) {
-			config.maxRetries = input.maxRetries;
-		} else {
-			diagnostics.push(
-				diagnostic(
-					source,
-					"maxRetries must be a safe integer between 1 and 10",
-				),
-			);
+		if (idle.kind === "data") {
+			if (validIdleDelaySeconds(idle.value)) {
+				config.idleDelaySeconds = idle.value;
+			} else {
+				diagnostics.push(
+					diagnostic(
+						source,
+						"idleDelaySeconds must be a safe integer between 1 and 3600",
+					),
+				);
+			}
 		}
-	}
 
-	if (input.decisionPrompt !== undefined) {
-		if (nonEmptyString(input.decisionPrompt)) {
-			config.decisionPrompt = input.decisionPrompt;
-		} else {
-			diagnostics.push(
-				diagnostic(source, "decisionPrompt must be a non-empty string"),
-			);
+		const retries = readOwnDataProperty(input, "maxRetries");
+		if (retries.kind === "non_data") {
+			return {
+				config: Object.create(null),
+				diagnostics: [diagnostic(source, INVALID_CONFIG_MESSAGE)],
+			};
 		}
-	}
-
-	if (input.continuePrompt !== undefined) {
-		if (nonEmptyString(input.continuePrompt)) {
-			config.continuePrompt = input.continuePrompt;
-		} else {
-			diagnostics.push(
-				diagnostic(source, "continuePrompt must be a non-empty string"),
-			);
+		if (retries.kind === "data") {
+			if (validMaxRetries(retries.value)) {
+				config.maxRetries = retries.value;
+			} else {
+				diagnostics.push(
+					diagnostic(
+						source,
+						"maxRetries must be a safe integer between 1 and 10",
+					),
+				);
+			}
 		}
-	}
 
-	let hasUnknownKey = false;
-	for (const key of Object.keys(input)) {
-		if (!(KNOWN_KEYS as readonly string[]).includes(key)) {
-			hasUnknownKey = true;
-			break;
+		const decision = readOwnDataProperty(input, "decisionPrompt");
+		if (decision.kind === "non_data") {
+			return {
+				config: Object.create(null),
+				diagnostics: [diagnostic(source, INVALID_CONFIG_MESSAGE)],
+			};
 		}
-	}
-	if (hasUnknownKey) {
-		diagnostics.push(diagnostic(source, "ignoring unsupported keys"));
-	}
+		if (decision.kind === "data") {
+			if (nonEmptyString(decision.value)) {
+				config.decisionPrompt = decision.value;
+			} else {
+				diagnostics.push(
+					diagnostic(source, "decisionPrompt must be a non-empty string"),
+				);
+			}
+		}
 
-	return { config, diagnostics };
+		const cont = readOwnDataProperty(input, "continuePrompt");
+		if (cont.kind === "non_data") {
+			return {
+				config: Object.create(null),
+				diagnostics: [diagnostic(source, INVALID_CONFIG_MESSAGE)],
+			};
+		}
+		if (cont.kind === "data") {
+			if (nonEmptyString(cont.value)) {
+				config.continuePrompt = cont.value;
+			} else {
+				diagnostics.push(
+					diagnostic(source, "continuePrompt must be a non-empty string"),
+				);
+			}
+		}
+
+		const known = KNOWN_KEYS as readonly string[];
+		let hasUnknownKey = false;
+		for (const key of listOwnKeys(input)) {
+			if (!known.includes(key)) {
+				hasUnknownKey = true;
+				break;
+			}
+		}
+		if (hasUnknownKey) {
+			diagnostics.push(diagnostic(source, "ignoring unsupported keys"));
+		}
+
+		return { config, diagnostics };
+	} catch {
+		// Hostile getters/proxies during ownership/property inspection must not escape.
+		return {
+			config: Object.create(null),
+			diagnostics: [diagnostic(source, INVALID_CONFIG_MESSAGE)],
+		};
+	}
 }
 
 export function loadConfigText(source: string, text: string): ConfigResult {
@@ -195,7 +267,7 @@ export function loadConfigText(source: string, text: string): ConfigResult {
 		return validateConfig(source, JSON.parse(text) as unknown);
 	} catch {
 		return {
-			config: {},
+			config: Object.create(null),
 			diagnostics: [
 				diagnostic(source, "configuration contains malformed JSON"),
 			],

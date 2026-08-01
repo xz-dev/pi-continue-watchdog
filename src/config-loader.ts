@@ -33,12 +33,24 @@ const nodeFileIO: ConfigFileIO = {
 	readFile: (path, encoding) => readFile(path, encoding),
 };
 
+/**
+ * True only when `error` is a non-null object with an own data property
+ * `code` whose stored value is exactly `"ENOENT"`.
+ * Never invokes getters/proxies; any inspection failure is non-silent.
+ */
 function isSilentMissing(error: unknown): boolean {
-	return (
-		typeof error === "object" &&
-		error !== null &&
-		(error as { code?: unknown }).code === "ENOENT"
-	);
+	if (typeof error !== "object" || error === null) {
+		return false;
+	}
+	try {
+		const descriptor = Object.getOwnPropertyDescriptor(error, "code");
+		if (descriptor === undefined || !("value" in descriptor)) {
+			return false;
+		}
+		return descriptor.value === "ENOENT";
+	} catch {
+		return false;
+	}
 }
 
 async function readConfig(
@@ -53,10 +65,10 @@ async function readConfig(
 		return loadConfigText(source, await io.readFile(path, "utf8"));
 	} catch (error) {
 		if (isSilentMissing(error)) {
-			return { config: {}, diagnostics: [] };
+			return { config: Object.create(null), diagnostics: [] };
 		}
 		return {
-			config: {},
+			config: Object.create(null),
 			diagnostics: [
 				{
 					source,
@@ -86,7 +98,7 @@ export async function loadRuntimeConfig(
 				"project",
 				io,
 			)
-		: { config: {}, diagnostics: [] as ConfigDiagnostic[] };
+		: { config: Object.create(null), diagnostics: [] as ConfigDiagnostic[] };
 
 	const merged = mergeConfig(global.config, project.config);
 	return {

@@ -20,6 +20,11 @@ import {
 } from "../src/config.js";
 import { loadRuntimeConfig } from "../src/config-loader.js";
 
+function assertEmptyPartialConfig(config: object): void {
+	assert.equal(Object.getPrototypeOf(config), null);
+	assert.deepEqual(Object.assign({}, config), {});
+}
+
 /** Rejected direct-continuation reminder (must never be shipped as default). */
 const REJECTED_DIRECT_REMINDER =
 	"Continue the task. If you are intentionally waiting for the user or all tasks are complete, call unlock_continue_watchdog.";
@@ -133,7 +138,7 @@ test("Example 12: invalid higher-precedence value preserves lower valid value", 
 
 test("validateConfig rejects non-object and invalid field types with bounded diagnostics", () => {
 	const nonObject = validateConfig("global", ["nope"]);
-	assert.deepEqual(nonObject.config, {});
+	assertEmptyPartialConfig(nonObject.config);
 	assert.equal(nonObject.diagnostics.length, 1);
 	assert.equal(nonObject.diagnostics[0]?.source, "global");
 	assert.match(nonObject.diagnostics[0]?.message ?? "", /object/i);
@@ -145,7 +150,7 @@ test("validateConfig rejects non-object and invalid field types with bounded dia
 		continuePrompt: null,
 		unknownKey: true,
 	});
-	assert.deepEqual(invalid.config, {});
+	assertEmptyPartialConfig(invalid.config);
 	assert.ok(invalid.diagnostics.length >= 3);
 	for (const d of invalid.diagnostics) {
 		assert.ok(d.message.length <= 240);
@@ -154,7 +159,7 @@ test("validateConfig rejects non-object and invalid field types with bounded dia
 
 test("loadConfigText reports malformed JSON without crashing", () => {
 	const result = loadConfigText("global", "{ not json");
-	assert.deepEqual(result.config, {});
+	assertEmptyPartialConfig(result.config);
 	assert.equal(result.diagnostics.length, 1);
 	assert.equal(result.diagnostics[0]?.source, "global");
 	assert.match(result.diagnostics[0]?.message ?? "", /malformed|JSON/i);
@@ -506,4 +511,239 @@ test("M1 fixtures: temporary directories are cleaned after tests", async (t) => 
 	// so verify cleanup helper works explicitly as the contract.
 	await rm(root, { recursive: true, force: true });
 	await assert.rejects(() => access(root), { code: "ENOENT" });
+});
+
+// --- Adversarial object-access hardening (review I1/I2) ---
+
+const ADVERSARIAL_SECRET =
+	"LEAK_SECRET_token=abc\npath=/tmp/secret/key.pem\nstack: Error: hostile";
+const INVALID_CONFIG_MESSAGE = "configuration is invalid";
+const READ_FAILURE_MESSAGE = "could not read configuration";
+
+test("I1: throwing code getter never crashes loader or leaks secret", async (t) => {
+	const { agentDir, cwd } = await fixture(t);
+	const hostile = {};
+	Object.defineProperty(hostile, "code", {
+		enumerable: true,
+		configurable: true,
+		get() {
+			throw new Error(ADVERSARIAL_SECRET);
+		},
+	});
+
+	const loaded = await loadRuntimeConfig({
+		cwd,
+		trusted: false,
+		agentDir,
+		io: {
+			async readFile(): Promise<string> {
+				throw hostile;
+			},
+		},
+	});
+
+	assert.deepEqual(loaded.config, { ...BUILT_IN_CONFIG });
+	assert.equal(loaded.diagnostics.length, 1);
+	assert.equal(loaded.diagnostics[0]?.source, "global");
+	assert.equal(loaded.diagnostics[0]?.message, READ_FAILURE_MESSAGE);
+	const msg = loaded.diagnostics[0]?.message ?? "";
+	assert.ok(msg.length <= 240);
+	assert.ok(!msg.includes("LEAK_SECRET"));
+	assert.ok(!msg.includes("token"));
+	assert.ok(!msg.includes("/tmp/secret"));
+	assert.ok(!msg.includes("hostile"));
+});
+
+test("I1: proxy traps that throw never crash loader or leak secret", async (t) => {
+	const { agentDir, cwd } = await fixture(t);
+	const hostile = new Proxy(
+		{},
+		{
+			get() {
+				throw new Error(ADVERSARIAL_SECRET);
+			},
+			ownKeys() {
+				throw new Error(ADVERSARIAL_SECRET);
+			},
+			getOwnPropertyDescriptor() {
+				throw new Error(ADVERSARIAL_SECRET);
+			},
+		},
+	);
+
+	const loaded = await loadRuntimeConfig({
+		cwd,
+		trusted: false,
+		agentDir,
+		io: {
+			async readFile(): Promise<string> {
+				throw hostile;
+			},
+		},
+	});
+
+	assert.deepEqual(loaded.config, { ...BUILT_IN_CONFIG });
+	assert.equal(loaded.diagnostics.length, 1);
+	assert.equal(loaded.diagnostics[0]?.source, "global");
+	assert.equal(loaded.diagnostics[0]?.message, READ_FAILURE_MESSAGE);
+	const msg = loaded.diagnostics[0]?.message ?? "";
+	assert.ok(!msg.includes("LEAK_SECRET"));
+	assert.ok(!msg.includes("token"));
+	assert.ok(!msg.includes("hostile"));
+});
+
+test("I2: inherited known fields are ignored; defaults and lower config preserved", () => {
+	const polluted = Object.create({
+		idleDelaySeconds: 99,
+		maxRetries: 1,
+		decisionPrompt: "Inherited decision must not apply",
+		continuePrompt: "Inherited continue must not apply",
+	}) as Record<string, unknown>;
+
+	const emptyInherited = validateConfig("global", polluted);
+	assertEmptyPartialConfig(emptyInherited.config);
+	assert.deepEqual(emptyInherited.diagnostics, []);
+
+	const withOwn = Object.create({
+		idleDelaySeconds: 99,
+		maxRetries: 1,
+	}) as Record<string, unknown>;
+	Object.defineProperty(withOwn, "decisionPrompt", {
+		value: "Own decision",
+		writable: true,
+		enumerable: true,
+		configurable: true,
+	});
+
+	const ownOnly = validateConfig("project", withOwn);
+	assert.equal(Object.hasOwn(ownOnly.config, "idleDelaySeconds"), false);
+	assert.equal(Object.hasOwn(ownOnly.config, "maxRetries"), false);
+	assert.equal(ownOnly.config.decisionPrompt, "Own decision");
+	assert.equal(Object.hasOwn(ownOnly.config, "continuePrompt"), false);
+
+	const merged = mergeConfig({ idleDelaySeconds: 8, maxRetries: 4 }, polluted);
+	assert.equal(merged.config.idleDelaySeconds, 8);
+	assert.equal(merged.config.maxRetries, 4);
+	assert.equal(merged.config.decisionPrompt, DEFAULT_DECISION_PROMPT);
+	assert.equal(merged.config.continuePrompt, DEFAULT_CONTINUE_PROMPT);
+});
+
+test("I2: ambient Object.prototype pollution is ignored with guaranteed cleanup", () => {
+	const proto = Object.prototype as Record<string, unknown>;
+	const marker = "__pi_continue_watchdog_pollution_idleDelaySeconds__";
+	const keys = [
+		"idleDelaySeconds",
+		"maxRetries",
+		"decisionPrompt",
+		"continuePrompt",
+	] as const;
+	const previous: Array<{
+		key: string;
+		descriptor: PropertyDescriptor | undefined;
+	}> = [];
+
+	try {
+		for (const key of keys) {
+			previous.push({
+				key,
+				descriptor: Object.getOwnPropertyDescriptor(proto, key),
+			});
+			Object.defineProperty(proto, key, {
+				value:
+					key === "idleDelaySeconds"
+						? 77
+						: key === "maxRetries"
+							? 2
+							: `polluted-${key}-${marker}`,
+				enumerable: true,
+				configurable: true,
+				writable: true,
+			});
+		}
+
+		const empty = validateConfig("global", {});
+		assertEmptyPartialConfig(empty.config);
+		assert.deepEqual(empty.diagnostics, []);
+
+		const partial = validateConfig("project", { idleDelaySeconds: 5 });
+		assert.equal(partial.config.idleDelaySeconds, 5);
+		assert.equal(Object.hasOwn(partial.config, "maxRetries"), false);
+		assert.equal(Object.hasOwn(partial.config, "decisionPrompt"), false);
+		assert.equal(Object.hasOwn(partial.config, "continuePrompt"), false);
+
+		const merged = mergeConfig({ maxRetries: 3 }, {});
+		assert.equal(
+			merged.config.idleDelaySeconds,
+			BUILT_IN_CONFIG.idleDelaySeconds,
+		);
+		assert.equal(merged.config.maxRetries, 3);
+		assert.equal(merged.config.decisionPrompt, DEFAULT_DECISION_PROMPT);
+		assert.equal(merged.config.continuePrompt, DEFAULT_CONTINUE_PROMPT);
+		assert.ok(
+			!JSON.stringify(merged).includes(marker),
+			"polluted prototype values must not enter merge result",
+		);
+	} finally {
+		for (const { key, descriptor } of previous) {
+			if (descriptor === undefined) {
+				Reflect.deleteProperty(proto, key);
+			} else {
+				Object.defineProperty(proto, key, descriptor);
+			}
+		}
+	}
+
+	for (const key of keys) {
+		assert.equal(
+			Object.getOwnPropertyDescriptor(Object.prototype, key),
+			undefined,
+			`Object.prototype.${key} must be restored`,
+		);
+	}
+});
+
+test("I1/I2: hostile config object/proxy for validateConfig yields generic diagnostic only", () => {
+	const throwingGetter = {};
+	Object.defineProperty(throwingGetter, "idleDelaySeconds", {
+		enumerable: true,
+		configurable: true,
+		get() {
+			throw new Error(ADVERSARIAL_SECRET);
+		},
+	});
+
+	const getterResult = validateConfig("global", throwingGetter);
+	assertEmptyPartialConfig(getterResult.config);
+	assert.equal(getterResult.diagnostics.length, 1);
+	assert.equal(getterResult.diagnostics[0]?.source, "global");
+	assert.equal(getterResult.diagnostics[0]?.message, INVALID_CONFIG_MESSAGE);
+	assert.ok(!getterResult.diagnostics[0]?.message.includes("LEAK_SECRET"));
+	assert.ok(!getterResult.diagnostics[0]?.message.includes("token"));
+
+	const hostileProxy = new Proxy(
+		{},
+		{
+			get() {
+				throw new Error(ADVERSARIAL_SECRET);
+			},
+			ownKeys() {
+				throw new Error(ADVERSARIAL_SECRET);
+			},
+			getOwnPropertyDescriptor() {
+				throw new Error(ADVERSARIAL_SECRET);
+			},
+			has() {
+				throw new Error(ADVERSARIAL_SECRET);
+			},
+		},
+	);
+
+	const proxyResult = validateConfig("project", hostileProxy);
+	assertEmptyPartialConfig(proxyResult.config);
+	assert.equal(proxyResult.diagnostics.length, 1);
+	assert.equal(proxyResult.diagnostics[0]?.source, "project");
+	assert.equal(proxyResult.diagnostics[0]?.message, INVALID_CONFIG_MESSAGE);
+	assert.ok(!proxyResult.diagnostics[0]?.message.includes("LEAK_SECRET"));
+	assert.ok(!proxyResult.diagnostics[0]?.message.includes("hostile"));
+	assert.ok(!JSON.stringify(proxyResult.diagnostics).includes("LEAK_SECRET"));
 });
