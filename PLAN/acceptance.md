@@ -54,7 +54,7 @@ Correct all accidental `cointinue` spellings; public names use `continue` only.
 ### Exact default `decisionPrompt`
 
 ```text
-Decide whether work should continue. Call unlock_continue_watchdog with a concise reason if you are intentionally waiting for the user or all tasks are complete. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.
+This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Call unlock_continue_watchdog with a concise reason if you are intentionally waiting for the user or all tasks are complete. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.
 ```
 
 ### Exact default `continuePrompt`
@@ -84,7 +84,7 @@ Continue until all jobs are done.
 |---|---|---|
 | `idleDelaySeconds` | `3` | Base delay in seconds; safe integer in `[1, 3600]` (timer-safe with maxRetries) |
 | `maxRetries` | `10` | Maximum **valid continue** decisions per lock cycle (not invalid re-asks); safe integer in `[1, 10]` |
-| `decisionPrompt` | exact default above | Hidden decision custom-message body |
+| `decisionPrompt` | exact default above | Hidden Pi custom-role body; explicitly identifies extension automation and says it is not a user message/request |
 | `continuePrompt` | exact default above | Compact fold-in after valid continue |
 
 **Config locations and precedence** (same pattern as sibling Pi plugins):
@@ -154,7 +154,7 @@ Per main ownership generation / lock cycle, at least:
    - `continue_watchdog` with empty/minimal input schema `{}`
    - `unlock_continue_watchdog` with required `reason: string`
      Tool description for unlock must say the reason is a **concise single-sentence** reason (validation rules below).
-2. Sends a **hidden** configurable custom message whose model-visible body is the configured `decisionPrompt` (exact default above).
+2. Sends a **hidden Pi custom-role** message—not a user-role message—whose model-visible body is the configured `decisionPrompt` (exact default above). Its default explicitly identifies the extension automation and says it is not a user message or request.
 3. Does **not** send the rejected direct-continuation “keep working / call unlock while tools remain normal” message as the idle wake path.
 
 The decision model turn **reads existing task context** already present in the session; the decision prompt does not need to restate the full task.
@@ -299,7 +299,7 @@ This uses the canonical persisted `AssistantMessage.stopReason` that Pi's own TU
 
 - exactly one decision window is opened for that attempt (not a direct continue custom message)
 - active tools are temporarily replaced with exactly `continue_watchdog` and `unlock_continue_watchdog`
-- a **hidden** decision custom message uses configured `decisionPrompt` (exact default in Product surface)
+- a **hidden Pi custom-role** decision message uses configured `decisionPrompt` (exact default in Product surface), identifies itself as extension automation, states it is not a user message/request, and is never injected with user role
 - the rejected direct-continuation default
   `Continue the task. If you are intentionally waiting for the user or all tasks are complete, call unlock_continue_watchdog.`
   is **not** used as the idle wake message
