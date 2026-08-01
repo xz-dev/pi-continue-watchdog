@@ -96,6 +96,7 @@ function createHarness(
 	});
 	const activation = createDecisionToolActivation(pi, {
 		isCurrentMain: () => currentMain,
+		getContinuePrompt: () => "Continue from configuration.",
 		...executors,
 	});
 
@@ -214,6 +215,31 @@ test("Slice 5 RED: decision schemas, descriptions, and prompt snippets define on
 		},
 		additionalProperties: false,
 	});
+});
+
+test("Slice 7 RED: the registered continue decision tool uses the compact configured-prompt renderer and hides its result row", () => {
+	const harness = createHarness();
+	const continueTool = registeredTool(harness, CONTINUE_WATCHDOG_TOOL_NAME);
+	assert.ok(continueTool.renderCall);
+	assert.ok(continueTool.renderResult);
+
+	const theme = {
+		fg(_color: string, text: string): string {
+			return text;
+		},
+	};
+	const call = continueTool.renderCall({}, theme as never, {} as never);
+	const result = continueTool.renderResult(
+		harness.continueResult,
+		{ expanded: false, isPartial: false },
+		theme as never,
+		{} as never,
+	);
+	assert.deepEqual(
+		call.render(120).map((line) => line.trimEnd()),
+		["Continue from configuration."],
+	);
+	assert.deepEqual(result.render(120), []);
 });
 
 test("Slice 5 RED: activation only follows lifecycle initialization and restores an ordered normal-only baseline", () => {

@@ -5,6 +5,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
+import { createContinueToolRenderers } from "./render.js";
+
 /** Public model-visible tool name used only during an automated decision window. */
 export const CONTINUE_WATCHDOG_TOOL_NAME = "continue_watchdog";
 
@@ -83,6 +85,8 @@ export interface DecisionToolExecutors {
 export interface DecisionToolActivationOptions extends DecisionToolExecutors {
 	/** Main ownership is live and may change after a decision window opens. */
 	readonly isCurrentMain: () => boolean;
+	/** Reads the effective config when Pi renders a valid continue decision. */
+	readonly getContinuePrompt: () => string;
 }
 
 export interface DecisionToolActivation {
@@ -182,6 +186,7 @@ export function createDecisionToolActivation(
 			description: CONTINUE_WATCHDOG_DESCRIPTION,
 			promptSnippet: CONTINUE_WATCHDOG_PROMPT_SNIPPET,
 			parameters: CONTINUE_WATCHDOG_PARAMETERS,
+			...createContinueToolRenderers(options.getContinuePrompt),
 			async execute(toolCallId, _params, _signal, _onUpdate, ctx) {
 				if (
 					!initialized ||
