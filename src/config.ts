@@ -90,8 +90,11 @@ type OwnDataRead =
 /**
  * Read an own data property without invoking accessors.
  * - missing/inherited-only → missing
- * - own data descriptor (`"value" in descriptor`) → data
+ * - own data descriptor (own `value` property on the descriptor) → data
  * - own accessor / non-data descriptor → non_data (never invoke getter)
+ *
+ * Uses Object.hasOwn(descriptor, "value") so ambient Object.prototype.value
+ * pollution cannot reclassify accessor descriptors as data.
  * Descriptor inspection traps may throw (hostile proxy).
  */
 function readOwnDataProperty(object: object, key: string): OwnDataRead {
@@ -99,20 +102,18 @@ function readOwnDataProperty(object: object, key: string): OwnDataRead {
 	if (descriptor === undefined) {
 		return { kind: "missing" };
 	}
-	if (!("value" in descriptor)) {
+	if (!Object.hasOwn(descriptor, "value")) {
 		return { kind: "non_data" };
 	}
 	return { kind: "data", value: descriptor.value };
 }
 
 /**
- * Enumerate own property names without relying on unguarded Object.keys alone.
+ * Enumerate own property keys (strings and symbols).
  * Throws when enumeration traps throw (hostile proxy).
  */
-function listOwnKeys(object: object): string[] {
-	return Reflect.ownKeys(object).filter(
-		(key): key is string => typeof key === "string",
-	);
+function listOwnKeys(object: object): PropertyKey[] {
+	return Reflect.ownKeys(object);
 }
 
 /**
@@ -153,19 +154,28 @@ function nonEmptyString(value: unknown): value is string {
 }
 
 export function validateConfig(source: string, value: unknown): ConfigResult {
-	if (value === null || typeof value !== "object" || Array.isArray(value)) {
+	// typeof/null checks are trap-free for ordinary values; Array.isArray and all
+	// subsequent shape/descriptor/key inspection can throw on hostile proxies.
+	if (value === null || typeof value !== "object") {
 		return {
 			config: Object.create(null),
 			diagnostics: [diagnostic(source, "configuration must be an object")],
 		};
 	}
 
-	const input = value as object;
-	// null-prototype so missing fields never read ambient Object.prototype pollution.
-	const config: Partial<ContinueWatchdogConfig> = Object.create(null);
-	const diagnostics: ConfigDiagnostic[] = [];
-
 	try {
+		if (Array.isArray(value)) {
+			return {
+				config: Object.create(null),
+				diagnostics: [diagnostic(source, "configuration must be an object")],
+			};
+		}
+
+		const input = value as object;
+		// null-prototype so missing fields never read ambient Object.prototype pollution.
+		const config: Partial<ContinueWatchdogConfig> = Object.create(null);
+		const diagnostics: ConfigDiagnostic[] = [];
+
 		const idle = readOwnDataProperty(input, "idleDelaySeconds");
 		if (idle.kind === "non_data") {
 			return {
@@ -241,20 +251,21 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 		}
 
 		const known = KNOWN_KEYS as readonly string[];
-		let hasUnknownKey = false;
+		let hasUnsupportedKey = false;
 		for (const key of listOwnKeys(input)) {
-			if (!known.includes(key)) {
-				hasUnknownKey = true;
+			// Any own symbol (or non-string key) is unsupported; never coerce/describe.
+			if (typeof key !== "string" || !known.includes(key)) {
+				hasUnsupportedKey = true;
 				break;
 			}
 		}
-		if (hasUnknownKey) {
+		if (hasUnsupportedKey) {
 			diagnostics.push(diagnostic(source, "ignoring unsupported keys"));
 		}
 
 		return { config, diagnostics };
 	} catch {
-		// Hostile getters/proxies during ownership/property inspection must not escape.
+		// Hostile getters/proxies/revoked proxies during shape inspection must not escape.
 		return {
 			config: Object.create(null),
 			diagnostics: [diagnostic(source, INVALID_CONFIG_MESSAGE)],

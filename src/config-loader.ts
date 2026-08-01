@@ -44,7 +44,9 @@ function isSilentMissing(error: unknown): boolean {
 	}
 	try {
 		const descriptor = Object.getOwnPropertyDescriptor(error, "code");
-		if (descriptor === undefined || !("value" in descriptor)) {
+		// Require an own data `value` on the descriptor — never `in`, so ambient
+		// Object.prototype.value pollution cannot reclassify accessors as data.
+		if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
 			return false;
 		}
 		return descriptor.value === "ENOENT";

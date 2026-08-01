@@ -747,3 +747,254 @@ test("I1/I2: hostile config object/proxy for validateConfig yields generic diagn
 	assert.ok(!proxyResult.diagnostics[0]?.message.includes("hostile"));
 	assert.ok(!JSON.stringify(proxyResult.diagnostics).includes("LEAK_SECRET"));
 });
+
+// --- Final review defenses (I1 descriptor.value pollution / I2 revoked proxy / I3 symbols) ---
+
+/** Null-prototype property descriptor so ambient Object.prototype pollution cannot taint defineProperty. */
+function nullDesc(fields: PropertyDescriptor): PropertyDescriptor {
+	return Object.assign(Object.create(null), fields) as PropertyDescriptor;
+}
+
+test("I1: Object.prototype.value pollution must not make accessor descriptors look like data", () => {
+	const proto = Object.prototype as Record<string, unknown>;
+	const previous = Object.getOwnPropertyDescriptor(proto, "value");
+	try {
+		// Null-proto descriptor: ordinary object literals would inherit polluted `value`.
+		Object.defineProperty(
+			proto,
+			"value",
+			nullDesc({
+				value: 999,
+				enumerable: true,
+				configurable: true,
+				writable: true,
+			}),
+		);
+
+		const accessorOnly: Record<string, unknown> = {};
+		Object.defineProperty(
+			accessorOnly,
+			"idleDelaySeconds",
+			nullDesc({
+				enumerable: true,
+				configurable: true,
+				get() {
+					return 5;
+				},
+			}),
+		);
+
+		const accessorResult = validateConfig("global", accessorOnly);
+		assertEmptyPartialConfig(accessorResult.config);
+		assert.equal(accessorResult.diagnostics.length, 1);
+		assert.equal(accessorResult.diagnostics[0]?.source, "global");
+		assert.equal(
+			accessorResult.diagnostics[0]?.message,
+			INVALID_CONFIG_MESSAGE,
+		);
+		assert.equal(
+			Object.hasOwn(accessorResult.config, "idleDelaySeconds"),
+			false,
+		);
+
+		// Inherited-only ambient value via prototype must still be missing (own-only policy).
+		const inheritedOnly = Object.create({
+			idleDelaySeconds: 12,
+		}) as Record<string, unknown>;
+		const inheritedResult = validateConfig("project", inheritedOnly);
+		assertEmptyPartialConfig(inheritedResult.config);
+		assert.deepEqual(inheritedResult.diagnostics, []);
+	} finally {
+		if (previous === undefined) {
+			Reflect.deleteProperty(proto, "value");
+		} else {
+			Object.defineProperty(proto, "value", previous);
+		}
+	}
+
+	assert.equal(
+		Object.getOwnPropertyDescriptor(Object.prototype, "value"),
+		undefined,
+		"Object.prototype.value must be restored",
+	);
+});
+
+test("I1: accessor-only error.code with Object.prototype.value=ENOENT is not silent", async (t) => {
+	const { agentDir, cwd } = await fixture(t);
+	const proto = Object.prototype as Record<string, unknown>;
+	const previous = Object.getOwnPropertyDescriptor(proto, "value");
+	try {
+		Object.defineProperty(
+			proto,
+			"value",
+			nullDesc({
+				value: "ENOENT",
+				enumerable: true,
+				configurable: true,
+				writable: true,
+			}),
+		);
+
+		const hostile: Record<string, unknown> = {};
+		Object.defineProperty(
+			hostile,
+			"code",
+			nullDesc({
+				enumerable: true,
+				configurable: true,
+				get() {
+					return "ENOENT";
+				},
+			}),
+		);
+
+		const loaded = await loadRuntimeConfig({
+			cwd,
+			trusted: false,
+			agentDir,
+			io: {
+				async readFile(): Promise<string> {
+					throw hostile;
+				},
+			},
+		});
+
+		assert.deepEqual(loaded.config, { ...BUILT_IN_CONFIG });
+		assert.equal(loaded.diagnostics.length, 1);
+		assert.equal(loaded.diagnostics[0]?.source, "global");
+		assert.equal(loaded.diagnostics[0]?.message, READ_FAILURE_MESSAGE);
+		assert.ok(!loaded.diagnostics[0]?.message.includes("ENOENT"));
+	} finally {
+		if (previous === undefined) {
+			Reflect.deleteProperty(proto, "value");
+		} else {
+			Object.defineProperty(proto, "value", previous);
+		}
+	}
+
+	assert.equal(
+		Object.getOwnPropertyDescriptor(Object.prototype, "value"),
+		undefined,
+		"Object.prototype.value must be restored",
+	);
+});
+
+test("I2: revoked Proxy yields exactly one generic invalid diagnostic and never throws", () => {
+	const target = { idleDelaySeconds: 5 };
+	const { proxy, revoke } = Proxy.revocable(target, {});
+	revoke();
+
+	let result: ReturnType<typeof validateConfig> | undefined;
+	assert.doesNotThrow(() => {
+		result = validateConfig("global", proxy);
+	});
+	assert.ok(result);
+	assertEmptyPartialConfig(result.config);
+	assert.equal(result.diagnostics.length, 1);
+	assert.equal(result.diagnostics[0]?.source, "global");
+	assert.equal(result.diagnostics[0]?.message, INVALID_CONFIG_MESSAGE);
+	assert.ok(
+		!JSON.stringify(result.diagnostics).toLowerCase().includes("proxy"),
+	);
+	assert.ok(!JSON.stringify(result.diagnostics).includes("revoked"));
+});
+
+test("I2: proxy invariant traps on ownKeys/getOwnPropertyDescriptor stay generic", () => {
+	// Non-extensible target + extra ownKeys entry → invariant TypeError.
+	const nonExtensible = Object.preventExtensions({});
+	const ownKeysInvariant = new Proxy(nonExtensible, {
+		ownKeys() {
+			return ["idleDelaySeconds"];
+		},
+		getOwnPropertyDescriptor() {
+			return undefined;
+		},
+	});
+
+	let result: ReturnType<typeof validateConfig> | undefined;
+	assert.doesNotThrow(() => {
+		result = validateConfig("project", ownKeysInvariant);
+	});
+	assert.ok(result);
+	assertEmptyPartialConfig(result.config);
+	assert.equal(result.diagnostics.length, 1);
+	assert.equal(result.diagnostics[0]?.source, "project");
+	assert.equal(result.diagnostics[0]?.message, INVALID_CONFIG_MESSAGE);
+
+	// Target has non-configurable property; trap reports configurable → invariant TypeError.
+	const target: Record<string, unknown> = {};
+	Object.defineProperty(
+		target,
+		"idleDelaySeconds",
+		nullDesc({
+			value: 4,
+			writable: false,
+			enumerable: true,
+			configurable: false,
+		}),
+	);
+	const descriptorInvariant = new Proxy(target, {
+		getOwnPropertyDescriptor() {
+			return nullDesc({
+				value: 4,
+				writable: false,
+				enumerable: true,
+				configurable: true,
+			});
+		},
+		ownKeys() {
+			return ["idleDelaySeconds"];
+		},
+	});
+
+	let descriptorResult: ReturnType<typeof validateConfig> | undefined;
+	assert.doesNotThrow(() => {
+		descriptorResult = validateConfig("global", descriptorInvariant);
+	});
+	assert.ok(descriptorResult);
+	assertEmptyPartialConfig(descriptorResult.config);
+	assert.equal(descriptorResult.diagnostics.length, 1);
+	assert.equal(
+		descriptorResult.diagnostics[0]?.message,
+		INVALID_CONFIG_MESSAGE,
+	);
+});
+
+test("I3: own symbol keys emit one generic unsupported diagnostic without description leak", () => {
+	const secretSymbol = Symbol("LEAK_SYMBOL_DESCRIPTION_secret-token");
+	const another = Symbol("another-secret-symbol");
+
+	const symbolOnly: Record<string | symbol, unknown> = {
+		[secretSymbol]: "must-not-appear",
+	};
+	const onlyResult = validateConfig("global", symbolOnly);
+	assertEmptyPartialConfig(onlyResult.config);
+	assert.equal(onlyResult.diagnostics.length, 1);
+	assert.equal(onlyResult.diagnostics[0]?.source, "global");
+	assert.equal(onlyResult.diagnostics[0]?.message, "ignoring unsupported keys");
+	assert.ok(!onlyResult.diagnostics[0]?.message.includes("LEAK_SYMBOL"));
+	assert.ok(!onlyResult.diagnostics[0]?.message.includes("secret"));
+	assert.ok(!JSON.stringify(onlyResult.diagnostics).includes("LEAK_SYMBOL"));
+	assert.ok(!JSON.stringify(onlyResult.diagnostics).includes("secret-token"));
+
+	const mixed: Record<string | symbol, unknown> = {
+		idleDelaySeconds: 7,
+		maxRetries: 2,
+		unknownStringKey: true,
+		[secretSymbol]: "hidden",
+		[another]: "also-hidden",
+	};
+	const mixedResult = validateConfig("project", mixed);
+	assert.equal(mixedResult.config.idleDelaySeconds, 7);
+	assert.equal(mixedResult.config.maxRetries, 2);
+	const unknownDiags = mixedResult.diagnostics.filter((d) =>
+		/unsupported|unknown/i.test(d.message),
+	);
+	assert.equal(unknownDiags.length, 1);
+	assert.equal(unknownDiags[0]?.message, "ignoring unsupported keys");
+	assert.ok(!unknownDiags[0]?.message.includes("LEAK_SYMBOL"));
+	assert.ok(!unknownDiags[0]?.message.includes("another-secret"));
+	assert.ok(!unknownDiags[0]?.message.includes("unknownStringKey"));
+	assert.ok(!JSON.stringify(mixedResult.diagnostics).includes("LEAK_SYMBOL"));
+	assert.ok(!JSON.stringify(mixedResult.diagnostics).includes("Symbol("));
+});
