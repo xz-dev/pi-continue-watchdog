@@ -47,7 +47,7 @@ Any acceptance text, test name, README, or implementation that still requires th
 | Unlock TUI notify (no reason) | `Continue watchdog unlocked` | User-only TUI notify |
 | Unlock TUI notify (with reason) | `Continue watchdog unlocked: <reason>` | User-only TUI notify |
 | Decision-failed TUI warning | `Continue watchdog decision failed after 3 attempts: <last error>` | User-only TUI notify/warning |
-| Observable main-run abort unlock | same behavior as reasonless `/unlock-continue-watchdog` | Automatic on the best-effort interactive Escape-abort path defined below |
+| Main-run abort unlock | same behavior as reasonless `/unlock-continue-watchdog` | Automatic when the terminal assistant message for the settled main run has `stopReason: "aborted"` |
 
 Correct all accidental `cointinue` spellings; public names use `continue` only.
 
@@ -74,7 +74,7 @@ Continue until all jobs are done.
 3. **Only main** may enter the decision window and receive decision tools. Non-main attachments must not expose decision tools as usable main controls.
 4. **Zero external-plugin dependencies.** Use only Pi public extension APIs plus this plugin’s own hub.
 5. **Lock state is runtime-only** for the current process/session attachment lifecycle. Not written to disk. Not restored on reload/new/resume/restart/shutdown.
-6. **Abort provenance boundary.** Pi's public `agent_end` / `agent_settled` extension events do not expose an abort cause. In interactive TUI mode, Pi's public `ctx.ui.onTerminalInput` can observe Escape before Pi handles it, while `ctx.isIdle()` distinguishes an active main run. Therefore v1 treats an unconsumed Escape observed while the UI-bound main is non-idle as a best-effort user-abort request: unlock first, return the input unchanged so Pi still performs its normal abort. Headless/RPC/programmatic aborts and Escape consumed by overlays or earlier listeners may be unobservable; never infer abort from ordinary `agent_settled`.
+6. **Abort provenance.** Pi's `agent_end` / `agent_settled` event payloads do not directly carry an abort flag, but the public read-only `ctx.sessionManager` exposes persisted session entries. Pi synthesizes and persists a terminal assistant message with `stopReason: "aborted"` for an aborted run before `agent_settled`. Capture the main branch boundary at `agent_start`; at `agent_settled`, inspect only assistant messages newly appended for that run. Unlock only when the run's terminal assistant message has `stopReason: "aborted"`. This follows the same canonical state that Pi's TUI renders as `Operation aborted`, covers standard Escape and programmatic aborts, and never infers abort from settle alone.
 
 ---
 
@@ -131,7 +131,7 @@ Per main ownership generation / lock cycle, at least:
 
 - `/unlock-continue-watchdog [reason]`
 - Valid decision-window `unlock_continue_watchdog({ reason })`
-- Best-effort interactive user-abort request: an unconsumed Escape observed while the UI-bound main is non-idle; this is reasonless, pass-through, and must not be inferred later from settle
+- A settled main run whose newly persisted terminal assistant message has `stopReason: "aborted"`; this is reasonless and must be scoped to entries added after that run's captured start boundary
 
 **What does not auto-lock / does not reset the main cycle:**
 
@@ -275,21 +275,21 @@ These examples are the accepted product contract. Each is externally observable 
 - a TUI-only reason entry is appended
 - same-state unlock still assigns and still notifies
 
-### Example 4 — Active-main Escape automatically unlocks without swallowing abort
+### Example 4 — An actually aborted main run automatically unlocks
 
-**Given** the UI-bound main is non-idle and the continue watchdog is locked or already unlocked
-**When** the plugin's public terminal-input listener observes an unconsumed Escape key
+**Given** a main run starts while the continue watchdog is locked or already unlocked, and the plugin records that run's current branch boundary
+**When** the run reaches `agent_settled`
+**And** the terminal assistant message among entries newly persisted after that boundary has `stopReason: "aborted"`
 **Then**
 
 - apply the same unconditional state transition as reasonless `/unlock-continue-watchdog`: unlocked; timers/decision state cancelled; attempts/failures reset; prior normal tools restored
 - TUI notifies exactly `Continue watchdog unlocked`, even when already unlocked
 - no unlock reason entry is appended
-- return/pass Escape through unchanged; the plugin must not consume it, so Pi retains authority to abort the run
-- a later ordinary `agent_settled` must not create a second unlock notification
+- process that settled run once, so no duplicate unlock notification is emitted for the same aborted message
 
-**And when** main is idle (for example Escape closes a selector, cancels an editor, or participates in double-Escape navigation), the listener does not change watchdog state.
+**And when** the settled run's terminal assistant message has any non-aborted stop reason, or no new terminal assistant message is attributable to that run, the plugin does not auto-unlock.
 
-**Public-API limitation:** this is truthful best-effort coverage of the interactive user Escape abort path, not a claim that every Pi abort source is observable. The plugin must not infer abort from settle alone.
+This uses the canonical persisted `AssistantMessage.stopReason` that Pi's own TUI renders as `Operation aborted`; it does not infer abort from the existence of `agent_settled` alone and does not depend on raw Escape input.
 
 ### Example 5 — Locked + all observable idle → exponential delayed **decision entry**
 
@@ -428,7 +428,7 @@ These are product/engineering constraints, not optional polish:
 | Generation-safe timers | `clearTimeout` alone is insufficient; callbacks check ownership/generation |
 | Command demotion safety | If main demotes, stale command handlers must be inert |
 | Notify channel | Lock/unlock/decision-failed notifies are TUI user-only; not injected as user-role conversation turns |
-| Abort truthfulness | Interactive active-main Escape unlock is best-effort and pass-through. Never claim programmatic/headless abort coverage or infer abort from plain settle because Pi public lifecycle events expose no abort provenance. |
+| Abort truthfulness | Capture a per-run branch boundary, then inspect only newly persisted assistant entries at `agent_settled`; unlock only when the terminal assistant has `stopReason: "aborted"`. Never reuse an older aborted entry or infer abort from settle alone. |
 | No context pollution from decisions | Future model-bound context never keeps the raw decision exchange after valid unlock/continue handling |
 | No persistent unlock tool | Outside the decision window, `unlock_continue_watchdog` / `continue_watchdog` are not part of the normal always-on tool set |
 | No other-plugin coupling | No imports or runtime detection of pi-subagents / pi-watchdog / pi-notify |
@@ -444,9 +444,9 @@ These are product/engineering constraints, not optional polish:
 - Counting only root idle and ignoring observable children (or the reverse)
 - Using `followUp` delivery that waits until the entire active tool flow stops if steer+triggerTurn is the accepted safe wake
 - Silent same-state lock/unlock (no TUI notify)
-- Consuming Escape after unlocking, preventing Pi from performing its normal abort
-- Unlocking on every Escape while main is idle (selectors, editors, double-Escape navigation)
-- Treating every ordinary `agent_settled` as aborted, or claiming public API coverage of headless/programmatic abort sources
+- Watching raw Escape and unlocking before knowing whether Pi produced an aborted run
+- Scanning the whole session without a run boundary, so an old aborted assistant message unlocks a later natural run
+- Treating every ordinary `agent_settled` as aborted instead of checking the newly persisted terminal assistant `stopReason`
 - Configurable invalid re-ask budget (must stay fixed at 3)
 - Counting invalid re-asks against `maxRetries`
 - Leaving decision tools active after unlock, continue, decision-failed, demote, or shutdown

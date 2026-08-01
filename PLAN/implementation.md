@@ -14,7 +14,7 @@ Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would ch
 
 ## Goals
 
-1. Implement the accepted examples in `PLAN/acceptance.md` (auto-lock, commands, observable active-main Escape unlock, temporary decision tools, validator + 3 re-asks, context folding, exponential continues, exhaustion, packaging/CI).
+1. Implement the accepted examples in `PLAN/acceptance.md` (auto-lock, commands, canonical settled-run abort unlock, temporary decision tools, validator + 3 re-asks, context folding, exponential continues, exhaustion, packaging/CI).
 2. Keep each branch small enough to review: one user-visible or install-visible behavior seam.
 3. Prefer test-first (ATDD outer / TDD inner) for functional slices.
 4. Mirror proven patterns from **pi-watchdog** (hub, trust-gated config, generation-safe timers, packed stock-Pi E2E, BSD-3-Clause) without copying unrelated product features or the rejected continue-watchdog v0 path.
@@ -27,7 +27,7 @@ Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would ch
 |---|---|
 | pi-watchdog | Process-global hub, UI-first root election, trust-gated config merge, generation/epoch timer guards, source + release install shapes, packed isolated stock-Pi CI |
 | pi-notify | Trust-gated global/project config precedence; **not** a model for decision tools or context folding |
-| Pi public APIs | Auto-lock on user-role `message_start` (not `input`); settle on `agent_settled`; wake via custom message **steer + triggerTurn**; `hasUI` for root priority; `setActiveTools` for next request; context hooks for non-destructive model-bound edits; `terminate: true` batch limitation; `ctx.ui.onTerminalInput` + TUI `ctx.isIdle()` for best-effort active-main Escape unlock. Public agent lifecycle events do not expose abort provenance, so never infer abort from settle. |
+| Pi public APIs | Auto-lock on user-role `message_start` (not `input`); settle on `agent_settled`; wake via custom message **steer + triggerTurn**; `hasUI` for root priority; `setActiveTools` for next request; context hooks for non-destructive model-bound edits; `terminate: true` batch limitation. Abort provenance comes from the newly persisted terminal assistant `stopReason` inspected through public read-only `ctx.sessionManager` at settle, not from raw Escape or settle alone. |
 
 ---
 
@@ -170,7 +170,7 @@ Order is dependency-aware. Each slice must leave `master` installable/testable f
 
 - Registered definitions for `continue_watchdog({})` and `unlock_continue_watchdog({ reason: string })`; Pi exposes no public unregister API
 - Unlock tool description states concise single-sentence reason guidance (validation still in decision module)
-- Capture the prior active tool-name set; **activate** exactly these two for the main decision request; restore the captured set on continue, unlock, invalid×3, Escape unlock, demotion, reload, and shutdown
+- Capture the prior active tool-name set; **activate** exactly these two for the main decision request; restore the captured set on continue, unlock, invalid×3, settled-run abort unlock, demotion, reload, and shutdown
 - Definitions may remain registered but are inactive/model-invisible outside a decision window; do not describe registration as temporary
 - Non-main must never activate them as main controls
 
@@ -231,22 +231,22 @@ Order is dependency-aware. Each slice must leave `master` installable/testable f
 
 ---
 
-### Slice 9 — Observable active-main Escape unlock
+### Slice 9 — Canonical settled-run abort unlock
 
-**Branch:** `slice/escape-abort-unlock`
+**Branch:** `slice/abort-outcome-unlock`
 **Examples:** 4
 
 **Deliver:**
 
-- In interactive TUI main only, register a public `ctx.ui.onTerminalInput` listener and match Escape using Pi TUI key utilities
-- If main is non-idle, apply unconditional reasonless unlock before Pi handles input: cancel timers/decision state, restore normal tools, reset attempts/failures, and notify exactly `Continue watchdog unlocked`
-- Return Escape unchanged and never consume it; Pi remains responsible for aborting the run
-- Ignore Escape while main is idle so selector/editor cancellation and double-Escape navigation do not unlock
-- Do not infer abort from `agent_settled`; document that headless/RPC/programmatic aborts and input consumed before this listener are outside truthful public-API coverage
-- Dispose the terminal listener on demote/reload/shutdown
+- On main `agent_start`, capture an immutable branch boundary (leaf ID or equivalent) and main ownership generation for that run
+- At main `agent_settled`, use public read-only `ctx.sessionManager` APIs to inspect only entries newly appended after the captured boundary
+- Find the run's terminal assistant message; if and only if `stopReason === "aborted"`, apply unconditional reasonless unlock: cancel timers/decision state, restore normal tools, reset attempts/failures, and notify exactly `Continue watchdog unlocked`
+- Mark the captured run outcome consumed so the same aborted entry cannot notify twice; discard boundaries on demotion/reload/shutdown
+- Do not depend on raw Escape input: Pi's canonical aborted assistant outcome covers Escape and other standard abort sources that settle through the normal run lifecycle
+- If there is no attributable new terminal assistant message or its stop reason is non-aborted, do nothing; never infer abort from settle alone
 
-**RED:** terminal-input tests for active Escape unlock + pass-through, same-state notification, idle Escape no-op, no duplicate notification on settle, and listener cleanup.
-**GREEN:** thin UI input adapter to the existing unconditional unlock controller path.
+**RED:** session-entry tests for aborted terminal assistant unlock, natural/error/length stop no-op, stale pre-boundary aborted entry ignored, same-state notification, no duplicate processing, and boundary cleanup.
+**GREEN:** a narrow run-outcome detector feeding the existing unconditional unlock controller path.
 
 ---
 
@@ -274,7 +274,7 @@ Order is dependency-aware. Each slice must leave `master` installable/testable f
 ### Slice 11 — Packed isolated stock-Pi E2E + CI
 
 **Branch:** `slice/e2e-ci`
-**Examples:** 13; end-to-end smoke for 1–8 as feasible, including active-main Escape pass-through unlock
+**Examples:** 13; end-to-end smoke for 1–8 as feasible, including a real Escape abort that persists `stopReason: "aborted"` and then unlocks
 
 **Deliver:**
 
@@ -358,7 +358,7 @@ Independent review contract for functional merges: Critical/Important/Minor find
 |---|---|
 | Reintroducing rejected direct continue | Acceptance supersession + stale-string guard in tests/docs |
 | Stale timers open decision after unlock/demote | Generation + epoch on every callback |
-| False abort attribution | Use only active-main TUI Escape as a documented best-effort abort request; pass it through unchanged; never infer abort from settle or claim headless/programmatic coverage |
+| False abort attribution | Capture a run branch boundary and inspect only newly persisted terminal assistant state at settle; require `stopReason: "aborted"`; never scan stale history or infer from settle alone |
 | Decision tools stuck active | Always restore on unlock/continue/decision-failed/demote/shutdown; tests assert restore |
 | Over-claiming “all agents” | Docs + diagnostics: observable same-process only |
 | Queued vs actual user message | Auto-lock only on user-role `message_start` |
@@ -391,7 +391,7 @@ Independent review contract for functional merges: Critical/Important/Minor find
 - [ ] Slice 6 protocol validator + 3 re-asks
 - [ ] Slice 7 context folding + custom rendering
 - [ ] Slice 8 auto-lock
-- [ ] Slice 9 active-main Escape unlock
+- [ ] Slice 9 settled-run abort unlock
 - [ ] Slice 10 idle timer / decision cycle / exhaustion
 - [ ] Slice 11 E2E/CI
 - [ ] Slice 12 README
