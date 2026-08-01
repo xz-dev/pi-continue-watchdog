@@ -11,6 +11,25 @@ import { randomUUID } from "node:crypto";
 
 export const HUB_SYMBOL = Symbol.for("pi-continue-watchdog:hub:v1");
 
+const HUB_ATTACHMENT_INSTANCE = Symbol(
+	"pi-continue-watchdog:hub-attachment-instance",
+);
+
+/**
+ * Opaque per-runtime-attachment identity. Create one when an extension instance
+ * attaches, retain it for that instance's complete lifecycle, and bind only once.
+ * It is deliberately distinct from the informational sessionId: simultaneous
+ * attachments can legitimately report the same sessionId.
+ */
+export interface HubAttachmentInstance {
+	readonly [HUB_ATTACHMENT_INSTANCE]: true;
+}
+
+/** Creates one opaque identity for a single runtime extension attachment. */
+export function createHubAttachmentInstance(): HubAttachmentInstance {
+	return Object.freeze({ [HUB_ATTACHMENT_INSTANCE]: true } as const);
+}
+
 export interface HubAttachmentIdentity {
 	readonly sessionId: string;
 	readonly hasUI: boolean;
@@ -63,6 +82,9 @@ export interface HubTransition {
 }
 
 export interface BindAttachmentInput {
+	/** Stable identity created and retained by one runtime extension attachment. */
+	readonly instance: HubAttachmentInstance;
+	/** Informational only; it is not a registry or idempotency key. */
 	readonly sessionId: string;
 	readonly hasUI: boolean;
 	/** An attachment which starts in-flight is busy until its settled lifecycle event. */
@@ -71,6 +93,11 @@ export interface BindAttachmentInput {
 
 export interface BindAttachmentResult {
 	readonly created: boolean;
+	/**
+	 * True when a repeated bind supplied different immutable first-bind metadata.
+	 * The original attachment and metadata always win; no transition is applied.
+	 */
+	readonly inputConflict: boolean;
 	readonly attachment: HubAttachment;
 	/** Present only when this bind won a new or promoted main ownership claim. */
 	readonly mainClaim: HubMainClaim | null;
@@ -93,8 +120,11 @@ export interface ObservableAgentHub {
 }
 
 interface RegisteredAttachment {
+	readonly instance: HubAttachmentInstance;
 	readonly attachment: HubAttachment;
 	readonly order: number;
+	/** Immutable bind input retained to report duplicate metadata conflicts. */
+	readonly initialBusy: boolean;
 	busy: boolean;
 }
 
@@ -137,8 +167,8 @@ function freezeEffect(effect: HubEffect): HubEffect {
 }
 
 class ProcessObservableAgentHub implements ObservableAgentHub {
-	private readonly attachmentsBySessionId = new Map<
-		string,
+	private readonly attachmentsByInstance = new WeakMap<
+		HubAttachmentInstance,
 		RegisteredAttachment
 	>();
 	private readonly attachmentsByToken = new Map<string, RegisteredAttachment>();
@@ -152,10 +182,11 @@ class ProcessObservableAgentHub implements ObservableAgentHub {
 	}
 
 	public bind(input: BindAttachmentInput): BindAttachmentResult {
-		const existing = this.attachmentsBySessionId.get(input.sessionId);
+		const existing = this.attachmentsByInstance.get(input.instance);
 		if (existing !== undefined) {
 			return Object.freeze({
 				created: false,
+				inputConflict: this.inputConflicts(existing, input),
 				attachment: existing.attachment,
 				mainClaim: null,
 				transition: this.noop(),
@@ -169,11 +200,13 @@ class ProcessObservableAgentHub implements ObservableAgentHub {
 			randomUUID(),
 		);
 		const registered: RegisteredAttachment = {
+			instance: input.instance,
 			attachment,
 			order: this.nextAttachmentOrder++,
+			initialBusy: input.initialBusy === true,
 			busy: input.initialBusy === true,
 		};
-		this.attachmentsBySessionId.set(input.sessionId, registered);
+		this.attachmentsByInstance.set(input.instance, registered);
 		this.attachmentsByToken.set(attachment.token, registered);
 
 		const effects: HubEffect[] = [];
@@ -189,6 +222,7 @@ class ProcessObservableAgentHub implements ObservableAgentHub {
 
 		return Object.freeze({
 			created: true,
+			inputConflict: false,
 			attachment,
 			mainClaim,
 			transition: this.complete(wasAllObservableIdle, effects),
@@ -224,9 +258,7 @@ class ProcessObservableAgentHub implements ObservableAgentHub {
 			this.main = undefined;
 			effects.push({ kind: "mainChanged", previous, main: null });
 		}
-		this.attachmentsBySessionId.delete(
-			registered.attachment.identity.sessionId,
-		);
+		this.attachmentsByInstance.delete(registered.instance);
 		this.attachmentsByToken.delete(registered.attachment.token);
 		return this.complete(wasAllObservableIdle, effects);
 	}
@@ -276,7 +308,7 @@ class ProcessObservableAgentHub implements ObservableAgentHub {
 	private preferredCandidate(): RegisteredAttachment | undefined {
 		let firstUi: RegisteredAttachment | undefined;
 		let firstHeadless: RegisteredAttachment | undefined;
-		for (const registered of this.attachmentsBySessionId.values()) {
+		for (const registered of this.attachmentsByToken.values()) {
 			if (registered.attachment.identity.hasUI) {
 				if (firstUi === undefined || registered.order < firstUi.order) {
 					firstUi = registered;
@@ -289,6 +321,17 @@ class ProcessObservableAgentHub implements ObservableAgentHub {
 			}
 		}
 		return firstUi ?? firstHeadless;
+	}
+
+	private inputConflicts(
+		existing: RegisteredAttachment,
+		input: BindAttachmentInput,
+	): boolean {
+		return (
+			existing.attachment.identity.sessionId !== input.sessionId ||
+			existing.attachment.identity.hasUI !== input.hasUI ||
+			existing.initialBusy !== (input.initialBusy === true)
+		);
 	}
 
 	private findRegistered(

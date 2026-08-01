@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+	createHubAttachmentInstance,
 	getProcessObservableAgentHub,
 	HUB_SYMBOL,
+	type HubAttachmentInstance,
 	type HubTransition,
 } from "../src/hub.js";
 
@@ -17,8 +19,9 @@ function bind(
 	sessionId: string,
 	hasUI: boolean,
 	initialBusy = false,
+	instance: HubAttachmentInstance = createHubAttachmentInstance(),
 ) {
-	return state.bind({ sessionId, hasUI, initialBusy });
+	return state.bind({ instance, sessionId, hasUI, initialBusy });
 }
 
 function mainClaim(
@@ -32,23 +35,107 @@ function effectKinds(transition: HubTransition): string[] {
 	return transition.effects.map((effect) => effect.kind);
 }
 
-test("Slice 3: bindings create opaque immutable identities and duplicate lifecycle binds are inert", () => {
+test("Slice 3 I1: one opaque attachment instance creates one immutable binding and exact repeated binds are inert", () => {
 	const state = hub();
 	try {
-		const first = bind(state, "root", false);
-		const duplicate = bind(state, "root", false);
+		const rootInstance = createHubAttachmentInstance();
+		const first = bind(state, "root", false, false, rootInstance);
+		const duplicate = bind(state, "root", false, false, rootInstance);
 		const child = bind(state, "child", false);
 
 		assert.equal(first.created, true);
 		assert.equal(duplicate.created, false);
+		assert.equal(duplicate.inputConflict, false);
 		assert.equal(duplicate.attachment, first.attachment);
 		assert.notEqual(first.attachment.token, child.attachment.token);
+		assert.equal(Object.isFrozen(rootInstance), true);
 		assert.equal(Object.isFrozen(first.attachment), true);
 		assert.equal(Object.isFrozen(first.attachment.identity), true);
 		assert.match(first.attachment.token, /^[0-9a-f-]{36}$/i);
 		assert.equal(duplicate.transition.applied, false);
 		assert.equal(state.snapshot.attachmentCount, 2);
 		assert.equal(state.snapshot.busyCount, 0);
+	} finally {
+		Reflect.deleteProperty(globalThis, HUB_SYMBOL);
+	}
+});
+
+test("Slice 3 I1: first bind wins immutable metadata and reports a conflicting repeated bind", () => {
+	const state = hub();
+	try {
+		const instance = createHubAttachmentInstance();
+		const first = bind(state, "first-session", false, false, instance);
+		const repeated = bind(state, "conflicting-session", true, true, instance);
+
+		assert.equal(repeated.created, false);
+		assert.equal(repeated.inputConflict, true);
+		assert.equal(repeated.attachment, first.attachment);
+		assert.equal(repeated.transition.applied, false);
+		assert.deepEqual(state.snapshot.main, {
+			sessionId: "first-session",
+			hasUI: false,
+			generation: mainClaim(first).generation,
+		});
+		assert.equal(state.snapshot.busyCount, 0);
+
+		assert.equal(state.markBusy(first.attachment).applied, true);
+		const afterLifecycleChange = bind(
+			state,
+			"first-session",
+			false,
+			false,
+			instance,
+		);
+		assert.equal(afterLifecycleChange.inputConflict, false);
+		assert.equal(afterLifecycleChange.transition.applied, false);
+	} finally {
+		Reflect.deleteProperty(globalThis, HUB_SYMBOL);
+	}
+});
+
+test("Slice 3 I1: same session attachments keep independent lifecycle state and detach", () => {
+	const state = hub();
+	try {
+		const headlessInstance = createHubAttachmentInstance();
+		const uiInstance = createHubAttachmentInstance();
+		const headless = bind(
+			state,
+			"shared-session",
+			false,
+			false,
+			headlessInstance,
+		);
+		const busyUi = bind(state, "shared-session", true, true, uiInstance);
+
+		assert.equal(headless.created, true);
+		assert.equal(busyUi.created, true);
+		assert.notEqual(headless.attachment, busyUi.attachment);
+		assert.equal(state.snapshot.attachmentCount, 2);
+		assert.equal(state.snapshot.busyCount, 1);
+		assert.deepEqual(state.snapshot.main, {
+			sessionId: "shared-session",
+			hasUI: true,
+			generation: mainClaim(busyUi).generation,
+		});
+		assert.equal(state.snapshot.allObservableIdle, false);
+
+		assert.equal(state.markBusy(headless.attachment).applied, true);
+		assert.equal(state.markIdle(headless.attachment).applied, true);
+		const detachedUi = state.detach(busyUi.attachment);
+		assert.equal(detachedUi.snapshot.attachmentCount, 1);
+		assert.equal(detachedUi.snapshot.busyCount, 0);
+		assert.equal(detachedUi.snapshot.main, null);
+		assert.equal(detachedUi.snapshot.allObservableIdle, false);
+		assert.equal(state.markIdle(busyUi.attachment).applied, false);
+		assert.equal(state.detach(busyUi.attachment).applied, false);
+		assert.equal(state.markBusy(headless.attachment).applied, true);
+		assert.equal(state.markIdle(headless.attachment).applied, true);
+
+		const reclaimed = state.reclaimMain(headless.attachment);
+		assert.equal(reclaimed.applied, true);
+		assert.equal(reclaimed.snapshot.main?.sessionId, "shared-session");
+		assert.equal(reclaimed.snapshot.main?.hasUI, false);
+		assert.equal(reclaimed.snapshot.allObservableIdle, true);
 	} finally {
 		Reflect.deleteProperty(globalThis, HUB_SYMBOL);
 	}
