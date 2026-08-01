@@ -82,8 +82,8 @@ Continue until all jobs are done.
 
 | Key | Default | Notes |
 |---|---|---|
-| `idleDelaySeconds` | `3` | Base delay in seconds; positive finite number |
-| `maxRetries` | `10` | Maximum **valid continue** decisions per lock cycle (not invalid re-asks) |
+| `idleDelaySeconds` | `3` | Base delay in seconds; safe integer in `[1, 3600]` (timer-safe with maxRetries) |
+| `maxRetries` | `10` | Maximum **valid continue** decisions per lock cycle (not invalid re-asks); safe integer in `[1, 10]` |
 | `decisionPrompt` | exact default above | Hidden decision custom-message body |
 | `continuePrompt` | exact default above | Compact fold-in after valid continue |
 

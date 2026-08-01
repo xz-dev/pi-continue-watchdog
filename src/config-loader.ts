@@ -27,10 +27,19 @@ export interface LoadedConfig {
 
 const CONFIG_FILE_NAME = "pi-continue-watchdog.json";
 const PROJECT_CONFIG_DIR = ".pi";
+const READ_FAILURE_MESSAGE = "could not read configuration";
 
 const nodeFileIO: ConfigFileIO = {
 	readFile: (path, encoding) => readFile(path, encoding),
 };
+
+function isSilentMissing(error: unknown): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		(error as { code?: unknown }).code === "ENOENT"
+	);
+}
 
 async function readConfig(
 	path: string,
@@ -43,17 +52,15 @@ async function readConfig(
 	try {
 		return loadConfigText(source, await io.readFile(path, "utf8"));
 	} catch (error) {
-		const err = error as NodeJS.ErrnoException;
-		if (err.code === "ENOENT") {
+		if (isSilentMissing(error)) {
 			return { config: {}, diagnostics: [] };
 		}
-		const detail = String(error).slice(0, 180);
 		return {
 			config: {},
 			diagnostics: [
 				{
 					source,
-					message: `could not read configuration: ${detail}`.slice(0, 240),
+					message: READ_FAILURE_MESSAGE,
 				},
 			],
 		};

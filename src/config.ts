@@ -2,12 +2,40 @@
  * Built-in defaults, validation, and field-level merge for continue-watchdog config.
  * Precedence: builtins < global < trusted project.
  * Invalid higher-precedence values do not erase valid lower-precedence values.
+ *
+ * Timer-safe product bounds (independent, conservative):
+ * - Node setTimeout max is 2^31-1 ms (MAX_TIMER_DELAY_MS).
+ * - Retry delay formula: idleDelaySeconds * 1000 * 2^(maxRetries-1).
+ * - idleDelaySeconds safe integer in [1, 3600]; maxRetries safe integer in [1, 10].
+ * - Worst allowed delay: 3600 * 1000 * 2^9 = 1_843_200_000 <= 2_147_483_647.
+ * Invalid values are rejected (no silent clamp).
  */
 
 export const DEFAULT_DECISION_PROMPT =
 	"Decide whether work should continue. Call unlock_continue_watchdog with a concise reason if you are intentionally waiting for the user or all tasks are complete. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.";
 
 export const DEFAULT_CONTINUE_PROMPT = "Continue until all jobs are done.";
+
+/** Node.js setTimeout maximum delay in milliseconds (2^31-1). */
+export const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+
+/** Minimum accepted idleDelaySeconds (inclusive). */
+export const MIN_IDLE_DELAY_SECONDS = 1;
+
+/**
+ * Maximum accepted idleDelaySeconds (inclusive).
+ * Chosen so maxRetries=10 always stays within Node timer limits at this idle base.
+ */
+export const MAX_IDLE_DELAY_SECONDS = 3600;
+
+/** Minimum accepted maxRetries (inclusive). */
+export const MIN_RETRIES = 1;
+
+/**
+ * Maximum accepted maxRetries (inclusive).
+ * Matches the accepted product default budget; higher values are not required.
+ */
+export const MAX_RETRIES = 10;
 
 export interface ContinueWatchdogConfig {
 	idleDelaySeconds: number;
@@ -53,14 +81,36 @@ function diagnostic(source: string, message: string): ConfigDiagnostic {
 	return { source, message: message.slice(0, MAX_DIAGNOSTIC_LENGTH) };
 }
 
-/** Positive finite number (allows fractional seconds for idle delay). */
-function positiveFiniteNumber(value: unknown): value is number {
-	return typeof value === "number" && Number.isFinite(value) && value > 0;
+/**
+ * Longest retry delay for a configured base and retry budget.
+ * Formula matches zero-based attempt `idleDelaySeconds * 2^attempt` with
+ * final attempt index `maxRetries - 1`.
+ */
+export function maxConfiguredDelayMs(
+	idleDelaySeconds: number,
+	maxRetries: number,
+): number {
+	return idleDelaySeconds * 1000 * 2 ** (maxRetries - 1);
 }
 
-/** Positive safe integer for retry budgets. */
-function positiveSafeInteger(value: unknown): value is number {
-	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+/** Safe integer idle delay within the product timer-safe range. */
+function validIdleDelaySeconds(value: unknown): value is number {
+	return (
+		typeof value === "number" &&
+		Number.isSafeInteger(value) &&
+		value >= MIN_IDLE_DELAY_SECONDS &&
+		value <= MAX_IDLE_DELAY_SECONDS
+	);
+}
+
+/** Safe integer retry budget within the product timer-safe range. */
+function validMaxRetries(value: unknown): value is number {
+	return (
+		typeof value === "number" &&
+		Number.isSafeInteger(value) &&
+		value >= MIN_RETRIES &&
+		value <= MAX_RETRIES
+	);
 }
 
 /** Non-empty string after trim is required for prompts. */
@@ -81,21 +131,27 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 	const diagnostics: ConfigDiagnostic[] = [];
 
 	if (input.idleDelaySeconds !== undefined) {
-		if (positiveFiniteNumber(input.idleDelaySeconds)) {
+		if (validIdleDelaySeconds(input.idleDelaySeconds)) {
 			config.idleDelaySeconds = input.idleDelaySeconds;
 		} else {
 			diagnostics.push(
-				diagnostic(source, "idleDelaySeconds must be a positive finite number"),
+				diagnostic(
+					source,
+					"idleDelaySeconds must be a safe integer between 1 and 3600",
+				),
 			);
 		}
 	}
 
 	if (input.maxRetries !== undefined) {
-		if (positiveSafeInteger(input.maxRetries)) {
+		if (validMaxRetries(input.maxRetries)) {
 			config.maxRetries = input.maxRetries;
 		} else {
 			diagnostics.push(
-				diagnostic(source, "maxRetries must be a positive safe integer"),
+				diagnostic(
+					source,
+					"maxRetries must be a safe integer between 1 and 10",
+				),
 			);
 		}
 	}
@@ -120,15 +176,15 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 		}
 	}
 
+	let hasUnknownKey = false;
 	for (const key of Object.keys(input)) {
 		if (!(KNOWN_KEYS as readonly string[]).includes(key)) {
-			diagnostics.push(
-				diagnostic(
-					source,
-					`ignoring unsupported key ${JSON.stringify(key).slice(0, 80)}`,
-				),
-			);
+			hasUnknownKey = true;
+			break;
 		}
+	}
+	if (hasUnknownKey) {
+		diagnostics.push(diagnostic(source, "ignoring unsupported keys"));
 	}
 
 	return { config, diagnostics };

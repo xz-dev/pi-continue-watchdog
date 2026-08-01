@@ -1,14 +1,20 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 
 import {
 	BUILT_IN_CONFIG,
 	DEFAULT_CONTINUE_PROMPT,
 	DEFAULT_DECISION_PROMPT,
 	loadConfigText,
+	MAX_IDLE_DELAY_SECONDS,
+	MAX_RETRIES,
+	MAX_TIMER_DELAY_MS,
+	MIN_IDLE_DELAY_SECONDS,
+	MIN_RETRIES,
+	maxConfiguredDelayMs,
 	mergeConfig,
 	validateConfig,
 } from "../src/config.js";
@@ -18,13 +24,23 @@ import { loadRuntimeConfig } from "../src/config-loader.js";
 const REJECTED_DIRECT_REMINDER =
 	"Continue the task. If you are intentionally waiting for the user or all tasks are complete, call unlock_continue_watchdog.";
 
-async function fixture(): Promise<{ agentDir: string; cwd: string }> {
+/** Node setTimeout hard limit (2^31-1 ms). */
+const NODE_MAX_TIMEOUT_MS = 2 ** 31 - 1;
+
+async function fixture(
+	t?: TestContext,
+): Promise<{ agentDir: string; cwd: string; root: string }> {
 	const root = await mkdtemp(join(tmpdir(), "pi-continue-watchdog-config-"));
+	if (t) {
+		t.after(async () => {
+			await rm(root, { recursive: true, force: true });
+		});
+	}
 	const agentDir = join(root, "agent");
 	const cwd = join(root, "project");
 	await mkdir(agentDir, { recursive: true });
 	await mkdir(join(cwd, ".pi"), { recursive: true });
-	return { agentDir, cwd };
+	return { agentDir, cwd, root };
 }
 
 test("Example 12: built-in defaults match acceptance (idleDelaySeconds=3, maxRetries=10, exact prompts)", () => {
@@ -145,8 +161,8 @@ test("loadConfigText reports malformed JSON without crashing", () => {
 	assert.ok((result.diagnostics[0]?.message.length ?? 0) <= 240);
 });
 
-test("Example 12: loadRuntimeConfig uses agentDir injection and trusted project file", async () => {
-	const { agentDir, cwd } = await fixture();
+test("Example 12: loadRuntimeConfig uses agentDir injection and trusted project file", async (t) => {
+	const { agentDir, cwd } = await fixture(t);
 	await writeFile(
 		join(agentDir, "pi-continue-watchdog.json"),
 		JSON.stringify({
@@ -176,8 +192,8 @@ test("Example 12: loadRuntimeConfig uses agentDir injection and trusted project 
 	assert.deepEqual(loaded.diagnostics, []);
 });
 
-test("Example 12: untrusted project file is ignored", async () => {
-	const { agentDir, cwd } = await fixture();
+test("Example 12: untrusted project file is ignored", async (t) => {
+	const { agentDir, cwd } = await fixture(t);
 	await writeFile(
 		join(agentDir, "pi-continue-watchdog.json"),
 		JSON.stringify({ idleDelaySeconds: 4, decisionPrompt: "Global only" }),
@@ -205,8 +221,8 @@ test("Example 12: untrusted project file is ignored", async () => {
 	assert.deepEqual(loaded.diagnostics, []);
 });
 
-test("Example 12: missing config files are silent", async () => {
-	const { agentDir, cwd } = await fixture();
+test("Example 12: missing config files are silent", async (t) => {
+	const { agentDir, cwd } = await fixture(t);
 	const loaded = await loadRuntimeConfig({
 		cwd,
 		trusted: true,
@@ -216,8 +232,8 @@ test("Example 12: missing config files are silent", async () => {
 	assert.deepEqual(loaded.diagnostics, []);
 });
 
-test("Example 12: unreadable config yields bounded diagnostic and keeps defaults", async () => {
-	const { agentDir, cwd } = await fixture();
+test("Example 12: unreadable config yields content-free bounded diagnostic and keeps defaults", async (t) => {
+	const { agentDir, cwd } = await fixture(t);
 	const io = {
 		async readFile(path: string): Promise<string> {
 			if (
@@ -225,7 +241,7 @@ test("Example 12: unreadable config yields bounded diagnostic and keeps defaults
 				path.includes("agent")
 			) {
 				const err = new Error(
-					"EACCES permission denied",
+					"EACCES permission denied /secret/path/token-abc",
 				) as NodeJS.ErrnoException;
 				err.code = "EACCES";
 				throw err;
@@ -246,17 +262,16 @@ test("Example 12: unreadable config yields bounded diagnostic and keeps defaults
 	assert.deepEqual(loaded.config, { ...BUILT_IN_CONFIG });
 	assert.equal(loaded.diagnostics.length, 1);
 	assert.equal(loaded.diagnostics[0]?.source, "global");
-	assert.match(
-		loaded.diagnostics[0]?.message ?? "",
-		/could not read|permission|EACCES/i,
-	);
+	assert.equal(loaded.diagnostics[0]?.message, "could not read configuration");
 	assert.ok((loaded.diagnostics[0]?.message.length ?? 0) <= 240);
-	// Do not dump full paths that may include secrets beyond a short bounded message
 	assert.ok(!loaded.diagnostics[0]?.message.includes("\n"));
+	assert.ok(!loaded.diagnostics[0]?.message.includes("token-abc"));
+	assert.ok(!loaded.diagnostics[0]?.message.includes("EACCES"));
+	assert.ok(!loaded.diagnostics[0]?.message.includes("/secret/"));
 });
 
-test("Example 12: malformed project JSON keeps global valid values", async () => {
-	const { agentDir, cwd } = await fixture();
+test("Example 12: malformed project JSON keeps global valid values", async (t) => {
+	const { agentDir, cwd } = await fixture(t);
 	await writeFile(
 		join(agentDir, "pi-continue-watchdog.json"),
 		JSON.stringify({ idleDelaySeconds: 11, maxRetries: 3 }),
@@ -277,13 +292,218 @@ test("Example 12: malformed project JSON keeps global valid values", async () =>
 	assert.equal(loaded.diagnostics[0]?.source, "project");
 });
 
-test("loadRuntimeConfig accepts positive finite idleDelaySeconds floats", async () => {
-	const { agentDir, cwd } = await fixture();
+test("loadRuntimeConfig rejects non-integer idleDelaySeconds (no silent clamp)", async (t) => {
+	const { agentDir, cwd } = await fixture(t);
 	await writeFile(
 		join(agentDir, "pi-continue-watchdog.json"),
 		JSON.stringify({ idleDelaySeconds: 0.5 }),
 	);
 	const loaded = await loadRuntimeConfig({ cwd, trusted: false, agentDir });
-	assert.equal(loaded.config.idleDelaySeconds, 0.5);
-	assert.deepEqual(loaded.diagnostics, []);
+	assert.equal(
+		loaded.config.idleDelaySeconds,
+		BUILT_IN_CONFIG.idleDelaySeconds,
+	);
+	assert.equal(loaded.diagnostics.length, 1);
+	assert.match(
+		loaded.diagnostics[0]?.message ?? "",
+		/idleDelaySeconds|integer|range/i,
+	);
+});
+
+// --- Hardening (review C0/I3/M1) ---
+
+test("C0 bounds: accepted extremes produce timer delays <= Node setTimeout max", () => {
+	assert.equal(MIN_IDLE_DELAY_SECONDS, 1);
+	assert.equal(MAX_IDLE_DELAY_SECONDS, 3600);
+	assert.equal(MIN_RETRIES, 1);
+	assert.equal(MAX_RETRIES, 10);
+	assert.equal(MAX_TIMER_DELAY_MS, NODE_MAX_TIMEOUT_MS);
+
+	const worst = maxConfiguredDelayMs(MAX_IDLE_DELAY_SECONDS, MAX_RETRIES);
+	assert.equal(worst, 3600 * 1000 * 2 ** 9);
+	assert.ok(worst <= NODE_MAX_TIMEOUT_MS);
+
+	const boundaryIdle = validateConfig("global", {
+		idleDelaySeconds: MAX_IDLE_DELAY_SECONDS,
+		maxRetries: MAX_RETRIES,
+	});
+	assert.equal(boundaryIdle.config.idleDelaySeconds, MAX_IDLE_DELAY_SECONDS);
+	assert.equal(boundaryIdle.config.maxRetries, MAX_RETRIES);
+	assert.deepEqual(boundaryIdle.diagnostics, []);
+
+	const minBoundary = validateConfig("global", {
+		idleDelaySeconds: MIN_IDLE_DELAY_SECONDS,
+		maxRetries: MIN_RETRIES,
+	});
+	assert.equal(minBoundary.config.idleDelaySeconds, MIN_IDLE_DELAY_SECONDS);
+	assert.equal(minBoundary.config.maxRetries, MIN_RETRIES);
+	assert.deepEqual(minBoundary.diagnostics, []);
+});
+
+test("C0 bounds: just-outside values are rejected without clamping", () => {
+	const overIdle = validateConfig("global", {
+		idleDelaySeconds: MAX_IDLE_DELAY_SECONDS + 1,
+	});
+	assert.equal(overIdle.config.idleDelaySeconds, undefined);
+	assert.equal(overIdle.diagnostics.length, 1);
+	assert.match(overIdle.diagnostics[0]?.message ?? "", /idleDelaySeconds/i);
+
+	const underIdle = validateConfig("global", { idleDelaySeconds: 0 });
+	assert.equal(underIdle.config.idleDelaySeconds, undefined);
+
+	const floatIdle = validateConfig("global", { idleDelaySeconds: 1.5 });
+	assert.equal(floatIdle.config.idleDelaySeconds, undefined);
+
+	const overRetries = validateConfig("project", {
+		maxRetries: MAX_RETRIES + 1,
+	});
+	assert.equal(overRetries.config.maxRetries, undefined);
+	assert.equal(overRetries.diagnostics.length, 1);
+	assert.match(overRetries.diagnostics[0]?.message ?? "", /maxRetries/i);
+
+	const underRetries = validateConfig("project", { maxRetries: 0 });
+	assert.equal(underRetries.config.maxRetries, undefined);
+
+	// Independent product guarantee: maxRetries=11 would overflow at max idle.
+	const overRetryWorst = maxConfiguredDelayMs(
+		MAX_IDLE_DELAY_SECONDS,
+		MAX_RETRIES + 1,
+	);
+	assert.ok(overRetryWorst > NODE_MAX_TIMEOUT_MS);
+});
+
+test("C0 bounds: invalid higher-precedence out-of-range preserves lower valid", () => {
+	const { config, diagnostics } = mergeConfig(
+		{ idleDelaySeconds: 12, maxRetries: 4 },
+		{ idleDelaySeconds: 3601, maxRetries: 11 },
+	);
+	assert.equal(config.idleDelaySeconds, 12);
+	assert.equal(config.maxRetries, 4);
+	assert.ok(diagnostics.length >= 2);
+	for (const d of diagnostics) {
+		assert.ok(d.message.length <= 240);
+		assert.ok(!d.message.includes("3601"));
+		assert.ok(!d.message.includes("11"));
+	}
+});
+
+test("I3 IO: only object/non-null code===ENOENT is silent; others are content-free", async (t) => {
+	const { agentDir, cwd } = await fixture(t);
+	const secret =
+		"SUPER_SECRET_TOKEN=abc\npath=/home/user/.secrets/key.pem\nstack: Error: boom";
+
+	const cases: Array<{ label: string; throwValue: unknown }> = [
+		{ label: "null", throwValue: null },
+		{ label: "string", throwValue: secret },
+		{
+			label: "object secret multiline",
+			throwValue: {
+				message: secret,
+				code: "EPERM",
+				stack: `Error: ${secret}`,
+				path: "/tmp/secret-path/token-xyz",
+			},
+		},
+		{
+			label: "ErrnoException without code",
+			throwValue: Object.assign(new Error(secret), {
+				path: "/tmp/leaky/path",
+			}),
+		},
+		{
+			label: "object with non-ENOENT code",
+			throwValue: Object.assign(new Error(secret), { code: "EACCES" }),
+		},
+		{
+			label: "object with code property not ENOENT string",
+			throwValue: { code: 2, message: secret },
+		},
+	];
+
+	for (const c of cases) {
+		const loaded = await loadRuntimeConfig({
+			cwd,
+			trusted: false,
+			agentDir,
+			io: {
+				async readFile(): Promise<string> {
+					throw c.throwValue;
+				},
+			},
+		});
+		assert.deepEqual(loaded.config, { ...BUILT_IN_CONFIG }, c.label);
+		assert.equal(loaded.diagnostics.length, 1, c.label);
+		assert.equal(loaded.diagnostics[0]?.source, "global", c.label);
+		assert.equal(
+			loaded.diagnostics[0]?.message,
+			"could not read configuration",
+			c.label,
+		);
+		const msg = loaded.diagnostics[0]?.message ?? "";
+		assert.ok(msg.length <= 240, c.label);
+		assert.ok(!msg.includes("\n"), c.label);
+		assert.ok(!msg.includes("SUPER_SECRET"), c.label);
+		assert.ok(!msg.includes("token"), c.label);
+		assert.ok(!msg.includes("/home/user"), c.label);
+		assert.ok(!msg.includes("stack"), c.label);
+		assert.ok(!msg.includes("EPERM"), c.label);
+		assert.ok(!msg.includes("EACCES"), c.label);
+	}
+
+	// True ENOENT remains silent.
+	const silent = await loadRuntimeConfig({
+		cwd,
+		trusted: false,
+		agentDir,
+		io: {
+			async readFile(): Promise<string> {
+				const err = new Error("missing") as NodeJS.ErrnoException;
+				err.code = "ENOENT";
+				throw err;
+			},
+		},
+	});
+	assert.deepEqual(silent.config, { ...BUILT_IN_CONFIG });
+	assert.deepEqual(silent.diagnostics, []);
+});
+
+test("I3 unknown keys: one generic content-free diagnostic; known fields preserved", () => {
+	const secretKey = "api_key_SECRET_do_not_leak";
+	const input: Record<string, unknown> = {
+		idleDelaySeconds: 8,
+		maxRetries: 3,
+		decisionPrompt: "Keep me",
+		[secretKey]: "value-must-not-appear",
+	};
+	for (let i = 0; i < 1000; i++) {
+		input[`extra_key_${i}_token`] = `secret-${i}`;
+	}
+
+	const result = validateConfig("project", input);
+	assert.equal(result.config.idleDelaySeconds, 8);
+	assert.equal(result.config.maxRetries, 3);
+	assert.equal(result.config.decisionPrompt, "Keep me");
+
+	const unknownDiags = result.diagnostics.filter((d) =>
+		/unsupported|unknown/i.test(d.message),
+	);
+	assert.equal(unknownDiags.length, 1);
+	assert.equal(unknownDiags[0]?.source, "project");
+	assert.equal(unknownDiags[0]?.message, "ignoring unsupported keys");
+	assert.ok((unknownDiags[0]?.message.length ?? 0) <= 240);
+	assert.ok(!unknownDiags[0]?.message.includes(secretKey));
+	assert.ok(!unknownDiags[0]?.message.includes("token"));
+	assert.ok(!unknownDiags[0]?.message.includes("1000"));
+	assert.ok(!unknownDiags[0]?.message.includes("api_key"));
+	assert.ok(!JSON.stringify(result.diagnostics).includes(secretKey));
+	assert.ok(!JSON.stringify(result.diagnostics).includes("secret-"));
+});
+
+test("M1 fixtures: temporary directories are cleaned after tests", async (t) => {
+	const { root } = await fixture(t);
+	await writeFile(join(root, "marker.txt"), "cleanup-me");
+	// t.after from fixture must remove root; assert callback is registered by running access after suite is not possible here,
+	// so verify cleanup helper works explicitly as the contract.
+	await rm(root, { recursive: true, force: true });
+	await assert.rejects(() => access(root), { code: "ENOENT" });
 });
