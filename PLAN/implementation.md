@@ -160,6 +160,8 @@ Order is dependency-aware. Each slice must leave `master` installable/testable f
 - Register `unlock_continue_watchdog` only for main
 - Description tells model to call it when intentionally waiting for the user or all tasks are complete
 - On invoke: unlock + TUI `Continue watchdog unlocked` (always)
+- Return only model-visible `Continue watchdog unlocked`; do not return state, config, or structured details
+- Return Pi's `terminate: true` hint so a final standalone unlock call skips the redundant post-tool model turn; test/document the all-results-in-batch limitation
 - Non-main must not successfully act as main unlock
 
 **RED:** tool registration/visibility and invoke notify/state tests.  
@@ -292,6 +294,7 @@ Independent review contract for functional merges: Critical/Important/Minor find
 | Over-claiming “all agents” | Docs + diagnostics: observable same-process only |
 | Queued vs actual user message | Auto-lock only on user-role `message_start` |
 | Same-state silent commands | Unconditional assign + exact TUI strings in tests |
+| Unlock triggers redundant full LLM request | Minimal one-line result plus `terminate: true`; document that the paired call/result remains in later history and mixed tool batches only terminate when every result opts in |
 | Destructive packaging scripts | Never default output to repo root; sentinel-owned dirs only |
 | Scope creep (footer, wall clock, other plugins) | Reject; point to acceptance non-examples |
 

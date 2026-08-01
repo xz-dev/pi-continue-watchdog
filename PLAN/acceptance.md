@@ -27,6 +27,7 @@ This document is the human-accepted ATDD contract. Implementation must satisfy t
 | Lock command | `/lock-continue-watchdog` | Human (TUI) |
 | Unlock command | `/unlock-continue-watchdog` | Human (TUI) |
 | Unlock tool | `unlock_continue_watchdog` | Main/root agent only |
+| Unlock tool result | `Continue watchdog unlocked` | One-line model-visible result; no state dump |
 | Default continue prompt | `Continue the task. If you are intentionally waiting for the user or all tasks are complete, call unlock_continue_watchdog.` | Model-visible custom message |
 | Lock TUI notify | `Continue watchdog locked` | User-only TUI notify |
 | Unlock TUI notify | `Continue watchdog unlocked` | User-only TUI notify |
@@ -142,6 +143,8 @@ These eleven examples are the accepted product contract. Each is externally obse
 - TUI notifies exactly: `Continue watchdog unlocked`
 - same-state unlock (already unlocked) still assigns and still notifies the same text
 - unlock notifications are user-only TUI notify, not model-context user messages
+- the AI tool returns only the one-line model-visible result `Continue watchdog unlocked`, with no full state/config/details dump
+- the AI tool returns Pi's `terminate: true` hint so a final standalone unlock call does not force a redundant follow-up LLM request; Pi only terminates early when every tool result in the same batch opts in
 
 ### Example 4 — Locked + all observable idle → exponential delayed continue
 
@@ -237,6 +240,7 @@ Default `maxRetries = 10` means **at most 10** automatic continue messages per l
 | Generation-safe timers | `clearTimeout` alone is insufficient; callbacks check ownership/generation |
 | Command demotion safety | If main demotes, stale command handlers must be inert; no reliance on command unregistration |
 | Notify channel | Lock/unlock notifies are TUI user-only; they must not be injected as user-role conversation turns |
+| Minimal tool context | Unlock returns only `Continue watchdog unlocked`; omit state/config/details and request `terminate: true`. The paired tool call/result remains in session history and may appear in later model context, as required by Pi/provider tool protocols. |
 | No other-plugin coupling | No imports or runtime detection of pi-subagents / pi-watchdog / pi-notify |
 
 ---
