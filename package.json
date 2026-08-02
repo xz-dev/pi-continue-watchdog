@@ -2,6 +2,7 @@
   "name": "pi-continue-watchdog",
   "version": "0.1.0",
   "type": "module",
+  "private": true,
   "description": "Continue-watchdog extension for Pi (two-stage idle decision flow).",
   "license": "BSD-3-Clause",
   "repository": {

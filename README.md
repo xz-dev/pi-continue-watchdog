@@ -2,7 +2,7 @@
 
 Pi extension that notices when all same-process extension-loaded observable agents are idle and asks the main AI to continue or intentionally unlock, so work does not stop without explanation.
 
-**Status:** source package (pre-publication). Not published to npm. GitHub hosting is planned as `xz-dev/pi-continue-watchdog`.
+**Status:** live source package. This project has no versioned releases; users track the latest `master` commit.
 
 **License:** [BSD-3-Clause](./LICENSE)
 
@@ -17,12 +17,10 @@ Pi extension that notices when all same-process extension-loaded observable agen
 Source entry: `pi.extensions` → `./src/extension.ts`.
 
 ```bash
-# Local clone / path
-pi install /path/to/pi-continue-watchdog
-
-# After the public repository exists
 pi install git:github.com/xz-dev/pi-continue-watchdog
 ```
+
+This unpinned Git source intentionally tracks the latest repository state. Use `pi update --extensions` to update installed Pi packages. The project does not publish npm versions, tags, or GitHub Releases.
 
 Reload Pi extensions or start a new session after install.
 

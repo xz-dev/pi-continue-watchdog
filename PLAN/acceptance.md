@@ -408,7 +408,8 @@ Stale timer callbacks (wrong generation/epoch/ownership) must not open a decisio
 - is licensed **BSD-3-Clause**
 - is **source-installable** from `master` (TypeScript entry via Pi extension manifest)
 - has **packed, isolated, stock-Pi** CI/E2E covering the real plugin artifact (not only unit mocks)
-- does **not** require npm publication, tags, or GitHub Releases for v1 (users track latest commits), unless product authority later expands distribution
+- is installed only as the unpinned live Git package `pi install git:github.com/xz-dev/pi-continue-watchdog`
+- has no npm publication, version tags, or GitHub Releases; users track the latest `master` commit
 
 ---
 

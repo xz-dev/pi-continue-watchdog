@@ -1,6 +1,6 @@
 # Implementation plan — pi-continue-watchdog
 
-**Status:** Slices 0–12 complete on `master` / `slice/readme`. Slice 13 (publication) remains human-gated.
+**Status:** Public live Git package on `master`. Slices 0–13 are complete; npm, tags, and GitHub Releases are intentionally not used.
 **Method:** One vertical behavior slice per branch; RED → GREEN → review (when functional) → merge → next branch
 **Language:** English only for all project artifacts
 
@@ -35,8 +35,8 @@ Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would ch
 | 9 | Abort-outcome unlock | Complete |
 | 10 | Idle timer / decision cycle / exhaustion | Complete |
 | 11 | Packed isolated stock-Pi E2E + CI | Complete |
-| 12 | README product docs | Complete (this docs slice) |
-| 13 | Publication readiness | Pending (human-gated; no public push claimed) |
+| 12 | README product docs | Complete |
+| 13 | Publication readiness | Complete (public live Git package) |
 
 **Current architecture (indicative filenames; may still be simplified):**
 
@@ -55,7 +55,7 @@ Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would ch
 | Auto-lock / abort | `src/auto-lock.ts`, `src/abort-outcome.ts` | Main user start lock; aborted-run unlock |
 | Tests / CI | `test/**`, `e2e/**`, `.github/workflows/ci.yml` | Unit + packed stock-Pi E2E |
 
-**Not claimed:** public GitHub repository created, first push completed, npm publication, tags, or GitHub Releases.
+**Distribution:** public `xz-dev/pi-continue-watchdog`, installed only with the unpinned command `pi install git:github.com/xz-dev/pi-continue-watchdog`. No npm publication, tags, or GitHub Releases.
 
 ---
 
@@ -145,15 +145,13 @@ Packed install + stock Pi E2E; GitHub Actions `check` + `test:e2e`.
 
 Public English install/behavior/commands/config/limitations/CI/license docs.
 
-### Slice 13 — Publication readiness — Pending
+### Slice 13 — Publication readiness — Complete
 
-- Complete a final `merge-code-reviewer` review; this docs-only review does not satisfy that gate
-- Final README/license consistency after human skim
-- Confirm public repo plan `xz-dev/pi-continue-watchdog`
-- No tags/npm unless later authorized
-- Human confirmation before `gh repo create` / first push
-
-**Not authorized by this plan alone:** creating the GitHub repo or pushing.
+- Final `merge-code-reviewer` review approved
+- Public repository created at `xz-dev/pi-continue-watchdog`
+- `master` is the live package source
+- Install only with `pi install git:github.com/xz-dev/pi-continue-watchdog`
+- No npm publication, version tags, or GitHub Releases
 
 ---
 
@@ -203,8 +201,8 @@ Independent review contract for functional merges: Critical/Important/Minor; end
 
 ---
 
-## Next actions
+## Ongoing maintenance
 
-1. Complete the mandatory final `merge-code-reviewer` review and address any Critical/Important findings.
-2. Request explicit human publication authority.
-3. Keep `PLAN/acceptance.md` authoritative for behavior.
+1. Keep `master` installable and CI green; users track its latest commit.
+2. Keep `PLAN/acceptance.md` authoritative for observable behavior.
+3. Do not add npm publication, version tags, or GitHub Releases.
