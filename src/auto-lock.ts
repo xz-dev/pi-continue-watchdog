@@ -1,55 +1,23 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	MessageStartEvent,
+} from "@earendil-works/pi-coding-agent";
 
 /**
- * The narrow lifecycle-to-controller seam for Example 1.
+ * The narrow lifecycle-to-controller seam for main user work.
  *
- * Main ownership is deliberately supplied by the caller rather than inferred
- * from a session ID or event payload. The runtime hub owns that authority and
- * validates the captured attachment claim and generation on every event.
+ * Main ownership is supplied by the caller. The runtime hub owns that
+ * authority and validates the attachment claim on every event.
  */
 export interface MainUserAutoLockBinding {
-	/**
-	 * One live ownership check. Callers must validate the current attachment and
-	 * derive a fresh generation claim for it rather than retaining a stale claim.
-	 */
+	/** Live ownership check for the current attachment. */
 	isCurrentMain(): boolean;
 	onMainUserMessageStart(): void;
 }
 
-type OwnDataRead =
-	| { readonly kind: "missing" }
-	| { readonly kind: "value"; readonly value: unknown }
-	| { readonly kind: "invalid" };
-
-/**
- * Reads only an own data property, never invoking a getter. Pi supplies typed
- * lifecycle records, but this defensive boundary also keeps malformed test or
- * host input from triggering lock state or throwing out of Pi's event dispatch.
- */
-function readOwnData(input: unknown, key: PropertyKey): OwnDataRead {
-	if (
-		input === null ||
-		(typeof input !== "object" && typeof input !== "function")
-	) {
-		return { kind: "missing" };
-	}
-	try {
-		const descriptor = Object.getOwnPropertyDescriptor(input, key);
-		if (descriptor === undefined) return { kind: "missing" };
-		return Object.hasOwn(descriptor, "value")
-			? { kind: "value", value: descriptor.value }
-			: { kind: "invalid" };
-	} catch {
-		return { kind: "invalid" };
-	}
-}
-
-/** True only for a lifecycle record with an own user-role message. */
-export function isUserRoleMessageStart(event: unknown): boolean {
-	const message = readOwnData(event, "message");
-	if (message.kind !== "value") return false;
-	const role = readOwnData(message.value, "role");
-	return role.kind === "value" && role.value === "user";
+/** True when a normal Pi `message_start` carries a user-role message. */
+export function isUserRoleMessageStart(event: MessageStartEvent): boolean {
+	return event.message?.role === "user";
 }
 
 /**

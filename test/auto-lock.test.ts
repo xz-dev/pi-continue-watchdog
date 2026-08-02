@@ -18,11 +18,11 @@ import {
 	type HubMainClaim,
 } from "../src/hub.js";
 
-type MessageStartHandler = (...args: unknown[]) => void;
+type LifecycleHandler = (...args: unknown[]) => void;
 
 interface Harness {
 	readonly controller: ReturnType<typeof createLockDecisionController>;
-	readonly handlers: Map<string, MessageStartHandler>;
+	readonly handlers: Map<string, LifecycleHandler[]>;
 	readonly calls: string[];
 	readonly commandNames: string[];
 	readonly entryRendererTypes: string[];
@@ -55,28 +55,28 @@ function controllerBinding(
 			return claim !== null && hub.isCurrentMain(claim);
 		},
 		onMainUserMessageStart(): void {
-			// Automatic user work assigns the same state as lock, but its command-only
-			// notification effect is intentionally not rendered at this seam.
 			controller.onMainUserMessageStart();
 		},
 	};
 }
 
-function createHarness(): Harness {
-	const hub = createObservableAgentHub();
-	const controller = createLockDecisionController({
-		idleDelaySeconds: 3,
-		maxRetries: 1,
-	});
-	const handlers = new Map<string, MessageStartHandler>();
-	const calls: string[] = [];
-	const commandNames: string[] = [];
-	const entryRendererTypes: string[] = [];
+function createMultiHandlerPi(options?: {
+	readonly handlers?: Map<string, LifecycleHandler[]>;
+	readonly calls?: string[];
+	readonly commandNames?: string[];
+	readonly entryRendererTypes?: string[];
+}): ExtensionAPI {
+	const handlers = options?.handlers ?? new Map<string, LifecycleHandler[]>();
+	const calls = options?.calls ?? [];
+	const commandNames = options?.commandNames ?? [];
+	const entryRendererTypes = options?.entryRendererTypes ?? [];
 	let activeTools: string[] = [];
-	const pi = {
-		on(name: string, handler: MessageStartHandler): void {
+	return {
+		on(name: string, handler: LifecycleHandler): void {
 			calls.push(name);
-			handlers.set(name, handler);
+			const list = handlers.get(name) ?? [];
+			list.push(handler);
+			handlers.set(name, list);
 		},
 		registerTool(tool: { readonly name: string }): void {
 			activeTools.push(tool.name);
@@ -95,11 +95,43 @@ function createHarness(): Harness {
 		},
 		appendEntry(): void {},
 	} as unknown as ExtensionAPI;
+}
 
-	createContinueWatchdogExtension({ hub, controller })(pi);
-	const sessionStart = handlers.get("session_start");
-	assert.ok(sessionStart, "expected a session_start handler");
-	sessionStart(
+function fireHandlers(
+	handlers: Map<string, LifecycleHandler[]>,
+	name: string,
+	...args: unknown[]
+): void {
+	const list = handlers.get(name);
+	assert.ok(list && list.length > 0, `expected ${name} handler`);
+	for (const handler of list) {
+		handler(...args);
+	}
+}
+
+function createHarness(): Harness {
+	const hub = createObservableAgentHub();
+	const controller = createLockDecisionController({
+		idleDelaySeconds: 3,
+		maxRetries: 1,
+	});
+	const handlers = new Map<string, LifecycleHandler[]>();
+	const calls: string[] = [];
+	const commandNames: string[] = [];
+	const entryRendererTypes: string[] = [];
+
+	createContinueWatchdogExtension({ hub, controller })(
+		createMultiHandlerPi({
+			handlers,
+			calls,
+			commandNames,
+			entryRendererTypes,
+		}),
+	);
+
+	fireHandlers(
+		handlers,
+		"session_start",
 		{ type: "session_start", reason: "startup" },
 		{
 			hasUI: true,
@@ -115,9 +147,7 @@ function createHarness(): Harness {
 		commandNames,
 		entryRendererTypes,
 		fire(event: unknown): void {
-			const handler = handlers.get("message_start");
-			assert.ok(handler, "expected a message_start handler");
-			handler(event);
+			fireHandlers(handlers, "message_start", event);
 		},
 	};
 }
@@ -148,7 +178,7 @@ function decisionId(
 	return decision.decisionId;
 }
 
-test("Example 1 RED: an actual main user message_start locks without a command notification", () => {
+test("actual main user message_start locks without a command notification", () => {
 	const harness = createHarness();
 
 	assert.equal(
@@ -178,7 +208,7 @@ test("Example 1 RED: an actual main user message_start locks without a command n
 	});
 });
 
-test("Example 1 RED: every actual main user start unconditionally resets exhausted and decision-failed cycles", () => {
+test("every actual main user start resets exhausted and decision-failed cycles", () => {
 	const harness = createHarness();
 	const { controller } = harness;
 
@@ -204,7 +234,7 @@ test("Example 1 RED: every actual main user start unconditionally resets exhaust
 	assert.equal(controller.snapshot.invalidDecisionAttempts, 0);
 });
 
-test("Example 1 RED: assistant, custom, inherited, and hostile message shapes cannot auto-lock", () => {
+test("non-user roles and missing messages are inert", () => {
 	const harness = createHarness();
 	const before = harness.controller.snapshot;
 
@@ -212,43 +242,24 @@ test("Example 1 RED: assistant, custom, inherited, and hostile message shapes ca
 		{ type: "message_start", message: { role: "assistant" } },
 		{ type: "message_start", message: { role: "toolResult" } },
 		{ type: "message_start", message: { role: "custom" } },
-		{ type: "message_start", message: Object.create({ role: "user" }) },
-		{
-			type: "message_start",
-			get message() {
-				throw new Error("hostile");
-			},
-		},
-		new Proxy(
-			{ type: "message_start", message: { role: "user" } },
-			{
-				getOwnPropertyDescriptor(): never {
-					throw new Error("hostile");
-				},
-			},
-		),
+		{ type: "message_start" },
 	]) {
-		assert.doesNotThrow(() => harness.fire(event));
+		harness.fire(event);
 	}
 
 	assert.deepEqual(harness.controller.snapshot, before);
 });
 
-test("Example 1 RED: child, stale, and detached main handlers are inert while the elected main handler remains active", () => {
+test("child, demoted, and detached handlers stay inert; reclaim restores main", () => {
 	const hub = createObservableAgentHub();
 	const oldMain = bindMain(hub, "headless-main", false);
 	const oldController = createLockDecisionController({
 		idleDelaySeconds: 3,
 		maxRetries: 1,
 	});
-	const oldHandlers = new Map<string, MessageStartHandler>();
-	const oldPi = {
-		on(name: string, handler: MessageStartHandler): void {
-			oldHandlers.set(name, handler);
-		},
-	} as unknown as ExtensionAPI;
+	const oldHandlers = new Map<string, LifecycleHandler[]>();
 	registerMainUserAutoLock(
-		oldPi,
+		createMultiHandlerPi({ handlers: oldHandlers }),
 		controllerBinding(oldController, hub, oldMain.attachment),
 	);
 
@@ -262,13 +273,8 @@ test("Example 1 RED: child, stale, and detached main handlers are inert while th
 		idleDelaySeconds: 3,
 		maxRetries: 1,
 	});
-	const childPi = {
-		on(_name: string, handler: MessageStartHandler): void {
-			childPi.handler = handler;
-		},
-		handler: undefined as MessageStartHandler | undefined,
-	} as unknown as ExtensionAPI & { handler?: MessageStartHandler };
-	registerMainUserAutoLock(childPi, {
+	const childHandlers = new Map<string, LifecycleHandler[]>();
+	registerMainUserAutoLock(createMultiHandlerPi({ handlers: childHandlers }), {
 		isCurrentMain: () => false,
 		onMainUserMessageStart: () => childController.onMainUserMessageStart(),
 	});
@@ -278,55 +284,43 @@ test("Example 1 RED: child, stale, and detached main handlers are inert while th
 		idleDelaySeconds: 3,
 		maxRetries: 1,
 	});
-	const electedHandlers = new Map<string, MessageStartHandler>();
-	const electedPi = {
-		on(name: string, handler: MessageStartHandler): void {
-			electedHandlers.set(name, handler);
-		},
-	} as unknown as ExtensionAPI;
+	const electedHandlers = new Map<string, LifecycleHandler[]>();
 	registerMainUserAutoLock(
-		electedPi,
+		createMultiHandlerPi({ handlers: electedHandlers }),
 		controllerBinding(electedController, hub, electedMain.attachment),
 	);
 
 	const event = userMessageStart();
-	oldHandlers.get("message_start")?.(event);
-	childPi.handler?.(event);
+	fireHandlers(oldHandlers, "message_start", event);
+	fireHandlers(childHandlers, "message_start", event);
 	assert.equal(oldController.snapshot.locked, false);
 	assert.equal(childController.snapshot.locked, false);
 
-	electedHandlers.get("message_start")?.(event);
+	fireHandlers(electedHandlers, "message_start", event);
 	assert.equal(electedController.snapshot.locked, true);
 
 	hub.detach(electedMain.attachment);
 	electedController.unlock();
-	electedHandlers.get("message_start")?.(event);
+	fireHandlers(electedHandlers, "message_start", event);
 	assert.equal(electedController.snapshot.locked, false);
 
 	const reclaimed = hub.reclaimMain(oldMain.attachment);
 	assert.equal(reclaimed.applied, true);
-	oldHandlers.get("message_start")?.(event);
+	fireHandlers(oldHandlers, "message_start", event);
 	assert.equal(oldController.snapshot.locked, true);
 });
 
-test("Slice 8 RED: repeated actual user events invoke the main transition without a same-state short circuit", () => {
-	const handlers = new Map<string, MessageStartHandler>();
+test("repeated actual user events invoke the main transition each time", () => {
+	const handlers = new Map<string, LifecycleHandler[]>();
 	let calls = 0;
-	const pi = {
-		on(name: string, handler: MessageStartHandler): void {
-			handlers.set(name, handler);
-		},
-	} as unknown as ExtensionAPI;
-	registerMainUserAutoLock(pi, {
+	registerMainUserAutoLock(createMultiHandlerPi({ handlers }), {
 		isCurrentMain: () => true,
 		onMainUserMessageStart: () => {
 			calls += 1;
 		},
 	});
 
-	const handler = handlers.get("message_start");
-	assert.ok(handler);
-	handler(userMessageStart());
-	handler(userMessageStart());
+	fireHandlers(handlers, "message_start", userMessageStart());
+	fireHandlers(handlers, "message_start", userMessageStart());
 	assert.equal(calls, 2);
 });

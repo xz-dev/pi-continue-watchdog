@@ -13,18 +13,17 @@ import type { HubMainClaim } from "./hub.js";
 /**
  * Narrow main-run abort detector.
  *
- * Captures an immutable leaf boundary at main `agent_start`, then at
+ * Captures the current leaf boundary at main `agent_start`, then at
  * `agent_settled` inspects only the newly appended branch suffix through public
  * `ctx.sessionManager` APIs. Unlocks only when the terminal new assistant has
  * `stopReason === "aborted"`. Never infers abort from settle alone.
  */
 
 export type TerminalAssistantOutcome =
-	| { readonly kind: "aborted" }
-	| { readonly kind: "non-aborted"; readonly stopReason: string }
-	| { readonly kind: "none" }
-	| { readonly kind: "boundary-missing" }
-	| { readonly kind: "invalid" };
+	| "aborted"
+	| "non-aborted"
+	| "none"
+	| "boundary-missing";
 
 export type AbortUnlockRuntimeEffect = Exclude<
 	ControllerEffect,
@@ -48,191 +47,65 @@ export interface MainAbortUnlockRuntime {
 	): Promise<void> | void;
 }
 
+/** Structural session surface used by pure boundary helpers and tests. */
+export interface BranchBoundarySession {
+	getLeafId(): string | null;
+	getBranch(): readonly BranchEntryView[];
+}
+
+/** Minimal branch entry shape for terminal-assistant inspection. */
+export interface BranchEntryView {
+	readonly id: string;
+	readonly type: string;
+	readonly message?: {
+		readonly role?: string;
+		readonly stopReason?: string;
+	};
+}
+
 interface CapturedRun {
 	readonly claim: HubMainClaim;
 	readonly boundaryLeafId: string | null;
 }
 
-type OwnDataRead =
-	| { readonly kind: "missing" }
-	| { readonly kind: "value"; readonly value: unknown }
-	| { readonly kind: "invalid" };
-
-/**
- * Reads only an own data property, never invoking a getter. SessionManager is
- * trusted, but entry payloads and hostile test doubles must not throw out of
- * Pi's event dispatch or spuriously unlock.
- */
-function readOwnData(input: unknown, key: PropertyKey): OwnDataRead {
-	if (
-		input === null ||
-		(typeof input !== "object" && typeof input !== "function")
-	) {
-		return { kind: "missing" };
-	}
-	try {
-		const descriptor = Object.getOwnPropertyDescriptor(input, key);
-		if (descriptor === undefined) return { kind: "missing" };
-		return Object.hasOwn(descriptor, "value")
-			? { kind: "value", value: descriptor.value }
-			: { kind: "invalid" };
-	} catch {
-		return { kind: "invalid" };
-	}
-}
-
-function callPublicMethod(
-	target: unknown,
-	name: string,
-): { readonly ok: true; readonly value: unknown } | { readonly ok: false } {
-	if (
-		target === null ||
-		(typeof target !== "object" && typeof target !== "function")
-	) {
-		return { ok: false };
-	}
-	try {
-		const method = (target as Record<string, unknown>)[name];
-		if (typeof method !== "function") return { ok: false };
-		return { ok: true, value: method.call(target) };
-	} catch {
-		return { ok: false };
-	}
-}
-
-/**
- * Capture the immutable current leaf ID as a run boundary.
- * `null` means the branch was empty at start; every later branch entry is new.
- * `undefined` means the public API could not be read safely.
- */
+/** Capture the immutable current leaf ID as a run boundary. */
 export function captureBranchBoundary(
-	sessionManager: unknown,
-): string | null | undefined {
-	const result = callPublicMethod(sessionManager, "getLeafId");
-	if (!result.ok) return undefined;
-	if (result.value === null) return null;
-	return typeof result.value === "string" ? result.value : undefined;
-}
-
-function isAssistantMessageEntry(
-	entry: unknown,
-): { readonly stopReason: string } | null | "invalid" {
-	const type = readOwnData(entry, "type");
-	if (type.kind === "invalid") return "invalid";
-	if (type.kind !== "value" || type.value !== "message") return null;
-
-	const message = readOwnData(entry, "message");
-	if (message.kind === "invalid") return "invalid";
-	if (message.kind !== "value") return null;
-
-	const role = readOwnData(message.value, "role");
-	if (role.kind === "invalid") return "invalid";
-	if (role.kind !== "value" || role.value !== "assistant") return null;
-
-	const stopReason = readOwnData(message.value, "stopReason");
-	if (stopReason.kind === "invalid") return "invalid";
-	if (stopReason.kind !== "value" || typeof stopReason.value !== "string") {
-		return "invalid";
-	}
-	return { stopReason: stopReason.value };
-}
-
-/**
- * Every public Pi SessionEntry exposes an own string `id`. Missing, non-string,
- * getter, or hostile id descriptors are treated as malformed.
- */
-function entryId(entry: unknown): string | undefined {
-	const id = readOwnData(entry, "id");
-	if (id.kind !== "value" || typeof id.value !== "string") return undefined;
-	return id.value;
-}
-
-/**
- * Snapshot a public `getBranch()` result into a fresh ordinary array using only
- * own data descriptors. All Array.isArray / length / index / descriptor probes
- * stay inside one try so revoked proxies, length traps, index traps, holes,
- * and accessors fail closed without escaping event dispatch.
- */
-function captureBranchEntries(input: unknown): readonly unknown[] | undefined {
-	try {
-		if (!Array.isArray(input)) return undefined;
-		const lengthDescriptor = Object.getOwnPropertyDescriptor(input, "length");
-		if (
-			lengthDescriptor === undefined ||
-			!Object.hasOwn(lengthDescriptor, "value") ||
-			!Number.isSafeInteger(lengthDescriptor.value) ||
-			lengthDescriptor.value < 0
-		) {
-			return undefined;
-		}
-		const length = lengthDescriptor.value as number;
-		const values: unknown[] = [];
-		for (let index = 0; index < length; index += 1) {
-			const item = Object.getOwnPropertyDescriptor(input, String(index));
-			if (item === undefined || !Object.hasOwn(item, "value")) {
-				return undefined;
-			}
-			values.push(item.value);
-		}
-		return values;
-	} catch {
-		return undefined;
-	}
+	sessionManager: Pick<BranchBoundarySession, "getLeafId">,
+): string | null {
+	return sessionManager.getLeafId();
 }
 
 /**
  * Inspect only the newly appended suffix of the current branch after the
  * captured leaf boundary. The terminal new assistant is the last newly
  * appended `type: "message"` entry with `message.role === "assistant"`.
- *
- * Fail closed when the boundary leaf is absent (branch switch / compaction /
- * rewrite), the public API is unreadable, the branch array is malformed, or
- * any inspected SessionEntry lacks an own string id.
  */
 export function inspectTerminalAssistantOutcome(
-	sessionManager: unknown,
+	sessionManager: Pick<BranchBoundarySession, "getBranch">,
 	boundaryLeafId: string | null,
 ): TerminalAssistantOutcome {
-	const branchResult = callPublicMethod(sessionManager, "getBranch");
-	if (!branchResult.ok) {
-		return { kind: "invalid" };
-	}
-
-	const branch = captureBranchEntries(branchResult.value);
-	if (branch === undefined) {
-		return { kind: "invalid" };
-	}
-
+	const branch = sessionManager.getBranch();
 	let startIndex = 0;
 
 	if (boundaryLeafId !== null) {
-		let found = false;
-		for (let i = 0; i < branch.length; i++) {
-			const id = entryId(branch[i]);
-			if (id === undefined) return { kind: "invalid" };
-			if (id === boundaryLeafId) {
-				startIndex = i + 1;
-				found = true;
-				break;
-			}
-		}
-		if (!found) return { kind: "boundary-missing" };
+		const boundaryIndex = branch.findIndex(
+			(entry) => entry.id === boundaryLeafId,
+		);
+		if (boundaryIndex === -1) return "boundary-missing";
+		startIndex = boundaryIndex + 1;
 	}
 
-	let terminalStopReason: string | null = null;
+	let terminalStopReason: string | undefined;
 	for (let i = startIndex; i < branch.length; i++) {
-		const id = entryId(branch[i]);
-		if (id === undefined) return { kind: "invalid" };
-		const assistant = isAssistantMessageEntry(branch[i]);
-		if (assistant === "invalid") return { kind: "invalid" };
-		if (assistant !== null) {
-			terminalStopReason = assistant.stopReason;
+		const entry = branch[i];
+		if (entry.type === "message" && entry.message?.role === "assistant") {
+			terminalStopReason = entry.message.stopReason;
 		}
 	}
 
-	if (terminalStopReason === null) return { kind: "none" };
-	if (terminalStopReason === "aborted") return { kind: "aborted" };
-	return { kind: "non-aborted", stopReason: terminalStopReason };
+	if (terminalStopReason === undefined) return "none";
+	if (terminalStopReason === "aborted") return "aborted";
+	return "non-aborted";
 }
 
 const UNLOCKED_NOTIFICATION = "Continue watchdog unlocked";
@@ -288,14 +161,11 @@ export function registerMainAbortUnlock(
 			return;
 		}
 
-		const boundaryLeafId = captureBranchBoundary(ctx.sessionManager);
-		if (boundaryLeafId === undefined) {
-			clear();
-			return;
-		}
-
 		// A new start always supersedes any prior unconsumed capture.
-		capture = Object.freeze({ claim, boundaryLeafId });
+		capture = {
+			claim,
+			boundaryLeafId: captureBranchBoundary(ctx.sessionManager),
+		};
 	});
 
 	pi.on("agent_settled", async (_event, ctx: ExtensionContext) => {
@@ -312,7 +182,7 @@ export function registerMainAbortUnlock(
 			ctx.sessionManager,
 			active.boundaryLeafId,
 		);
-		if (outcome.kind !== "aborted") return;
+		if (outcome !== "aborted") return;
 
 		const transition = runtime.controller.unlock();
 		await applyUnlockEffects(transition, runtime, ctx);
