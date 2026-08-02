@@ -33,26 +33,12 @@ const nodeFileIO: ConfigFileIO = {
 	readFile: (path, encoding) => readFile(path, encoding),
 };
 
-/**
- * True only when `error` is a non-null object with an own data property
- * `code` whose stored value is exactly `"ENOENT"`.
- * Never invokes getters/proxies; any inspection failure is non-silent.
- */
 function isSilentMissing(error: unknown): boolean {
-	if (typeof error !== "object" || error === null) {
-		return false;
-	}
-	try {
-		const descriptor = Object.getOwnPropertyDescriptor(error, "code");
-		// Require an own data `value` on the descriptor — never `in`, so ambient
-		// Object.prototype.value pollution cannot reclassify accessors as data.
-		if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
-			return false;
-		}
-		return descriptor.value === "ENOENT";
-	} catch {
-		return false;
-	}
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		(error as NodeJS.ErrnoException).code === "ENOENT"
+	);
 }
 
 async function readConfig(
@@ -67,16 +53,11 @@ async function readConfig(
 		return loadConfigText(source, await io.readFile(path, "utf8"));
 	} catch (error) {
 		if (isSilentMissing(error)) {
-			return { config: Object.create(null), diagnostics: [] };
+			return { config: {}, diagnostics: [] };
 		}
 		return {
-			config: Object.create(null),
-			diagnostics: [
-				{
-					source,
-					message: READ_FAILURE_MESSAGE,
-				},
-			],
+			config: {},
+			diagnostics: [{ source, message: READ_FAILURE_MESSAGE }],
 		};
 	}
 }
@@ -100,7 +81,10 @@ export async function loadRuntimeConfig(
 				"project",
 				io,
 			)
-		: { config: Object.create(null), diagnostics: [] as ConfigDiagnostic[] };
+		: {
+				config: {} as Partial<ContinueWatchdogConfig>,
+				diagnostics: [] as ConfigDiagnostic[],
+			};
 
 	const merged = mergeConfig(global.config, project.config);
 	return {

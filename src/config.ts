@@ -3,7 +3,7 @@
  * Precedence: builtins < global < trusted project.
  * Invalid higher-precedence values do not erase valid lower-precedence values.
  *
- * Timer-safe product bounds (independent, conservative):
+ * Timer-safe product bounds:
  * - Node setTimeout max is 2^31-1 ms (MAX_TIMER_DELAY_MS).
  * - Retry delay formula: idleDelaySeconds * 1000 * 2^(maxRetries-1).
  * - idleDelaySeconds safe integer in [1, 3600]; maxRetries safe integer in [1, 10].
@@ -47,8 +47,6 @@ export interface ContinueWatchdogConfig {
 	continuePrompt: string;
 }
 
-export type ConfigInput = Record<string, unknown>;
-
 export interface ConfigDiagnostic {
 	source: string;
 	message: string;
@@ -72,51 +70,25 @@ export const BUILT_IN_CONFIG: Readonly<ContinueWatchdogConfig> = Object.freeze({
 });
 
 const MAX_DIAGNOSTIC_LENGTH = 240;
-const INVALID_CONFIG_MESSAGE = "configuration is invalid";
 
-const KNOWN_KEYS = [
+const KNOWN_KEYS = new Set([
 	"idleDelaySeconds",
 	"maxRetries",
 	"decisionPrompt",
 	"continuePrompt",
-] as const;
+]);
 
 function diagnostic(source: string, message: string): ConfigDiagnostic {
 	return { source, message: message.slice(0, MAX_DIAGNOSTIC_LENGTH) };
 }
 
-type OwnDataRead =
-	| { kind: "missing" }
-	| { kind: "data"; value: unknown }
-	| { kind: "non_data" };
-
-/**
- * Read an own data property without invoking accessors.
- * - missing/inherited-only → missing
- * - own data descriptor (own `value` property on the descriptor) → data
- * - own accessor / non-data descriptor → non_data (never invoke getter)
- *
- * Uses Object.hasOwn(descriptor, "value") so ambient Object.prototype.value
- * pollution cannot reclassify accessor descriptors as data.
- * Descriptor inspection traps may throw (hostile proxy).
- */
-function readOwnDataProperty(object: object, key: string): OwnDataRead {
-	const descriptor = Object.getOwnPropertyDescriptor(object, key);
-	if (descriptor === undefined) {
-		return { kind: "missing" };
-	}
-	if (!Object.hasOwn(descriptor, "value")) {
-		return { kind: "non_data" };
-	}
-	return { kind: "data", value: descriptor.value };
-}
-
-/**
- * Enumerate own property keys (strings and symbols).
- * Throws when enumeration traps throw (hostile proxy).
- */
-function listOwnKeys(object: object): PropertyKey[] {
-	return Reflect.ownKeys(object);
+function copyBuiltIn(): ContinueWatchdogConfig {
+	return {
+		idleDelaySeconds: BUILT_IN_CONFIG.idleDelaySeconds,
+		maxRetries: BUILT_IN_CONFIG.maxRetries,
+		decisionPrompt: BUILT_IN_CONFIG.decisionPrompt,
+		continuePrompt: BUILT_IN_CONFIG.continuePrompt,
+	};
 }
 
 /**
@@ -131,7 +103,6 @@ export function maxConfiguredDelayMs(
 	return idleDelaySeconds * 1000 * 2 ** (maxRetries - 1);
 }
 
-/** Safe integer idle delay within the product timer-safe range. */
 function validIdleDelaySeconds(value: unknown): value is number {
 	return (
 		typeof value === "number" &&
@@ -141,7 +112,6 @@ function validIdleDelaySeconds(value: unknown): value is number {
 	);
 }
 
-/** Safe integer retry budget within the product timer-safe range. */
 function validMaxRetries(value: unknown): value is number {
 	return (
 		typeof value === "number" &&
@@ -153,10 +123,8 @@ function validMaxRetries(value: unknown): value is number {
 
 /**
  * Count Unicode code points only until the supplied bound is exceeded.
- *
- * This deliberately does not allocate a full `Array.from(value)` result for an
- * untrusted config string. Lone surrogate code units count as one code point,
- * matching the string iterator / Array.from behavior.
+ * Lone surrogate code units count as one code point, matching the string
+ * iterator / Array.from behavior.
  */
 export function hasAtMostUnicodeCodePoints(
 	value: string,
@@ -184,130 +152,86 @@ export function isValidPrompt(value: unknown): value is string {
 	);
 }
 
+/**
+ * Validate ordinary config objects (JSON.parse results or plain objects).
+ * Own string keys only; invalid fields are omitted with a bounded diagnostic.
+ */
 export function validateConfig(source: string, value: unknown): ConfigResult {
-	// typeof/null checks are trap-free for ordinary values; Array.isArray and all
-	// subsequent shape/descriptor/key inspection can throw on hostile proxies.
-	if (value === null || typeof value !== "object") {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) {
 		return {
-			config: Object.create(null),
+			config: {},
 			diagnostics: [diagnostic(source, "configuration must be an object")],
 		};
 	}
 
-	try {
-		if (Array.isArray(value)) {
-			return {
-				config: Object.create(null),
-				diagnostics: [diagnostic(source, "configuration must be an object")],
-			};
-		}
+	const input = value as Record<string, unknown>;
+	const config: Partial<ContinueWatchdogConfig> = {};
+	const diagnostics: ConfigDiagnostic[] = [];
 
-		const input = value as object;
-		// null-prototype so missing fields never read ambient Object.prototype pollution.
-		const config: Partial<ContinueWatchdogConfig> = Object.create(null);
-		const diagnostics: ConfigDiagnostic[] = [];
-
-		const idle = readOwnDataProperty(input, "idleDelaySeconds");
-		if (idle.kind === "non_data") {
-			return {
-				config: Object.create(null),
-				diagnostics: [diagnostic(source, INVALID_CONFIG_MESSAGE)],
-			};
+	if (Object.hasOwn(input, "idleDelaySeconds")) {
+		const idle = input.idleDelaySeconds;
+		if (validIdleDelaySeconds(idle)) {
+			config.idleDelaySeconds = idle;
+		} else {
+			diagnostics.push(
+				diagnostic(
+					source,
+					"idleDelaySeconds must be a safe integer between 1 and 3600",
+				),
+			);
 		}
-		if (idle.kind === "data") {
-			if (validIdleDelaySeconds(idle.value)) {
-				config.idleDelaySeconds = idle.value;
-			} else {
-				diagnostics.push(
-					diagnostic(
-						source,
-						"idleDelaySeconds must be a safe integer between 1 and 3600",
-					),
-				);
-			}
-		}
-
-		const retries = readOwnDataProperty(input, "maxRetries");
-		if (retries.kind === "non_data") {
-			return {
-				config: Object.create(null),
-				diagnostics: [diagnostic(source, INVALID_CONFIG_MESSAGE)],
-			};
-		}
-		if (retries.kind === "data") {
-			if (validMaxRetries(retries.value)) {
-				config.maxRetries = retries.value;
-			} else {
-				diagnostics.push(
-					diagnostic(
-						source,
-						"maxRetries must be a safe integer between 1 and 10",
-					),
-				);
-			}
-		}
-
-		const decision = readOwnDataProperty(input, "decisionPrompt");
-		if (decision.kind === "non_data") {
-			return {
-				config: Object.create(null),
-				diagnostics: [diagnostic(source, INVALID_CONFIG_MESSAGE)],
-			};
-		}
-		if (decision.kind === "data") {
-			if (isValidPrompt(decision.value)) {
-				config.decisionPrompt = decision.value;
-			} else {
-				diagnostics.push(
-					diagnostic(
-						source,
-						`decisionPrompt must be a non-empty string of at most ${MAX_PROMPT_CHARACTERS} Unicode characters`,
-					),
-				);
-			}
-		}
-
-		const cont = readOwnDataProperty(input, "continuePrompt");
-		if (cont.kind === "non_data") {
-			return {
-				config: Object.create(null),
-				diagnostics: [diagnostic(source, INVALID_CONFIG_MESSAGE)],
-			};
-		}
-		if (cont.kind === "data") {
-			if (isValidPrompt(cont.value)) {
-				config.continuePrompt = cont.value;
-			} else {
-				diagnostics.push(
-					diagnostic(
-						source,
-						`continuePrompt must be a non-empty string of at most ${MAX_PROMPT_CHARACTERS} Unicode characters`,
-					),
-				);
-			}
-		}
-
-		const known = KNOWN_KEYS as readonly string[];
-		let hasUnsupportedKey = false;
-		for (const key of listOwnKeys(input)) {
-			// Any own symbol (or non-string key) is unsupported; never coerce/describe.
-			if (typeof key !== "string" || !known.includes(key)) {
-				hasUnsupportedKey = true;
-				break;
-			}
-		}
-		if (hasUnsupportedKey) {
-			diagnostics.push(diagnostic(source, "ignoring unsupported keys"));
-		}
-
-		return { config, diagnostics };
-	} catch {
-		// Hostile getters/proxies/revoked proxies during shape inspection must not escape.
-		return {
-			config: Object.create(null),
-			diagnostics: [diagnostic(source, INVALID_CONFIG_MESSAGE)],
-		};
 	}
+
+	if (Object.hasOwn(input, "maxRetries")) {
+		const retries = input.maxRetries;
+		if (validMaxRetries(retries)) {
+			config.maxRetries = retries;
+		} else {
+			diagnostics.push(
+				diagnostic(
+					source,
+					"maxRetries must be a safe integer between 1 and 10",
+				),
+			);
+		}
+	}
+
+	if (Object.hasOwn(input, "decisionPrompt")) {
+		const decision = input.decisionPrompt;
+		if (isValidPrompt(decision)) {
+			config.decisionPrompt = decision;
+		} else {
+			diagnostics.push(
+				diagnostic(
+					source,
+					`decisionPrompt must be a non-empty string of at most ${MAX_PROMPT_CHARACTERS} Unicode characters`,
+				),
+			);
+		}
+	}
+
+	if (Object.hasOwn(input, "continuePrompt")) {
+		const cont = input.continuePrompt;
+		if (isValidPrompt(cont)) {
+			config.continuePrompt = cont;
+		} else {
+			diagnostics.push(
+				diagnostic(
+					source,
+					`continuePrompt must be a non-empty string of at most ${MAX_PROMPT_CHARACTERS} Unicode characters`,
+				),
+			);
+		}
+	}
+
+	for (const key of Object.keys(input)) {
+		if (!KNOWN_KEYS.has(key)) {
+			diagnostics.push(diagnostic(source, "ignoring unsupported keys"));
+			break;
+		}
+	}
+
+	return { config, diagnostics };
 }
 
 export function loadConfigText(source: string, text: string): ConfigResult {
@@ -315,7 +239,7 @@ export function loadConfigText(source: string, text: string): ConfigResult {
 		return validateConfig(source, JSON.parse(text) as unknown);
 	} catch {
 		return {
-			config: Object.create(null),
+			config: {},
 			diagnostics: [
 				diagnostic(source, "configuration contains malformed JSON"),
 			],
@@ -332,13 +256,7 @@ export function mergeConfig(
 		validateConfig("project", project ?? {}),
 	];
 
-	const config: ContinueWatchdogConfig = {
-		idleDelaySeconds: BUILT_IN_CONFIG.idleDelaySeconds,
-		maxRetries: BUILT_IN_CONFIG.maxRetries,
-		decisionPrompt: BUILT_IN_CONFIG.decisionPrompt,
-		continuePrompt: BUILT_IN_CONFIG.continuePrompt,
-	};
-
+	const config = copyBuiltIn();
 	for (const { config: partial } of layers) {
 		if (partial.idleDelaySeconds !== undefined) {
 			config.idleDelaySeconds = partial.idleDelaySeconds;
