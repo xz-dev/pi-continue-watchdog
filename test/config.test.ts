@@ -48,7 +48,7 @@ test("built-in defaults match acceptance and reject the stale direct reminder", 
 	);
 	assert.equal(
 		BUILT_IN_CONFIG.continuePrompt,
-		"Continue until all jobs are done.",
+		"Continue until user assistance is required.",
 	);
 	assert.equal(DEFAULT_DECISION_PROMPT, BUILT_IN_CONFIG.decisionPrompt);
 	assert.equal(DEFAULT_CONTINUE_PROMPT, BUILT_IN_CONFIG.continuePrompt);

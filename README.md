@@ -33,7 +33,7 @@ Observable behavior only (implementation details may change):
 3. The decision is a **hidden automated** custom message (not a user message). For that check only, the model may call exactly one of:
    - `continue_watchdog` — keep working
    - `unlock_continue_watchdog` with a concise reason — stop automatic checks
-4. **Continue** injects the compact prompt `Continue until all jobs are done.` (configurable) and ordinary work resumes without further user input.
+4. **Continue** injects the compact prompt `Continue until user assistance is required.` (configurable) and ordinary work resumes without further user input.
 5. **Unlock** shows the reason in the TUI and does **not** start another work turn. Future model context drops the decision exchange.
 6. A decision gets up to **3 total attempts**. After the third invalid response, the extension stays locked/failed until a new main user message or manual lock.
 7. After each valid continue, the next idle delay doubles: default **3s, 6s, 12s, …** up to **10** valid continues per lock cycle.
@@ -70,7 +70,7 @@ This is an automated continuation check from the pi-continue-watchdog extension,
 Default continue prompt (configurable):
 
 ```text
-Continue until all jobs are done.
+Continue until user assistance is required.
 ```
 
 Decision-failed TUI warning:
@@ -95,7 +95,7 @@ Project config is ignored when the project is untrusted. Missing files are silen
   "idleDelaySeconds": 3,
   "maxRetries": 10,
   "decisionPrompt": "This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Call unlock_continue_watchdog with a concise reason if you are intentionally waiting for the user or all tasks are complete. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.",
-  "continuePrompt": "Continue until all jobs are done."
+  "continuePrompt": "Continue until user assistance is required."
 }
 ```
 
@@ -104,7 +104,7 @@ Project config is ignored when the project is untrusted. Missing files are silen
 | `idleDelaySeconds` | `3` | Safe integer `1`–`3600` |
 | `maxRetries` | `10` | Safe integer `1`–`10` (valid continues per lock cycle) |
 | `decisionPrompt` | see above | Non-blank, ≤ **16384** Unicode code points |
-| `continuePrompt` | `Continue until all jobs are done.` | Non-blank, ≤ **16384** Unicode code points |
+| `continuePrompt` | `Continue until user assistance is required.` | Non-blank, ≤ **16384** Unicode code points |
 
 Invalid re-ask budget is fixed at **3** (not configurable).
 

@@ -29,7 +29,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const decisionTools = ["continue_watchdog", "unlock_continue_watchdog"];
 const decisionPromptStart =
 	"This is an automated continuation check from the pi-continue-watchdog extension";
-const continuePrompt = "Continue until all jobs are done.";
+const continuePrompt = "Continue until user assistance is required.";
 
 interface RequestRecord {
 	readonly receivedAt: number;

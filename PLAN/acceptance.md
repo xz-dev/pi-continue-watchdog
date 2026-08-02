@@ -50,7 +50,7 @@ Any acceptance text, test name, README, or implementation that still requires th
 | Continue decision tool | `continue_watchdog` | Main/root only; **decision window only**; empty/minimal args `{}` |
 | Unlock decision tool | `unlock_continue_watchdog` | Main/root only; **decision window only**; required `{ reason: string }` |
 | Default `decisionPrompt` | see exact default below | Hidden custom message during decision window |
-| Default `continuePrompt` | `Continue until all jobs are done.` | Compact model-visible replacement after valid continue fold |
+| Default `continuePrompt` | `Continue until user assistance is required.` | Compact model-visible replacement after valid continue fold |
 | Lock TUI notify | `Continue watchdog locked` | User-only TUI notify |
 | Unlock TUI notify (no reason) | `Continue watchdog unlocked` | User-only TUI notify |
 | Unlock TUI notify (with reason) | `Continue watchdog unlocked: <reason>` | User-only TUI notify |
@@ -68,7 +68,7 @@ This is an automated continuation check from the pi-continue-watchdog extension,
 ### Exact default `continuePrompt`
 
 ```text
-Continue until all jobs are done.
+Continue until user assistance is required.
 ```
 
 ---
@@ -219,7 +219,7 @@ On invalid decision:
 - Reasonless (no reason field required or used)
 - Restore normal tools
 - The decision-only turn ends, and ordinary work continues automatically without further user input
-- Context folding removes the complete decision prompt / reply / tool call / results and replaces them with **one** compact custom message containing the configured `continuePrompt` (exact default: `Continue until all jobs are done.`)
+- Context folding removes the complete decision prompt / reply / tool call / results and replaces them with **one** compact custom message containing the configured `continuePrompt` (exact default: `Continue until user assistance is required.`)
 - Custom tool rendering folds the continue tool call/result into **one compact TUI line** that surfaces the `continuePrompt` text
 - Consumes **one** exponential retry (attempt advances)
 - Next settle + all-observable-idle uses the next exponential delay
@@ -321,7 +321,7 @@ With defaults, delays for successive continue attempts begin **3s, 6s, 12s, 24s,
 
 - normal tools are restored
 - the decision-only turn ends and ordinary work continues automatically without further user input
-- model-bound context removes the full decision exchange and inserts one compact custom message equal to configured `continuePrompt` (default `Continue until all jobs are done.`)
+- model-bound context removes the full decision exchange and inserts one compact custom message equal to configured `continuePrompt` (default `Continue until user assistance is required.`)
 - TUI shows a compact single-line rendering for the continue tool call/result including that continue prompt
 - one exponential retry is consumed
 - after settle, if still locked and all observable idle, the **next** exponential delay arms
