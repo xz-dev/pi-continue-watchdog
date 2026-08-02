@@ -51,7 +51,7 @@ const UNLOCK_CONTINUE_WATCHDOG_PARAMETERS = Type.Object(
 
 export type DecisionToolKind = "continue" | "unlock";
 
-/** A validated tool call handed to the Slice 6 decision protocol executor. */
+/** A validated tool call handed to the decision protocol executor. */
 export interface DecisionToolCall {
 	readonly kind: DecisionToolKind;
 	readonly reason?: string;
@@ -59,11 +59,6 @@ export interface DecisionToolCall {
 	readonly ctx: ExtensionContext;
 }
 
-/**
- * Deliberately opaque result details: Slice 5 makes no protocol or rendering
- * decision. The future executor owns validation, state transitions, folding,
- * TUI rendering, and whether a particular outcome should terminate.
- */
 export interface DecisionToolExecutor {
 	onDecisionToolCall(
 		call: DecisionToolCall,
@@ -96,27 +91,33 @@ export interface DecisionToolActivation {
 	 * Removes registered decision tools from the current active set.
 	 *
 	 * Pi makes registered tools active by default. Runtime wiring MUST invoke this
-	 * for every attachment, main and non-main, from `session_start` after Pi has
-	 * bound its active-tool APIs and before that session's first model request.
-	 * Slice 5 deliberately installs no lifecycle hook itself. A thrown Pi API call
+	 * for every attachment from `session_start` after Pi has bound its active-tool
+	 * APIs and before that session's first model request. A thrown Pi API call
 	 * leaves initialization incomplete so the later lifecycle callback can retry.
 	 */
 	readonly initializeDecisionToolsInactive: () => boolean;
 	/**
 	 * Snapshot currently active normal tools and replace them with exactly the pair.
-	 * This is inert until initialization succeeds; non-main attachments and a
-	 * duplicate active entry are also intentionally inert.
+	 * Inert until initialization succeeds; non-main attachments and a duplicate
+	 * active entry are also inert.
 	 */
 	readonly activateDecisionTools: () => boolean;
 	/**
-	 * Restore the exact prior normal-tool set. This remains available after demotion
-	 * so lifecycle cleanup cannot strand the decision pair as the active set. A
-	 * thrown Pi API call leaves the capture intact for a later retry.
+	 * Restore the exact prior normal-tool set. Remains available after demotion so
+	 * lifecycle cleanup cannot strand the decision pair. A thrown Pi API call
+	 * leaves the capture intact for a later retry.
 	 */
 	readonly restoreDecisionTools: () => boolean;
 	readonly isActive: () => boolean;
 	/** A read-only testing/runtime seam; null after restore or before activation. */
 	readonly getCapturedActiveTools: () => readonly string[] | null;
+}
+
+function isDecisionToolName(name: string): boolean {
+	return (
+		name === CONTINUE_WATCHDOG_TOOL_NAME ||
+		name === UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME
+	);
 }
 
 function staleDecisionToolResult(): AgentToolResult<{
@@ -129,10 +130,7 @@ function staleDecisionToolResult(): AgentToolResult<{
 	};
 }
 
-/**
- * Builds pure tool execution delegates. No validation, batching semantics,
- * context folding, decision retries, or timer behavior belongs in this slice.
- */
+/** Builds pure tool execution delegates for the protocol collector. */
 export function createDecisionToolExecutors(
 	executor: DecisionToolExecutor,
 ): DecisionToolExecutors {
@@ -219,17 +217,14 @@ export function createDecisionToolActivation(
 
 	registerDecisionTools();
 
-	return Object.freeze({
+	return {
 		registerDecisionTools,
 		initializeDecisionToolsInactive(): boolean {
 			if (initialized) return false;
 
-			// Copy now: a host implementation may retain/mutate its returned array.
 			const activeTools = [...pi.getActiveTools()];
 			const inactiveTools = activeTools.filter(
-				(name) =>
-					name !== CONTINUE_WATCHDOG_TOOL_NAME &&
-					name !== UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
+				(name) => !isDecisionToolName(name),
 			);
 			if (inactiveTools.length !== activeTools.length) {
 				pi.setActiveTools(inactiveTools);
@@ -242,18 +237,14 @@ export function createDecisionToolActivation(
 				!initialized ||
 				!options.isCurrentMain() ||
 				capturedActiveTools !== null
-			)
+			) {
 				return false;
+			}
 
-			// Filter defensively: Pi keeps definitions registered, but they are never
-			// part of a restored normal-tool baseline, even if another caller reactivated
-			// either definition between this attachment's lifecycle callbacks.
-			const baseline = Object.freeze(
-				[...pi.getActiveTools()].filter(
-					(name) =>
-						name !== CONTINUE_WATCHDOG_TOOL_NAME &&
-						name !== UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
-				),
+			// Exclude decision names so a reactivated definition is never part of the
+			// restored normal-tool baseline.
+			const baseline = [...pi.getActiveTools()].filter(
+				(name) => !isDecisionToolName(name),
 			);
 			pi.setActiveTools([...DECISION_TOOL_NAMES]);
 			capturedActiveTools = baseline;
@@ -273,5 +264,5 @@ export function createDecisionToolActivation(
 		getCapturedActiveTools(): readonly string[] | null {
 			return capturedActiveTools === null ? null : [...capturedActiveTools];
 		},
-	});
+	};
 }

@@ -1,9 +1,8 @@
 /**
  * Pure lock and decision-window state machine.
  *
- * Runtime wiring owns timers, Pi hooks, tool registration, and notifications. This
- * controller only records state and emits immutable intents for that wiring to
- * perform. The constructor accepts timer-safe values already validated by config.
+ * Runtime wiring owns timers, Pi hooks, tool registration, and notifications.
+ * This controller only records state and emits intents for that wiring.
  */
 
 export interface LockDecisionControllerConfig {
@@ -89,27 +88,17 @@ interface MutableState {
 	decisionId: number | null;
 }
 
-function freezeTimer(timer: IdleTimerIntent): IdleTimerIntent {
-	return Object.freeze({ ...timer });
-}
-
-function freezeSnapshot(state: MutableState): LockDecisionSnapshot {
-	return Object.freeze({
+function snapshotOf(state: MutableState): LockDecisionSnapshot {
+	return {
 		locked: state.locked,
 		attempt: state.attempt,
 		exhausted: state.exhausted,
 		decisionFailed: state.decisionFailed,
 		invalidDecisionAttempts: state.invalidDecisionAttempts,
 		lastInvalidDecisionError: state.lastInvalidDecisionError,
-		idleTimer: state.idleTimer ? freezeTimer(state.idleTimer) : null,
+		idleTimer: state.idleTimer ? { ...state.idleTimer } : null,
 		decisionOpen: state.decisionOpen,
-	});
-}
-
-function freezeEffects(
-	effects: readonly ControllerEffect[],
-): readonly ControllerEffect[] {
-	return Object.freeze(effects.map((effect) => Object.freeze({ ...effect })));
+	};
 }
 
 function normaliseInvalidDecisionError(error: unknown): string {
@@ -136,11 +125,16 @@ class PureLockDecisionController implements LockDecisionController {
 	private state = initialState();
 	private nextTimerId = 1;
 	private nextDecisionId = 1;
+	private readonly idleDelaySeconds: number;
+	private readonly maxRetries: number;
 
-	public constructor(private readonly config: LockDecisionControllerConfig) {}
+	public constructor(config: LockDecisionControllerConfig) {
+		this.idleDelaySeconds = config.idleDelaySeconds;
+		this.maxRetries = config.maxRetries;
+	}
 
 	public get snapshot(): LockDecisionSnapshot {
-		return freezeSnapshot(this.state);
+		return snapshotOf(this.state);
 	}
 
 	public lock(): ControllerTransition {
@@ -172,7 +166,7 @@ class PureLockDecisionController implements LockDecisionController {
 		const idleTimer: IdleTimerIntent = {
 			id: this.nextTimerId++,
 			attempt: this.state.attempt,
-			delaySeconds: this.config.idleDelaySeconds * 2 ** this.state.attempt,
+			delaySeconds: this.idleDelaySeconds * 2 ** this.state.attempt,
 		};
 		this.state = { ...this.state, idleTimer };
 		return this.applied([
@@ -267,7 +261,7 @@ class PureLockDecisionController implements LockDecisionController {
 		this.state = {
 			...this.state,
 			attempt,
-			exhausted: attempt >= this.config.maxRetries,
+			exhausted: attempt >= this.maxRetries,
 			invalidDecisionAttempts: 0,
 			lastInvalidDecisionError: null,
 			decisionOpen: false,
@@ -320,19 +314,19 @@ class PureLockDecisionController implements LockDecisionController {
 	}
 
 	private applied(effects: readonly ControllerEffect[]): ControllerTransition {
-		return Object.freeze({
+		return {
 			applied: true,
 			snapshot: this.snapshot,
-			effects: freezeEffects(effects),
-		});
+			effects: [...effects],
+		};
 	}
 
 	private noop(): ControllerTransition {
-		return Object.freeze({
+		return {
 			applied: false,
 			snapshot: this.snapshot,
-			effects: freezeEffects([]),
-		});
+			effects: [],
+		};
 	}
 }
 

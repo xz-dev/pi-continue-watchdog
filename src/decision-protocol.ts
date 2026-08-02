@@ -67,8 +67,7 @@ export type DecisionResponseContent =
 
 /**
  * Completed decision response abstraction. Runtime adapters convert Pi's
- * AssistantMessage content into this small, provider-independent shape before
- * protocol validation. It deliberately excludes tool results and timers.
+ * AssistantMessage content into this small shape before protocol validation.
  */
 export interface DecisionResponse {
 	readonly content: readonly DecisionResponseContent[];
@@ -101,6 +100,10 @@ export interface DecisionProtocolFinalization {
 	readonly reaskPrompt?: string;
 	readonly reason?: string;
 	readonly notification?: string;
+	/** Present for valid continue/unlock so runtime can persist a fold marker. */
+	readonly toolCallId?: string;
+	/** Response cycle that produced this finalization (valid and invalid outcomes). */
+	readonly cycleId?: number;
 }
 
 export interface DecisionProtocolSessionOptions {
@@ -112,7 +115,7 @@ export interface DecisionProtocolSessionOptions {
 
 /**
  * Complete-response collector shared by the individual Pi decision tools.
- * Each tool execution is deliberately inert until `finalize()` validates the
+ * Each tool execution is inert until `finalizeResponse()` validates the
  * completed assistant response as a whole.
  */
 export interface DecisionProtocolSession extends DecisionToolExecutor {
@@ -120,7 +123,7 @@ export interface DecisionProtocolSession extends DecisionToolExecutor {
 	readonly currentCycleId: number;
 	/**
 	 * Finalize exactly one completed response for `cycleId`. A duplicate callback
-	 * for the current cycle receives the same frozen result; another cycle's
+	 * for the current cycle receives the same cached result; another cycle's
 	 * callback is ignored without changing controller state.
 	 */
 	readonly finalizeResponse: (
@@ -135,11 +138,6 @@ export interface DecisionProtocolSession extends DecisionToolExecutor {
 	readonly advanceAfterReask: (cycleId: number) => boolean;
 }
 
-type OwnDataProperty =
-	| { readonly kind: "missing" }
-	| { readonly kind: "data"; readonly value: unknown }
-	| { readonly kind: "non-data" };
-
 interface RecordedDecisionToolCall {
 	readonly cycleId: number;
 	readonly kind: "continue" | "unlock";
@@ -147,67 +145,19 @@ interface RecordedDecisionToolCall {
 	readonly reason?: string | null;
 }
 
-function readOwnDataProperty(
-	input: unknown,
-	key: PropertyKey,
-): OwnDataProperty {
-	if (
-		input === null ||
-		(typeof input !== "object" && typeof input !== "function")
-	) {
-		return { kind: "missing" };
-	}
-
-	try {
-		const descriptor = Object.getOwnPropertyDescriptor(input, key);
-		if (descriptor === undefined) return { kind: "missing" };
-		if (!("value" in descriptor)) return { kind: "non-data" };
-		return { kind: "data", value: descriptor.value };
-	} catch {
-		return { kind: "non-data" };
-	}
-}
-
-function ownKeys(input: unknown): readonly PropertyKey[] | null {
-	if (input === null || typeof input !== "object") return null;
-	try {
-		return Reflect.ownKeys(input);
-	} catch {
-		return null;
-	}
-}
-
-function isPlainObject(input: unknown): input is Record<PropertyKey, unknown> {
-	if (input === null || typeof input !== "object") return false;
-	try {
-		const prototype = Object.getPrototypeOf(input);
-		return prototype === Object.prototype || prototype === null;
-	} catch {
-		return false;
-	}
-}
-
-function isWhitespaceOnlyText(content: DecisionTextContent): boolean {
-	return content.text.trim().length === 0;
-}
-
-function getToolCallArgumentValue(
-	argumentsValue: unknown,
-	key: string,
-): OwnDataProperty {
-	if (!isPlainObject(argumentsValue)) return { kind: "non-data" };
-	return readOwnDataProperty(argumentsValue, key);
+function isOrdinaryObject(input: unknown): input is Record<string, unknown> {
+	return typeof input === "object" && input !== null && !Array.isArray(input);
 }
 
 function hasExactlyOwnKeys(
 	input: unknown,
 	expectedKeys: readonly string[],
 ): boolean {
-	if (!isPlainObject(input)) return false;
-	const keys = ownKeys(input);
-	if (keys === null || keys.length !== expectedKeys.length) return false;
-	return keys.every(
-		(key) => typeof key === "string" && expectedKeys.includes(key),
+	if (!isOrdinaryObject(input)) return false;
+	const keys = Object.keys(input);
+	return (
+		keys.length === expectedKeys.length &&
+		expectedKeys.every((key) => keys.includes(key))
 	);
 }
 
@@ -239,11 +189,9 @@ function validateToolCall(
 		if (!hasExactlyOwnKeys(content.arguments, ["reason"])) {
 			return { valid: false, error: INVALID_UNLOCK_REASON_ERROR };
 		}
-		const reason = getToolCallArgumentValue(content.arguments, "reason");
-		const normalizedReason =
-			reason.kind === "data"
-				? normalizeDecisionUnlockReason(reason.value)
-				: null;
+		const normalizedReason = normalizeDecisionUnlockReason(
+			(content.arguments as Record<string, unknown>).reason,
+		);
 		if (normalizedReason === null) {
 			return { valid: false, error: INVALID_UNLOCK_REASON_ERROR };
 		}
@@ -262,135 +210,111 @@ function validateToolCall(
 
 /**
  * Apply the exactly-one/no-prose decision protocol to a completed normalized
- * assistant response. Thinking blocks are intentionally ignored: they are not
- * model prose and Pi treats them as private reasoning content.
+ * assistant response. Thinking blocks are ignored: they are not model prose.
  */
 export function validateDecisionResponse(
 	response: DecisionResponse,
 ): DecisionValidation {
-	try {
-		const toolCalls: DecisionToolCallContent[] = [];
-		const content = response.content;
-		if (!Array.isArray(content)) {
-			return { valid: false, error: MALFORMED_DECISION_RESPONSE_ERROR };
-		}
-
-		for (let index = 0; index < content.length; index += 1) {
-			const block = content[index];
-			if (block === undefined || block.type === "thinking") continue;
-			if (block.type === "text") {
-				if (!isWhitespaceOnlyText(block)) {
-					return { valid: false, error: PROSE_DECISION_RESPONSE_ERROR };
-				}
-				continue;
-			}
-			if (block.type === "toolCall") {
-				toolCalls.push(block);
-				continue;
-			}
-			if (block.type === "malformed") {
-				return { valid: false, error: MALFORMED_DECISION_RESPONSE_ERROR };
-			}
-			return { valid: false, error: UNSUPPORTED_DECISION_CONTENT_ERROR };
-		}
-
-		if (toolCalls.length === 0) {
-			return { valid: false, error: NO_DECISION_TOOL_ERROR };
-		}
-		if (
-			toolCalls.some(
-				(toolCall) =>
-					toolCall.name !== "continue_watchdog" &&
-					toolCall.name !== "unlock_continue_watchdog",
-			)
-		) {
-			return { valid: false, error: UNKNOWN_DECISION_TOOL_ERROR };
-		}
-		if (toolCalls.length > 1) {
-			return { valid: false, error: MULTIPLE_DECISION_TOOLS_ERROR };
-		}
-		const toolCall = toolCalls[0];
-		if (toolCall === undefined) {
-			return { valid: false, error: NO_DECISION_TOOL_ERROR };
-		}
-		return validateToolCall(toolCall);
-	} catch {
+	const toolCalls: DecisionToolCallContent[] = [];
+	const content = response.content;
+	if (!Array.isArray(content)) {
 		return { valid: false, error: MALFORMED_DECISION_RESPONSE_ERROR };
 	}
+
+	for (const block of content) {
+		if (block === undefined || block.type === "thinking") continue;
+		if (block.type === "text") {
+			if (block.text.trim().length > 0) {
+				return { valid: false, error: PROSE_DECISION_RESPONSE_ERROR };
+			}
+			continue;
+		}
+		if (block.type === "toolCall") {
+			toolCalls.push(block);
+			continue;
+		}
+		if (block.type === "malformed") {
+			return { valid: false, error: MALFORMED_DECISION_RESPONSE_ERROR };
+		}
+		return { valid: false, error: UNSUPPORTED_DECISION_CONTENT_ERROR };
+	}
+
+	if (toolCalls.length === 0) {
+		return { valid: false, error: NO_DECISION_TOOL_ERROR };
+	}
+	if (
+		toolCalls.some(
+			(toolCall) =>
+				toolCall.name !== "continue_watchdog" &&
+				toolCall.name !== "unlock_continue_watchdog",
+		)
+	) {
+		return { valid: false, error: UNKNOWN_DECISION_TOOL_ERROR };
+	}
+	if (toolCalls.length > 1) {
+		return { valid: false, error: MULTIPLE_DECISION_TOOLS_ERROR };
+	}
+	const toolCall = toolCalls[0];
+	if (toolCall === undefined) {
+		return { valid: false, error: NO_DECISION_TOOL_ERROR };
+	}
+	return validateToolCall(toolCall);
 }
 
 function malformedResponse(): DecisionResponse {
-	const content: readonly DecisionResponseContent[] = Object.freeze([
-		{ type: "malformed" },
-	]);
-	return Object.freeze({ content });
+	return { content: [{ type: "malformed" }] };
 }
 
 function normalizeAssistantContentBlock(
 	input: unknown,
 ): DecisionResponseContent {
-	const type = readOwnDataProperty(input, "type");
-	if (type.kind !== "data" || typeof type.value !== "string") {
+	if (!isOrdinaryObject(input) || typeof input.type !== "string") {
 		return { type: "malformed" };
 	}
-	if (type.value === "thinking") return { type: "thinking" };
-	if (type.value === "text") {
-		const text = readOwnDataProperty(input, "text");
-		return text.kind === "data" && typeof text.value === "string"
-			? { type: "text", text: text.value }
-			: { type: "malformed" };
-	}
-	if (type.value !== "toolCall") return { type: "other" };
 
-	const id = readOwnDataProperty(input, "id");
-	const name = readOwnDataProperty(input, "name");
-	const argumentsValue = readOwnDataProperty(input, "arguments");
-	if (
-		id.kind !== "data" ||
-		typeof id.value !== "string" ||
-		name.kind !== "data" ||
-		typeof name.value !== "string" ||
-		argumentsValue.kind !== "data"
-	) {
-		return { type: "malformed" };
+	switch (input.type) {
+		case "thinking":
+			return { type: "thinking" };
+		case "text":
+			return typeof input.text === "string"
+				? { type: "text", text: input.text }
+				: { type: "malformed" };
+		case "toolCall": {
+			if (typeof input.id !== "string" || typeof input.name !== "string") {
+				return { type: "malformed" };
+			}
+			if (!Object.hasOwn(input, "arguments")) {
+				return { type: "malformed" };
+			}
+			return {
+				type: "toolCall",
+				toolCallId: input.id,
+				name: input.name,
+				arguments: input.arguments,
+			};
+		}
+		default:
+			return { type: "other" };
 	}
-	return {
-		type: "toolCall",
-		toolCallId: id.value,
-		name: name.value,
-		arguments: argumentsValue.value,
-	};
 }
 
 /**
  * Convert Pi's completed AssistantMessage structural shape without importing Pi
- * internals. The runtime can pass its public AgentMessage directly; non-assistant
- * or malformed values become a fixed validation failure rather than throwing or
- * exposing arbitrary provider data in a later re-ask.
+ * internals. Non-assistant or malformed values become a fixed validation failure.
  */
 export function normalizeAssistantDecisionResponse(
 	message: unknown,
 ): DecisionResponse {
-	try {
-		const role = readOwnDataProperty(message, "role");
-		const content = readOwnDataProperty(message, "content");
-		if (
-			role.kind !== "data" ||
-			role.value !== "assistant" ||
-			content.kind !== "data" ||
-			!Array.isArray(content.value)
-		) {
-			return malformedResponse();
-		}
-
-		const normalized: DecisionResponseContent[] = [];
-		for (let index = 0; index < content.value.length; index += 1) {
-			normalized.push(normalizeAssistantContentBlock(content.value[index]));
-		}
-		return Object.freeze({ content: Object.freeze(normalized) });
-	} catch {
+	if (!isOrdinaryObject(message)) return malformedResponse();
+	if (message.role !== "assistant" || !Array.isArray(message.content)) {
 		return malformedResponse();
 	}
+
+	const normalized: DecisionResponseContent[] = [];
+	for (const block of message.content) {
+		normalized.push(normalizeAssistantContentBlock(block));
+	}
+	return { content: normalized };
 }
 
 /** Build the hidden immediate re-ask body from a safe fixed validator error. */
@@ -448,9 +372,8 @@ function matchesRecordedTool(
 
 /**
  * Create one stateful collector for a controller-owned decision window. The
- * collector is intentionally the only Slice 6 bridge from individual Pi tool
- * executions to whole-assistant-message validation; it neither sends messages
- * nor folds context nor owns any timer or TUI effect.
+ * collector bridges individual Pi tool executions to whole-assistant-message
+ * validation; it neither sends messages nor folds context nor owns timers.
  */
 export function createDecisionProtocolSession(
 	options: DecisionProtocolSessionOptions,
@@ -459,15 +382,14 @@ export function createDecisionProtocolSession(
 	let recorded: RecordedDecisionToolCall[] = [];
 	let finalized: DecisionProtocolFinalization | null = null;
 
-	const ignoredFinalization = (): DecisionProtocolFinalization =>
-		Object.freeze({
-			outcome: "ignored",
-			transition: Object.freeze({
-				applied: false,
-				snapshot: options.controller.snapshot,
-				effects: Object.freeze([]),
-			}),
-		});
+	const ignoredFinalization = (): DecisionProtocolFinalization => ({
+		outcome: "ignored",
+		transition: {
+			applied: false,
+			snapshot: options.controller.snapshot,
+			effects: [],
+		},
+	});
 
 	const finalizeInvalid = (error: string): DecisionProtocolFinalization => {
 		const transition = options.controller.recordInvalidDecision(
@@ -475,22 +397,24 @@ export function createDecisionProtocolSession(
 			error,
 		);
 		if (!transition.applied) {
-			return Object.freeze({ outcome: "ignored", transition });
+			return { outcome: "ignored", transition };
 		}
 		if (transition.snapshot.decisionFailed) {
-			return Object.freeze({
+			return {
 				outcome: "decision-failed",
 				transition,
 				error,
 				notification: formatDecisionFailedNotification(error),
-			});
+				cycleId,
+			};
 		}
-		return Object.freeze({
+		return {
 			outcome: "reask",
 			transition,
 			error,
 			reaskPrompt: buildDecisionReaskPrompt(options.decisionPrompt, error),
-		});
+			cycleId,
+		};
 	};
 
 	const onDecisionToolCall = (
@@ -537,18 +461,25 @@ export function createDecisionProtocolSession(
 				? options.controller.recordValidContinue(options.decisionId)
 				: options.controller.recordValidUnlock(options.decisionId);
 		if (!transition.applied) {
-			finalized = Object.freeze({ outcome: "ignored", transition });
+			finalized = { outcome: "ignored", transition };
 			return finalized;
 		}
 		if (validation.decision.kind === "continue") {
-			finalized = Object.freeze({ outcome: "continue", transition });
+			finalized = {
+				outcome: "continue",
+				transition,
+				toolCallId: validation.decision.toolCallId,
+				cycleId,
+			};
 			return finalized;
 		}
-		finalized = Object.freeze({
+		finalized = {
 			outcome: "unlock",
 			transition,
 			reason: validation.decision.reason,
-		});
+			toolCallId: validation.decision.toolCallId,
+			cycleId,
+		};
 		return finalized;
 	};
 
@@ -566,12 +497,12 @@ export function createDecisionProtocolSession(
 		return true;
 	};
 
-	return Object.freeze({
+	return {
 		get currentCycleId(): number {
 			return cycleId;
 		},
 		onDecisionToolCall,
 		finalizeResponse,
 		advanceAfterReask,
-	});
+	};
 }

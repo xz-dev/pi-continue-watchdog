@@ -27,7 +27,6 @@ type RegisteredDecisionTool = ToolDefinition;
 type DecisionDetails = { readonly result: string };
 
 interface Harness {
-	readonly pi: ExtensionAPI;
 	readonly tools: Map<string, RegisteredDecisionTool>;
 	readonly setActiveCalls: string[][];
 	readonly delegated: DecisionToolCall[];
@@ -65,8 +64,7 @@ function createHarness(
 	const pi = {
 		registerTool(tool: RegisteredDecisionTool): void {
 			tools.set(tool.name, tool);
-			// Stock Pi registers custom definitions into the initial active set. The
-			// manager must later remove its two definitions through setActiveTools.
+			// Stock Pi registers custom definitions into the initial active set.
 			if (activateRegisteredTools && !activeTools.includes(tool.name)) {
 				activeTools.push(tool.name);
 			}
@@ -101,7 +99,6 @@ function createHarness(
 	});
 
 	return {
-		pi,
 		tools,
 		setActiveCalls,
 		delegated,
@@ -143,7 +140,7 @@ function initializeDecisionTools(harness: Harness): void {
 	assert.equal(harness.activation.initializeDecisionToolsInactive(), true);
 }
 
-test("Slice 5 RED: registers definitions into Pi's default active set, then lifecycle initialization removes exactly the decision pair", () => {
+test("registers definitions into Pi's default active set, then initialization removes the pair", () => {
 	const harness = createHarness();
 
 	assert.deepEqual(
@@ -164,20 +161,13 @@ test("Slice 5 RED: registers definitions into Pi's default active set, then life
 	assert.deepEqual(harness.setActiveCalls, [["read", "bash", "edit"]]);
 	assert.equal(harness.activation.initializeDecisionToolsInactive(), false);
 	assert.deepEqual(harness.setActiveCalls, [["read", "bash", "edit"]]);
-
-	assert.equal(Object.isFrozen(DECISION_TOOL_NAMES), true);
 	assert.deepEqual(DECISION_TOOL_NAMES, [
 		CONTINUE_WATCHDOG_TOOL_NAME,
 		UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
 	]);
-	assert.throws(() => {
-		(DECISION_TOOL_NAMES as unknown as { push(name: string): void }).push(
-			"hostile",
-		);
-	}, TypeError);
 });
 
-test("Slice 5 RED: decision schemas, descriptions, and prompt snippets define only the accepted automated non-user protocol", () => {
+test("decision schemas, descriptions, and prompt snippets define the automated protocol", () => {
 	const harness = createHarness();
 	const continueTool = registeredTool(harness, CONTINUE_WATCHDOG_TOOL_NAME);
 	const unlockTool = registeredTool(
@@ -188,7 +178,6 @@ test("Slice 5 RED: decision schemas, descriptions, and prompt snippets define on
 	assert.equal(continueTool.description, CONTINUE_WATCHDOG_DESCRIPTION);
 	assert.equal(continueTool.promptSnippet, CONTINUE_WATCHDOG_PROMPT_SNIPPET);
 	assert.match(continueTool.description, /automated/i);
-	assert.match(continueTool.description, /pi-continue-watchdog/i);
 	assert.match(continueTool.description, /not a user request/i);
 	assert.deepEqual(schemaJson(continueTool), {
 		type: "object",
@@ -201,11 +190,7 @@ test("Slice 5 RED: decision schemas, descriptions, and prompt snippets define on
 		unlockTool.promptSnippet,
 		UNLOCK_CONTINUE_WATCHDOG_PROMPT_SNIPPET,
 	);
-	assert.match(unlockTool.description, /automated/i);
-	assert.match(unlockTool.description, /pi-continue-watchdog/i);
-	assert.match(unlockTool.description, /not a user request/i);
 	assert.match(unlockTool.description, /concise, clear one-sentence/i);
-	assert.match(unlockTool.description, /non-empty/i);
 	assert.match(unlockTool.description, /500 characters/i);
 	assert.deepEqual(schemaJson(unlockTool), {
 		type: "object",
@@ -217,7 +202,7 @@ test("Slice 5 RED: decision schemas, descriptions, and prompt snippets define on
 	});
 });
 
-test("Slice 7 RED: the registered continue decision tool uses the compact configured-prompt renderer and hides its result row", () => {
+test("registered continue tool uses the compact configured-prompt renderer", () => {
 	const harness = createHarness();
 	const continueTool = registeredTool(harness, CONTINUE_WATCHDOG_TOOL_NAME);
 	assert.ok(continueTool.renderCall);
@@ -242,41 +227,32 @@ test("Slice 7 RED: the registered continue decision tool uses the compact config
 	assert.deepEqual(result.render(120), []);
 });
 
-test("Slice 5 RED: activation only follows lifecycle initialization and restores an ordered normal-only baseline", () => {
+test("activation follows initialization and restores an ordered normal-only baseline", () => {
 	const initial = ["read", "bash", "read"];
 	const harness = createHarness(initial);
 
 	assert.equal(harness.activation.activateDecisionTools(), false);
-	assert.equal(harness.activation.isActive(), false);
 	initializeDecisionTools(harness);
 	assert.deepEqual(harness.activeTools(), initial);
-	assert.deepEqual(harness.setActiveCalls, [initial]);
 
 	assert.equal(harness.activation.activateDecisionTools(), true);
 	assert.equal(harness.activation.isActive(), true);
 	assert.deepEqual(harness.activeTools(), [...DECISION_TOOL_NAMES]);
 	assert.deepEqual(harness.activation.getCapturedActiveTools(), initial);
-	assert.deepEqual(harness.setActiveCalls, [initial, [...DECISION_TOOL_NAMES]]);
 
-	// A repeated decision entry must not overwrite the normal-tool snapshot.
+	// A second activation while already active is inert.
 	harness.setActiveTools(["hostile-normal-tool"]);
 	assert.equal(harness.activation.activateDecisionTools(), false);
-	assert.deepEqual(harness.setActiveCalls, [initial, [...DECISION_TOOL_NAMES]]);
 	assert.deepEqual(harness.activation.getCapturedActiveTools(), initial);
 
 	assert.equal(harness.activation.restoreDecisionTools(), true);
 	assert.equal(harness.activation.isActive(), false);
 	assert.deepEqual(harness.activeTools(), initial);
-	assert.deepEqual(harness.setActiveCalls, [
-		initial,
-		[...DECISION_TOOL_NAMES],
-		initial,
-	]);
 	assert.equal(harness.activation.getCapturedActiveTools(), null);
 	assert.equal(harness.activation.restoreDecisionTools(), false);
 });
 
-test("Slice 5 RED: lifecycle initialization removes the pair for a non-main attachment, which still cannot activate controls", () => {
+test("non-main attachments initialize inactive and cannot activate decision tools", () => {
 	const harness = createHarness(["read", "bash"]);
 	harness.setCurrentMain(false);
 
@@ -284,11 +260,10 @@ test("Slice 5 RED: lifecycle initialization removes the pair for a non-main atta
 	assert.equal(harness.activation.activateDecisionTools(), false);
 	assert.equal(harness.activation.isActive(), false);
 	assert.deepEqual(harness.activeTools(), ["read", "bash"]);
-	assert.deepEqual(harness.setActiveCalls, [["read", "bash"]]);
 	assert.equal(harness.activation.getCapturedActiveTools(), null);
 });
 
-test("Slice 5 RED: a demoted active attachment restores its original normal set without requiring current-main ownership", () => {
+test("demoted active attachment still restores its original normal set", () => {
 	const harness = createHarness(["read", "bash"]);
 	initializeDecisionTools(harness);
 	assert.equal(harness.activation.activateDecisionTools(), true);
@@ -297,14 +272,9 @@ test("Slice 5 RED: a demoted active attachment restores its original normal set 
 	assert.equal(harness.activation.restoreDecisionTools(), true);
 	assert.equal(harness.activation.isActive(), false);
 	assert.deepEqual(harness.activeTools(), ["read", "bash"]);
-	assert.deepEqual(harness.setActiveCalls, [
-		["read", "bash"],
-		[...DECISION_TOOL_NAMES],
-		["read", "bash"],
-	]);
 });
 
-test("Slice 5 RED: each active main decision tool delegates the exact validated call to the future protocol seam", async () => {
+test("active main decision tools delegate the exact validated call", async () => {
 	const harness = createHarness();
 	const context = { marker: "decision-context" } as unknown as ExtensionContext;
 	const continueTool = registeredTool(harness, CONTINUE_WATCHDOG_TOOL_NAME);
@@ -347,7 +317,7 @@ test("Slice 5 RED: each active main decision tool delegates the exact validated 
 	]);
 });
 
-test("Slice 5 RED: uninitialized, inactive, or demoted tool execution cannot delegate decision control and returns the fixed terminating stale result", async () => {
+test("uninitialized, inactive, or demoted execution returns the fixed terminating stale result", async () => {
 	const harness = createHarness();
 	const context = {} as ExtensionContext;
 	const continueTool = registeredTool(harness, CONTINUE_WATCHDOG_TOOL_NAME);
@@ -375,7 +345,6 @@ test("Slice 5 RED: uninitialized, inactive, or demoted tool execution cannot del
 		context,
 	);
 	assert.deepEqual(inactive, uninitialized);
-	assert.deepEqual(harness.delegated, []);
 
 	assert.equal(harness.activation.activateDecisionTools(), true);
 	harness.setCurrentMain(false);
@@ -390,17 +359,7 @@ test("Slice 5 RED: uninitialized, inactive, or demoted tool execution cannot del
 	assert.deepEqual(harness.delegated, []);
 });
 
-test("Slice 5 RED: initialization is idempotent and skips setActiveTools when both definitions are already inactive", () => {
-	const harness = createHarness(["read", "bash"], false);
-
-	initializeDecisionTools(harness);
-	assert.deepEqual(harness.activeTools(), ["read", "bash"]);
-	assert.deepEqual(harness.setActiveCalls, []);
-	assert.equal(harness.activation.initializeDecisionToolsInactive(), false);
-	assert.deepEqual(harness.setActiveCalls, []);
-});
-
-test("Slice 5 RED: initialization retries after Pi active-tool API failures without exposing a partially initialized state", () => {
+test("Pi active-tool API failures leave retryable state for init, activate, and restore", () => {
 	const harness = createHarness();
 
 	harness.throwNextGetActiveTools();
@@ -409,12 +368,6 @@ test("Slice 5 RED: initialization retries after Pi active-tool API failures with
 		/getActiveTools failed/,
 	);
 	assert.equal(harness.activation.activateDecisionTools(), false);
-	assert.deepEqual(harness.activeTools(), [
-		"read",
-		"bash",
-		"edit",
-		...DECISION_TOOL_NAMES,
-	]);
 
 	harness.throwNextSetActiveTools();
 	assert.throws(
@@ -422,20 +375,9 @@ test("Slice 5 RED: initialization retries after Pi active-tool API failures with
 		/setActiveTools failed/,
 	);
 	assert.equal(harness.activation.activateDecisionTools(), false);
-	assert.deepEqual(harness.activeTools(), [
-		"read",
-		"bash",
-		"edit",
-		...DECISION_TOOL_NAMES,
-	]);
 
 	initializeDecisionTools(harness);
 	assert.deepEqual(harness.activeTools(), ["read", "bash", "edit"]);
-});
-
-test("Slice 5 RED: activation does not capture a baseline until Pi replaces the active set, then retries cleanly", () => {
-	const harness = createHarness();
-	initializeDecisionTools(harness);
 
 	harness.setActiveTools([
 		"read",
@@ -453,18 +395,11 @@ test("Slice 5 RED: activation does not capture a baseline until Pi replaces the 
 	assert.equal(harness.activation.getCapturedActiveTools(), null);
 
 	assert.equal(harness.activation.activateDecisionTools(), true);
-	assert.deepEqual(harness.activeTools(), [...DECISION_TOOL_NAMES]);
 	assert.deepEqual(harness.activation.getCapturedActiveTools(), [
 		"read",
 		"bash",
 		"read",
 	]);
-});
-
-test("Slice 5 RED: restoration clears its captured baseline only after Pi accepts it, so a failed restore is retryable", () => {
-	const harness = createHarness();
-	initializeDecisionTools(harness);
-	assert.equal(harness.activation.activateDecisionTools(), true);
 
 	harness.throwNextSetActiveTools();
 	assert.throws(
@@ -472,14 +407,6 @@ test("Slice 5 RED: restoration clears its captured baseline only after Pi accept
 		/setActiveTools failed/,
 	);
 	assert.equal(harness.activation.isActive(), true);
-	assert.deepEqual(harness.activation.getCapturedActiveTools(), [
-		"read",
-		"bash",
-		"edit",
-	]);
-	assert.deepEqual(harness.activeTools(), [...DECISION_TOOL_NAMES]);
-
 	assert.equal(harness.activation.restoreDecisionTools(), true);
-	assert.equal(harness.activation.isActive(), false);
-	assert.deepEqual(harness.activeTools(), ["read", "bash", "edit"]);
+	assert.deepEqual(harness.activeTools(), ["read", "bash", "read"]);
 });

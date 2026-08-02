@@ -51,7 +51,7 @@ function openDecision(state: ReturnType<typeof controller>): {
 	};
 }
 
-test("Slice 2: initial snapshot is immutable and unlocked without timer or decision window", () => {
+test("initial snapshot is unlocked with no timer or decision window", () => {
 	const state = controller();
 
 	assert.deepEqual(state.snapshot, {
@@ -64,10 +64,9 @@ test("Slice 2: initial snapshot is immutable and unlocked without timer or decis
 		idleTimer: null,
 		decisionOpen: false,
 	});
-	assert.equal(Object.isFrozen(state.snapshot), true);
 });
 
-test("Examples 1-2: manual lock and main user start always reset, cancel stale state, and notify", () => {
+test("manual lock and main user start always reset, cancel pending work, and notify", () => {
 	const state = controller({ idleDelaySeconds: 3, maxRetries: 2 });
 
 	const first = state.lock();
@@ -100,7 +99,7 @@ test("Examples 1-2: manual lock and main user start always reset, cancel stale s
 	assert.equal(state.snapshot.decisionOpen, false);
 });
 
-test("Examples 3 and 7 state seam: unlock is unconditional and resets/cancels/restores", () => {
+test("unlock is unconditional and cancels or restores pending work", () => {
 	const state = controller();
 
 	const alreadyUnlocked = state.unlock();
@@ -144,7 +143,7 @@ test("Examples 3 and 7 state seam: unlock is unconditional and resets/cancels/re
 	});
 });
 
-test("Examples 5, 6, and 10: valid continues advance zero-based 3s exponential delays then exhaust", () => {
+test("valid continues advance zero-based exponential delays then exhaust", () => {
 	const state = controller({ idleDelaySeconds: 3, maxRetries: 3 });
 	state.lock();
 
@@ -180,7 +179,7 @@ test("Examples 5, 6, and 10: valid continues advance zero-based 3s exponential d
 	assert.equal(state.snapshot.idleTimer, null);
 });
 
-test("Example 10: stale or duplicate continue cannot double-consume the retry budget", () => {
+test("stale continue cannot double-consume the retry budget", () => {
 	const state = controller({ idleDelaySeconds: 3, maxRetries: 1 });
 	state.lock();
 	const { decisionId: activeDecisionId } = openDecision(state);
@@ -195,7 +194,7 @@ test("Example 10: stale or duplicate continue cannot double-consume the retry bu
 	assert.equal(state.snapshot.attempt, 1);
 });
 
-test("Examples 1, 2, and 10: manual lock or actual main user start resets exhausted state", () => {
+test("manual lock or main user start resets exhausted and decision-failed state", () => {
 	const state = controller({ idleDelaySeconds: 3, maxRetries: 1 });
 	state.lock();
 	const { decisionId: firstDecisionId } = openDecision(state);
@@ -221,7 +220,7 @@ test("Examples 1, 2, and 10: manual lock or actual main user start resets exhaus
 	assert.equal(state.snapshot.exhausted, false);
 });
 
-test("Example 8: invalids re-ask twice without retry consumption, then enter locked decision-failed", () => {
+test("invalid decisions re-ask twice without retry consumption, then decision-fail", () => {
 	const state = controller({ idleDelaySeconds: 3, maxRetries: 2 });
 	state.lock();
 	const { decisionId: activeDecisionId } = openDecision(state);
@@ -280,7 +279,7 @@ test("Example 8: invalids re-ask twice without retry consumption, then enter loc
 	assert.equal(state.onAllObservableIdle().applied, true);
 });
 
-test("Example 9: busy cancels the delay and the next all-idle arms full delay for same attempt", () => {
+test("busy cancels the delay and the next all-idle arms the same attempt again", () => {
 	const state = controller({ idleDelaySeconds: 7, maxRetries: 2 });
 	state.lock();
 	const first = armEffect(state.onAllObservableIdle());
@@ -301,7 +300,7 @@ test("Example 9: busy cancels the delay and the next all-idle arms full delay fo
 	assert.notEqual(second.timerId, first.timerId);
 });
 
-test("Slice 2: stale/duplicate idle, timer fires, and decision responses have deterministic guarded outcomes", () => {
+test("stale idle, timer, and decision ids are inert", () => {
 	const state = controller();
 	state.lock();
 	const timer = armEffect(state.onAllObservableIdle());
@@ -319,50 +318,31 @@ test("Slice 2: stale/duplicate idle, timer fires, and decision responses have de
 	);
 });
 
-test("Slice 2: snapshots/effects are immutable and controller copies its validated config values", () => {
+test("snapshots are fresh objects and config values are copied at construction", () => {
 	const suppliedConfig = { idleDelaySeconds: 3, maxRetries: 2 };
 	const state = controller(suppliedConfig);
-	const initial = state.snapshot;
 	const locked = state.lock();
-	assert.equal(Object.isFrozen(initial), true);
-	assert.equal(Object.isFrozen(locked), true);
-	assert.equal(Object.isFrozen(locked.effects), true);
-	assert.equal(Object.isFrozen(locked.effects[0]), true);
-
 	const arm = armEffect(state.onAllObservableIdle());
-	const snapshot = state.snapshot;
-	assert.ok(snapshot.idleTimer);
-	assert.equal(Object.isFrozen(snapshot.idleTimer), true);
+	const snapA = state.snapshot;
+	const snapB = state.snapshot;
+
+	assert.notEqual(snapA, snapB);
+	assert.deepEqual(snapA, snapB);
+	assert.notEqual(locked.effects, state.lock().effects);
+
 	suppliedConfig.idleDelaySeconds = 999;
 	suppliedConfig.maxRetries = 999;
 	assert.equal(arm.delaySeconds, 3);
-	assert.equal(snapshot.idleTimer.delaySeconds, 3);
-	assert.throws(() => {
-		(snapshot as unknown as { attempt: number }).attempt = 99;
-	}, TypeError);
-	assert.throws(() => {
-		(snapshot.idleTimer as { delaySeconds: number }).delaySeconds = 99;
-	}, TypeError);
-});
 
-test("Slice 2: hostile invalid-decision inputs are bounded and do not consume valid retries", () => {
-	const state = controller({ idleDelaySeconds: 3, maxRetries: 2 });
-	state.lock();
-	const { decisionId: activeDecisionId } = openDecision(state);
-
+	const nonString = openDecision(state);
 	const hostile = state.recordInvalidDecision(
-		activeDecisionId,
-		Symbol("hostile"),
+		nonString.decisionId,
+		Symbol("not-a-string"),
 	);
-	assert.deepEqual(hostile.effects, [
-		{
-			kind: "reaskDecision",
-			decisionId: activeDecisionId,
-			invalidDecisionAttempt: 1,
-			error: "Invalid decision.",
-		},
-	]);
-	assert.equal(state.snapshot.attempt, 0);
-	assert.equal(state.snapshot.invalidDecisionAttempts, 1);
-	assert.equal(state.snapshot.lastInvalidDecisionError, "Invalid decision.");
+	assert.equal(
+		hostile.effects[0]?.kind === "reaskDecision"
+			? hostile.effects[0].error
+			: null,
+		"Invalid decision.",
+	);
 });
