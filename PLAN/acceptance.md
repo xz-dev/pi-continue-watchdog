@@ -154,13 +154,13 @@ Per main ownership generation / lock cycle, at least:
 
 ### Entry
 
-**Given** main is locked, not exhausted, not decision-failed, and every observable same-process session is idle  
-**When** idle remains continuous for `idleDelaySeconds × 2^(N-1)` for the current continue attempt `N`  
+**Given** main is locked, not exhausted, not decision-failed, and every observable same-process session is idle
+**When** idle remains continuous for `idleDelaySeconds × 2^(N-1)` for the current continue attempt `N`
 **Then** the plugin:
 
 1. Temporarily offers the main agent **exactly**:
    - `continue_watchdog` with empty/minimal input schema `{}`
-   - `unlock_continue_watchdog` with required `reason: string`  
+   - `unlock_continue_watchdog` with required `reason: string`
      Unlock tool text must say the reason is a **concise single-sentence** reason (validation rules below).
 2. Sends a **hidden custom-role** message—not a user-role message—whose model-visible body is the configured `decisionPrompt` (exact default above). Its default explicitly identifies the extension automation and says it is not a user message or request.
 3. Does **not** send the rejected direct-continuation “keep working / call unlock while tools remain normal” message as the idle wake path.
@@ -196,7 +196,7 @@ On invalid decision:
 5. After the **third** invalid attempt:
    - restore **normal** tools
    - remain **locked** and enter **decision-failed** (no idle timer)
-   - TUI warning exactly:  
+   - TUI warning exactly:
      `Continue watchdog decision failed after 3 attempts: <last error>`
    - New actual root user message start or manual `/lock-continue-watchdog` resets failures/attempts and re-arms the cycle
 
@@ -244,8 +244,8 @@ These examples are the accepted product contract. Each is externally observable 
 
 ### Example 1 — Actual main user message auto-locks
 
-**Given** the main session is unlocked or already locked (any prior attempt, exhaustion, or decision-failed state)  
-**When** a **user-role** message actually starts processing on main (not mere queueing)  
+**Given** the main session is unlocked or already locked (any prior attempt, exhaustion, or decision-failed state)
+**When** a **user-role** message actually starts processing on main (not mere queueing)
 **Then**
 
 - `locked` is set to `true` (unconditionally)
@@ -255,8 +255,8 @@ These examples are the accepted product contract. Each is externally observable 
 
 ### Example 2 — Manual lock always assigns and notifies
 
-**Given** main is locked or unlocked  
-**When** the human runs `/lock-continue-watchdog`  
+**Given** main is locked or unlocked
+**When** the human runs `/lock-continue-watchdog`
 **Then**
 
 - `locked` is set to `true`
@@ -266,15 +266,15 @@ These examples are the accepted product contract. Each is externally observable 
 
 ### Example 3 — Manual unlock with optional reason
 
-**Given** main is locked or unlocked, with or without a pending idle timer or decision window  
-**When** the human runs `/unlock-continue-watchdog` with empty/blank reason  
+**Given** main is locked or unlocked, with or without a pending idle timer or decision window
+**When** the human runs `/unlock-continue-watchdog` with empty/blank reason
 **Then**
 
 - unlocked; timers cancelled; attempts/failures reset
 - TUI notifies exactly: `Continue watchdog unlocked`
 - no TUI-only reason entry
 
-**When** the human runs `/unlock-continue-watchdog` with a nonblank reason  
+**When** the human runs `/unlock-continue-watchdog` with a nonblank reason
 **Then**
 
 - unlocked as above
@@ -285,8 +285,8 @@ These examples are the accepted product contract. Each is externally observable 
 
 ### Example 4 — An actually aborted main run automatically unlocks
 
-**Given** a main run starts while the continue watchdog is locked or already unlocked  
-**When** that run ends and Pi reports it as **aborted**  
+**Given** a main run starts while the continue watchdog is locked or already unlocked
+**When** that run ends and Pi reports it as **aborted**
 **Then**
 
 - apply the same unconditional state transition as reasonless `/unlock-continue-watchdog`: unlocked; timers/decision state cancelled; attempts/failures reset; prior normal tools restored
@@ -300,23 +300,23 @@ Ordinary natural idle settle never counts as abort.
 
 ### Example 5 — Locked + all observable idle → exponential delayed **decision entry**
 
-**Given** main is locked, not exhausted, not decision-failed, and every observable same-process session is idle  
-**When** idle remains continuous for `idleDelaySeconds × 2^(N-1)` for the current attempt `N`  
+**Given** main is locked, not exhausted, not decision-failed, and every observable same-process session is idle
+**When** idle remains continuous for `idleDelaySeconds × 2^(N-1)` for the current attempt `N`
 **Then**
 
 - exactly one decision window is opened for that attempt (not a direct continue custom message)
 - active tools are temporarily replaced with exactly `continue_watchdog` and `unlock_continue_watchdog`
 - a **hidden custom-role** decision message uses configured `decisionPrompt` (exact default in Product surface), identifies itself as extension automation, states it is not a user message/request, and is never injected with user role
-- the rejected direct-continuation default  
-  `Continue the task. If you are intentionally waiting for the user or all tasks are complete, call unlock_continue_watchdog.`  
+- the rejected direct-continuation default
+  `Continue the task. If you are intentionally waiting for the user or all tasks are complete, call unlock_continue_watchdog.`
   is **not** used as the idle wake message
 
 With defaults, delays for successive continue attempts begin **3s, 6s, 12s, 24s, …**
 
 ### Example 6 — Valid continue: fold, compact prompt, retry consumption
 
-**Given** a decision window is open  
-**When** the main agent returns a valid `continue_watchdog` decision  
+**Given** a decision window is open
+**When** the main agent returns a valid `continue_watchdog` decision
 **Then**
 
 - normal tools are restored
@@ -328,8 +328,8 @@ With defaults, delays for successive continue attempts begin **3s, 6s, 12s, 24s,
 
 ### Example 7 — Valid unlock: reason notify, fold to nothing, no further work turn
 
-**Given** a decision window is open  
-**When** the main agent returns a valid `unlock_continue_watchdog` with reason e.g. `Waiting for user confirmation on deploy.`  
+**Given** a decision window is open
+**When** the main agent returns a valid `unlock_continue_watchdog` with reason e.g. `Waiting for user confirmation on deploy.`
 **Then**
 
 - normal tools restored; unlocked; timers cancelled; attempts/failures reset
@@ -341,15 +341,15 @@ With defaults, delays for successive continue attempts begin **3s, 6s, 12s, 24s,
 
 ### Example 8 — Invalid decision re-asks then decision-failed
 
-**Given** a decision window is open  
-**When** the model responds invalidly (no tool, both tools, unknown tool, prose-only, empty reason, reason > 500 Unicode characters)  
+**Given** a decision window is open
+**When** the model responds invalidly (no tool, both tools, unknown tool, prose-only, empty reason, reason > 500 Unicode characters)
 **Then**
 
 - immediately re-ask with a hidden prompt that includes the exact previous error and explains invalidity
 - temporary decision-only tools remain
 - invalid re-asks do **not** advance exponential continue attempt / do not count toward `maxRetries`
 
-**When** the third consecutive invalid decision occurs  
+**When** the third consecutive invalid decision occurs
 **Then**
 
 - restore normal tools
@@ -359,19 +359,19 @@ With defaults, delays for successive continue attempts begin **3s, 6s, 12s, 24s,
 
 ### Example 9 — Activity during delay cancels; full delay restarts
 
-**Given** a pending idle timer for the current attempt  
-**When** any observable session becomes busy before the timer fires  
+**Given** a pending idle timer for the current attempt
+**When** any observable session becomes busy before the timer fires
 **Then** that timer is cancelled and must not open a decision window
 
-**When** all observable sessions are idle again  
+**When** all observable sessions are idle again
 **Then** the **full** delay for the **same** current attempt restarts from zero
 
 Stale timer callbacks (wrong generation/epoch/ownership) must not open a decision window or wake main.
 
 ### Example 10 — Exhaustion after max valid continues
 
-**Given** default `maxRetries = 10` and 10 **valid continue** decisions have already been consumed in this lock cycle  
-**When** main remains locked and all observable sessions become idle again  
+**Given** default `maxRetries = 10` and 10 **valid continue** decisions have already been consumed in this lock cycle
+**When** main remains locked and all observable sessions become idle again
 **Then**
 
 - no further idle timer is scheduled
@@ -381,7 +381,7 @@ Stale timer callbacks (wrong generation/epoch/ownership) must not open a decisio
 
 ### Example 11 — Runtime-only lock; clean unlocked on session lifecycle edges
 
-**When** Pi reloads extensions, starts a new session, resumes, restarts, or shuts the attachment down  
+**When** Pi reloads extensions, starts a new session, resumes, restarts, or shuts the attachment down
 **Then**
 
 - lock state is **not** restored from disk
@@ -392,11 +392,11 @@ Stale timer callbacks (wrong generation/epoch/ownership) must not open a decisio
 
 ### Example 12 — Trusted config overrides with safe fallback
 
-**Given** global and/or trusted-project `pi-continue-watchdog.json`  
-**When** valid `idleDelaySeconds`, `maxRetries`, `decisionPrompt`, and/or `continuePrompt` are provided  
+**Given** global and/or trusted-project `pi-continue-watchdog.json`
+**When** valid `idleDelaySeconds`, `maxRetries`, `decisionPrompt`, and/or `continuePrompt` are provided
 **Then** effective config uses field-level override (trusted project over global over defaults)
 
-**When** values are missing, unreadable, or invalid  
+**When** values are missing, unreadable, or invalid
 **Then** retain valid lower-precedence values / defaults and emit bounded diagnostics (no crash, no silent use of nonsense numbers that would fire immediately in an unbounded way)
 
 ### Example 13 — Publication, language, packaging, CI
