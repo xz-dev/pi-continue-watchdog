@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { hasAtMostUnicodeCodePoints, isValidPrompt } from "./config.js";
+import { isValidPrompt } from "./config.js";
 
 /** Stable persisted metadata version for decision exchanges and their fold marker. */
 export const DECISION_PROTOCOL_VERSION = 1;
@@ -13,14 +13,6 @@ export const DECISION_FOLD_MESSAGE_TYPE = "pi-continue-watchdog:decision-fold";
 
 /** Model-bound compact replacement emitted only by the context hook. */
 export const CONTINUATION_MESSAGE_TYPE = "pi-continue-watchdog:continuation";
-
-const MAX_EXCHANGE_ID_LENGTH = 256;
-
-/** Conservative bound for a persisted Pi message content array. */
-export const MAX_PERSISTED_CONTENT_BLOCKS = 1024;
-
-/** Maximum provider tool-call identifier size accepted for a foldable exchange. */
-export const MAX_TOOL_CALL_ID_CHARACTERS = 1024;
 
 export interface DecisionMessageDetails {
 	readonly version: typeof DECISION_PROTOCOL_VERSION;
@@ -74,10 +66,7 @@ export interface DecisionCustomMessage {
 	readonly details: unknown;
 }
 
-type OwnDataProperty =
-	| { readonly kind: "missing" }
-	| { readonly kind: "data"; readonly value: unknown }
-	| { readonly kind: "non-data" };
+type DecisionToolName = "continue_watchdog" | "unlock_continue_watchdog";
 
 type ParsedDecisionMessage = {
 	readonly type: "decision";
@@ -112,12 +101,12 @@ type ParsedPluginMessage =
 
 type ParsedToolCall = {
 	readonly id: string;
-	readonly name: "continue_watchdog" | "unlock_continue_watchdog";
+	readonly name: DecisionToolName;
 };
 
 type ParsedToolResult = {
 	readonly id: string;
-	readonly name: "continue_watchdog" | "unlock_continue_watchdog";
+	readonly name: DecisionToolName;
 };
 
 type FoldedSegment<T extends object> = {
@@ -125,65 +114,22 @@ type FoldedSegment<T extends object> = {
 	readonly replacement: T | undefined;
 };
 
-function readOwnDataProperty(
-	input: unknown,
-	key: PropertyKey,
-): OwnDataProperty {
-	if (
-		input === null ||
-		(typeof input !== "object" && typeof input !== "function")
-	) {
-		return { kind: "missing" };
-	}
-
-	try {
-		const descriptor = Object.getOwnPropertyDescriptor(input, key);
-		if (descriptor === undefined) return { kind: "missing" };
-		if (!Object.hasOwn(descriptor, "value")) return { kind: "non-data" };
-		return { kind: "data", value: descriptor.value };
-	} catch {
-		return { kind: "non-data" };
-	}
+function isObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
 }
 
-function hasExactlyOwnStringKeys(
-	input: unknown,
-	expectedKeys: readonly string[],
-): boolean {
-	if (input === null || typeof input !== "object") return false;
-	try {
-		const keys = Reflect.ownKeys(input);
-		return (
-			keys.length === expectedKeys.length &&
-			keys.every((key) => typeof key === "string" && expectedKeys.includes(key))
-		);
-	} catch {
-		return false;
-	}
+function asString(value: unknown): string | undefined {
+	return typeof value === "string" ? value : undefined;
 }
 
-function ownString(input: unknown, key: string): string | undefined {
-	const value = readOwnDataProperty(input, key);
-	return value.kind === "data" && typeof value.value === "string"
-		? value.value
-		: undefined;
-}
-
-function ownFiniteNumber(input: unknown, key: string): number | undefined {
-	const value = readOwnDataProperty(input, key);
-	return value.kind === "data" &&
-		typeof value.value === "number" &&
-		Number.isFinite(value.value)
-		? value.value
+function asFiniteNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value)
+		? value
 		: undefined;
 }
 
 function validExchangeId(value: unknown): value is string {
-	return (
-		typeof value === "string" &&
-		value.length > 0 &&
-		value.length <= MAX_EXCHANGE_ID_LENGTH
-	);
+	return typeof value === "string" && value.length > 0;
 }
 
 function validCycleId(value: unknown): value is number {
@@ -191,58 +137,59 @@ function validCycleId(value: unknown): value is number {
 }
 
 function validToolCallId(value: unknown): value is string {
-	return (
-		typeof value === "string" &&
-		value.length > 0 &&
-		hasAtMostUnicodeCodePoints(value, MAX_TOOL_CALL_ID_CHARACTERS)
-	);
+	return typeof value === "string" && value.length > 0;
 }
 
-function validPrompt(value: unknown): value is string {
-	return isValidPrompt(value);
+function isDecisionToolName(value: unknown): value is DecisionToolName {
+	return value === "continue_watchdog" || value === "unlock_continue_watchdog";
+}
+
+/**
+ * Pi sendMessage accepts a content string; after reload, custom messages use a
+ * single text block. Accept either normal shape for plugin records.
+ */
+function customContentText(input: unknown): string | undefined {
+	if (!isObject(input)) return undefined;
+	const content = input.content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content) || content.length !== 1) return undefined;
+	const block = content[0];
+	if (
+		!isObject(block) ||
+		block.type !== "text" ||
+		typeof block.text !== "string"
+	) {
+		return undefined;
+	}
+	return block.text;
 }
 
 function decisionDetails(input: unknown): DecisionMessageDetails | undefined {
-	if (!hasExactlyOwnStringKeys(input, ["version", "exchangeId", "cycleId"])) {
-		return undefined;
-	}
-	const version = readOwnDataProperty(input, "version");
-	const exchangeId = ownString(input, "exchangeId");
-	const cycleId = ownFiniteNumber(input, "cycleId");
+	if (!isObject(input)) return undefined;
+	const exchangeId = input.exchangeId;
+	const cycleId = input.cycleId;
 	if (
-		version.kind !== "data" ||
-		version.value !== DECISION_PROTOCOL_VERSION ||
+		input.version !== DECISION_PROTOCOL_VERSION ||
 		!validExchangeId(exchangeId) ||
 		!validCycleId(cycleId)
 	) {
 		return undefined;
 	}
-	return { version: DECISION_PROTOCOL_VERSION, exchangeId, cycleId };
+	return {
+		version: DECISION_PROTOCOL_VERSION,
+		exchangeId,
+		cycleId,
+	};
 }
 
 function foldDetails(input: unknown): DecisionFoldDetails | undefined {
-	if (input === null || typeof input !== "object") return undefined;
-	const outcome = ownString(input, "outcome");
-	const expectedKeys =
-		outcome === "continue"
-			? [
-					"version",
-					"exchangeId",
-					"cycleId",
-					"outcome",
-					"toolCallId",
-					"continuePrompt",
-				]
-			: ["version", "exchangeId", "cycleId", "outcome", "toolCallId"];
-	if (!hasExactlyOwnStringKeys(input, expectedKeys)) return undefined;
-
-	const version = readOwnDataProperty(input, "version");
-	const exchangeId = ownString(input, "exchangeId");
-	const cycleId = ownFiniteNumber(input, "cycleId");
-	const toolCallId = ownString(input, "toolCallId");
+	if (!isObject(input)) return undefined;
+	const exchangeId = input.exchangeId;
+	const cycleId = input.cycleId;
+	const toolCallId = input.toolCallId;
+	const outcome = input.outcome;
 	if (
-		version.kind !== "data" ||
-		version.value !== DECISION_PROTOCOL_VERSION ||
+		input.version !== DECISION_PROTOCOL_VERSION ||
 		!validExchangeId(exchangeId) ||
 		!validCycleId(cycleId) ||
 		!validToolCallId(toolCallId)
@@ -258,178 +205,89 @@ function foldDetails(input: unknown): DecisionFoldDetails | undefined {
 			toolCallId,
 		};
 	}
-	if (outcome !== "continue") return undefined;
-	const continuePrompt = ownString(input, "continuePrompt");
-	if (!validPrompt(continuePrompt)) return undefined;
+	if (outcome !== "continue" || !isValidPrompt(input.continuePrompt)) {
+		return undefined;
+	}
 	return {
 		version: DECISION_PROTOCOL_VERSION,
 		exchangeId,
 		cycleId,
 		outcome,
 		toolCallId,
-		continuePrompt,
+		continuePrompt: input.continuePrompt,
 	};
 }
 
 function parsePluginMessage(input: unknown): ParsedPluginMessage {
-	const role = ownString(input, "role");
-	if (role !== "custom") return { type: "unrelated" };
-	const customType = ownString(input, "customType");
+	if (!isObject(input) || input.role !== "custom") return { type: "unrelated" };
+	const customType = asString(input.customType);
 	if (
 		customType !== DECISION_MESSAGE_TYPE &&
 		customType !== DECISION_FOLD_MESSAGE_TYPE
 	) {
 		return { type: "unrelated" };
 	}
-	const details = readOwnDataProperty(input, "details");
-	const timestamp = ownFiniteNumber(input, "timestamp");
-	if (details.kind !== "data" || timestamp === undefined) {
+
+	const timestamp = asFiniteNumber(input.timestamp);
+	const content = customContentText(input);
+	if (timestamp === undefined || content === undefined)
 		return { type: "invalid" };
-	}
+
 	if (customType === DECISION_MESSAGE_TYPE) {
-		const parsed = decisionDetails(details.value);
-		const content = ownCustomContentText(input);
-		return parsed === undefined || !validPrompt(content)
+		const parsed = decisionDetails(input.details);
+		return parsed === undefined || !isValidPrompt(content)
 			? { type: "invalid" }
 			: { type: "decision", ...parsed };
 	}
 
-	const parsed = foldDetails(details.value);
-	const content = ownCustomContentText(input);
-	if (parsed === undefined || content === undefined) return { type: "invalid" };
-	if (
-		(parsed.outcome === "unlock" && content.length !== 0) ||
-		(parsed.outcome === "continue" && content !== parsed.continuePrompt)
-	) {
-		return { type: "invalid" };
+	const parsed = foldDetails(input.details);
+	if (parsed === undefined) return { type: "invalid" };
+	if (parsed.outcome === "unlock") {
+		return content.length === 0
+			? { type: "fold", ...parsed, timestamp }
+			: { type: "invalid" };
 	}
-	return parsed.outcome === "unlock"
+	return content === parsed.continuePrompt
 		? { type: "fold", ...parsed, timestamp }
-		: { type: "fold", ...parsed, timestamp };
+		: { type: "invalid" };
 }
 
-function ownIndexedDataArray(
-	input: unknown,
-	maxLength: number,
-): readonly unknown[] | undefined {
-	try {
-		if (!Array.isArray(input)) return undefined;
-		const length = Object.getOwnPropertyDescriptor(input, "length");
-		if (
-			length === undefined ||
-			!Object.hasOwn(length, "value") ||
-			!Number.isSafeInteger(length.value) ||
-			length.value < 0 ||
-			length.value > maxLength
-		) {
-			return undefined;
-		}
-		const values: unknown[] = [];
-		for (let index = 0; index < length.value; index += 1) {
-			const item = Object.getOwnPropertyDescriptor(input, String(index));
-			if (item === undefined || !Object.hasOwn(item, "value")) return undefined;
-			values.push(item.value);
-		}
-		return values;
-	} catch {
-		return undefined;
-	}
-}
-
-function strictTextBlockText(input: unknown): string | undefined {
-	if (!hasExactlyOwnStringKeys(input, ["type", "text"])) return undefined;
-	return ownString(input, "type") === "text"
-		? ownString(input, "text")
-		: undefined;
-}
-
-function ownCustomContentText(input: unknown): string | undefined {
-	const content = readOwnDataProperty(input, "content");
-	if (content.kind !== "data") return undefined;
-	if (typeof content.value === "string") return content.value;
-	const blocks = ownIndexedDataArray(
-		content.value,
-		MAX_PERSISTED_CONTENT_BLOCKS,
-	);
-	if (blocks === undefined || blocks.length !== 1) return undefined;
-	return strictTextBlockText(blocks[0]);
-}
-
-function isRecord(value: unknown): value is object {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
+/**
+ * Collect decision tool calls from a normal assistant content array.
+ * Unknown block types keep the exchange unfoldable so raw context is retained.
+ */
 function parseAssistantToolCalls(
 	input: unknown,
 ): readonly ParsedToolCall[] | undefined {
-	if (ownString(input, "role") !== "assistant") return undefined;
-	const content = readOwnDataProperty(input, "content");
-	if (content.kind !== "data") return undefined;
-	const blocks = ownIndexedDataArray(
-		content.value,
-		MAX_PERSISTED_CONTENT_BLOCKS,
-	);
-	if (blocks === undefined) return undefined;
+	if (!isObject(input) || input.role !== "assistant") return undefined;
+	if (!Array.isArray(input.content)) return undefined;
 
 	const calls: ParsedToolCall[] = [];
-	for (let index = 0; index < blocks.length; index += 1) {
-		const block = blocks[index];
-		const type = ownString(block, "type");
-		if (type === "text") {
-			if (ownString(block, "text") === undefined) return undefined;
+	for (const block of input.content) {
+		if (!isObject(block)) return undefined;
+		if (block.type === "text") {
+			if (typeof block.text !== "string") return undefined;
 			continue;
 		}
-		if (type === "thinking") {
-			if (ownString(block, "thinking") === undefined) return undefined;
+		if (block.type === "thinking") {
+			if (typeof block.thinking !== "string") return undefined;
 			continue;
 		}
-		if (type !== "toolCall") return undefined;
+		if (block.type !== "toolCall") return undefined;
 
-		const id = ownString(block, "id");
-		const name = ownString(block, "name");
-		const argumentsValue = readOwnDataProperty(block, "arguments");
-		if (
-			!validToolCallId(id) ||
-			(name !== "continue_watchdog" && name !== "unlock_continue_watchdog") ||
-			argumentsValue.kind !== "data" ||
-			!isRecord(argumentsValue.value)
-		) {
-			return undefined;
-		}
+		const id = asString(block.id);
+		const name = block.name;
+		if (!validToolCallId(id) || !isDecisionToolName(name)) return undefined;
 		calls.push({ id, name });
 	}
 	return calls;
 }
 
-function validToolResultContentBlock(input: unknown): boolean {
-	const type = ownString(input, "type");
-	if (type === "text") return ownString(input, "text") !== undefined;
-	if (type === "image") {
-		return (
-			ownString(input, "data") !== undefined &&
-			ownString(input, "mimeType") !== undefined
-		);
-	}
-	return false;
-}
-
 function parseToolResult(input: unknown): ParsedToolResult | undefined {
-	if (ownString(input, "role") !== "toolResult") return undefined;
-	const id = ownString(input, "toolCallId");
-	const name = ownString(input, "toolName");
-	const content = readOwnDataProperty(input, "content");
-	const blocks =
-		content.kind === "data"
-			? ownIndexedDataArray(content.value, MAX_PERSISTED_CONTENT_BLOCKS)
-			: undefined;
-	if (
-		!validToolCallId(id) ||
-		(name !== "continue_watchdog" && name !== "unlock_continue_watchdog") ||
-		blocks === undefined ||
-		!blocks.every(validToolResultContentBlock)
-	) {
-		return undefined;
-	}
+	if (!isObject(input) || input.role !== "toolResult") return undefined;
+	const id = asString(input.toolCallId);
+	const name = input.toolName;
+	if (!validToolCallId(id) || !isDecisionToolName(name)) return undefined;
 	return { id, name };
 }
 
@@ -441,11 +299,11 @@ function createContinuationMessage<T extends object>(
 		customType: CONTINUATION_MESSAGE_TYPE,
 		content: [{ type: "text", text: marker.continuePrompt }],
 		display: false,
-		details: Object.freeze({
+		details: {
 			version: DECISION_PROTOCOL_VERSION,
 			exchangeId: marker.exchangeId,
 			outcome: "continue" as const,
-		}),
+		},
 		timestamp: marker.timestamp,
 	} as T;
 }
@@ -456,6 +314,7 @@ function findFoldedSegment<T extends object>(
 	start: ParsedDecisionMessage,
 ): FoldedSegment<T> | undefined {
 	let cycleId = start.cycleId;
+	// Only the final re-ask cycle's call/result pair may validate the fold marker.
 	const calls = new Map<string, ParsedToolCall>();
 	const results = new Map<string, ParsedToolResult>();
 
@@ -463,6 +322,7 @@ function findFoldedSegment<T extends object>(
 		const message = messages[index];
 		const pluginMessage = parsePluginMessage(message);
 		if (pluginMessage.type === "invalid") return undefined;
+
 		if (pluginMessage.type === "decision") {
 			if (
 				pluginMessage.exchangeId !== start.exchangeId ||
@@ -471,28 +331,31 @@ function findFoldedSegment<T extends object>(
 				return undefined;
 			}
 			cycleId = pluginMessage.cycleId;
+			calls.clear();
+			results.clear();
 			continue;
 		}
+
 		if (pluginMessage.type === "fold") {
 			if (
 				pluginMessage.exchangeId !== start.exchangeId ||
 				pluginMessage.cycleId !== cycleId ||
-				!calls.has(pluginMessage.toolCallId) ||
-				!results.has(pluginMessage.toolCallId) ||
-				calls.size !== results.size
+				calls.size !== 1 ||
+				results.size !== 1
 			) {
 				return undefined;
 			}
 			const finalCall = calls.get(pluginMessage.toolCallId);
 			const finalResult = results.get(pluginMessage.toolCallId);
+			const expectedName =
+				pluginMessage.outcome === "continue"
+					? "continue_watchdog"
+					: "unlock_continue_watchdog";
 			if (
 				finalCall === undefined ||
 				finalResult === undefined ||
 				finalCall.name !== finalResult.name ||
-				finalCall.name !==
-					(pluginMessage.outcome === "continue"
-						? "continue_watchdog"
-						: "unlock_continue_watchdog")
+				finalCall.name !== expectedName
 			) {
 				return undefined;
 			}
@@ -505,8 +368,8 @@ function findFoldedSegment<T extends object>(
 			};
 		}
 
-		const role = ownString(message, "role");
-		if (role === "assistant") {
+		if (!isObject(message)) return undefined;
+		if (message.role === "assistant") {
 			const assistantCalls = parseAssistantToolCalls(message);
 			if (assistantCalls === undefined) return undefined;
 			for (const call of assistantCalls) {
@@ -515,7 +378,7 @@ function findFoldedSegment<T extends object>(
 			}
 			continue;
 		}
-		if (role === "toolResult") {
+		if (message.role === "toolResult") {
 			const result = parseToolResult(message);
 			const call = result === undefined ? undefined : calls.get(result.id);
 			if (
@@ -530,8 +393,7 @@ function findFoldedSegment<T extends object>(
 			continue;
 		}
 
-		// A decision response may contain only assistant/tool records and hidden
-		// re-asks. A user or unrelated custom/system record is never safe to erase.
+		// User, system, or unrelated custom messages are never safe to erase.
 		return undefined;
 	}
 
@@ -548,20 +410,20 @@ export function createDecisionPromptMessage(
 	if (
 		!validExchangeId(input.exchangeId) ||
 		!validCycleId(input.cycleId) ||
-		!validPrompt(input.decisionPrompt)
+		!isValidPrompt(input.decisionPrompt)
 	) {
 		throw new TypeError("invalid decision prompt message input");
 	}
-	return Object.freeze({
+	return {
 		customType: DECISION_MESSAGE_TYPE,
 		content: input.decisionPrompt,
 		display: false,
-		details: Object.freeze({
+		details: {
 			version: DECISION_PROTOCOL_VERSION,
 			exchangeId: input.exchangeId,
 			cycleId: input.cycleId,
-		}),
-	});
+		},
+	};
 }
 
 /**
@@ -579,35 +441,35 @@ export function createDecisionFoldMessage(
 		throw new TypeError("invalid decision fold message input");
 	}
 	if (input.outcome === "continue") {
-		if (!validPrompt(input.continuePrompt)) {
+		if (!isValidPrompt(input.continuePrompt)) {
 			throw new TypeError("invalid decision fold message input");
 		}
-		return Object.freeze({
+		return {
 			customType: DECISION_FOLD_MESSAGE_TYPE,
 			content: input.continuePrompt,
 			display: false,
-			details: Object.freeze({
+			details: {
 				version: DECISION_PROTOCOL_VERSION,
 				exchangeId: input.exchangeId,
 				cycleId: input.cycleId,
 				outcome: "continue" as const,
 				toolCallId: input.toolCallId,
 				continuePrompt: input.continuePrompt,
-			}),
-		});
+			},
+		};
 	}
-	return Object.freeze({
+	return {
 		customType: DECISION_FOLD_MESSAGE_TYPE,
 		content: "",
 		display: false,
-		details: Object.freeze({
+		details: {
 			version: DECISION_PROTOCOL_VERSION,
 			exchangeId: input.exchangeId,
 			cycleId: input.cycleId,
 			outcome: "unlock" as const,
 			toolCallId: input.toolCallId,
-		}),
-	});
+		},
+	};
 }
 
 /**
@@ -616,28 +478,25 @@ export function createDecisionFoldMessage(
  * Any malformed or interleaved sequence fails closed by preserving raw messages.
  */
 export function foldDecisionContext<T extends object>(messages: T[]): T[] {
-	try {
-		if (!Array.isArray(messages)) return messages;
-		const folded: T[] = [];
-		let changed = false;
-		for (let index = 0; index < messages.length; index += 1) {
-			const message = messages[index];
-			const pluginMessage = parsePluginMessage(message);
-			if (pluginMessage.type === "invalid") return messages;
-			if (pluginMessage.type !== "decision") {
-				folded.push(message);
-				continue;
-			}
-			const segment = findFoldedSegment(messages, index, pluginMessage);
-			if (segment === undefined) return messages;
-			if (segment.replacement !== undefined) folded.push(segment.replacement);
-			index = segment.endIndex;
-			changed = true;
+	if (!Array.isArray(messages)) return messages;
+
+	const folded: T[] = [];
+	let changed = false;
+	for (let index = 0; index < messages.length; index += 1) {
+		const message = messages[index];
+		const pluginMessage = parsePluginMessage(message);
+		if (pluginMessage.type === "invalid") return messages;
+		if (pluginMessage.type !== "decision") {
+			folded.push(message);
+			continue;
 		}
-		return changed ? folded : messages;
-	} catch {
-		return messages;
+		const segment = findFoldedSegment(messages, index, pluginMessage);
+		if (segment === undefined) return messages;
+		if (segment.replacement !== undefined) folded.push(segment.replacement);
+		index = segment.endIndex;
+		changed = true;
 	}
+	return changed ? folded : messages;
 }
 
 /** Register the public Pi context hook; no session entry is mutated or removed. */
