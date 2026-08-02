@@ -137,11 +137,47 @@ function isAssistantMessageEntry(
 	return { stopReason: stopReason.value };
 }
 
-function entryId(entry: unknown): string | null | "invalid" {
+/**
+ * Every public Pi SessionEntry exposes an own string `id`. Missing, non-string,
+ * getter, or hostile id descriptors are treated as malformed.
+ */
+function entryId(entry: unknown): string | undefined {
 	const id = readOwnData(entry, "id");
-	if (id.kind === "invalid") return "invalid";
-	if (id.kind !== "value" || typeof id.value !== "string") return null;
+	if (id.kind !== "value" || typeof id.value !== "string") return undefined;
 	return id.value;
+}
+
+/**
+ * Snapshot a public `getBranch()` result into a fresh ordinary array using only
+ * own data descriptors. All Array.isArray / length / index / descriptor probes
+ * stay inside one try so revoked proxies, length traps, index traps, holes,
+ * and accessors fail closed without escaping event dispatch.
+ */
+function captureBranchEntries(input: unknown): readonly unknown[] | undefined {
+	try {
+		if (!Array.isArray(input)) return undefined;
+		const lengthDescriptor = Object.getOwnPropertyDescriptor(input, "length");
+		if (
+			lengthDescriptor === undefined ||
+			!Object.hasOwn(lengthDescriptor, "value") ||
+			!Number.isSafeInteger(lengthDescriptor.value) ||
+			lengthDescriptor.value < 0
+		) {
+			return undefined;
+		}
+		const length = lengthDescriptor.value as number;
+		const values: unknown[] = [];
+		for (let index = 0; index < length; index += 1) {
+			const item = Object.getOwnPropertyDescriptor(input, String(index));
+			if (item === undefined || !Object.hasOwn(item, "value")) {
+				return undefined;
+			}
+			values.push(item.value);
+		}
+		return values;
+	} catch {
+		return undefined;
+	}
 }
 
 /**
@@ -150,25 +186,30 @@ function entryId(entry: unknown): string | null | "invalid" {
  * appended `type: "message"` entry with `message.role === "assistant"`.
  *
  * Fail closed when the boundary leaf is absent (branch switch / compaction /
- * rewrite), the public API is unreadable, or entries are malformed.
+ * rewrite), the public API is unreadable, the branch array is malformed, or
+ * any inspected SessionEntry lacks an own string id.
  */
 export function inspectTerminalAssistantOutcome(
 	sessionManager: unknown,
 	boundaryLeafId: string | null,
 ): TerminalAssistantOutcome {
 	const branchResult = callPublicMethod(sessionManager, "getBranch");
-	if (!branchResult.ok || !Array.isArray(branchResult.value)) {
+	if (!branchResult.ok) {
 		return { kind: "invalid" };
 	}
 
-	const branch = branchResult.value as readonly unknown[];
+	const branch = captureBranchEntries(branchResult.value);
+	if (branch === undefined) {
+		return { kind: "invalid" };
+	}
+
 	let startIndex = 0;
 
 	if (boundaryLeafId !== null) {
 		let found = false;
 		for (let i = 0; i < branch.length; i++) {
 			const id = entryId(branch[i]);
-			if (id === "invalid") return { kind: "invalid" };
+			if (id === undefined) return { kind: "invalid" };
 			if (id === boundaryLeafId) {
 				startIndex = i + 1;
 				found = true;
@@ -180,6 +221,8 @@ export function inspectTerminalAssistantOutcome(
 
 	let terminalStopReason: string | null = null;
 	for (let i = startIndex; i < branch.length; i++) {
+		const id = entryId(branch[i]);
+		if (id === undefined) return { kind: "invalid" };
 		const assistant = isAssistantMessageEntry(branch[i]);
 		if (assistant === "invalid") return { kind: "invalid" };
 		if (assistant !== null) {

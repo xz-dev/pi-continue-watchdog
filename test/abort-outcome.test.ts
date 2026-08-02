@@ -301,6 +301,158 @@ test("pure: inspectTerminalAssistantOutcome only considers the post-boundary suf
 	);
 });
 
+test("pure: malformed branch arrays fail closed without length/index probes escaping", () => {
+	const aborted = assistant("a1", "aborted");
+
+	const lengthTrap = new Proxy([aborted], {
+		getOwnPropertyDescriptor(target, key) {
+			if (key === "length") throw new Error("length trap");
+			return Reflect.getOwnPropertyDescriptor(target, key);
+		},
+	});
+	const indexTrap = new Proxy([aborted], {
+		getOwnPropertyDescriptor(target, key) {
+			if (key === "0") throw new Error("index trap");
+			return Reflect.getOwnPropertyDescriptor(target, key);
+		},
+	});
+	const getTrap = new Proxy([aborted], {
+		get(_target, key) {
+			if (key === "length" || key === "0") {
+				throw new Error("get trap must not be required");
+			}
+			return Reflect.get(_target, key as PropertyKey, _target);
+		},
+	});
+	const { proxy: revokedProxy, revoke } = Proxy.revocable([aborted], {});
+	revoke();
+
+	const sparse = [aborted];
+	sparse.length = 2;
+	const accessor = [] as unknown[];
+	Object.defineProperty(accessor, "0", {
+		get() {
+			throw new Error("must not invoke branch accessor");
+		},
+		configurable: true,
+	});
+	accessor.length = 1;
+	const iteratorHostile = Object.assign([aborted], {
+		[Symbol.iterator](): Iterator<never> {
+			throw new Error("must not iterate getBranch result");
+		},
+	});
+
+	const invalidBranches: readonly unknown[] = [
+		lengthTrap,
+		indexTrap,
+		revokedProxy,
+		sparse,
+		accessor,
+		{ 0: aborted, length: 1 },
+		null,
+		"not-an-array",
+	];
+	for (const branch of invalidBranches) {
+		assert.doesNotThrow(() =>
+			inspectTerminalAssistantOutcome({ getBranch: () => branch }, null),
+		);
+		assert.deepEqual(
+			inspectTerminalAssistantOutcome({ getBranch: () => branch }, null),
+			{ kind: "invalid" },
+		);
+	}
+
+	// Descriptor-based snapshot may still succeed when only `get` is hostile;
+	// that path must not throw and must not spuriously unlock from a trap.
+	assert.doesNotThrow(() =>
+		inspectTerminalAssistantOutcome({ getBranch: () => getTrap }, null),
+	);
+	assert.deepEqual(
+		inspectTerminalAssistantOutcome({ getBranch: () => getTrap }, null),
+		{ kind: "aborted" },
+	);
+	assert.doesNotThrow(() =>
+		inspectTerminalAssistantOutcome({ getBranch: () => iteratorHostile }, null),
+	);
+	assert.deepEqual(
+		inspectTerminalAssistantOutcome({ getBranch: () => iteratorHostile }, null),
+		{ kind: "aborted" },
+	);
+});
+
+test("pure: every inspected branch entry requires an own string id", () => {
+	const missingPrefixId = {
+		type: "message",
+		parentId: null,
+		message: { role: "user" },
+	};
+	const abortedSuffix = assistant("a1", "aborted");
+	assert.deepEqual(
+		inspectTerminalAssistantOutcome(
+			{ getBranch: () => [missingPrefixId, abortedSuffix] },
+			null,
+		),
+		{ kind: "invalid" },
+	);
+	assert.deepEqual(
+		inspectTerminalAssistantOutcome(
+			{
+				getBranch: () => [user("u0"), missingPrefixId, abortedSuffix],
+			},
+			"u0",
+		),
+		{ kind: "invalid" },
+	);
+
+	const missingSuffixId = {
+		type: "message",
+		parentId: "u0",
+		message: { role: "assistant", stopReason: "aborted" },
+	};
+	assert.deepEqual(
+		inspectTerminalAssistantOutcome(
+			{ getBranch: () => [user("u0"), missingSuffixId] },
+			"u0",
+		),
+		{ kind: "invalid" },
+	);
+
+	const nonStringId = {
+		type: "message",
+		id: 42,
+		parentId: null,
+		message: { role: "assistant", stopReason: "aborted" },
+	};
+	assert.deepEqual(
+		inspectTerminalAssistantOutcome({ getBranch: () => [nonStringId] }, null),
+		{ kind: "invalid" },
+	);
+
+	const getterId = Object.defineProperty(
+		{
+			type: "message",
+			parentId: null,
+			message: { role: "assistant", stopReason: "aborted" },
+		},
+		"id",
+		{
+			get() {
+				throw new Error("must not invoke id getter");
+			},
+			enumerable: true,
+			configurable: true,
+		},
+	);
+	assert.doesNotThrow(() =>
+		inspectTerminalAssistantOutcome({ getBranch: () => [getterId] }, null),
+	);
+	assert.deepEqual(
+		inspectTerminalAssistantOutcome({ getBranch: () => [getterId] }, null),
+		{ kind: "invalid" },
+	);
+});
+
 test("Example 4: aborted terminal assistant unlocks, notifies, restores, and appends no reason entry", async () => {
 	const harness = createAbortHarness({ locked: true });
 	harness.append(user("u0"));
@@ -587,6 +739,52 @@ test("Example 4: malformed and proxy entries do not throw or unlock", async () =
 	await assert.doesNotReject(async () => harness2.settle());
 	assert.equal(harness2.controller.snapshot.locked, true);
 	assert.deepEqual(harness2.notifications, []);
+});
+
+test("Example 4: hostile getBranch arrays and missing entry ids neither throw nor unlock", async () => {
+	const aborted = assistant("a1", "aborted");
+
+	const cases: Array<() => unknown> = [
+		() =>
+			new Proxy([aborted], {
+				getOwnPropertyDescriptor(target, key) {
+					if (key === "length") throw new Error("length trap");
+					return Reflect.getOwnPropertyDescriptor(target, key);
+				},
+			}),
+		() =>
+			new Proxy([aborted], {
+				getOwnPropertyDescriptor(target, key) {
+					if (key === "0") throw new Error("index trap");
+					return Reflect.getOwnPropertyDescriptor(target, key);
+				},
+			}),
+		() => {
+			const { proxy, revoke } = Proxy.revocable([aborted], {});
+			revoke();
+			return proxy;
+		},
+		() => [
+			{ type: "message", parentId: null, message: { role: "user" } },
+			aborted,
+		],
+		() => [
+			{
+				type: "message",
+				parentId: null,
+				message: { role: "assistant", stopReason: "aborted" },
+			},
+		],
+	];
+
+	for (const makeBranch of cases) {
+		const harness = createAbortHarness({ locked: true });
+		await harness.start();
+		harness.sessionManager.getBranch = () => makeBranch() as BranchEntry[];
+		await assert.doesNotReject(async () => harness.settle());
+		assert.equal(harness.controller.snapshot.locked, true);
+		assert.deepEqual(harness.notifications, []);
+	}
 });
 
 test("Example 4: a new agent_start supersedes the prior capture", async () => {
