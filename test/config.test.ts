@@ -10,6 +10,7 @@ import {
 	DEFAULT_DECISION_PROMPT,
 	loadConfigText,
 	MAX_IDLE_DELAY_SECONDS,
+	MAX_PROMPT_CHARACTERS,
 	MAX_RETRIES,
 	MAX_TIMER_DELAY_MS,
 	MIN_IDLE_DELAY_SECONDS,
@@ -343,6 +344,35 @@ test("C0 bounds: accepted extremes produce timer delays <= Node setTimeout max",
 	assert.equal(minBoundary.config.idleDelaySeconds, MIN_IDLE_DELAY_SECONDS);
 	assert.equal(minBoundary.config.maxRetries, MIN_RETRIES);
 	assert.deepEqual(minBoundary.diagnostics, []);
+});
+
+test("I2: prompts use a shared Unicode-code-point bound without truncation", () => {
+	const atLimit = "😀".repeat(MAX_PROMPT_CHARACTERS);
+	const overLimit = `${atLimit}😀`;
+	const valid = validateConfig("global", {
+		decisionPrompt: atLimit,
+		continuePrompt: atLimit,
+	});
+	assert.equal(valid.config.decisionPrompt, atLimit);
+	assert.equal(valid.config.continuePrompt, atLimit);
+	assert.deepEqual(valid.diagnostics, []);
+
+	const invalid = validateConfig("project", {
+		decisionPrompt: overLimit,
+		continuePrompt: overLimit,
+	});
+	assert.equal(invalid.config.decisionPrompt, undefined);
+	assert.equal(invalid.config.continuePrompt, undefined);
+	assert.deepEqual(invalid.diagnostics, [
+		{
+			source: "project",
+			message: `decisionPrompt must be a non-empty string of at most ${MAX_PROMPT_CHARACTERS} Unicode characters`,
+		},
+		{
+			source: "project",
+			message: `continuePrompt must be a non-empty string of at most ${MAX_PROMPT_CHARACTERS} Unicode characters`,
+		},
+	]);
 });
 
 test("C0 bounds: just-outside values are rejected without clamping", () => {

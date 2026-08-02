@@ -16,6 +16,9 @@ export const DEFAULT_DECISION_PROMPT =
 
 export const DEFAULT_CONTINUE_PROMPT = "Continue until all jobs are done.";
 
+/** Maximum prompt size, measured in Unicode code points, accepted from config. */
+export const MAX_PROMPT_CHARACTERS = 16_384;
+
 /** Node.js setTimeout maximum delay in milliseconds (2^31-1). */
 export const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
@@ -148,9 +151,37 @@ function validMaxRetries(value: unknown): value is number {
 	);
 }
 
-/** Non-empty string after trim is required for prompts. */
-function nonEmptyString(value: unknown): value is string {
-	return typeof value === "string" && value.trim().length > 0;
+/**
+ * Count Unicode code points only until the supplied bound is exceeded.
+ *
+ * This deliberately does not allocate a full `Array.from(value)` result for an
+ * untrusted config string. Lone surrogate code units count as one code point,
+ * matching the string iterator / Array.from behavior.
+ */
+export function hasAtMostUnicodeCodePoints(
+	value: string,
+	maximum: number,
+): boolean {
+	let codePoints = 0;
+	for (let index = 0; index < value.length; codePoints += 1) {
+		if (codePoints >= maximum) return false;
+		const first = value.charCodeAt(index);
+		const second = value.charCodeAt(index + 1);
+		index +=
+			first >= 0xd800 && first <= 0xdbff && second >= 0xdc00 && second <= 0xdfff
+				? 2
+				: 1;
+	}
+	return true;
+}
+
+/** Non-blank bounded Unicode string required for configured prompts. */
+export function isValidPrompt(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		hasAtMostUnicodeCodePoints(value, MAX_PROMPT_CHARACTERS) &&
+		value.trim().length > 0
+	);
 }
 
 export function validateConfig(source: string, value: unknown): ConfigResult {
@@ -224,11 +255,14 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 			};
 		}
 		if (decision.kind === "data") {
-			if (nonEmptyString(decision.value)) {
+			if (isValidPrompt(decision.value)) {
 				config.decisionPrompt = decision.value;
 			} else {
 				diagnostics.push(
-					diagnostic(source, "decisionPrompt must be a non-empty string"),
+					diagnostic(
+						source,
+						`decisionPrompt must be a non-empty string of at most ${MAX_PROMPT_CHARACTERS} Unicode characters`,
+					),
 				);
 			}
 		}
@@ -241,11 +275,14 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 			};
 		}
 		if (cont.kind === "data") {
-			if (nonEmptyString(cont.value)) {
+			if (isValidPrompt(cont.value)) {
 				config.continuePrompt = cont.value;
 			} else {
 				diagnostics.push(
-					diagnostic(source, "continuePrompt must be a non-empty string"),
+					diagnostic(
+						source,
+						`continuePrompt must be a non-empty string of at most ${MAX_PROMPT_CHARACTERS} Unicode characters`,
+					),
 				);
 			}
 		}

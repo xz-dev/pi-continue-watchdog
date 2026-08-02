@@ -84,8 +84,8 @@ Continue until all jobs are done.
 |---|---|---|
 | `idleDelaySeconds` | `3` | Base delay in seconds; safe integer in `[1, 3600]` (timer-safe with maxRetries) |
 | `maxRetries` | `10` | Maximum **valid continue** decisions per lock cycle (not invalid re-asks); safe integer in `[1, 10]` |
-| `decisionPrompt` | exact default above | Hidden Pi custom-role body; explicitly identifies extension automation and says it is not a user message/request |
-| `continuePrompt` | exact default above | Compact fold-in after valid continue |
+| `decisionPrompt` | exact default above | Hidden Pi custom-role body; explicitly identifies extension automation and says it is not a user message/request; nonblank and at most 16,384 Unicode code points |
+| `continuePrompt` | exact default above | Compact fold-in after valid continue; nonblank and at most 16,384 Unicode code points |
 
 **Config locations and precedence** (same pattern as sibling Pi plugins):
 
@@ -93,7 +93,7 @@ Continue until all jobs are done.
 2. Global: `$PI_CODING_AGENT_DIR/pi-continue-watchdog.json` (default `~/.pi/agent/pi-continue-watchdog.json`)
 3. Trusted project only: `<cwd>/.pi/pi-continue-watchdog.json` when `ctx.isProjectTrusted()` is true
 
-Trusted-project fields override global field-by-field (`builtins < global < trusted project`). Invalid high-precedence values must not erase valid lower-precedence values; emit bounded diagnostics. Missing files are silent.
+Trusted-project fields override global field-by-field (`builtins < global < trusted project`). Invalid high-precedence values must not erase valid lower-precedence values; emit bounded diagnostics. Missing files are silent. Configured prompt limits count Unicode code points without truncation: exactly 16,384 is valid and longer values are invalid.
 
 **Retry delay formula** for continue attempt `N` (1-based; advances only on **valid continue**):
 

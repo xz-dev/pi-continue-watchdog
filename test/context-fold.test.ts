@@ -2,11 +2,20 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+	type ContextEvent,
+	convertToLlm,
+} from "@earendil-works/pi-coding-agent";
+import { MAX_PROMPT_CHARACTERS } from "../src/config.js";
+import {
 	CONTINUATION_MESSAGE_TYPE,
+	createDecisionFoldMessage,
+	createDecisionPromptMessage,
 	DECISION_FOLD_MESSAGE_TYPE,
 	DECISION_MESSAGE_TYPE,
 	DECISION_PROTOCOL_VERSION,
 	foldDecisionContext,
+	MAX_PERSISTED_CONTENT_BLOCKS,
+	MAX_TOOL_CALL_ID_CHARACTERS,
 	registerDecisionContextFolding,
 } from "../src/context-fold.js";
 
@@ -66,6 +75,28 @@ function text(textContent: string): Record<string, unknown> {
 	return { type: "text", text: textContent };
 }
 
+/**
+ * Pi's persisted CustomMessage shape after reloading a sendMessage string:
+ * role=custom, content=[{ type: "text", text }], and numeric timestamp.
+ * `createCustomMessage` is internal; this source-backed fixture stays on public
+ * imports while `convertToLlm` proves the resulting public AgentMessage shape.
+ */
+function persistedCustomMessage(
+	message: ReturnType<
+		typeof createDecisionPromptMessage | typeof createDecisionFoldMessage
+	>,
+	timestamp: number,
+): Message {
+	return {
+		role: "custom",
+		customType: message.customType,
+		content: [{ type: "text", text: message.content }],
+		display: message.display,
+		details: message.details,
+		timestamp,
+	};
+}
+
 function toolResult(
 	toolCallId: string,
 	toolName: "continue_watchdog" | "unlock_continue_watchdog",
@@ -94,7 +125,9 @@ function foldMarker(options: {
 		role: "custom",
 		customType: DECISION_FOLD_MESSAGE_TYPE,
 		content:
-			options.outcome === "continue" ? (options.continuePrompt ?? "") : "",
+			options.outcome === "continue"
+				? (options.continuePrompt ?? CONTINUE_PROMPT)
+				: "",
 		display: false,
 		details:
 			options.outcome === "continue"
@@ -162,6 +195,217 @@ function validUnlockExchange(): Message[] {
 	];
 }
 
+test("C1: Pi persisted custom blocks round-trip through the installed constructor and fold valid exchanges", () => {
+	const decisionPayload = createDecisionPromptMessage({
+		exchangeId: EXCHANGE_ID,
+		cycleId: 1,
+		decisionPrompt: "hidden decision prompt",
+	});
+	const foldPayload = createDecisionFoldMessage({
+		exchangeId: EXCHANGE_ID,
+		cycleId: 1,
+		outcome: "continue",
+		toolCallId: "continue-call",
+		continuePrompt: CONTINUE_PROMPT,
+	});
+	const decisionRecord = persistedCustomMessage(decisionPayload, 10);
+	const foldRecord = persistedCustomMessage(foldPayload, 13);
+	assert.deepEqual(decisionRecord.content, [
+		{ type: "text", text: "hidden decision prompt" },
+	]);
+	assert.deepEqual(foldRecord.content, [
+		{ type: "text", text: CONTINUE_PROMPT },
+	]);
+
+	const folded = foldDecisionContext([
+		decisionRecord,
+		assistant([toolCall("continue-call", "continue_watchdog", {})], 11),
+		toolResult("continue-call", "continue_watchdog", 12),
+		foldRecord,
+	] as never);
+	assert.equal(folded.length, 1);
+	assert.deepEqual(
+		convertToLlm(folded as unknown as Parameters<typeof convertToLlm>[0]),
+		[
+			{
+				role: "user",
+				content: [{ type: "text", text: CONTINUE_PROMPT }],
+				timestamp: 13,
+			},
+		],
+	);
+});
+
+test("C1: string custom content remains compatible while persisted block arrays are exact", () => {
+	const messages = [
+		decision(EXCHANGE_ID, 1, 10),
+		assistant([toolCall("continue-call", "continue_watchdog", {})], 11),
+		toolResult("continue-call", "continue_watchdog", 12),
+		foldMarker({
+			outcome: "continue",
+			toolCallId: "continue-call",
+			timestamp: 13,
+		}),
+	];
+	assert.equal(foldDecisionContext(messages as never).length, 1);
+});
+
+test("C1/I1: malformed persisted block arrays fail closed without iteration", () => {
+	const invalidContent: readonly unknown[] = [
+		[],
+		[
+			{ type: "text", text: CONTINUE_PROMPT },
+			{ type: "text", text: "" },
+		],
+		[{ type: "image", data: "not-a-decision", mimeType: "image/png" }],
+		[{ type: "text", text: CONTINUE_PROMPT, ignored: true }],
+		new Proxy([{ type: "text", text: CONTINUE_PROMPT }], {
+			getOwnPropertyDescriptor(_target, key) {
+				if (key === "0") throw new Error("must fail closed");
+				return Reflect.getOwnPropertyDescriptor(_target, key);
+			},
+		}),
+	];
+	for (const content of invalidContent) {
+		const messages = validContinueExchange();
+		(messages[3] as Message).content = content;
+		assert.doesNotThrow(() => foldDecisionContext(messages as never));
+		assert.equal(foldDecisionContext(messages as never), messages);
+	}
+
+	const iteratorHostile = validContinueExchange();
+	(iteratorHostile[3] as Message).content = Object.assign(
+		[{ type: "text", text: CONTINUE_PROMPT }],
+		{
+			[Symbol.iterator](): Iterator<never> {
+				throw new Error("must not iterate persisted content");
+			},
+		},
+	);
+	assert.equal(foldDecisionContext(iteratorHostile as never).length, 1);
+});
+
+test("I1: strict indexed arrays reject holes, accessors, and over-limit content", () => {
+	const sparse = [{ type: "text", text: CONTINUE_PROMPT }];
+	sparse.length = 2;
+	const accessor = [] as unknown[];
+	Object.defineProperty(accessor, "0", {
+		get() {
+			throw new Error("must not invoke content accessor");
+		},
+		configurable: true,
+	});
+	accessor.length = 1;
+	const overLimit = Array.from(
+		{ length: MAX_PERSISTED_CONTENT_BLOCKS + 1 },
+		() => ({ type: "text", text: CONTINUE_PROMPT }),
+	);
+
+	for (const content of [sparse, accessor, overLimit]) {
+		const messages = validContinueExchange();
+		(messages[3] as Message).content = content;
+		assert.equal(foldDecisionContext(messages as never), messages);
+	}
+});
+
+test("I1: hostile assistant content arrays fail closed without invoking their iterator", () => {
+	const content = Object.assign(
+		[toolCall("continue-call", "continue_watchdog", {})],
+		{
+			[Symbol.iterator](): Iterator<never> {
+				throw new Error("must not iterate assistant content");
+			},
+		},
+	);
+	const messages = [
+		decision(EXCHANGE_ID, 1, 10),
+		assistant(content, 11),
+		toolResult("continue-call", "continue_watchdog", 12),
+		foldMarker({
+			outcome: "continue",
+			toolCallId: "continue-call",
+			timestamp: 13,
+		}),
+	];
+	assert.doesNotThrow(() => foldDecisionContext(messages as never));
+	assert.equal(foldDecisionContext(messages as never).length, 1);
+});
+
+test("I2: constructor and parser share exact Unicode prompt and tool-call-id bounds", () => {
+	const promptAtLimit = "😀".repeat(MAX_PROMPT_CHARACTERS);
+	const promptOverLimit = `${promptAtLimit}😀`;
+	const idAtLimit = "x".repeat(MAX_TOOL_CALL_ID_CHARACTERS);
+	const idOverLimit = `${idAtLimit}x`;
+
+	assert.doesNotThrow(() =>
+		createDecisionPromptMessage({
+			exchangeId: EXCHANGE_ID,
+			cycleId: 1,
+			decisionPrompt: promptAtLimit,
+		}),
+	);
+	assert.throws(
+		() =>
+			createDecisionPromptMessage({
+				exchangeId: EXCHANGE_ID,
+				cycleId: 1,
+				decisionPrompt: promptOverLimit,
+			}),
+		/invalid decision prompt message input/,
+	);
+	assert.doesNotThrow(() =>
+		createDecisionFoldMessage({
+			exchangeId: EXCHANGE_ID,
+			cycleId: 1,
+			outcome: "continue",
+			toolCallId: idAtLimit,
+			continuePrompt: promptAtLimit,
+		}),
+	);
+	assert.throws(
+		() =>
+			createDecisionFoldMessage({
+				exchangeId: EXCHANGE_ID,
+				cycleId: 1,
+				outcome: "continue",
+				toolCallId: idOverLimit,
+				continuePrompt: CONTINUE_PROMPT,
+			}),
+		/invalid decision fold message input/,
+	);
+	assert.throws(
+		() =>
+			createDecisionFoldMessage({
+				exchangeId: EXCHANGE_ID,
+				cycleId: 1,
+				outcome: "continue",
+				toolCallId: idAtLimit,
+				continuePrompt: promptOverLimit,
+			}),
+		/invalid decision fold message input/,
+	);
+
+	for (const applyInvalidValue of [
+		(messages: Message[], value: string) => {
+			(messages[0]?.details as { exchangeId: string }).exchangeId = value;
+		},
+		(messages: Message[], value: string) => {
+			(messages[1]?.content as Message[])[0] = toolCall(
+				value,
+				"continue_watchdog",
+				{},
+			);
+		},
+		(messages: Message[], value: string) => {
+			(messages[3]?.details as { toolCallId: string }).toolCallId = value;
+		},
+	]) {
+		const messages = validContinueExchange();
+		applyInvalidValue(messages, idOverLimit);
+		assert.equal(foldDecisionContext(messages as never), messages);
+	}
+});
+
 test("Slice 7 RED Example 6: a correlated valid unlock exchange is removed only from model-bound context", () => {
 	const messages = [
 		user("Keep this task.", 1),
@@ -191,7 +435,7 @@ test("Slice 7 RED Example 7: a correlated valid continue exchange becomes exactl
 	assert.deepEqual(folded[1], {
 		role: "custom",
 		customType: CONTINUATION_MESSAGE_TYPE,
-		content: CONTINUE_PROMPT,
+		content: [{ type: "text", text: CONTINUE_PROMPT }],
 		display: false,
 		details: {
 			version: DECISION_PROTOCOL_VERSION,
@@ -229,7 +473,7 @@ test("Slice 7 RED: the complete exchange includes invalid re-ask cycles before t
 		{
 			role: "custom",
 			customType: CONTINUATION_MESSAGE_TYPE,
-			content: CONTINUE_PROMPT,
+			content: [{ type: "text", text: CONTINUE_PROMPT }],
 			display: false,
 			details: {
 				version: DECISION_PROTOCOL_VERSION,
@@ -355,7 +599,7 @@ test("Slice 7 RED: the Pi context hook delegates only a new model-bound message 
 	assert.ok(handler);
 
 	const messages = validContinueExchange();
-	const result = handler({ messages });
+	const result = handler({ messages } as unknown as ContextEvent);
 	assert.deepEqual(
 		result?.messages?.map((message) => (message as Message).customType),
 		[CONTINUATION_MESSAGE_TYPE],
