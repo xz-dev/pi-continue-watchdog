@@ -5,6 +5,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
+import { registerMainAbortUnlock } from "./abort-outcome.js";
 import { registerMainUserAutoLock } from "./auto-lock.js";
 import { createMainCommands } from "./commands.js";
 import { BUILT_IN_CONFIG } from "./config.js";
@@ -57,11 +58,11 @@ export function createContinueWatchdogExtension(
 
 	const applyEffect = (
 		effect: Exclude<ControllerEffect, { readonly kind: "notify" }>,
-		_ctx?: ExtensionCommandContext,
+		_ctx?: ExtensionCommandContext | ExtensionContext,
 	): void => {
 		// Timer and decision runtime orchestration land in Slice 10. Preserve the
 		// active-tool cleanup effect now so a later decision window cannot strand
-		// its pair merely because a main user message reset the controller.
+		// its pair merely because a main user message or abort unlock reset it.
 		if (effect.kind === "restoreDecisionTools") {
 			decisionTools.restoreDecisionTools();
 		}
@@ -107,6 +108,19 @@ export function createContinueWatchdogExtension(
 			},
 		});
 
+		const abortUnlock = registerMainAbortUnlock(pi, {
+			isCurrentMain,
+			getMainClaim(): HubMainClaim | null {
+				if (attachment === null) return null;
+				return hub.mainClaimFor(attachment);
+			},
+			isCurrentMainClaim(claim: HubMainClaim): boolean {
+				return hub.isCurrentMain(claim);
+			},
+			controller,
+			applyEffect,
+		});
+
 		pi.on("session_start", (_event, ctx: ExtensionContext) => {
 			const bound = hub.bind({
 				instance: attachmentInstance,
@@ -123,6 +137,7 @@ export function createContinueWatchdogExtension(
 		});
 
 		pi.on("session_shutdown", () => {
+			abortUnlock.clear();
 			decisionTools.restoreDecisionTools();
 			if (attachment !== null) hub.detach(attachment);
 			attachment = null;
