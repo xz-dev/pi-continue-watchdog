@@ -44,6 +44,8 @@ export interface MainCommandRuntime {
 		effect: CommandRuntimeEffect,
 		ctx: ExtensionCommandContext,
 	): Promise<void> | void;
+	/** Arm from the fresh lock state when the main attachment is already idle. */
+	reconcileIdle?(): void;
 }
 
 interface StaticTextComponent {
@@ -183,6 +185,7 @@ async function handleLock(
 		ctx,
 		undefined,
 	);
+	runtime.reconcileIdle?.();
 }
 
 async function handleUnlock(

@@ -548,7 +548,7 @@ test("extension registers hooks, clears on shutdown, and unlocks through settle"
 		{ type: "agent_settled" },
 		shutdown.ctx,
 	);
-	assert.equal(shutdownController.snapshot.locked, true);
+	assert.equal(shutdownController.snapshot.locked, false);
 	assert.deepEqual(shutdown.notifications, []);
 
 	const unlockController = makeController();
