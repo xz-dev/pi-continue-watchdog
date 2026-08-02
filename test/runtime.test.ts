@@ -511,6 +511,181 @@ test("demotion, shutdown, stale timer, activation and send failures cleanly unlo
 	assert.equal(timer.cleared, true);
 });
 
+test("external unlock after agent_end cancels pending continue before settle", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.openDecision();
+	await harness.executeContinue();
+
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [assistant([toolCall("continue-1", "continue_watchdog", {})])],
+	});
+	const sentBefore = harness.sent.length;
+	const turnsBefore = harness.triggeredTurns;
+
+	harness.runtime.prepareForLockStateChange();
+	harness.runtime.applyTransition(harness.controller.unlock(), undefined, {
+		suppressNotify: true,
+	});
+	assert.deepEqual(harness.activeTools, ["read", "bash"]);
+
+	harness.streaming = false;
+	await harness.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(harness.sent.length, sentBefore);
+	assert.equal(harness.triggeredTurns, turnsBefore);
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.controller.snapshot.idleTimer, null);
+});
+
+test("manual lock after pending continue clears fold and rearms base idle delay", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.openDecision();
+	await harness.executeContinue();
+
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [assistant([toolCall("continue-1", "continue_watchdog", {})])],
+	});
+	const sentBefore = harness.sent.length;
+
+	harness.runtime.prepareForLockStateChange();
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	assert.deepEqual(harness.activeTools, ["read", "bash"]);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+
+	harness.streaming = false;
+	await harness.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(harness.sent.length, sentBefore);
+	harness.runtime.reconcileIdle();
+	assert.equal(harness.clock.records.at(-1)?.delayMs, 3000);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+});
+
+test("shared hub reclaims main after UI shutdown then prefers a new UI bind", async () => {
+	const hub = createObservableAgentHub();
+	const clock = new FakeClock();
+	const config: ContinueWatchdogConfig = {
+		idleDelaySeconds: 3,
+		maxRetries: 2,
+		decisionPrompt: "Decide now.",
+		continuePrompt: "Continue compactly.",
+	};
+
+	function attach(sessionId: string, hasUI: boolean) {
+		const handlers = new Map<string, Handler[]>();
+		const controller = createLockDecisionController(config);
+		const holder = { controller };
+		let activeTools = ["read", "bash"];
+		let captured: string[] | null = null;
+		const tools: DecisionToolActivation = {
+			registerDecisionTools: () => {},
+			initializeDecisionToolsInactive(): boolean {
+				return true;
+			},
+			activateDecisionTools(): boolean {
+				if (captured !== null) return false;
+				captured = [...activeTools];
+				activeTools = ["continue_watchdog", "unlock_continue_watchdog"];
+				return true;
+			},
+			restoreDecisionTools(): boolean {
+				if (captured === null) return false;
+				activeTools = captured;
+				captured = null;
+				return true;
+			},
+			isActive: () => captured !== null,
+			getCapturedActiveTools: () => captured,
+		};
+		const pi = {
+			on(name: string, handler: Handler): void {
+				const list = handlers.get(name) ?? [];
+				list.push(handler);
+				handlers.set(name, list);
+			},
+			sendMessage(): void {},
+			appendEntry(): void {},
+		} as unknown as ExtensionAPI;
+		const runtime = createDecisionRuntime({
+			pi,
+			hub,
+			attachmentInstance: createHubAttachmentInstance(),
+			controllerHolder: holder,
+			decisionTools: tools,
+			injectedController: true,
+			initialConfig: config,
+			clock,
+		});
+		runtime.registerLifecycle();
+		const ctx = {
+			hasUI,
+			cwd: "/project",
+			isIdle: () => true,
+			isProjectTrusted: () => true,
+			sessionManager: { getSessionId: () => sessionId },
+			ui: { notify(): void {} },
+		} as unknown as ExtensionContext;
+		return {
+			runtime,
+			controller,
+			handlers,
+			ctx,
+			async start() {
+				for (const handler of handlers.get("session_start") ?? []) {
+					await handler({ type: "session_start" } as never, ctx);
+				}
+			},
+		};
+	}
+
+	const ui = attach("ui-main", true);
+	const child = attach("child", false);
+	await ui.start();
+	await child.start();
+	assert.equal(ui.runtime.isCurrentMain(), true);
+	assert.equal(child.runtime.isCurrentMain(), false);
+
+	ui.runtime.applyTransition(ui.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	ui.runtime.reconcileIdle();
+	assert.equal(clock.records.length, 1);
+
+	ui.runtime.shutdown();
+	assert.equal(child.runtime.isCurrentMain(), true);
+	assert.equal(hub.snapshot.main?.sessionId, "child");
+	assert.equal(hub.snapshot.main?.hasUI, false);
+
+	child.runtime.applyTransition(child.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	child.runtime.reconcileIdle();
+	assert.equal(clock.records.at(-1)?.delayMs, 3000);
+
+	const nextUi = attach("ui-next", true);
+	await nextUi.start();
+	assert.equal(nextUi.runtime.isCurrentMain(), true);
+	assert.equal(child.runtime.isCurrentMain(), false);
+	assert.equal(hub.snapshot.main?.sessionId, "ui-next");
+	assert.equal(hub.snapshot.main?.hasUI, true);
+
+	nextUi.runtime.applyTransition(nextUi.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	nextUi.runtime.reconcileIdle();
+	assert.equal(clock.records.at(-1)?.delayMs, 3000);
+	assert.equal(nextUi.controller.snapshot.locked, true);
+});
+
 test("effective config loads before binding is reconciled and shutdown blocks late load", async () => {
 	let resolveLoad:
 		| ((value: { config: ContinueWatchdogConfig; diagnostics: [] }) => void)

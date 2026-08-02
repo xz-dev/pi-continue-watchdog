@@ -98,6 +98,9 @@ function createHarness(): CommandHarness {
 	const runtime: MainCommandRuntime = {
 		controller,
 		isCurrentMain: () => currentMain,
+		prepareForLockStateChange(): void {
+			timeline.push("prepare");
+		},
 		applyEffect: async (effect) => {
 			effects.push(effect);
 			timeline.push(effect.kind);
@@ -247,6 +250,7 @@ test("Examples 2-3 RED: command transitions reset exhausted or decision-failed s
 		{ kind: "cancelIdleTimer", timerId: pendingTimer.timerId },
 	]);
 	assert.deepEqual(harness.timeline, [
+		"prepare",
 		"cancelIdleTimer",
 		"notify:Continue watchdog unlocked",
 	]);
@@ -260,6 +264,7 @@ test("Examples 2-3 RED: command transitions reset exhausted or decision-failed s
 		{ kind: "restoreDecisionTools", decisionId: openDecisionId },
 	]);
 	assert.deepEqual(harness.timeline, [
+		"prepare",
 		"restoreDecisionTools",
 		"notify:Continue watchdog unlocked",
 	]);

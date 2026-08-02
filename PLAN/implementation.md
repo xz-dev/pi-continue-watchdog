@@ -260,8 +260,8 @@ Order is dependency-aware. Each slice must leave `master` installable/testable f
 - When locked and all observable idle → arm one-shot timer for current attempt delay
 - Busy → cancel; idle again → full delay restart for same attempt
 - Fire → enter decision window: `setActiveTools` to decision pair; send **hidden** `decisionPrompt` via steer+triggerTurn (or documented equivalent that does not cancel in-flight tools)
-- Wire valid continue → restore tools, fold, advance attempt, allow next idle cycle
-- Wire valid unlock → restore tools, fold to nothing, unlock notify/reason
+- Wire valid continue → end the decision-only turn; after the decision run settles, immediately send the compact fold/continue prompt and start the next ordinary work turn; restore tools, advance attempt, allow next idle cycle
+- Wire valid unlock → restore tools, fold to nothing, unlock notify/reason; no next ordinary work turn
 - After `maxRetries` valid continues → exhausted, no timer
 - session shutdown / demote / reload: unlock clean, clear timers, restore tools, no durable restore
 - Generation guards on callbacks; `unref` timers

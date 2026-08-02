@@ -41,6 +41,11 @@ export interface MainAbortUnlockRuntime {
 	/** True only when the stored claim still identifies the current main. */
 	isCurrentMainClaim(claim: HubMainClaim): boolean;
 	readonly controller: LockDecisionController;
+	/**
+	 * Drop any pending decision finalization before the abort unlock transition
+	 * so a later settle path cannot continue after abort unlock.
+	 */
+	prepareForLockStateChange(): void;
 	applyEffect(
 		effect: AbortUnlockRuntimeEffect,
 		ctx: ExtensionContext,
@@ -184,6 +189,7 @@ export function registerMainAbortUnlock(
 		);
 		if (outcome !== "aborted") return;
 
+		runtime.prepareForLockStateChange();
 		const transition = runtime.controller.unlock();
 		await applyUnlockEffects(transition, runtime, ctx);
 	});

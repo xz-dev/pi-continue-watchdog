@@ -40,6 +40,11 @@ export type CommandRuntimeEffect = Exclude<
 export interface MainCommandRuntime {
 	readonly controller: LockDecisionController;
 	readonly isCurrentMain: () => boolean;
+	/**
+	 * Invalidate any pending decision finalization/timer before lock or unlock so
+	 * a later settle cannot continue after the human command.
+	 */
+	prepareForLockStateChange(): void;
 	applyEffect(
 		effect: CommandRuntimeEffect,
 		ctx: ExtensionCommandContext,
@@ -179,6 +184,7 @@ async function handleLock(
 	ctx: ExtensionCommandContext,
 ): Promise<void> {
 	if (!runtime.isCurrentMain()) return;
+	runtime.prepareForLockStateChange();
 	await applyControllerEffects(
 		runtime.controller.lock().effects,
 		runtime,
@@ -195,6 +201,7 @@ async function handleUnlock(
 	ctx: ExtensionCommandContext,
 ): Promise<void> {
 	if (!runtime.isCurrentMain()) return;
+	runtime.prepareForLockStateChange();
 
 	const reason = normaliseHumanUnlockReason(args);
 	await applyControllerEffects(

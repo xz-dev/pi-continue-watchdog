@@ -108,6 +108,7 @@ export function createContinueWatchdogExtension(
 				return holder.controller;
 			},
 			isCurrentMain: runtime.isCurrentMain,
+			prepareForLockStateChange: () => runtime?.prepareForLockStateChange(),
 			applyEffect: runtime.applyEffect,
 			reconcileIdle: runtime.reconcileIdle,
 		});
@@ -116,6 +117,7 @@ export function createContinueWatchdogExtension(
 		registerMainUserAutoLock(pi, {
 			isCurrentMain: runtime.isCurrentMain,
 			onMainUserMessageStart(): void {
+				runtime?.prepareForLockStateChange();
 				runtime?.applyTransition(
 					holder.controller.onMainUserMessageStart(),
 					undefined,
@@ -133,6 +135,7 @@ export function createContinueWatchdogExtension(
 			get controller() {
 				return holder.controller;
 			},
+			prepareForLockStateChange: () => runtime?.prepareForLockStateChange(),
 			applyEffect: runtime.applyEffect,
 		});
 

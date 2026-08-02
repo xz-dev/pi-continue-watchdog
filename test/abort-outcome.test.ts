@@ -185,6 +185,9 @@ function createAbortHarness(
 			return hub.isCurrentMain(claim);
 		},
 		controller,
+		prepareForLockStateChange() {
+			timeline.push("prepare");
+		},
 		applyEffect(effect) {
 			effects.push(effect);
 			timeline.push(effect.kind);
@@ -325,6 +328,7 @@ test("aborted terminal unlock restores tools then notifies bare text", async () 
 		["restoreDecisionTools"],
 	);
 	assert.deepEqual(harness.timeline, [
+		"prepare",
 		"restoreDecisionTools",
 		"notify:Continue watchdog unlocked",
 	]);
@@ -413,6 +417,9 @@ test("demotion/detach/reclaim and child capture stay inert", async () => {
 			return hub.isCurrentMain(claim);
 		},
 		controller,
+		prepareForLockStateChange() {
+			throw new Error("demoted settle must not prepare");
+		},
 		applyEffect() {
 			throw new Error("demoted settle must not apply effects");
 		},
@@ -447,6 +454,9 @@ test("demotion/detach/reclaim and child capture stay inert", async () => {
 		getMainClaim: () => null,
 		isCurrentMainClaim: () => false,
 		controller: childController,
+		prepareForLockStateChange() {
+			throw new Error("child must not prepare");
+		},
 		applyEffect() {
 			throw new Error("child must not apply effects");
 		},

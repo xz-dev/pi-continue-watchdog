@@ -100,6 +100,11 @@ export interface DecisionRuntime {
 	isCurrentMain(): boolean;
 	getMainClaim(): HubMainClaim | null;
 	isCurrentMainClaim(claim: HubMainClaim): boolean;
+	/**
+	 * Drop any in-flight decision finalization/timer before an external lock
+	 * transition so a later settle cannot continue after human unlock/lock/abort.
+	 */
+	prepareForLockStateChange(): void;
 	applyEffect(
 		effect: Exclude<ControllerEffect, { kind: "notify" }>,
 		ctx?: RuntimeContext,
@@ -199,6 +204,17 @@ export function createDecisionRuntime(
 		}
 	};
 
+	/**
+	 * Invalidate runtime-local decision state before an external controller
+	 * transition. Does not unlock the controller itself.
+	 */
+	const prepareForLockStateChange = (): void => {
+		clearArmedTimer();
+		restoreDecisionTools();
+		activeDecision = null;
+		pendingFinalization = null;
+	};
+
 	const silentlyAbandonDecision = (): void => {
 		const transition = options.controllerHolder.controller.unlock();
 		for (const effect of transition.effects) {
@@ -208,6 +224,16 @@ export function createDecisionRuntime(
 		restoreDecisionTools();
 		activeDecision = null;
 		pendingFinalization = null;
+	};
+
+	/**
+	 * Explicitly reclaim main when the hub has none. Detach never auto-promotes;
+	 * remaining attachments elect the deterministic preferred candidate here.
+	 */
+	const ensureMain = (): void => {
+		if (stopped || attachment === null) return;
+		if (options.hub.snapshot.main !== null) return;
+		options.hub.reclaimMain(attachment);
 	};
 
 	const sendDecisionPrompt = (
@@ -353,6 +379,7 @@ export function createDecisionRuntime(
 	};
 
 	const syncHubState = (): void => {
+		ensureMain();
 		const current = isCurrentMain();
 		if (ownedMain && !current) {
 			applyTransition(options.controllerHolder.controller.unlock(), undefined, {
@@ -506,7 +533,6 @@ export function createDecisionRuntime(
 			});
 			attachment = bound.attachment;
 			options.decisionTools.initializeDecisionToolsInactive();
-			ownedMain = isCurrentMain();
 
 			if (!options.injectedController) {
 				const loaded: LoadedConfig = await loadConfig({
@@ -573,6 +599,7 @@ export function createDecisionRuntime(
 		isCurrentMain,
 		getMainClaim,
 		isCurrentMainClaim: (claim) => options.hub.isCurrentMain(claim),
+		prepareForLockStateChange,
 		applyEffect,
 		applyTransition,
 		reconcileIdle,

@@ -210,7 +210,7 @@ On invalid decision:
 
 - Reasonless (no reason field required or used)
 - Restore normal tools
-- Work continues **immediately** (not `terminate`)
+- The decision-only turn ends, and ordinary work continues automatically without further user input
 - Context hook removes the complete decision prompt / reply / tool call / results and replaces them with **one** compact custom message containing the configured `continuePrompt` (exact default: `Continue until all jobs are done.`)
 - Custom tool renderer folds the continue tool call/result into **one compact TUI line** that surfaces the `continuePrompt` text
 - Consumes **one** exponential retry (attempt advances)
@@ -313,10 +313,10 @@ With defaults, delays for successive continue attempts begin **3s, 6s, 12s, 24s,
 **Then**
 
 - normal tools are restored
+- the decision-only turn ends and ordinary work continues automatically without further user input
 - model-bound context removes the full decision exchange and inserts one compact custom message equal to configured `continuePrompt` (default `Continue until all jobs are done.`)
 - TUI shows a compact single-line rendering for the continue tool call/result including that continue prompt
 - one exponential retry is consumed
-- the agent continues work without `terminate` on the continue tool
 - after settle, if still locked and all observable idle, the **next** exponential delay arms
 
 ### Example 7 — Valid unlock: reason notify, fold to nothing, terminate
