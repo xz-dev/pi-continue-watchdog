@@ -37,6 +37,7 @@ Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would ch
 | 11 | Packed isolated stock-Pi E2E + CI | Complete |
 | 12 | README product docs | Complete |
 | 13 | Publication readiness | Complete (public live Git package) |
+| 14 | Neutral `user-ready` semantic producer | In progress on `feat/neutral-user-ready-hook` |
 
 **Current architecture (indicative filenames; may still be simplified):**
 
@@ -51,6 +52,7 @@ Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would ch
 | Context fold | `src/context-fold.ts` | Model-bound remove/replace of decision exchanges |
 | Render | `src/render.ts` | Compact continue TUI line |
 | Runtime | `src/runtime.ts` | Timers, decision entry, continue/unlock delivery |
+| Semantic hook | `src/semantic-hook.ts` | Neutral `pi:semantic-hook:v1` / `user-ready` producer helpers |
 | Commands | `src/commands.ts` | `/lock-continue-watchdog`, `/unlock-continue-watchdog` |
 | Auto-lock / abort | `src/auto-lock.ts`, `src/abort-outcome.ts` | Main user start lock; aborted-run unlock |
 | Tests / CI | `test/**`, `e2e/**`, `.github/workflows/ci.yml` | Unit + packed stock-Pi E2E |

@@ -379,7 +379,39 @@ Stale timer callbacks (wrong generation/epoch/ownership) must not open a decisio
 - a new actual main user message start or manual `/lock-continue-watchdog` resets attempts and clears exhaustion
 - human unlock and (after a future re-arm) decision unlock still work per Examples 3 and 7
 
-### Example 11 — Runtime-only lock; clean unlocked on session lifecycle edges
+### Example 11 — Terminal automatic stop publishes neutral `user-ready`
+
+**Given** the elected main attachment observes a new aggregate-idle epoch
+**And** the watchdog has finished every automatic action it can take for that epoch
+**When** the terminal stop is one of:
+
+1. Valid AI decision unlock with a validated reason
+2. Max valid continue attempts exhausted
+3. Third invalid decision becomes decision-failed
+
+**Then** the main attachment publishes exactly one fresh plain-data envelope on Pi's public bus channel `pi:semantic-hook:v1`:
+
+```json
+{"version":1,"name":"user-ready","values":{"STOP_KIND":"AI_UNLOCK","REASON":"<validated reason>"}}
+```
+
+or
+
+```json
+{"version":1,"name":"user-ready","values":{"STOP_KIND":"EXHAUSTED"}}
+```
+
+or
+
+```json
+{"version":1,"name":"user-ready","values":{"STOP_KIND":"DECISION_FAILED"}}
+```
+
+**And** it does **not** publish for human `/unlock-continue-watchdog` (with or without reason), canonical/manual/user abort unlock, initial ordinary unlocked idle, valid continue or intermediate decision/settled states, locked normal/pending idle timer, stale/demoted/reloaded ownership, or repeated settled/reconcile in the same terminal epoch.
+
+Only AI decision unlock retains a publication intent/reason until the resulting authoritative aggregate-idle settle. Existing reason validation/trim/length remains authority; decision-failed does not publish last error text. Absence or failure of every consumer must not change watchdog state.
+
+### Example 12 — Runtime-only lock; clean unlocked on session lifecycle edges
 
 **When** Pi reloads extensions, starts a new session, resumes, restarts, or shuts the attachment down
 **Then**
@@ -390,7 +422,8 @@ Stale timer callbacks (wrong generation/epoch/ownership) must not open a decisio
 - normal tools are not left permanently replaced by decision tools after demotion/shutdown
 - no orphaned wakes after demotion/shutdown
 
-### Example 12 — Trusted config overrides with safe fallback
+
+### Example 13 — Trusted config overrides with safe fallback
 
 **Given** global and/or trusted-project `pi-continue-watchdog.json`
 **When** valid `idleDelaySeconds`, `maxRetries`, `decisionPrompt`, and/or `continuePrompt` are provided
@@ -399,7 +432,7 @@ Stale timer callbacks (wrong generation/epoch/ownership) must not open a decisio
 **When** values are missing, unreadable, or invalid
 **Then** retain valid lower-precedence values / defaults and emit bounded diagnostics (no crash, no silent use of nonsense numbers that would fire immediately in an unbounded way)
 
-### Example 13 — Publication, language, packaging, CI
+### Example 14 — Publication, language, packaging, CI
 
 **Then** the shipped project:
 

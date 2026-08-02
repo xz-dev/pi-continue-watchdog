@@ -54,7 +54,33 @@ interface PackedFixture {
 	readonly packageDir: string;
 }
 
-async function makePackedFixture(t: TestContext): Promise<PackedFixture> {
+/**
+ * Independent neutral consumer probe for packed E2E.
+ * Knows only channel `pi:semantic-hook:v1` and the plain envelope schema.
+ * It does not import or name pi-continue-watchdog.
+ */
+const NEUTRAL_SEMANTIC_PROBE_SOURCE = `import { appendFileSync } from "node:fs";
+
+const CHANNEL = "pi:semantic-hook:v1";
+
+export default function registerNeutralSemanticProbe(pi) {
+	pi.on("session_start", () => {
+		const out = process.env.PI_SEMANTIC_PROBE_OUT;
+		if (typeof out !== "string" || out.length === 0) return;
+		pi.events.on(CHANNEL, (data) => {
+			appendFileSync(out, JSON.stringify(data) + "\\n");
+		});
+	});
+}
+`;
+
+async function makePackedFixture(
+	t: TestContext,
+	options?: {
+		readonly withSemanticProbe?: boolean;
+		readonly watchdogConfig?: Record<string, unknown>;
+	},
+): Promise<PackedFixture & { readonly probeOut?: string }> {
 	const root = await mkdtemp(join(tmpdir(), "pi-continue-watchdog-e2e-"));
 	t.after(async () => rm(root, { recursive: true, force: true }));
 	const packDir = join(root, "pack");
@@ -106,11 +132,38 @@ async function makePackedFixture(t: TestContext): Promise<PackedFixture> {
 	assert.equal((await readdir(packageDir)).includes("test"), false);
 	assert.equal((await readdir(packageDir)).includes("e2e"), false);
 
+	const extensions: string[] = [packageDir];
+	let probeOut: string | undefined;
+	if (options?.withSemanticProbe) {
+		const probePath = join(root, "neutral-semantic-probe.mjs");
+		probeOut = join(root, "semantic-probe-out.jsonl");
+		await writeFile(probePath, NEUTRAL_SEMANTIC_PROBE_SOURCE);
+		await writeFile(probeOut, "");
+		extensions.push(probePath);
+	}
+	if (options?.watchdogConfig !== undefined) {
+		await writeFile(
+			join(agentDir, "pi-continue-watchdog.json"),
+			JSON.stringify(options.watchdogConfig),
+		);
+	}
+
 	await writeFile(
 		join(agentDir, "settings.json"),
-		JSON.stringify({ extensions: [packageDir] }),
+		JSON.stringify({ extensions }),
 	);
-	return { root, home, agentDir, cwd, packageDir };
+	return { root, home, agentDir, cwd, packageDir, probeOut };
+}
+
+async function readProbeEnvelopes(
+	probeOut: string,
+): Promise<Array<Record<string, unknown>>> {
+	const raw = await readFile(probeOut, "utf8");
+	return raw
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0)
+		.map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
 function toolNames(request: RequestRecord): string[] {
@@ -240,13 +293,19 @@ async function startMockServer(
 }
 
 async function createSession(
-	fixture: PackedFixture,
+	fixture: PackedFixture & { readonly probeOut?: string },
 	baseUrl: string,
 ): Promise<{ session: AgentSession; extensionPath: string }> {
 	const previousHome = process.env.HOME;
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const previousProbeOut = process.env.PI_SEMANTIC_PROBE_OUT;
 	process.env.HOME = fixture.home;
 	process.env.PI_CODING_AGENT_DIR = fixture.agentDir;
+	if (fixture.probeOut !== undefined) {
+		process.env.PI_SEMANTIC_PROBE_OUT = fixture.probeOut;
+	} else {
+		delete process.env.PI_SEMANTIC_PROBE_OUT;
+	}
 	try {
 		const loader = new DefaultResourceLoader({
 			cwd: fixture.cwd,
@@ -258,7 +317,11 @@ async function createSession(
 		});
 		await loader.reload();
 		assert.deepEqual(loader.getExtensions().errors, []);
-		const [loaded] = loader.getExtensions().extensions;
+		const loaded = loader
+			.getExtensions()
+			.extensions.find((extension) =>
+				extension.path.startsWith(fixture.packageDir),
+			);
 		assert.ok(loaded);
 		assert.equal(loaded.path.startsWith(fixture.packageDir), true);
 
@@ -297,6 +360,9 @@ async function createSession(
 		else process.env.HOME = previousHome;
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		if (previousProbeOut === undefined)
+			delete process.env.PI_SEMANTIC_PROBE_OUT;
+		else process.env.PI_SEMANTIC_PROBE_OUT = previousProbeOut;
 	}
 }
 
@@ -425,4 +491,77 @@ test("packed command unlock and canonical programmatic abort prevent a decision 
 	assert.equal(branchAssistants[0]?.stopReason, "aborted");
 	await new Promise((resolvePromise) => setTimeout(resolvePromise, 3_300));
 	assert.equal(requests.length, 1);
+});
+
+test("packed neutral probe receives AI unlock user-ready and suppresses continue", {
+	timeout: 45_000,
+}, async (t) => {
+	// Continue path: probe must remain empty through decision + continued work.
+	const continueFixture = await makePackedFixture(t, {
+		withSemanticProbe: true,
+		watchdogConfig: { idleDelaySeconds: 1 },
+	});
+	assert.ok(continueFixture.probeOut);
+	const continueServer = await startMockServer(t, [
+		{ kind: "stop" },
+		{ kind: "continue" },
+		{ kind: "stop" },
+	]);
+	const continueSession = await createSession(
+		continueFixture,
+		continueServer.baseUrl,
+	);
+	t.after(() => continueSession.session.dispose());
+
+	await continueSession.session.prompt(
+		"Continue path must not emit user-ready.",
+	);
+	await waitFor(
+		() => continueServer.requests.length === 3,
+		8_000,
+		"continued provider turn with probe",
+	);
+	await continueSession.session.waitForIdle();
+	assert.deepEqual(await readProbeEnvelopes(continueFixture.probeOut), []);
+
+	// AI unlock path: probe receives exactly one AI_UNLOCK envelope with reason.
+	const unlockFixture = await makePackedFixture(t, {
+		withSemanticProbe: true,
+		watchdogConfig: { idleDelaySeconds: 1 },
+	});
+	assert.ok(unlockFixture.probeOut);
+	const unlockServer = await startMockServer(t, [
+		{ kind: "stop" },
+		{ kind: "unlock", reason: "waiting for human review" },
+	]);
+	const unlockSession = await createSession(
+		unlockFixture,
+		unlockServer.baseUrl,
+	);
+	t.after(() => unlockSession.session.dispose());
+
+	await unlockSession.session.prompt("Unlock after the decision check.");
+	await waitFor(
+		() => unlockServer.requests.length === 2,
+		8_000,
+		"unlock decision request",
+	);
+	await unlockSession.session.waitForIdle();
+	const unlockDeadline = Date.now() + 3_000;
+	while ((await readProbeEnvelopes(unlockFixture.probeOut)).length < 1) {
+		if (Date.now() >= unlockDeadline) {
+			throw new Error("Timed out waiting for AI unlock user-ready envelope");
+		}
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	}
+	assert.deepEqual(await readProbeEnvelopes(unlockFixture.probeOut), [
+		{
+			version: 1,
+			name: "user-ready",
+			values: {
+				STOP_KIND: "AI_UNLOCK",
+				REASON: "waiting for human review",
+			},
+		},
+	]);
 });

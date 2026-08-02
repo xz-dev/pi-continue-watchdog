@@ -114,6 +114,20 @@ Delay for continue attempt `N` (1-based, advances only on **valid continue**):
 delaySeconds(N) = idleDelaySeconds × 2^(N - 1)
 ```
 
+
+## Neutral `user-ready` semantic hook
+
+When the elected main attachment reaches a **terminal aggregate-idle** epoch where this extension will not start another automatic decision or continue run, it publishes one fresh plain-data envelope on Pi's public bus:
+
+- Channel: `pi:semantic-hook:v1`
+- Envelope name: `user-ready`
+- Values by stop kind:
+  - AI decision unlock: `{ "STOP_KIND": "AI_UNLOCK", "REASON": "<validated reason>" }`
+  - Max valid continues exhausted: `{ "STOP_KIND": "EXHAUSTED" }`
+  - Third invalid decision: `{ "STOP_KIND": "DECISION_FAILED" }`
+
+Publication is at most once per such terminal idle epoch. It does **not** publish for human `/unlock-continue-watchdog`, abort unlock, valid continue, intermediate decision states, or ordinary unlocked idle. The producer does not import, identify, require, or wait for any consumer (including pi-notify). Delivery is best-effort current-listener-only with no ack, retry, or replay.
+
 ## Scope and limitations
 
 - **“All agents”** means same-process sessions that loaded this extension and are known to its process-local hub. Isolated, out-of-process, or non-extension children may be absent.

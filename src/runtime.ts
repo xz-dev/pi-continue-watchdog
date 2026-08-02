@@ -39,6 +39,7 @@ import type {
 	HubMainClaim,
 	ObservableAgentHub,
 } from "./hub.js";
+import { createUserReadyEnvelope, emitSemanticHook } from "./semantic-hook.js";
 
 export interface RuntimeControllerHolder {
 	controller: LockDecisionController;
@@ -185,6 +186,10 @@ export function createDecisionRuntime(
 	let armedTimer: ArmedTimer | null = null;
 	let activeDecision: ActiveDecision | null = null;
 	let pendingFinalization: PendingFinalization | null = null;
+	/** Retained only for AI decision unlock until the next all-idle settle. */
+	let pendingAiUnlockReason: string | null = null;
+	/** At-most-once publication guard for the current aggregate-idle epoch. */
+	let publishedForIdleEpoch = false;
 
 	const getMainClaim = (): HubMainClaim | null =>
 		attachment === null ? null : options.hub.mainClaimFor(attachment);
@@ -218,6 +223,8 @@ export function createDecisionRuntime(
 		restoreDecisionTools();
 		activeDecision = null;
 		pendingFinalization = null;
+		// Human/abort unlock must not inherit a prior AI unlock publication intent.
+		pendingAiUnlockReason = null;
 	};
 
 	const silentlyAbandonDecision = (): void => {
@@ -229,6 +236,7 @@ export function createDecisionRuntime(
 		restoreDecisionTools();
 		activeDecision = null;
 		pendingFinalization = null;
+		pendingAiUnlockReason = null;
 	};
 
 	/**
@@ -397,6 +405,51 @@ export function createDecisionRuntime(
 		applyTransition(options.controllerHolder.controller.onAllObservableIdle());
 	};
 
+	/**
+	 * Publish neutral `user-ready` at most once for the current all-idle epoch.
+	 * Only AI decision unlock, exhausted, and decision-failed terminal states
+	 * produce a signal. Ordinary unlocked idle never publishes by inference.
+	 */
+	const maybePublishUserReady = (): void => {
+		if (
+			stopped ||
+			!configReady ||
+			!isCurrentMain() ||
+			!options.hub.snapshot.allObservableIdle ||
+			pendingFinalization !== null ||
+			publishedForIdleEpoch
+		) {
+			return;
+		}
+
+		let envelope = null as ReturnType<typeof createUserReadyEnvelope> | null;
+		if (pendingAiUnlockReason !== null) {
+			envelope = createUserReadyEnvelope({
+				STOP_KIND: "AI_UNLOCK",
+				REASON: pendingAiUnlockReason,
+			});
+			pendingAiUnlockReason = null;
+		} else {
+			const snapshot = options.controllerHolder.controller.snapshot;
+			if (snapshot.locked && snapshot.exhausted) {
+				envelope = createUserReadyEnvelope({ STOP_KIND: "EXHAUSTED" });
+			} else if (snapshot.locked && snapshot.decisionFailed) {
+				envelope = createUserReadyEnvelope({
+					STOP_KIND: "DECISION_FAILED",
+				});
+			}
+		}
+
+		if (envelope === null) return;
+		publishedForIdleEpoch = true;
+		try {
+			emitSemanticHook(options.pi.events, envelope);
+		} catch {
+			// Listener failures are contained by Pi's bus; emission itself must
+			// never escape into controller/runtime control flow.
+		}
+	};
+
 	const syncHubState = (): void => {
 		ensureMain();
 		const current = isCurrentMain();
@@ -408,12 +461,16 @@ export function createDecisionRuntime(
 			restoreDecisionTools();
 			activeDecision = null;
 			pendingFinalization = null;
+			pendingAiUnlockReason = null;
+			publishedForIdleEpoch = false;
 		}
 		ownedMain = current;
 		if (!current || !configReady) return;
 		if (options.hub.snapshot.allObservableIdle) {
 			reconcileIdle();
+			maybePublishUserReady();
 		} else {
+			publishedForIdleEpoch = false;
 			applyTransition(options.controllerHolder.controller.onObservableBusy());
 		}
 	};
@@ -422,14 +479,19 @@ export function createDecisionRuntime(
 		if (!stopped) syncHubState();
 	});
 
-	const deliverPending = (ctx: ExtensionContext): void => {
+	/**
+	 * Deliver a cached decision finalization. Returns true when a valid continue
+	 * was dispatched so this settle stays intermediate and must not publish
+	 * terminal `user-ready` yet.
+	 */
+	const deliverPending = (ctx: ExtensionContext): boolean => {
 		const pending = pendingFinalization;
 		if (
 			pending === null ||
 			activeDecision !== pending.active ||
 			!options.hub.isCurrentMain(pending.active.claim)
 		) {
-			return;
+			return false;
 		}
 		pendingFinalization = null;
 		const { finalization, active, cycleId } = pending;
@@ -440,7 +502,7 @@ export function createDecisionRuntime(
 				!active.protocol.advanceAfterReask(cycleId)
 			) {
 				silentlyAbandonDecision();
-				return;
+				return false;
 			}
 			try {
 				sendDecisionPrompt(
@@ -451,7 +513,8 @@ export function createDecisionRuntime(
 			} catch {
 				silentlyAbandonDecision();
 			}
-			return;
+			// Re-ask is still an open decision cycle, not a terminal epoch.
+			return false;
 		}
 
 		restoreDecisionTools();
@@ -465,7 +528,7 @@ export function createDecisionRuntime(
 					),
 				"warning",
 			);
-			return;
+			return false;
 		}
 
 		if (
@@ -474,7 +537,7 @@ export function createDecisionRuntime(
 			finalization.toolCallId === undefined ||
 			finalization.cycleId === undefined
 		) {
-			return;
+			return false;
 		}
 
 		if (finalization.outcome === "continue") {
@@ -489,13 +552,16 @@ export function createDecisionRuntime(
 					}),
 					{ triggerTurn: true, deliverAs: "steer" },
 				);
+				return true;
 			} catch {
 				silentlyAbandonDecision();
+				return false;
 			}
-			return;
 		}
 
 		const reason = finalization.reason ?? "";
+		// Retain AI unlock publication intent until the authoritative all-idle settle.
+		pendingAiUnlockReason = reason;
 		try {
 			options.pi.sendMessage(
 				createDecisionFoldMessage({
@@ -516,6 +582,7 @@ export function createDecisionRuntime(
 		} catch {
 			// The controller is already unlocked and must not be re-armed.
 		}
+		return false;
 	};
 
 	const handleAgentEnd = (event: AgentEndEvent): void => {
@@ -588,7 +655,9 @@ export function createDecisionRuntime(
 
 		options.pi.on("agent_settled", (_event, ctx: ExtensionContext) => {
 			if (attachment !== null) options.hub.markIdle(attachment);
-			deliverPending(ctx);
+			const continued = deliverPending(ctx);
+			// Valid continue remains intermediate; wait for the next real idle epoch.
+			if (!continued) maybePublishUserReady();
 		});
 	};
 
@@ -600,6 +669,8 @@ export function createDecisionRuntime(
 		restoreDecisionTools();
 		activeDecision = null;
 		pendingFinalization = null;
+		pendingAiUnlockReason = null;
+		publishedForIdleEpoch = false;
 		if (attachment !== null) options.hub.detach(attachment);
 		attachment = null;
 		ownedMain = false;
