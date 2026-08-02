@@ -189,11 +189,11 @@ function createAbortHarness(
 	registerMainAbortUnlock(pi, {
 		isCurrentMain(): boolean {
 			if (forceMain !== null) return forceMain;
-			const claim = hub.mainClaimFor(bound.attachment!);
+			const claim = hub.mainClaimFor(bound.attachment);
 			return claim !== null && hub.isCurrentMain(claim);
 		},
 		getMainClaim(): HubMainClaim | null {
-			return hub.mainClaimFor(bound.attachment!);
+			return hub.mainClaimFor(bound.attachment);
 		},
 		isCurrentMainClaim(claim: HubMainClaim): boolean {
 			return hub.isCurrentMain(claim);
@@ -567,11 +567,11 @@ test("Example 4: demoted/detached settle discards capture and does not unlock", 
 		} as unknown as ExtensionAPI,
 		{
 			isCurrentMain(): boolean {
-				const claim = hub.mainClaimFor(headless.attachment!);
+				const claim = hub.mainClaimFor(headless.attachment);
 				return claim !== null && hub.isCurrentMain(claim);
 			},
 			getMainClaim(): HubMainClaim | null {
-				return hub.mainClaimFor(headless.attachment!);
+				return hub.mainClaimFor(headless.attachment);
 			},
 			isCurrentMainClaim(claim: HubMainClaim): boolean {
 				return hub.isCurrentMain(claim);
