@@ -90,7 +90,7 @@ Continue until user assistance is required.
 
 | Key | Default | Notes |
 |---|---|---|
-| `idleDelaySeconds` | `3` | Base delay in seconds; safe integer in `[1, 3600]` (timer-safe with maxRetries) |
+| `idleDelaySeconds` | `3` | Base delay in seconds; any finite number `>= 0`. Zero schedules an asynchronous 0 ms decision and fractions are allowed. |
 | `maxRetries` | `10` | Maximum **valid continue** decisions per lock cycle (not invalid re-asks); safe integer in `[1, 10]` |
 | `decisionPrompt` | exact default above | Hidden custom-role body; explicitly identifies extension automation and says it is not a user message/request; nonblank and at most 16,384 Unicode code points |
 | `continuePrompt` | exact default above | Compact fold-in after valid continue; nonblank and at most 16,384 Unicode code points |
@@ -109,7 +109,7 @@ Trusted-project fields override global field-by-field (`builtins < global < trus
 delaySeconds(N) = idleDelaySeconds × 2^(N - 1)
 ```
 
-With defaults: 3s, 6s, 12s, 24s, … for attempts 1…`maxRetries`.
+With defaults: 3s, 6s, 12s, 24s, … for attempts 1…`maxRetries`. With a zero base, every attempt schedules through a 0 ms timer.
 
 **Non-configurable:** invalid decision re-ask budget is fixed at **3** attempts (not a config key).
 
