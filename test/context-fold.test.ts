@@ -195,7 +195,7 @@ function validUnlockExchange(): Message[] {
 	];
 }
 
-test("C1: Pi persisted custom blocks round-trip through the installed constructor and fold valid exchanges", () => {
+test("C1: source-backed persisted custom blocks fold and convert through the public Pi API", () => {
 	const decisionPayload = createDecisionPromptMessage({
 		exchangeId: EXCHANGE_ID,
 		cycleId: 1,
