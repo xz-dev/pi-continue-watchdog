@@ -166,7 +166,10 @@ class PureLockDecisionController implements LockDecisionController {
 		const idleTimer: IdleTimerIntent = {
 			id: this.nextTimerId++,
 			attempt: this.state.attempt,
-			delaySeconds: this.idleDelaySeconds * 2 ** this.state.attempt,
+			delaySeconds: Math.min(
+				this.idleDelaySeconds * 2 ** this.state.attempt,
+				Number.MAX_VALUE,
+			),
 		};
 		this.state = { ...this.state, idleTimer };
 		return this.applied([

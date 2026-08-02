@@ -34,6 +34,7 @@ interface TimerRecord {
 
 class FakeClock implements RuntimeClock {
 	readonly records: TimerRecord[] = [];
+	private currentTimeMs = 0;
 
 	setTimeout(
 		callback: () => void,
@@ -56,10 +57,17 @@ class FakeClock implements RuntimeClock {
 		(handle as TimerRecord).cleared = true;
 	}
 
+	now(): number {
+		return this.currentTimeMs;
+	}
+
 	fire(index: number): void {
 		const record = this.records[index];
 		assert.ok(record, `expected timer ${index}`);
-		if (!record.cleared) record.callback();
+		if (!record.cleared) {
+			this.currentTimeMs += record.delayMs;
+			record.callback();
+		}
 	}
 }
 
@@ -299,6 +307,95 @@ test("idle arms one unref timer and opens one hidden decision-only window", asyn
 		triggerTurn: true,
 		deliverAs: "steer",
 	});
+});
+
+test("zero idle delay schedules an asynchronous immediate decision", async () => {
+	const harness = createHarness({ config: { idleDelaySeconds: 0 } });
+	await startIdle(harness);
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	harness.runtime.reconcileIdle();
+
+	assert.equal(harness.clock.records.length, 1);
+	assert.equal(harness.clock.records[0]?.delayMs, 0);
+	assert.equal(harness.sent.length, 0);
+	harness.clock.fire(0);
+	assert.equal(harness.sent[0]?.message.customType, DECISION_MESSAGE_TYPE);
+});
+
+test("fractional idle delay is scheduled in milliseconds", async () => {
+	const harness = createHarness({ config: { idleDelaySeconds: 0.5 } });
+	await startIdle(harness);
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	harness.runtime.reconcileIdle();
+
+	assert.equal(harness.clock.records[0]?.delayMs, 500);
+});
+
+test("delays beyond one Node timer are scheduled in bounded chunks", async () => {
+	const maximumTimerDelayMs = 2 ** 31 - 1;
+	const harness = createHarness({
+		config: { idleDelaySeconds: (maximumTimerDelayMs + 1000) / 1000 },
+	});
+	await startIdle(harness);
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	harness.runtime.reconcileIdle();
+
+	assert.equal(harness.clock.records[0]?.delayMs, maximumTimerDelayMs);
+	harness.clock.fire(0);
+	assert.equal(harness.sent.length, 0);
+	assert.equal(harness.clock.records[1]?.delayMs, 1000);
+	harness.clock.fire(1);
+	assert.equal(harness.sent[0]?.message.customType, DECISION_MESSAGE_TYPE);
+});
+
+test("busy activity cancels the current chunk of a long delay", async () => {
+	const maximumTimerDelayMs = 2 ** 31 - 1;
+	const harness = createHarness({
+		config: { idleDelaySeconds: (maximumTimerDelayMs + 1000) / 1000 },
+	});
+	await startIdle(harness);
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	harness.runtime.reconcileIdle();
+	const child = harness.hub.bind({
+		instance: createHubAttachmentInstance(),
+		sessionId: "child",
+		hasUI: false,
+		initialBusy: false,
+	}).attachment;
+
+	harness.hub.markBusy(child);
+	assert.equal(harness.clock.records[0]?.cleared, true);
+	harness.clock.fire(0);
+	assert.equal(harness.clock.records.length, 1);
+	assert.equal(harness.sent.length, 0);
+});
+
+test("the largest finite delay starts with one bounded timer chunk", async () => {
+	const maximumTimerDelayMs = 2 ** 31 - 1;
+	const harness = createHarness({
+		config: { idleDelaySeconds: Number.MAX_VALUE },
+	});
+	await startIdle(harness);
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	harness.runtime.reconcileIdle();
+
+	assert.equal(harness.clock.records.length, 1);
+	assert.equal(harness.clock.records[0]?.delayMs, maximumTimerDelayMs);
+	assert.equal(harness.sent.length, 0);
+	harness.clock.fire(0);
+	assert.equal(harness.sent.length, 0);
+	assert.equal(harness.clock.records[1]?.delayMs, maximumTimerDelayMs);
+	assert.equal(harness.clock.records.length, 2);
 });
 
 test("observable child busy cancels and full idle restarts the same delay", async () => {

@@ -9,13 +9,10 @@ import {
 	DEFAULT_CONTINUE_PROMPT,
 	DEFAULT_DECISION_PROMPT,
 	loadConfigText,
-	MAX_IDLE_DELAY_SECONDS,
 	MAX_PROMPT_CHARACTERS,
 	MAX_RETRIES,
-	MAX_TIMER_DELAY_MS,
 	MIN_IDLE_DELAY_SECONDS,
 	MIN_RETRIES,
-	maxConfiguredDelayMs,
 	mergeConfig,
 	validateConfig,
 } from "../src/config.js";
@@ -144,41 +141,23 @@ test("validateConfig rejects non-objects, arrays, and invalid field types", () =
 	}
 });
 
-test("numeric bounds accept extremes and reject just-outside values without clamping", () => {
-	assert.equal(MIN_IDLE_DELAY_SECONDS, 1);
-	assert.equal(MAX_IDLE_DELAY_SECONDS, 3600);
+test("idle delay accepts every finite nonnegative number while retries keep integer bounds", () => {
+	assert.equal(MIN_IDLE_DELAY_SECONDS, 0);
 	assert.equal(MIN_RETRIES, 1);
 	assert.equal(MAX_RETRIES, 10);
-	assert.equal(
-		maxConfiguredDelayMs(MAX_IDLE_DELAY_SECONDS, MAX_RETRIES),
-		3600 * 1000 * 2 ** 9,
-	);
-	assert.ok(
-		maxConfiguredDelayMs(MAX_IDLE_DELAY_SECONDS, MAX_RETRIES) <=
-			MAX_TIMER_DELAY_MS,
-	);
-	assert.ok(
-		maxConfiguredDelayMs(MAX_IDLE_DELAY_SECONDS, MAX_RETRIES + 1) >
-			MAX_TIMER_DELAY_MS,
-	);
 
-	const ok = validateConfig("global", {
-		idleDelaySeconds: MAX_IDLE_DELAY_SECONDS,
-		maxRetries: MAX_RETRIES,
-	});
-	assert.equal(ok.config.idleDelaySeconds, MAX_IDLE_DELAY_SECONDS);
-	assert.equal(ok.config.maxRetries, MAX_RETRIES);
-	assert.deepEqual(ok.diagnostics, []);
+	for (const idleDelaySeconds of [0, 0.5, 3601, Number.MAX_VALUE]) {
+		const result = validateConfig("global", {
+			idleDelaySeconds,
+			maxRetries: MAX_RETRIES,
+		});
+		assert.equal(result.config.idleDelaySeconds, idleDelaySeconds);
+		assert.equal(result.config.maxRetries, MAX_RETRIES);
+		assert.deepEqual(result.diagnostics, []);
+	}
 
-	const minOk = validateConfig("global", {
-		idleDelaySeconds: MIN_IDLE_DELAY_SECONDS,
-		maxRetries: MIN_RETRIES,
-	});
-	assert.equal(minOk.config.idleDelaySeconds, MIN_IDLE_DELAY_SECONDS);
-	assert.equal(minOk.config.maxRetries, MIN_RETRIES);
-
-	for (const idle of [0, 1.5, MAX_IDLE_DELAY_SECONDS + 1, Number.NaN]) {
-		const result = validateConfig("global", { idleDelaySeconds: idle });
+	for (const idleDelaySeconds of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+		const result = validateConfig("global", { idleDelaySeconds });
 		assert.equal(result.config.idleDelaySeconds, undefined);
 		assert.equal(result.diagnostics.length, 1);
 		assert.match(result.diagnostics[0]?.message ?? "", /idleDelaySeconds/i);
@@ -192,7 +171,7 @@ test("numeric bounds accept extremes and reject just-outside values without clam
 
 	const preserved = mergeConfig(
 		{ idleDelaySeconds: 12, maxRetries: 4 },
-		{ idleDelaySeconds: 3601, maxRetries: 11 },
+		{ idleDelaySeconds: -1, maxRetries: 11 },
 	);
 	assert.equal(preserved.config.idleDelaySeconds, 12);
 	assert.equal(preserved.config.maxRetries, 4);
@@ -367,22 +346,15 @@ test("malformed project JSON keeps global valid values", async (t) => {
 	assert.match(loaded.diagnostics[0]?.message ?? "", /malformed|JSON/i);
 });
 
-test("non-integer idleDelaySeconds is rejected without silent clamp", async (t) => {
+test("fractional idleDelaySeconds loads without clamping", async (t) => {
 	const { agentDir, cwd } = await fixture(t);
 	await writeFile(
 		join(agentDir, "pi-continue-watchdog.json"),
 		JSON.stringify({ idleDelaySeconds: 0.5 }),
 	);
 	const loaded = await loadRuntimeConfig({ cwd, trusted: false, agentDir });
-	assert.equal(
-		loaded.config.idleDelaySeconds,
-		BUILT_IN_CONFIG.idleDelaySeconds,
-	);
-	assert.equal(loaded.diagnostics.length, 1);
-	assert.match(
-		loaded.diagnostics[0]?.message ?? "",
-		/idleDelaySeconds|integer|range/i,
-	);
+	assert.equal(loaded.config.idleDelaySeconds, 0.5);
+	assert.deepEqual(loaded.diagnostics, []);
 });
 
 test("ENOENT is silent while non-ENOENT throw values stay content-free", async (t) => {

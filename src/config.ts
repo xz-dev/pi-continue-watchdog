@@ -3,11 +3,9 @@
  * Precedence: builtins < global < trusted project.
  * Invalid higher-precedence values do not erase valid lower-precedence values.
  *
- * Timer-safe product bounds:
- * - Node setTimeout max is 2^31-1 ms (MAX_TIMER_DELAY_MS).
- * - Retry delay formula: idleDelaySeconds * 1000 * 2^(maxRetries-1).
- * - idleDelaySeconds safe integer in [1, 3600]; maxRetries safe integer in [1, 10].
- * - Worst allowed delay: 3600 * 1000 * 2^9 = 1_843_200_000 <= 2_147_483_647.
+ * Validation:
+ * - idleDelaySeconds is any finite number >= 0; zero schedules a 0 ms timer.
+ * - maxRetries remains a safe integer in [1, 10].
  * Invalid values are rejected (no silent clamp).
  */
 
@@ -20,17 +18,8 @@ export const DEFAULT_CONTINUE_PROMPT =
 /** Maximum prompt size, measured in Unicode code points, accepted from config. */
 export const MAX_PROMPT_CHARACTERS = 16_384;
 
-/** Node.js setTimeout maximum delay in milliseconds (2^31-1). */
-export const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
-
 /** Minimum accepted idleDelaySeconds (inclusive). */
-export const MIN_IDLE_DELAY_SECONDS = 1;
-
-/**
- * Maximum accepted idleDelaySeconds (inclusive).
- * Chosen so maxRetries=10 always stays within Node timer limits at this idle base.
- */
-export const MAX_IDLE_DELAY_SECONDS = 3600;
+export const MIN_IDLE_DELAY_SECONDS = 0;
 
 /** Minimum accepted maxRetries (inclusive). */
 export const MIN_RETRIES = 1;
@@ -92,24 +81,11 @@ function copyBuiltIn(): ContinueWatchdogConfig {
 	};
 }
 
-/**
- * Longest retry delay for a configured base and retry budget.
- * Formula matches zero-based attempt `idleDelaySeconds * 2^attempt` with
- * final attempt index `maxRetries - 1`.
- */
-export function maxConfiguredDelayMs(
-	idleDelaySeconds: number,
-	maxRetries: number,
-): number {
-	return idleDelaySeconds * 1000 * 2 ** (maxRetries - 1);
-}
-
 function validIdleDelaySeconds(value: unknown): value is number {
 	return (
 		typeof value === "number" &&
-		Number.isSafeInteger(value) &&
-		value >= MIN_IDLE_DELAY_SECONDS &&
-		value <= MAX_IDLE_DELAY_SECONDS
+		Number.isFinite(value) &&
+		value >= MIN_IDLE_DELAY_SECONDS
 	);
 }
 
@@ -177,7 +153,7 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 			diagnostics.push(
 				diagnostic(
 					source,
-					"idleDelaySeconds must be a safe integer between 1 and 3600",
+					"idleDelaySeconds must be a finite number greater than or equal to 0",
 				),
 			);
 		}

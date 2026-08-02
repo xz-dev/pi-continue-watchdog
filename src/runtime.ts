@@ -51,13 +51,17 @@ export interface RuntimeTimerHandle {
 export interface RuntimeClock {
 	setTimeout(callback: () => void, delayMs: number): RuntimeTimerHandle;
 	clearTimeout(handle: RuntimeTimerHandle): void;
+	now?(): number;
 }
 
 const nodeClock: RuntimeClock = {
 	setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
 	clearTimeout: (handle) =>
 		clearTimeout(handle as ReturnType<typeof setTimeout>),
+	now: () => Date.now(),
 };
+
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
 interface ActiveDecision {
 	readonly decisionId: number;
@@ -167,6 +171,7 @@ export function createDecisionRuntime(
 	options: DecisionRuntimeOptions,
 ): DecisionRuntime {
 	const clock = options.clock ?? nodeClock;
+	const now = (): number => clock.now?.() ?? Date.now();
 	const createExchangeId = options.createExchangeId ?? randomUUID;
 	const loadConfig = options.loadConfig ?? loadRuntimeConfig;
 	let config: ContinueWatchdogConfig = {
@@ -294,28 +299,42 @@ export function createDecisionRuntime(
 		if (claim === null || !options.hub.isCurrentMain(claim)) return;
 		clearArmedTimer();
 
-		const timer: ArmedTimer = {
-			timerId,
-			claim,
-			handle: clock.setTimeout(() => {
-				if (armedTimer !== timer) return;
-				armedTimer = null;
-				if (
-					stopped ||
-					!options.hub.isCurrentMain(timer.claim) ||
-					!options.hub.snapshot.allObservableIdle ||
-					options.controllerHolder.controller.snapshot.idleTimer?.id !==
-						timer.timerId
-				) {
-					return;
-				}
-				applyTransition(
-					options.controllerHolder.controller.beginDecision(timer.timerId),
-				);
-			}, delaySeconds * 1000),
+		const deadline = Math.min(now() + delaySeconds * 1000, Number.MAX_VALUE);
+		const schedule = (): void => {
+			const delayMs = Math.min(
+				Math.max(0, deadline - now()),
+				MAX_TIMER_DELAY_MS,
+			);
+			const timer: ArmedTimer = {
+				timerId,
+				claim,
+				handle: clock.setTimeout(() => {
+					if (armedTimer !== timer) return;
+					if (
+						stopped ||
+						!options.hub.isCurrentMain(timer.claim) ||
+						!options.hub.snapshot.allObservableIdle ||
+						options.controllerHolder.controller.snapshot.idleTimer?.id !==
+							timer.timerId
+					) {
+						armedTimer = null;
+						return;
+					}
+					if (now() < deadline) {
+						schedule();
+						return;
+					}
+					armedTimer = null;
+					applyTransition(
+						options.controllerHolder.controller.beginDecision(timer.timerId),
+					);
+				}, delayMs),
+			};
+			armedTimer = timer;
+			timer.handle.unref?.();
 		};
-		armedTimer = timer;
-		timer.handle.unref?.();
+
+		schedule();
 	};
 
 	const applyEffect = (

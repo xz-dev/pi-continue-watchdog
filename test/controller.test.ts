@@ -279,6 +279,44 @@ test("invalid decisions re-ask twice without retry consumption, then decision-fa
 	assert.equal(state.onAllObservableIdle().applied, true);
 });
 
+test("zero idle delay stays zero across continued attempts", () => {
+	const state = controller({ idleDelaySeconds: 0, maxRetries: 2 });
+	state.lock();
+	const first = armEffect(state.onAllObservableIdle());
+	assert.equal(first.delaySeconds, 0);
+	const firstDecision = decisionId(state.beginDecision(first.timerId));
+	state.recordValidContinue(firstDecision);
+	const second = armEffect(state.onAllObservableIdle());
+	assert.equal(second.delaySeconds, 0);
+	assert.equal(second.attempt, 1);
+});
+
+test("fractional idle delay doubles after a valid continue", () => {
+	const state = controller({ idleDelaySeconds: 0.25, maxRetries: 2 });
+	state.lock();
+	const first = armEffect(state.onAllObservableIdle());
+	assert.equal(first.delaySeconds, 0.25);
+	const firstDecision = decisionId(state.beginDecision(first.timerId));
+	state.recordValidContinue(firstDecision);
+	const second = armEffect(state.onAllObservableIdle());
+	assert.equal(second.delaySeconds, 0.5);
+});
+
+test("finite idle base keeps finite controller delays through the final retry", () => {
+	const state = controller({
+		idleDelaySeconds: Number.MAX_VALUE,
+		maxRetries: 10,
+	});
+	state.lock();
+
+	for (let attempt = 0; attempt < 10; attempt += 1) {
+		const timer = armEffect(state.onAllObservableIdle());
+		assert.equal(Number.isFinite(timer.delaySeconds), true);
+		assert.equal(timer.delaySeconds, Number.MAX_VALUE);
+		state.recordValidContinue(decisionId(state.beginDecision(timer.timerId)));
+	}
+});
+
 test("busy cancels the delay and the next all-idle arms the same attempt again", () => {
 	const state = controller({ idleDelaySeconds: 7, maxRetries: 2 });
 	state.lock();
