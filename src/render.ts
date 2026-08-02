@@ -15,6 +15,11 @@ export interface ContinueToolRenderers {
 	readonly renderResult: NonNullable<ToolDefinition["renderResult"]>;
 }
 
+export interface UnlockToolRenderers {
+	readonly renderCall: NonNullable<ToolDefinition["renderCall"]>;
+	readonly renderResult: NonNullable<ToolDefinition["renderResult"]>;
+}
+
 export function createContinueToolRenderers(
 	getContinuePrompt: () => string,
 ): ContinueToolRenderers {
@@ -29,6 +34,27 @@ export function createContinueToolRenderers(
 			_context,
 		) {
 			return new Text("", 0, 0);
+		},
+	};
+}
+
+export function createUnlockToolRenderers(): UnlockToolRenderers {
+	return {
+		renderCall(_args, _theme, _context) {
+			return new Text("", 0, 0);
+		},
+		renderResult(result, _options, theme, _context) {
+			const recorded =
+				typeof result.details === "object" &&
+				result.details !== null &&
+				(result.details as { readonly kind?: unknown }).kind ===
+					"decision-recorded";
+			if (recorded) return new Text("", 0, 0);
+
+			const text = result.content
+				.flatMap((content) => (content.type === "text" ? [content.text] : []))
+				.join("\n");
+			return new Text(theme.fg("error", text), 0, 0);
 		},
 	};
 }

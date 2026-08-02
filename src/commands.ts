@@ -2,6 +2,7 @@ import type {
 	EntryRenderer,
 	ExtensionAPI,
 	ExtensionCommandContext,
+	Theme,
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 
@@ -99,10 +100,16 @@ export function wrapTuiText(text: string, width: number): string[] {
 	return lines;
 }
 
-function createStaticTextComponent(text: string): StaticTextComponent {
+function createStaticTextComponent(
+	text: string,
+	theme?: Theme,
+): StaticTextComponent {
 	return {
 		render(width: number): string[] {
-			return wrapTuiText(text, width);
+			const lines = wrapTuiText(text, width);
+			return theme === undefined
+				? lines
+				: lines.map((line) => theme.fg("success", line));
 		},
 		invalidate(): void {
 			// This immutable component has no cached render state.
@@ -129,12 +136,12 @@ function getHumanUnlockReason(entry: unknown): string {
  * added to LLM context; this renderer intentionally has no model-facing path.
  */
 export function createHumanUnlockEntryRenderer(): EntryRenderer<HumanUnlockEntry> {
-	return (entry) => {
+	return (entry, _options, theme) => {
 		const reason = getHumanUnlockReason(entry);
 		const text = reason
-			? `Continue watchdog unlocked: ${reason}`
-			: "Continue watchdog unlocked";
-		return createStaticTextComponent(text);
+			? `✓ Watchdog unlocked · ${reason}`
+			: "✓ Watchdog unlocked";
+		return createStaticTextComponent(text, theme);
 	};
 }
 

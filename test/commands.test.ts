@@ -161,11 +161,17 @@ function armDecision(
 	return decision.decisionId;
 }
 
+const ENTRY_THEME = {
+	fg(_color: string, text: string): string {
+		return text;
+	},
+};
+
 function renderHumanUnlockEntry(data: unknown, width: number): string[] {
 	const component = createHumanUnlockEntryRenderer()(
 		{ data } as never,
 		{ expanded: false } as never,
-		{} as never,
+		ENTRY_THEME as never,
 	);
 	assert.ok(component);
 	return component.render(width);
@@ -295,10 +301,7 @@ test("Example 3 RED: blank reason appends no entry, while a trimmed reason notif
 	const renderer = harness.entryRenderers.get(HUMAN_UNLOCK_ENTRY_TYPE);
 	assert.ok(renderer);
 	const rendered = renderer({ data: harness.entries[0].data }).render(10_000);
-	assert.equal(
-		rendered.join("\n"),
-		"Continue watchdog unlocked: Waiting for input",
-	);
+	assert.equal(rendered.join("\n"), "✓ Watchdog unlocked · Waiting for input");
 });
 
 test("Example 3 RED: human reason truncation is code-point safe at 500 Unicode characters", async () => {
@@ -329,18 +332,22 @@ test("Example 3 RED: human reason preserves internal multiline content", async (
 	);
 	const renderer = createHumanUnlockEntryRenderer();
 	assert.equal(
-		renderer({ data: { reason } } as never, { expanded: false }, {} as never)
+		renderer(
+			{ data: { reason } } as never,
+			{ expanded: false },
+			ENTRY_THEME as never,
+		)
 			?.render(10_000)
 			.join("\n"),
-		`Continue watchdog unlocked: ${reason}`,
+		`✓ Watchdog unlocked · ${reason}`,
 	);
 });
 
 test("Slice 4 RED: unlock-reason entry wraps ASCII text to the current terminal width", () => {
 	assert.deepEqual(renderHumanUnlockEntry({ reason: "alpha" }, 12), [
-		"Continue wat",
-		"chdog unlock",
-		"ed: alpha",
+		"✓ Watchdog u",
+		"nlocked · al",
+		"pha",
 	]);
 });
 
@@ -376,10 +383,9 @@ test("I1 RED: unlock-reason entry uses Pi widths for multi-spacing-mark Thai, La
 
 test("Slice 4 RED: unlock-reason entry preserves multiline empty lines while wrapping", () => {
 	assert.deepEqual(renderHumanUnlockEntry({ reason: "first\n\nthird" }, 10), [
-		"Continue w",
-		"atchdog un",
-		"locked: fi",
-		"rst",
+		"✓ Watchdog",
+		" unlocked ",
+		"· first",
 		"",
 		"third",
 	]);
@@ -388,13 +394,13 @@ test("Slice 4 RED: unlock-reason entry preserves multiline empty lines while wra
 test("Slice 4 RED: unlock-reason entry safely falls back for malformed data and sanitizes terminal controls", () => {
 	for (const data of [undefined, null, {}, { reason: null }, { reason: 42 }]) {
 		assert.deepEqual(renderHumanUnlockEntry(data, 10_000), [
-			"Continue watchdog unlocked",
+			"✓ Watchdog unlocked",
 		]);
 	}
 
 	assert.deepEqual(
 		renderHumanUnlockEntry({ reason: "safe\u001b[31mred\u0007\t" }, 10_000),
-		["Continue watchdog unlocked: safe?[31mred??"],
+		["✓ Watchdog unlocked · safe?[31mred??"],
 	);
 });
 

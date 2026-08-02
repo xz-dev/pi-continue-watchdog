@@ -7,10 +7,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
-import {
-	HUMAN_UNLOCK_ENTRY_TYPE,
-	type HumanUnlockEntry,
-} from "../src/commands.js";
+import type { HumanUnlockEntry } from "../src/commands.js";
 import type { ContinueWatchdogConfig } from "../src/config.js";
 import {
 	DECISION_FOLD_MESSAGE_TYPE,
@@ -385,7 +382,7 @@ test("continued settle rearms exponential delay once and exhausts at max", async
 	assert.equal(harness.controller.snapshot.idleTimer, null);
 });
 
-test("valid unlock folds without a turn, persists reason, and notifies", async () => {
+test("valid unlock folds without a turn and leaves one compact persisted result", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
 	harness.openDecision();
@@ -407,14 +404,11 @@ test("valid unlock folds without a turn, persists reason, and notifies", async (
 	assert.equal(harness.triggeredTurns, turnsBefore);
 	assert.deepEqual(harness.entries, [
 		{
-			type: HUMAN_UNLOCK_ENTRY_TYPE,
+			type: "pi-continue-watchdog:unlock",
 			data: { reason: "waiting for user" },
 		},
 	]);
-	assert.deepEqual(harness.notifications.at(-1), {
-		message: "Continue watchdog unlocked: waiting for user",
-		level: undefined,
-	});
+	assert.deepEqual(harness.notifications, []);
 	assert.equal(harness.controller.snapshot.locked, false);
 });
 

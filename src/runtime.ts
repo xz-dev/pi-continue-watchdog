@@ -497,7 +497,6 @@ export function createDecisionRuntime(
 		} catch {
 			// The controller is already unlocked and must not be re-armed.
 		}
-		ctx.ui.notify(`Continue watchdog unlocked: ${reason}`);
 	};
 
 	const handleAgentEnd = (event: AgentEndEvent): void => {

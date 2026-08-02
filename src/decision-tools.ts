@@ -5,7 +5,10 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-import { createContinueToolRenderers } from "./render.js";
+import {
+	createContinueToolRenderers,
+	createUnlockToolRenderers,
+} from "./render.js";
 
 /** Public model-visible tool name used only during an automated decision window. */
 export const CONTINUE_WATCHDOG_TOOL_NAME = "continue_watchdog";
@@ -202,6 +205,8 @@ export function createDecisionToolActivation(
 			description: UNLOCK_CONTINUE_WATCHDOG_DESCRIPTION,
 			promptSnippet: UNLOCK_CONTINUE_WATCHDOG_PROMPT_SNIPPET,
 			parameters: UNLOCK_CONTINUE_WATCHDOG_PARAMETERS,
+			renderShell: "self",
+			...createUnlockToolRenderers(),
 			async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 				if (
 					!initialized ||

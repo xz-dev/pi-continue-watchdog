@@ -227,6 +227,56 @@ test("registered continue tool uses the compact configured-prompt renderer", () 
 	assert.deepEqual(result.render(120), []);
 });
 
+test("registered unlock tool hides its automated decision trace", () => {
+	const harness = createHarness();
+	const unlockTool = registeredTool(
+		harness,
+		UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
+	);
+	assert.equal(unlockTool.renderShell, "self");
+	assert.ok(unlockTool.renderCall);
+	assert.ok(unlockTool.renderResult);
+
+	const theme = {
+		fg(_color: string, text: string): string {
+			return text;
+		},
+	};
+	const call = unlockTool.renderCall(
+		{ reason: "Waiting for user confirmation." },
+		theme as never,
+		{} as never,
+	);
+	const result = unlockTool.renderResult(
+		{
+			content: [{ type: "text", text: "Decision recorded." }],
+			details: { kind: "decision-recorded" },
+			terminate: true,
+		},
+		{ expanded: false, isPartial: false },
+		theme as never,
+		{} as never,
+	);
+
+	assert.deepEqual(call.render(120), []);
+	assert.deepEqual(result.render(120), []);
+
+	const staleResult = unlockTool.renderResult(
+		{
+			content: [{ type: "text", text: STALE_DECISION_TOOL_MESSAGE }],
+			details: { kind: "stale-decision-tool" },
+			terminate: true,
+		},
+		{ expanded: false, isPartial: false },
+		theme as never,
+		{} as never,
+	);
+	assert.deepEqual(
+		staleResult.render(120).map((line) => line.trimEnd()),
+		[STALE_DECISION_TOOL_MESSAGE],
+	);
+});
+
 test("activation follows initialization and restores an ordered normal-only baseline", () => {
 	const initial = ["read", "bash", "read"];
 	const harness = createHarness(initial);
