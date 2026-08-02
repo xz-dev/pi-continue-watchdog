@@ -36,10 +36,11 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.check.json",
-    "lint": "biome check src test",
-    "format": "biome format --write src test",
+    "lint": "biome check src test e2e",
+    "format": "biome format --write src test e2e",
     "test": "tsx --test test/*.test.ts",
-    "check": "npm run lint && npm run typecheck && npm run test && npm run build"
+    "check": "npm run lint && npm run typecheck && npm run test && npm run build",
+    "test:e2e": "tsx --test e2e/*.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
