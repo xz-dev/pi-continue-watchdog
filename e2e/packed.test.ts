@@ -86,7 +86,7 @@ async function makePackedFixture(t: TestContext): Promise<PackedFixture> {
 		"npm",
 		[
 			"install",
-			"--offline",
+			"--prefer-offline",
 			"--ignore-scripts",
 			"--no-audit",
 			"--no-fund",
