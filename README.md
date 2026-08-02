@@ -37,7 +37,7 @@ Observable behavior only (implementation details may change):
    - `unlock_continue_watchdog` with a concise reason — stop automatic checks
 4. **Continue** injects the compact prompt `Continue until all jobs are done.` (configurable) and ordinary work resumes without further user input.
 5. **Unlock** shows the reason in the TUI and does **not** start another work turn. Future model context drops the decision exchange.
-6. Invalid decisions are re-asked up to **3** times, then the extension stays locked/failed until a new main user message or manual lock.
+6. A decision gets up to **3 total attempts**. After the third invalid response, the extension stays locked/failed until a new main user message or manual lock.
 7. After each valid continue, the next idle delay doubles: default **3s, 6s, 12s, …** up to **10** valid continues per lock cycle.
 8. An **aborted** main run unlocks automatically (reasonless), same as manual unlock without a reason.
 

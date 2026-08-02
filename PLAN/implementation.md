@@ -15,7 +15,7 @@ Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would ch
 - No hostile Proxy / speculative global hardening required for v1.
 - Prefer simple, obvious modules the human can modify later.
 - Core product goal: prevent unexplained AI stops. Remove complexity that does not serve that goal.
-- Final functional review for merges that change behavior: merge-code-reviewer when required by the human.
+- A final `merge-code-reviewer` review is mandatory before publication.
 
 ---
 
@@ -147,6 +147,7 @@ Public English install/behavior/commands/config/limitations/CI/license docs.
 
 ### Slice 13 — Publication readiness — Pending
 
+- Complete a final `merge-code-reviewer` review; this docs-only review does not satisfy that gate
 - Final README/license consistency after human skim
 - Confirm public repo plan `xz-dev/pi-continue-watchdog`
 - No tags/npm unless later authorized
@@ -179,9 +180,10 @@ Continue the task. If you are intentionally waiting for the user or all tasks ar
 |---|---|---|
 | Functional slices 1–11 | Required | Approved + checks green |
 | Scaffold 0, docs 12 | Optional | Checks green; human may skim README |
-| Publish | Human product authority | Explicit yes |
+| Final publication review | `merge-code-reviewer` | Approved + all checks green |
+| Publish | Human product authority | Final review approved + explicit yes |
 
-Independent review contract for functional merges: Critical/Important/Minor; end with `APPROVED` or `CHANGES REQUIRED`. Prefer merge-code-reviewer for final behavior review when requested.
+Independent review contract for functional merges: Critical/Important/Minor; end with `APPROVED` or `CHANGES REQUIRED`. The final publication review must use `merge-code-reviewer`.
 
 ---
 
@@ -203,6 +205,6 @@ Independent review contract for functional merges: Critical/Important/Minor; end
 
 ## Next actions
 
-1. Human skim of README + acceptance wording if desired.
-2. Slice 13 only with explicit publish authority.
+1. Complete the mandatory final `merge-code-reviewer` review and address any Critical/Important findings.
+2. Request explicit human publication authority.
 3. Keep `PLAN/acceptance.md` authoritative for behavior.
