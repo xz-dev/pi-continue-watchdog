@@ -88,15 +88,9 @@ export interface DecisionToolActivationOptions extends DecisionToolExecutors {
 }
 
 export interface DecisionToolActivation {
-	/** Registers the pair once for this Pi extension attachment. */
-	readonly registerDecisionTools: () => void;
 	/**
-	 * Removes registered decision tools from the current active set.
-	 *
-	 * Pi makes registered tools active by default. Runtime wiring MUST invoke this
-	 * for every attachment from `session_start` after Pi has bound its active-tool
-	 * APIs and before that session's first model request. A thrown Pi API call
-	 * leaves initialization incomplete so the later lifecycle callback can retry.
+	 * Marks active-tool management ready without registering decision definitions.
+	 * Runtime wiring invokes this for every attachment from `session_start`.
 	 */
 	readonly initializeDecisionToolsInactive: () => boolean;
 	/**
@@ -164,9 +158,9 @@ export function createDecisionToolExecutors(
 }
 
 /**
- * Registers permanent definitions and owns their temporary active-set visibility.
- * Pi has no public unregister API, so the definitions remain in getAllTools();
- * callers must use this manager to ensure they are model-invisible outside the
+ * Lazily registers the decision definitions and owns their temporary active-set
+ * visibility. Pi has no public unregister API, so after the first main-agent
+ * decision the definitions remain registered but model-invisible outside the
  * narrow decision request window.
  */
 export function createDecisionToolActivation(
@@ -179,7 +173,6 @@ export function createDecisionToolActivation(
 
 	const registerDecisionTools = (): void => {
 		if (registered) return;
-		registered = true;
 
 		pi.registerTool({
 			name: CONTINUE_WATCHDOG_TOOL_NAME,
@@ -218,22 +211,13 @@ export function createDecisionToolActivation(
 				return options.executeUnlock(toolCallId, params.reason, ctx);
 			},
 		});
+		registered = true;
 	};
 
-	registerDecisionTools();
-
 	return {
-		registerDecisionTools,
 		initializeDecisionToolsInactive(): boolean {
 			if (initialized) return false;
 
-			const activeTools = [...pi.getActiveTools()];
-			const inactiveTools = activeTools.filter(
-				(name) => !isDecisionToolName(name),
-			);
-			if (inactiveTools.length !== activeTools.length) {
-				pi.setActiveTools(inactiveTools);
-			}
 			initialized = true;
 			return true;
 		},
@@ -246,13 +230,27 @@ export function createDecisionToolActivation(
 				return false;
 			}
 
-			// Exclude decision names so a reactivated definition is never part of the
-			// restored normal-tool baseline.
+			// Capture the normal baseline before registration because stock Pi activates
+			// newly registered custom tools by default.
 			const baseline = [...pi.getActiveTools()].filter(
 				(name) => !isDecisionToolName(name),
 			);
-			pi.setActiveTools([...DECISION_TOOL_NAMES]);
+			// Publish the captured baseline before registration because stock Pi activates
+			// each newly registered custom tool. Any partial registration or active-set
+			// failure can then be restored by the runtime's normal cleanup path.
 			capturedActiveTools = baseline;
+			try {
+				registerDecisionTools();
+				pi.setActiveTools([...DECISION_TOOL_NAMES]);
+			} catch (error) {
+				try {
+					pi.setActiveTools([...baseline]);
+					capturedActiveTools = null;
+				} catch {
+					// Retain the capture so a later cleanup attempt can restore it.
+				}
+				throw error;
+			}
 			return true;
 		},
 		restoreDecisionTools(): boolean {

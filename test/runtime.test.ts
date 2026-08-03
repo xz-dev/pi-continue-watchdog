@@ -142,7 +142,6 @@ function createHarness(options?: {
 	let runtime: ReturnType<typeof createDecisionRuntime>;
 
 	const tools: DecisionToolActivation = {
-		registerDecisionTools: () => {},
 		initializeDecisionToolsInactive(): boolean {
 			initialized = true;
 			return true;
@@ -965,6 +964,112 @@ test("pending valid continue keeps reconcile inert until fold delivery", async (
 	assert.equal(harness.clock.records.at(-1)?.delayMs, 6000);
 });
 
+test("child completion only makes aggregate idle; exactly one inquiry comes from main", async () => {
+	const config: ContinueWatchdogConfig = {
+		idleDelaySeconds: 3,
+		maxRetries: 2,
+		decisionPrompt: "Decide now.",
+		continuePrompt: "Continue compactly.",
+	};
+	const hub = createObservableAgentHub();
+	const clock = new FakeClock();
+	const sentBy: string[] = [];
+	const activatedBy: string[] = [];
+
+	function attach(sessionId: string, hasUI: boolean) {
+		const handlers = new Map<string, Handler[]>();
+		const controller = createLockDecisionController(config);
+		let active = false;
+		const tools: DecisionToolActivation = {
+			initializeDecisionToolsInactive: () => true,
+			activateDecisionTools(): boolean {
+				activatedBy.push(sessionId);
+				active = true;
+				return true;
+			},
+			restoreDecisionTools(): boolean {
+				const wasActive = active;
+				active = false;
+				return wasActive;
+			},
+			isActive: () => active,
+			getCapturedActiveTools: () => (active ? ["read"] : null),
+		};
+		const pi = {
+			on(event: string, handler: Handler): void {
+				const list = handlers.get(event) ?? [];
+				list.push(handler);
+				handlers.set(event, list);
+			},
+			sendMessage(): void {
+				sentBy.push(sessionId);
+			},
+			appendEntry(): void {},
+		} as unknown as ExtensionAPI;
+		const runtime = createDecisionRuntime({
+			pi,
+			hub,
+			attachmentInstance: createHubAttachmentInstance(),
+			controllerHolder: { controller },
+			decisionTools: tools,
+			injectedController: true,
+			initialConfig: config,
+			clock,
+		});
+		runtime.registerLifecycle();
+		let idle = false;
+		const ctx = {
+			hasUI,
+			cwd: "/project",
+			isIdle: () => idle,
+			isProjectTrusted: () => true,
+			sessionManager: { getSessionId: () => sessionId },
+			ui: { notify(): void {} },
+		} as unknown as ExtensionContext;
+		return {
+			runtime,
+			controller,
+			ctx,
+			async emit(event: string): Promise<void> {
+				if (event === "agent_settled") idle = true;
+				for (const handler of handlers.get(event) ?? []) {
+					await handler({ type: event } as never, ctx);
+				}
+			},
+		};
+	}
+
+	const main = attach("main", true);
+	const firstChild = attach("child-a", false);
+	const lastChild = attach("child-b", false);
+	await main.emit("session_start");
+	await firstChild.emit("session_start");
+	await lastChild.emit("session_start");
+	main.runtime.applyTransition(main.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+
+	await main.emit("agent_settled");
+	assert.equal(clock.records[0]?.delayMs, 0);
+	clock.fire(0);
+	assert.deepEqual(sentBy, []);
+
+	await firstChild.emit("agent_settled");
+	assert.equal(clock.records[1]?.delayMs, 0);
+	clock.fire(1);
+	assert.deepEqual(sentBy, []);
+
+	await lastChild.emit("agent_settled");
+	assert.equal(clock.records[2]?.delayMs, 3000);
+	assert.equal(clock.records[3]?.delayMs, 0);
+	clock.fire(3);
+	assert.deepEqual(sentBy, []);
+	assert.deepEqual(activatedBy, []);
+	clock.fire(2);
+	assert.deepEqual(activatedBy, ["main"]);
+	assert.deepEqual(sentBy, ["main"]);
+});
+
 test("shared hub reclaims main after UI shutdown then prefers a new UI bind", async () => {
 	const hub = createObservableAgentHub();
 	const clock = new FakeClock();
@@ -982,7 +1087,6 @@ test("shared hub reclaims main after UI shutdown then prefers a new UI bind", as
 		let activeTools = ["read", "bash"];
 		let captured: string[] | null = null;
 		const tools: DecisionToolActivation = {
-			registerDecisionTools: () => {},
 			initializeDecisionToolsInactive(): boolean {
 				return true;
 			},

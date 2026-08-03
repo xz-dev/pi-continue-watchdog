@@ -139,7 +139,6 @@ function createSemanticHarness(options?: {
 	});
 
 	const tools: DecisionToolActivation = {
-		registerDecisionTools: () => {},
 		initializeDecisionToolsInactive(): boolean {
 			initialized = true;
 			return true;
