@@ -1,6 +1,6 @@
 # Implementation plan — pi-continue-watchdog
 
-**Status:** Public live Git package on `master`. Slices 0–16 are complete; npm, tags, and GitHub Releases are intentionally not used.
+**Status:** Public live Git package on `master`. Slices 0–17 are complete; npm, tags, and GitHub Releases are intentionally not used.
 **Method:** One vertical behavior slice per branch; RED → GREEN → review (when functional) → merge → next branch
 **Language:** English only for all project artifacts
 
@@ -40,24 +40,25 @@ Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would ch
 | 14 | Neutral `user-ready` semantic producer | Complete |
 | 15 | Universal idle lifecycle state machine | Complete |
 | 16 | Unified reasoned unlock UI | Complete |
+| 17 | Realm-wide process domain + root-only control | Complete |
 
 **Current architecture (indicative filenames; may still be simplified):**
 
 | Area | File(s) | Responsibility |
 |---|---|---|
 | Entry | `src/extension.ts` | Pi lifecycle wiring for one attachment |
-| Hub | `src/hub.ts` | Process-local attachment registry, main election, busy/idle |
-| Config | `src/config.ts`, `src/config-loader.ts` | Defaults, validation, global + trusted-project merge |
+| Hub | `src/hub.ts` | Realm-wide process domain (`globalThis` + versioned `Symbol.for`): attachment registry, main election, busy/idle. Not a module-evaluation singleton. |
+| Config | `src/config.ts`, `src/config-loader.ts` | Defaults, validation, global + trusted-project merge (loaded only by current-main ownership) |
 | Controller | `src/controller.ts` | Lock / attempt / exhaustion / decision-failed state |
 | Decision protocol | `src/decision-protocol.ts` | Validity, re-asks, decision-failed text |
-| Decision tools | `src/decision-tools.ts` | Definitions + temporary active set |
+| Decision tools | `src/decision-tools.ts` | Definitions + temporary active set (main decision window only) |
 | Context fold | `src/context-fold.ts` | Model-bound remove/replace of decision exchanges |
 | Render | `src/render.ts` | Compact continue TUI line |
-| Runtime | `src/runtime.ts` | Timers, decision entry, continue/unlock delivery |
-| Semantic hook | `src/semantic-hook.ts` | Neutral `pi:semantic-hook:v1` / `user-ready` producer helpers |
-| Commands | `src/commands.ts` | `/lock-continue-watchdog`, `/unlock-continue-watchdog` |
+| Runtime | `src/runtime.ts` | Lifecycle observe/report for every attachment; config/controller/timer/decision tools/messages/UI/`user-ready` only under exact current-main generation claim |
+| Semantic hook | `src/semantic-hook.ts` | Neutral `pi:semantic-hook:v1` / `user-ready` producer helpers via ResourceLoader-local `pi.events` (delivery only, not process coordination) |
+| Commands | `src/commands.ts` | `/lock-continue-watchdog`, `/unlock-continue-watchdog` (main-owned) |
 | Auto-lock / abort | `src/auto-lock.ts`, `src/abort-outcome.ts` | Main user fresh-cycle lock; current-main aborted-run unlock |
-| Tests / CI | `test/**`, `e2e/**`, `.github/workflows/ci.yml` | Unit + packed stock-Pi E2E |
+| Tests / CI | `test/**`, `e2e/**`, `.github/workflows/ci.yml` | Unit + packed stock-Pi E2E (incl. multi-ResourceLoader / distinct-cwd) |
 
 **Distribution:** public `xz-dev/pi-continue-watchdog`, installed only with the unpinned command `pi install git:github.com/xz-dev/pi-continue-watchdog`. No npm publication, tags, or GitHub Releases.
 
@@ -111,7 +112,7 @@ Pure controller: fresh lock, non-resetting unlock, ensure-lock, exponential dela
 
 ### Slice 3 — Hub — Complete
 
-Process-local hub, main election, busy/idle snapshots.
+Process-local hub, main election, busy/idle snapshots. (Later corrected by Slice 17: the process domain is realm-wide via `globalThis` + `Symbol.for`, not a module-evaluation singleton.)
 
 ### Slice 4 — Commands / notify — Complete
 
@@ -176,6 +177,28 @@ Publishes a generic same-process semantic hook only for terminal AI unlock, exha
 - Both persist exactly one muted TUI-only `Continue watchdog unlocked · <reason>` entry
 - Reasonless manual/abort unlock notifications remain unchanged
 
+### Slice 17 — Realm-wide process domain + root-only control — Complete
+
+**Problem:** Pi may load this extension through independent `DefaultResourceLoader` instances and independent Jiti/module evaluations in one Node process (including distinct `cwd` values). A module-local hub singleton splits observable-agent membership, main election, and aggregate idle. Child attachments must not run a full control plane.
+
+**Module boundary change:**
+
+| Concern | Boundary |
+|---|---|
+| Same-process coordination | One JavaScript-realm domain in `src/hub.ts`: standard `globalThis` + versioned `Symbol.for(...)`. Survives independent ResourceLoader/Jiti evaluations and distinct cwd values. |
+| Framework inputs | Pi public lifecycle/session APIs only. No other-plugin dependencies and no path heuristics for identity/election. |
+| Attachment roles | Every extension-enabled attachment observes and reports lifecycle. Only the exact current-main generation claim owns config load, controller, timers, decision tools/messages, UI notifies, and `user-ready`. |
+| Non-main attachments | Observer-only: do not load project/global watchdog config and do not register decision tools. |
+| `pi.events` | Remains ResourceLoader-local; used only for semantic-hook delivery, never for process coordination. |
+| Pure headless | First-bound best-effort main is unchanged. |
+| Coverage | Still excludes out-of-process, isolated, and non-extension children. |
+
+**Verification:**
+
+- Unit: process-domain loading under public multi-`DefaultResourceLoader` / distinct-cwd independent evaluations; observer-only control (config unread, no decision-tool registration, root-only effects)
+- Packed stock-Pi E2E: multi-ResourceLoader / distinct-cwd path asserts shared aggregate idle and root-only decision/control effects
+- Acceptance Example 15 remains the product contract
+
 ---
 
 ## Testing strategy
@@ -183,8 +206,9 @@ Publishes a generic same-process semantic hook only for terminal AI unlock, exha
 | Layer | What |
 |---|---|
 | Pure unit | Config, controller, reason validation, decision validity, hub, fold replacements |
-| Extension unit | Commands, tools, hooks with fakes |
-| E2E | Packed artifact + stock Pi; isolated dirs |
+| Extension unit | Commands, tools, hooks with fakes; observer-only vs current-main ownership |
+| Process domain | Independent ResourceLoader/module evaluations share one realm-wide hub |
+| E2E | Packed artifact + stock Pi; isolated dirs; multi-ResourceLoader / distinct-cwd root-only control |
 | ATDD traceability | Tests name acceptance example IDs where practical |
 
 **Stale-string guard:** tests/docs must not reintroduce the rejected direct reminder:
@@ -216,7 +240,9 @@ Independent review contract for functional merges: Critical/Important/Minor; end
 | Stale timers after unlock/demote | Generation/epoch guards |
 | False abort attribution | Only unlock on actual Pi-reported aborted main runs |
 | Decision tools stuck active | Always restore after unlock/continue/failed/demote/shutdown |
-| Over-claiming “all agents” | Observable same-process only |
+| Over-claiming “all agents” | Observable same-process only; exclude out-of-process / isolated / non-extension |
+| Split hub under multi-ResourceLoader | Realm-wide `globalThis` + versioned `Symbol.for` domain |
+| Child full control plane | Non-main is observer-only; exact current-main generation owns control |
 | Queued vs actual user message | Auto-lock only when processing starts |
 | Same-state silent commands | Unconditional assign + exact TUI strings |
 | Context pollution | Fold unlock → nothing; continue → compact prompt only |

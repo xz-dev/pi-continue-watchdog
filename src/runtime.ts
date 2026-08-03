@@ -42,7 +42,7 @@ import type {
 import { createUserReadyEnvelope, emitSemanticHook } from "./semantic-hook.js";
 
 export interface RuntimeControllerHolder {
-	controller: LockDecisionController;
+	controller: LockDecisionController | null;
 }
 
 export interface RuntimeTimerHandle {
@@ -100,7 +100,7 @@ export interface DecisionRuntimeOptions {
 }
 
 export interface DecisionRuntime {
-	readonly controller: LockDecisionController;
+	readonly controller: LockDecisionController | null;
 	readonly config: ContinueWatchdogConfig;
 	isCurrentMain(): boolean;
 	getMainClaim(): HubMainClaim | null;
@@ -117,7 +117,10 @@ export interface DecisionRuntime {
 	applyTransition(
 		transition: ControllerTransition,
 		ctx?: RuntimeContext,
-		options?: { readonly suppressNotify?: boolean },
+		options?: {
+			readonly suppressNotify?: boolean;
+			readonly claim?: HubMainClaim;
+		},
 	): void;
 	reconcileIdle(): void;
 	executeDecisionTool(
@@ -175,11 +178,16 @@ export function createDecisionRuntime(
 	const now = (): number => clock.now?.() ?? Date.now();
 	const createExchangeId = options.createExchangeId ?? randomUUID;
 	const loadConfig = options.loadConfig ?? loadRuntimeConfig;
+	const injectedController = options.injectedController
+		? options.controllerHolder.controller
+		: null;
 	let config: ContinueWatchdogConfig = {
 		...(options.initialConfig ?? BUILT_IN_CONFIG),
 	};
 	let attachment: HubAttachment | null = null;
-	let ownedMain = false;
+	let ownedClaim: HubMainClaim | null = null;
+	let sessionContext: ExtensionContext | null = null;
+	let configLoad: Promise<void> | null = null;
 	let configReady = options.injectedController === true;
 	let lifecycleGeneration = 0;
 	/** Bumps on every agent_start so deferred settled wakes cannot outlive that run. */
@@ -198,9 +206,23 @@ export function createDecisionRuntime(
 	const getMainClaim = (): HubMainClaim | null =>
 		attachment === null ? null : options.hub.mainClaimFor(attachment);
 
+	const owns = (claim: HubMainClaim): boolean =>
+		!stopped && options.hub.isCurrentMain(claim);
+
 	const isCurrentMain = (): boolean => {
 		const claim = getMainClaim();
-		return claim !== null && options.hub.isCurrentMain(claim);
+		return claim !== null && owns(claim);
+	};
+
+	const currentController = (
+		claim?: HubMainClaim | null,
+	): LockDecisionController | null => {
+		const controller = options.controllerHolder.controller;
+		if (controller === null) return null;
+		const effectiveClaim = claim ?? getMainClaim();
+		return effectiveClaim !== null && options.hub.isCurrentMain(effectiveClaim)
+			? controller
+			: null;
 	};
 
 	const clearArmedTimer = (timerId?: number): void => {
@@ -233,7 +255,7 @@ export function createDecisionRuntime(
 
 	const silentlyAbandonDecision = (): void => {
 		// Unlock first so locked=false is authoritative, then clear runtime work.
-		options.controllerHolder.controller.unlock();
+		options.controllerHolder.controller?.unlock();
 		clearOperationalPendingWork();
 	};
 
@@ -263,17 +285,28 @@ export function createDecisionRuntime(
 	};
 
 	const openDecision = (decisionId: number): void => {
+		// Exact claim fence for this open attempt — not a live re-lookup later.
 		const claim = getMainClaim();
+		const controller = currentController(claim);
+		if (claim === null || controller === null || !owns(claim)) {
+			silentlyAbandonDecision();
+			return;
+		}
+		const stillOwns = (): boolean => owns(claim);
+
 		let activated = false;
 		try {
-			activated =
-				claim !== null &&
-				options.hub.isCurrentMain(claim) &&
-				options.decisionTools.activateDecisionTools();
+			activated = options.decisionTools.activateDecisionTools(stillOwns);
 		} catch {
 			activated = false;
 		}
-		if (claim === null || !activated) {
+		// Revalidate after activation before constructing/storing activeDecision.
+		// Activation already restored the baseline on stale ownership; if a race
+		// left tools active under a dead claim, clear them before abandoning.
+		if (!activated || !stillOwns()) {
+			if (options.decisionTools.isActive()) {
+				restoreDecisionTools();
+			}
 			silentlyAbandonDecision();
 			return;
 		}
@@ -283,18 +316,26 @@ export function createDecisionRuntime(
 			exchangeId: createExchangeId(),
 			claim,
 			protocol: createDecisionProtocolSession({
-				controller: options.controllerHolder.controller,
+				controller,
 				decisionId,
 				decisionPrompt: config.decisionPrompt,
 			}),
 		};
 		activeDecision = active;
 		try {
+			if (!stillOwns()) {
+				silentlyAbandonDecision();
+				return;
+			}
 			sendDecisionPrompt(
 				active,
 				active.protocol.currentCycleId,
 				config.decisionPrompt,
 			);
+			// A demotion that lands during/after send must not leave a live exchange.
+			if (!stillOwns()) {
+				silentlyAbandonDecision();
+			}
 		} catch {
 			silentlyAbandonDecision();
 		}
@@ -302,7 +343,7 @@ export function createDecisionRuntime(
 
 	const armIdleTimer = (timerId: number, delaySeconds: number): void => {
 		const claim = getMainClaim();
-		if (claim === null || !options.hub.isCurrentMain(claim)) return;
+		if (claim === null || currentController(claim) === null) return;
 		clearArmedTimer();
 
 		const deadline = Math.min(now() + delaySeconds * 1000, Number.MAX_VALUE);
@@ -316,12 +357,12 @@ export function createDecisionRuntime(
 				claim,
 				handle: clock.setTimeout(() => {
 					if (armedTimer !== timer) return;
+					const controller = currentController(timer.claim);
 					if (
 						stopped ||
-						!options.hub.isCurrentMain(timer.claim) ||
+						controller === null ||
 						!options.hub.snapshot.allObservableIdle ||
-						options.controllerHolder.controller.snapshot.idleTimer?.id !==
-							timer.timerId
+						controller.snapshot.idleTimer?.id !== timer.timerId
 					) {
 						armedTimer = null;
 						return;
@@ -331,9 +372,9 @@ export function createDecisionRuntime(
 						return;
 					}
 					armedTimer = null;
-					applyTransition(
-						options.controllerHolder.controller.beginDecision(timer.timerId),
-					);
+					applyTransition(controller.beginDecision(timer.timerId), undefined, {
+						claim: timer.claim,
+					});
 				}, delayMs),
 			};
 			armedTimer = timer;
@@ -347,6 +388,7 @@ export function createDecisionRuntime(
 		effect: Exclude<ControllerEffect, { kind: "notify" }>,
 		_ctx?: RuntimeContext,
 	): void => {
+		if (currentController() === null) return;
 		switch (effect.kind) {
 			case "armIdleTimer":
 				armIdleTimer(effect.timerId, effect.delaySeconds);
@@ -374,9 +416,15 @@ export function createDecisionRuntime(
 	const applyTransition = (
 		transition: ControllerTransition,
 		ctx?: RuntimeContext,
-		applyOptions?: { readonly suppressNotify?: boolean },
+		applyOptions?: {
+			readonly suppressNotify?: boolean;
+			readonly claim?: HubMainClaim;
+		},
 	): void => {
+		const claim = applyOptions?.claim ?? getMainClaim();
+		if (claim === null || !options.hub.isCurrentMain(claim)) return;
 		for (const effect of transition.effects) {
+			if (!options.hub.isCurrentMain(claim)) return;
 			if (effect.kind === "notify") {
 				if (!applyOptions?.suppressNotify && ctx !== undefined) {
 					ctx.ui.notify(
@@ -392,16 +440,19 @@ export function createDecisionRuntime(
 	};
 
 	const reconcileIdle = (): void => {
+		const claim = getMainClaim();
+		const controller = currentController(claim);
 		if (
 			stopped ||
 			!configReady ||
-			!isCurrentMain() ||
+			claim === null ||
+			controller === null ||
 			!options.hub.snapshot.allObservableIdle ||
 			pendingFinalization !== null
 		) {
 			return;
 		}
-		applyTransition(options.controllerHolder.controller.onAllObservableIdle());
+		applyTransition(controller.onAllObservableIdle(), undefined, { claim });
 	};
 
 	/**
@@ -421,6 +472,10 @@ export function createDecisionRuntime(
 			return;
 		}
 
+		const claim = getMainClaim();
+		const controller = currentController(claim);
+		if (claim === null || controller === null) return;
+
 		let envelope = null as ReturnType<typeof createUserReadyEnvelope> | null;
 		if (pendingAiUnlockReason !== null) {
 			envelope = createUserReadyEnvelope({
@@ -429,7 +484,7 @@ export function createDecisionRuntime(
 			});
 			pendingAiUnlockReason = null;
 		} else {
-			const snapshot = options.controllerHolder.controller.snapshot;
+			const snapshot = controller.snapshot;
 			if (snapshot.locked && snapshot.exhausted) {
 				envelope = createUserReadyEnvelope({ STOP_KIND: "EXHAUSTED" });
 			} else if (snapshot.locked && snapshot.decisionFailed) {
@@ -439,7 +494,7 @@ export function createDecisionRuntime(
 			}
 		}
 
-		if (envelope === null) return;
+		if (envelope === null || !options.hub.isCurrentMain(claim)) return;
 		publishedForIdleEpoch = true;
 		try {
 			emitSemanticHook(options.pi.events, envelope);
@@ -449,25 +504,110 @@ export function createDecisionRuntime(
 		}
 	};
 
+	const dropControl = (): void => {
+		// Ownership has already been invalidated by the hub before cleanup starts.
+		// Safe to call again after re-entrant demotion — every step is idempotent.
+		settledCallbackGeneration += 1;
+		options.controllerHolder.controller?.unlock();
+		clearOperationalPendingWork();
+		options.controllerHolder.controller = null;
+		configReady = false;
+		configLoad = null;
+		ownedClaim = null;
+		publishedForIdleEpoch = false;
+	};
+
+	/**
+	 * After an ownership-dependent external/re-entrant call, stop further work if
+	 * the captured claim is no longer current. Ensures local control cleanup when
+	 * demotion did not already drop us via the hub subscription.
+	 */
+	const stopIfStale = (claim: HubMainClaim): boolean => {
+		if (owns(claim)) return false;
+		if (ownedClaim !== null) dropControl();
+		else clearOperationalPendingWork();
+		return true;
+	};
+
+	const acquireControl = (claim: HubMainClaim): void => {
+		if (stopped || !options.hub.isCurrentMain(claim)) return;
+		ownedClaim = claim;
+		options.decisionTools.initializeDecisionToolsInactive();
+		if (options.injectedController) {
+			options.controllerHolder.controller = injectedController;
+			configReady = injectedController !== null;
+			syncHubState();
+			return;
+		}
+		if (configReady && options.controllerHolder.controller !== null) {
+			syncHubState();
+			return;
+		}
+		if (configLoad !== null || sessionContext === null) return;
+
+		const ctx = sessionContext;
+		const generation = lifecycleGeneration;
+		configLoad = (async () => {
+			const loaded: LoadedConfig = await loadConfig({
+				cwd: ctx.cwd,
+				trusted: ctx.isProjectTrusted(),
+				agentDir: options.agentDir ?? getAgentDir(),
+			});
+			if (
+				stopped ||
+				generation !== lifecycleGeneration ||
+				attachment === null ||
+				ownedClaim !== claim ||
+				!options.hub.isCurrentMain(claim)
+			) {
+				return;
+			}
+			config = { ...loaded.config };
+			options.controllerHolder.controller =
+				createLockDecisionController(config);
+			configReady = true;
+			for (const diagnostic of loaded.diagnostics) {
+				if (!owns(claim)) {
+					dropControl();
+					return;
+				}
+				try {
+					ctx.ui.notify(diagnostic.message, "warning");
+				} catch {
+					// Configuration remains usable when a non-TUI host rejects notify.
+				}
+				// Revalidate after notify: a synchronous demotion must not emit later
+				// diagnostics or continue into control-plane sync.
+				if (!owns(claim)) {
+					dropControl();
+					return;
+				}
+			}
+			if (owns(claim)) syncHubState();
+		})().finally(() => {
+			if (ownedClaim === claim) configLoad = null;
+		});
+	};
+
 	const syncHubState = (): void => {
 		ensureMain();
-		const current = isCurrentMain();
-		if (ownedMain && !current) {
-			// Demotion: unlock first (preserve cycle accounting), then cleanup.
-			applyTransition(options.controllerHolder.controller.unlock(), undefined, {
-				suppressNotify: true,
-			});
-			clearOperationalPendingWork();
-			publishedForIdleEpoch = false;
+		const claim = getMainClaim();
+		if (ownedClaim !== null && !options.hub.isCurrentMain(ownedClaim)) {
+			dropControl();
 		}
-		ownedMain = current;
-		if (!current || !configReady) return;
+		if (claim === null) return;
+		if (ownedClaim === null) {
+			acquireControl(claim);
+			return;
+		}
+		const controller = currentController(claim);
+		if (!configReady || controller === null) return;
 		if (options.hub.snapshot.allObservableIdle) {
 			reconcileIdle();
 			maybePublishUserReady();
 		} else {
 			publishedForIdleEpoch = false;
-			applyTransition(options.controllerHolder.controller.onObservableBusy());
+			applyTransition(controller.onObservableBusy(), undefined, { claim });
 		}
 	};
 
@@ -479,18 +619,24 @@ export function createDecisionRuntime(
 	 * Deliver a cached decision finalization. Returns true when a valid continue
 	 * was dispatched so this settle stays intermediate and must not publish
 	 * terminal `user-ready` yet.
+	 *
+	 * Captures the decision exchange claim and revalidates it immediately before
+	 * and after every ownership-dependent external/re-entrant call so a
+	 * synchronous demotion cannot continue into later messages, UI, or entries.
 	 */
 	const deliverPending = (ctx: ExtensionContext): boolean => {
 		const pending = pendingFinalization;
 		if (
 			pending === null ||
 			activeDecision !== pending.active ||
-			!options.hub.isCurrentMain(pending.active.claim)
+			!owns(pending.active.claim)
 		) {
 			return false;
 		}
 		pendingFinalization = null;
 		const { finalization, active, cycleId } = pending;
+		// Exact claim carried by this decision exchange — not a live re-lookup.
+		const claim = active.claim;
 
 		if (finalization.outcome === "reask") {
 			if (
@@ -500,6 +646,7 @@ export function createDecisionRuntime(
 				silentlyAbandonDecision();
 				return false;
 			}
+			if (stopIfStale(claim)) return false;
 			try {
 				sendDecisionPrompt(
 					active,
@@ -508,22 +655,32 @@ export function createDecisionRuntime(
 				);
 			} catch {
 				silentlyAbandonDecision();
+				return false;
 			}
+			if (stopIfStale(claim)) return false;
 			// Re-ask is still an open decision cycle, not a terminal epoch.
 			return false;
 		}
 
+		if (stopIfStale(claim)) return false;
 		restoreDecisionTools();
+		if (stopIfStale(claim)) return false;
 		activeDecision = null;
 
 		if (finalization.outcome === "decision-failed") {
-			ctx.ui.notify(
-				finalization.notification ??
-					formatDecisionFailedNotification(
-						finalization.error ?? "Invalid decision.",
-					),
-				"warning",
-			);
+			if (stopIfStale(claim)) return false;
+			try {
+				ctx.ui.notify(
+					finalization.notification ??
+						formatDecisionFailedNotification(
+							finalization.error ?? "Invalid decision.",
+						),
+					"warning",
+				);
+			} catch {
+				// Non-TUI hosts may reject notify; decision-failed is already final.
+			}
+			stopIfStale(claim);
 			return false;
 		}
 
@@ -537,6 +694,7 @@ export function createDecisionRuntime(
 		}
 
 		if (finalization.outcome === "continue") {
+			if (stopIfStale(claim)) return false;
 			try {
 				options.pi.sendMessage(
 					createDecisionFoldMessage({
@@ -548,14 +706,17 @@ export function createDecisionRuntime(
 					}),
 					{ triggerTurn: true, deliverAs: "steer" },
 				);
-				return true;
 			} catch {
 				silentlyAbandonDecision();
 				return false;
 			}
+			// Demotion after a successful send still must not claim intermediate continue.
+			if (stopIfStale(claim)) return false;
+			return true;
 		}
 
 		const reason = finalization.reason ?? "";
+		if (stopIfStale(claim)) return false;
 		// Retain AI unlock publication intent until the authoritative all-idle settle.
 		pendingAiUnlockReason = reason;
 		try {
@@ -568,6 +729,7 @@ export function createDecisionRuntime(
 				}),
 				{ triggerTurn: false, deliverAs: "steer" },
 			);
+			if (stopIfStale(claim)) return false;
 			try {
 				options.pi.appendEntry<HumanUnlockEntry>(HUMAN_UNLOCK_ENTRY_TYPE, {
 					reason,
@@ -575,8 +737,10 @@ export function createDecisionRuntime(
 			} catch {
 				// The state is already unlocked; a TUI-only history entry is optional.
 			}
+			stopIfStale(claim);
 		} catch {
 			// The controller is already unlocked and must not be re-armed.
+			stopIfStale(claim);
 		}
 		// The persisted TUI-only entry is the sole visible reasoned unlock output.
 		return false;
@@ -623,7 +787,7 @@ export function createDecisionRuntime(
 
 	const registerLifecycle = (): void => {
 		options.pi.on("session_start", async (_event, ctx: ExtensionContext) => {
-			const generation = ++lifecycleGeneration;
+			++lifecycleGeneration;
 			const bound = options.hub.bind({
 				instance: options.attachmentInstance,
 				sessionId: ctx.sessionManager.getSessionId(),
@@ -631,46 +795,24 @@ export function createDecisionRuntime(
 				initialBusy: !ctx.isIdle(),
 			});
 			attachment = bound.attachment;
-			options.decisionTools.initializeDecisionToolsInactive();
-
-			if (!options.injectedController) {
-				const loaded: LoadedConfig = await loadConfig({
-					cwd: ctx.cwd,
-					trusted: ctx.isProjectTrusted(),
-					agentDir: options.agentDir ?? getAgentDir(),
-				});
-				if (
-					stopped ||
-					generation !== lifecycleGeneration ||
-					attachment !== bound.attachment
-				) {
-					return;
-				}
-				config = { ...loaded.config };
-				options.controllerHolder.controller =
-					createLockDecisionController(config);
-				for (const diagnostic of loaded.diagnostics) {
-					try {
-						ctx.ui.notify(diagnostic.message, "warning");
-					} catch {
-						// Configuration remains usable when a non-TUI host rejects notify.
-					}
-				}
-			}
-			configReady = true;
+			sessionContext = ctx;
 			syncHubState();
+			await configLoad;
 		});
 
 		options.pi.on("agent_start", () => {
 			// Invalidate any deferred settled wake from a previous run on this attachment.
 			agentActivityGeneration += 1;
-			if (isCurrentMain()) {
-				const transition = options.controllerHolder.controller.ensureLocked();
+			const claim = getMainClaim();
+			const controller = currentController(claim);
+			if (claim !== null && controller !== null) {
+				const transition = controller.ensureLocked();
 				if (transition.applied) {
 					// Fresh silent lock: controller first, then operational cleanup.
 					clearOperationalPendingWork();
 					applyTransition(transition, undefined, {
 						suppressNotify: true,
+						claim,
 					});
 				}
 				// Already locked: preserve cycle/decision; do not clear active work.
@@ -686,6 +828,8 @@ export function createDecisionRuntime(
 			if (stopped || !ctx.isIdle()) return;
 
 			if (attachment !== null) options.hub.markIdle(attachment);
+			if (!isCurrentMain() || options.controllerHolder.controller === null)
+				return;
 
 			// Pi marks the session idle before emitting agent_settled. Defer the
 			// wake check until every settled handler has returned so a later handler
@@ -728,18 +872,17 @@ export function createDecisionRuntime(
 		if (stopped) return;
 		stopped = true;
 		lifecycleGeneration += 1;
-		// Unlock first (preserve cycle accounting), then clear operational work.
-		options.controllerHolder.controller.unlock();
-		clearOperationalPendingWork();
-		publishedForIdleEpoch = false;
-		if (attachment !== null) options.hub.detach(attachment);
+		const detached = attachment;
+		if (detached !== null) options.hub.detach(detached);
+		// Hub ownership invalidation happens before local cleanup effects.
+		dropControl();
 		attachment = null;
-		ownedMain = false;
+		sessionContext = null;
 		unsubscribe();
 	};
 
 	return {
-		get controller(): LockDecisionController {
+		get controller(): LockDecisionController | null {
 			return options.controllerHolder.controller;
 		},
 		get config(): ContinueWatchdogConfig {

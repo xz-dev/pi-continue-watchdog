@@ -130,10 +130,11 @@ Publication is at most once per such terminal idle epoch. It does **not** publis
 
 ## Scope and limitations
 
-- **“All agents”** means same-process sessions that loaded this extension and are known to its process-local hub. Isolated, out-of-process, or non-extension children may be absent.
-- **Main election:** UI-bound session wins; pure headless uses first-bound attachment as best-effort main.
+- **“All agents”** means same-process sessions that loaded this extension and report lifecycle into **one process-wide domain**. That domain is shared across independent extension evaluations in the same Node process—including distinct project `cwd` values and separate Pi `ResourceLoader` loads. Isolated, out-of-process, or non-extension children remain outside coverage.
+- **Main election:** UI-bound session wins; pure headless uses first-bound attachment as best-effort main; later non-UI attachments do not steal main.
+- **Root ownership:** every extension-enabled attachment observes and reports busy/idle. Only the exact current main owns config, timers, decision tools/messages, UI notifies, and `user-ready` publication. Non-main attachments are **observer-only**: they do not load watchdog config or register decision tools.
+- **Framework boundary:** coordination uses only Pi public lifecycle/session APIs. There is no dependence on other plugins or path heuristics. Pi's `pi.events` bus is for semantic-hook delivery only, not for process coordination.
 - **Lock state is runtime-only.** A new process/session attachment begins unlocked until its current main agent starts. Nothing is written to disk, and shutdown cancels runtime activity.
-- **No dependence** on pi-subagents, pi-watchdog, pi-notify, or any other plugin.
 - Decision tools are main-only controls during the decision window.
 
 ## Context cleanliness
@@ -145,7 +146,7 @@ After a valid continue or unlock, future **model-bound** context drops the raw d
 ```bash
 npm ci
 npm run check      # lint, typecheck, unit tests, build
-npm run test:e2e   # packed isolated install + stock Pi E2E (includes real 3s idle path)
+npm run test:e2e   # packed isolated install + stock Pi E2E (real 3s idle path; multi-ResourceLoader / distinct-cwd root-only control)
 ```
 
 CI (`.github/workflows/ci.yml`) runs `npm ci`, `npm run check`, and `npm run test:e2e` on `master` push and pull requests.

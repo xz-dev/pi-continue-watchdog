@@ -20,6 +20,7 @@ import {
 	type AgentSession,
 	createAgentSession,
 	DefaultResourceLoader,
+	type ExtensionUIContext,
 	ModelRuntime,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
@@ -66,17 +67,22 @@ interface PackedFixture {
  * Knows only channel `pi:semantic-hook:v1` and the plain envelope schema.
  * It does not import or name pi-continue-watchdog.
  */
-const NEUTRAL_SEMANTIC_PROBE_SOURCE = `import { appendFileSync } from "node:fs";
+const NEUTRAL_SEMANTIC_PROBE_SOURCE = `import { randomUUID } from "node:crypto";
+import { appendFileSync } from "node:fs";
 
 const CHANNEL = "pi:semantic-hook:v1";
+const evaluationId = randomUUID();
+const outputPath = process.env.PI_SEMANTIC_PROBE_OUT;
+
+function record(kind, ctx, data) {
+	if (typeof outputPath !== "string" || outputPath.length === 0) return;
+	appendFileSync(outputPath, JSON.stringify({ kind, cwd: ctx.cwd, evaluationId, data }) + "\\n");
+}
 
 export default function registerNeutralSemanticProbe(pi) {
-	pi.on("session_start", () => {
-		const out = process.env.PI_SEMANTIC_PROBE_OUT;
-		if (typeof out !== "string" || out.length === 0) return;
-		pi.events.on(CHANNEL, (data) => {
-			appendFileSync(out, JSON.stringify(data) + "\\n");
-		});
+	pi.on("session_start", (_event, ctx) => {
+		record("session-start", ctx);
+		pi.events.on(CHANNEL, (data) => record("semantic-hook", ctx, data));
 	});
 }
 `;
@@ -85,6 +91,8 @@ async function makePackedFixture(
 	t: TestContext,
 	options?: {
 		readonly withSemanticProbe?: boolean;
+		readonly withProbeOutput?: boolean;
+		readonly includeWatchdog?: boolean;
 		readonly watchdogConfig?: Record<string, unknown>;
 		readonly piSettings?: Record<string, unknown>;
 	},
@@ -140,13 +148,16 @@ async function makePackedFixture(
 	assert.equal((await readdir(packageDir)).includes("test"), false);
 	assert.equal((await readdir(packageDir)).includes("e2e"), false);
 
-	const extensions: string[] = [packageDir];
+	const extensions: string[] =
+		options?.includeWatchdog === false ? [] : [packageDir];
 	let probeOut: string | undefined;
+	if (options?.withSemanticProbe || options?.withProbeOutput) {
+		probeOut = join(root, "semantic-probe-out.jsonl");
+		await writeFile(probeOut, "");
+	}
 	if (options?.withSemanticProbe) {
 		const probePath = join(root, "neutral-semantic-probe.mjs");
-		probeOut = join(root, "semantic-probe-out.jsonl");
 		await writeFile(probePath, NEUTRAL_SEMANTIC_PROBE_SOURCE);
-		await writeFile(probeOut, "");
 		extensions.push(probePath);
 	}
 	if (options?.watchdogConfig !== undefined) {
@@ -163,15 +174,28 @@ async function makePackedFixture(
 	return { root, home, agentDir, cwd, packageDir, probeOut };
 }
 
-async function readProbeEnvelopes(
-	probeOut: string,
-): Promise<Array<Record<string, unknown>>> {
+interface ProbeRecord {
+	readonly kind: "session-start" | "semantic-hook";
+	readonly cwd: string;
+	readonly evaluationId: string;
+	readonly data?: Record<string, unknown>;
+}
+
+async function readProbeRecords(probeOut: string): Promise<ProbeRecord[]> {
 	const raw = await readFile(probeOut, "utf8");
 	return raw
 		.split("\n")
 		.map((line) => line.trim())
 		.filter((line) => line.length > 0)
-		.map((line) => JSON.parse(line) as Record<string, unknown>);
+		.map((line) => JSON.parse(line) as ProbeRecord);
+}
+
+async function readProbeEnvelopes(
+	probeOut: string,
+): Promise<Array<Record<string, unknown>>> {
+	return (await readProbeRecords(probeOut))
+		.filter((record) => record.kind === "semantic-hook")
+		.map((record) => record.data ?? {});
 }
 
 function toolNames(request: RequestRecord): string[] {
@@ -315,8 +339,18 @@ async function startMockServer(
 async function createSession(
 	fixture: PackedFixture & { readonly probeOut?: string },
 	baseUrl: string,
-	options?: { readonly contextWindow?: number; readonly maxTokens?: number },
-): Promise<{ session: AgentSession; extensionPath: string }> {
+	options?: {
+		readonly contextWindow?: number;
+		readonly maxTokens?: number;
+		readonly cwd?: string;
+		readonly uiContext?: ExtensionUIContext;
+		readonly additionalExtensionPaths?: string[];
+	},
+): Promise<{
+	session: AgentSession;
+	extensionPath: string;
+	loader: DefaultResourceLoader;
+}> {
 	const previousHome = process.env.HOME;
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const previousProbeOut = process.env.PI_SEMANTIC_PROBE_OUT;
@@ -328,9 +362,11 @@ async function createSession(
 		delete process.env.PI_SEMANTIC_PROBE_OUT;
 	}
 	try {
+		const cwd = options?.cwd ?? fixture.cwd;
 		const loader = new DefaultResourceLoader({
-			cwd: fixture.cwd,
+			cwd,
 			agentDir: fixture.agentDir,
+			additionalExtensionPaths: options?.additionalExtensionPaths,
 			noSkills: true,
 			noPromptTemplates: true,
 			noThemes: true,
@@ -340,8 +376,10 @@ async function createSession(
 		assert.deepEqual(loader.getExtensions().errors, []);
 		const loaded = loader
 			.getExtensions()
-			.extensions.find((extension) =>
-				extension.path.startsWith(fixture.packageDir),
+			.extensions.find(
+				(extension) =>
+					extension.path.startsWith(fixture.packageDir) ||
+					options?.additionalExtensionPaths?.includes(extension.path),
 			);
 		assert.ok(loaded);
 		assert.equal(loaded.path.startsWith(fixture.packageDir), true);
@@ -367,15 +405,19 @@ async function createSession(
 		const model = modelRuntime.getModel("watchdog-e2e", "watchdog-e2e");
 		assert.ok(model);
 		const { session } = await createAgentSession({
-			cwd: fixture.cwd,
+			cwd,
 			agentDir: fixture.agentDir,
 			modelRuntime,
 			model,
 			resourceLoader: loader,
 			sessionManager: SessionManager.inMemory(),
 		});
-		await session.bindExtensions({ mode: "print" });
-		return { session, extensionPath: loaded.path };
+		await session.bindExtensions(
+			options?.uiContext === undefined
+				? { mode: "print" }
+				: { mode: "rpc", uiContext: options.uiContext },
+		);
+		return { session, extensionPath: loaded.path, loader };
 	} finally {
 		if (previousHome === undefined) delete process.env.HOME;
 		else process.env.HOME = previousHome;
@@ -399,6 +441,221 @@ async function waitFor(
 		await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
 	}
 }
+
+async function shutdownSession(session: AgentSession): Promise<void> {
+	await session.extensionRunner.emit({
+		type: "session_shutdown",
+		reason: "quit",
+	});
+	session.dispose();
+}
+
+function createRpcUiContext(): ExtensionUIContext {
+	// bindExtensions only treats a supplied public UI context as UI-capable; the
+	// watchdog uses notify in this E2E and does not require a real terminal/TUI.
+	return {
+		async select() {
+			return undefined;
+		},
+		async confirm() {
+			return false;
+		},
+		async input() {
+			return undefined;
+		},
+		notify() {},
+		onTerminalInput() {
+			return () => {};
+		},
+	} as unknown as ExtensionUIContext;
+}
+
+test("packed stock Pi shares aggregate idle and root control across independent ResourceLoaders", {
+	timeout: 35_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t, {
+		includeWatchdog: false,
+		withProbeOutput: true,
+		watchdogConfig: { idleDelaySeconds: 0.25 },
+	});
+	assert.ok(fixture.probeOut);
+	const packedWatchdogPath = join(fixture.packageDir, "src", "extension.ts");
+	const packedProbePath = join(fixture.packageDir, "e2e-domain-probe.ts");
+	await writeFile(
+		packedProbePath,
+		NEUTRAL_SEMANTIC_PROBE_SOURCE.replace(
+			'import { appendFileSync } from "node:fs";',
+			'import { appendFileSync } from "node:fs";\nimport registerWatchdog from "./src/extension.ts";',
+		).replace(
+			"export default function registerNeutralSemanticProbe(pi) {",
+			"export default function registerNeutralSemanticProbe(pi) {\n\tregisterWatchdog(pi);",
+		),
+	);
+	const rootCwd = join(fixture.root, "root-project");
+	const childACwd = join(fixture.root, "child-a-project");
+	const childBCwd = join(fixture.root, "child-b-project");
+	await Promise.all(
+		[rootCwd, childACwd, childBCwd].map((cwd) =>
+			mkdir(cwd, { recursive: true }),
+		),
+	);
+
+	let markChildBStarted: (() => void) | undefined;
+	const childBStarted = new Promise<void>((resolveStarted) => {
+		markChildBStarted = resolveStarted;
+	});
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "delayed", started: () => markChildBStarted?.() },
+		{ kind: "stop", text: "root settled" },
+		{ kind: "stop", text: "child-a settled" },
+		{ kind: "unlock", reason: "aggregate idle proven" },
+	]);
+
+	const root = await createSession(fixture, baseUrl, {
+		cwd: rootCwd,
+		uiContext: createRpcUiContext(),
+		additionalExtensionPaths: [packedProbePath],
+	});
+	const childA = await createSession(fixture, baseUrl, {
+		cwd: childACwd,
+		additionalExtensionPaths: [packedProbePath],
+	});
+	const childB = await createSession(fixture, baseUrl, {
+		cwd: childBCwd,
+		additionalExtensionPaths: [packedProbePath],
+	});
+	t.after(async () => {
+		await Promise.all([
+			shutdownSession(root.session),
+			shutdownSession(childA.session),
+			shutdownSession(childB.session),
+		]);
+	});
+
+	for (const loaded of [root, childA, childB]) {
+		assert.equal(loaded.extensionPath, packedProbePath);
+		assert.equal(loaded.extensionPath.startsWith(fixture.packageDir), true);
+	}
+	assert.equal(packedWatchdogPath.startsWith(fixture.packageDir), true);
+	assert.notEqual(root.loader, childA.loader);
+	assert.notEqual(root.loader, childB.loader);
+	assert.notEqual(childA.loader, childB.loader);
+
+	const initialProbeRecords = await readProbeRecords(fixture.probeOut);
+	const starts = initialProbeRecords.filter(
+		(record) => record.kind === "session-start",
+	);
+	assert.deepEqual(
+		starts.map((record) => record.cwd).sort(),
+		[rootCwd, childACwd, childBCwd].sort(),
+	);
+	assert.equal(
+		new Set(starts.map((record) => record.evaluationId)).size,
+		3,
+		"distinct-cwd loaders must independently evaluate their packed extension graph",
+	);
+
+	const registeredDecisionTools = (session: AgentSession): string[] =>
+		session.extensionRunner
+			.getAllRegisteredTools()
+			.map((tool) => tool.definition.name)
+			.filter((name) => decisionTools.includes(name))
+			.sort();
+	assert.deepEqual(registeredDecisionTools(root.session), []);
+	assert.deepEqual(registeredDecisionTools(childA.session), []);
+	assert.deepEqual(registeredDecisionTools(childB.session), []);
+
+	const childBPrompt = childB.session.prompt(
+		"Remain busy while the other observable agents settle.",
+	);
+	await childBStarted;
+	await root.session.prompt("Root settles while child-b remains busy.");
+	await childA.session.prompt(
+		"Child-a also settles while child-b remains busy.",
+	);
+	await Promise.all([root.session.waitForIdle(), childA.session.waitForIdle()]);
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
+
+	assert.equal(requests.length, 3);
+	assert.equal(
+		requests.some((request) =>
+			request.messages.some((message) =>
+				textOf(message).includes(decisionPromptStart),
+			),
+		),
+		false,
+		"root and child-a settling cannot decide while child-b remains busy",
+	);
+	assert.deepEqual(registeredDecisionTools(root.session), []);
+	assert.deepEqual(registeredDecisionTools(childA.session), []);
+	assert.deepEqual(registeredDecisionTools(childB.session), []);
+
+	await childB.session.abort();
+	await childBPrompt;
+	await childB.session.waitForIdle();
+	await waitFor(() => requests.length === 4, 5_000, "aggregate-idle decision");
+	await root.session.waitForIdle();
+
+	const decisionRequests = requests.filter((request) =>
+		request.messages.some((message) =>
+			textOf(message).includes(decisionPromptStart),
+		),
+	);
+	assert.equal(decisionRequests.length, 1);
+	assert.deepEqual(
+		toolNames(decisionRequests[0] as RequestRecord),
+		decisionTools,
+	);
+	assert.deepEqual(registeredDecisionTools(root.session), decisionTools);
+	assert.deepEqual(registeredDecisionTools(childA.session), []);
+	assert.deepEqual(registeredDecisionTools(childB.session), []);
+	assert.equal(
+		requests
+			.slice(0, 3)
+			.every((request) =>
+				decisionTools.every((name) => !toolNames(request).includes(name)),
+			),
+		true,
+		"children and the root's ordinary turn must never activate decision tools",
+	);
+
+	await waitFor(
+		() =>
+			requests.length === 4 &&
+			root.session.isIdle &&
+			registeredDecisionTools(root.session).length === decisionTools.length,
+		2_000,
+		"root unlock completion",
+	);
+	let finalProbeRecords = await readProbeRecords(fixture.probeOut);
+	const hookDeadline = Date.now() + 2_000;
+	while (
+		finalProbeRecords.every((record) => record.kind !== "semantic-hook") &&
+		Date.now() < hookDeadline
+	) {
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+		finalProbeRecords = await readProbeRecords(fixture.probeOut);
+	}
+	const hooks = finalProbeRecords.filter(
+		(record) => record.kind === "semantic-hook",
+	);
+	assert.deepEqual(hooks, [
+		{
+			kind: "semantic-hook",
+			cwd: rootCwd,
+			evaluationId: starts.find((record) => record.cwd === rootCwd)
+				?.evaluationId,
+			data: {
+				version: 1,
+				name: "user-ready",
+				values: {
+					STOP_KIND: "AI_UNLOCK",
+					REASON: "aggregate idle proven",
+				},
+			},
+		},
+	]);
+});
 
 test("packed artifact asks after threshold compaction settles", {
 	timeout: 35_000,
@@ -427,7 +684,7 @@ test("packed artifact asks after threshold compaction settles", {
 		contextWindow: 64,
 		maxTokens: 16,
 	});
-	t.after(() => session.dispose());
+	t.after(() => shutdownSession(session));
 	assert.match(
 		extensionPath,
 		/node_modules\/pi-continue-watchdog\/src\/extension\.ts$/,
@@ -559,7 +816,7 @@ test("packed source artifact waits a real 3 seconds, decides continue, and folds
 		{ kind: "stop" },
 	]);
 	const { session, extensionPath } = await createSession(fixture, baseUrl);
-	t.after(() => session.dispose());
+	t.after(() => shutdownSession(session));
 	assert.match(
 		extensionPath,
 		/node_modules\/pi-continue-watchdog\/src\/extension\.ts$/,
@@ -621,7 +878,7 @@ test("packed command unlock and canonical programmatic abort prevent a decision 
 		{ kind: "delayed", started: () => markStreamStarted?.() },
 	]);
 	const { session } = await createSession(fixture, baseUrl);
-	t.after(() => session.dispose());
+	t.after(() => shutdownSession(session));
 	let markAssistantStarted: (() => void) | undefined;
 	const assistantStarted = new Promise<void>((resolveStarted) => {
 		markAssistantStarted = resolveStarted;
@@ -693,6 +950,10 @@ test("packed neutral probe receives AI unlock user-ready and suppresses continue
 	);
 	await continueSession.session.waitForIdle();
 	assert.deepEqual(await readProbeEnvelopes(continueFixture.probeOut), []);
+	await continueSession.session.extensionRunner.emit({
+		type: "session_shutdown",
+		reason: "quit",
+	});
 
 	// AI unlock path: probe receives exactly one AI_UNLOCK envelope with reason.
 	const unlockFixture = await makePackedFixture(t, {
@@ -708,7 +969,7 @@ test("packed neutral probe receives AI unlock user-ready and suppresses continue
 		unlockFixture,
 		unlockServer.baseUrl,
 	);
-	t.after(() => unlockSession.session.dispose());
+	t.after(() => shutdownSession(unlockSession.session));
 
 	await unlockSession.session.prompt("Unlock after the decision check.");
 	await waitFor(

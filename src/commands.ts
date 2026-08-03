@@ -7,6 +7,7 @@ import type {
 import { visibleWidth } from "@earendil-works/pi-tui";
 
 import type { ControllerEffect, LockDecisionController } from "./controller.js";
+import type { HubMainClaim } from "./hub.js";
 
 /** Pi command names omit the slash used for interactive invocation. */
 export const LOCK_CONTINUE_WATCHDOG_COMMAND = "lock-continue-watchdog";
@@ -39,8 +40,11 @@ export type CommandRuntimeEffect = Exclude<
  * cannot be lost while this slice remains independently testable.
  */
 export interface MainCommandRuntime {
-	readonly controller: LockDecisionController;
+	readonly controller: LockDecisionController | null;
 	readonly isCurrentMain: () => boolean;
+	/** Capture and revalidate the exact current ownership generation. */
+	readonly getMainClaim?: () => HubMainClaim | null;
+	readonly isCurrentMainClaim?: (claim: HubMainClaim) => boolean;
 	/**
 	 * Invalidate pending decision finalization/timer after lock or unlock so a
 	 * later settle cannot continue after the human command.
@@ -171,8 +175,16 @@ async function applyControllerEffects(
 	runtime: MainCommandRuntime,
 	ctx: ExtensionCommandContext,
 	unlockReason: string | undefined,
+	claim: HubMainClaim | null,
 ): Promise<void> {
 	for (const effect of effects) {
+		if (
+			claim !== null &&
+			runtime.isCurrentMainClaim !== undefined &&
+			!runtime.isCurrentMainClaim(claim)
+		) {
+			return;
+		}
 		if (effect.kind === "notify") {
 			// A reason is persisted as the sole visible unlock output below.
 			if (effect.notification === "unlocked" && unlockReason !== undefined) {
@@ -186,15 +198,47 @@ async function applyControllerEffects(
 	}
 }
 
+function currentControllerClaim(runtime: MainCommandRuntime): {
+	readonly controller: LockDecisionController;
+	readonly claim: HubMainClaim | null;
+} | null {
+	if (!runtime.isCurrentMain()) return null;
+	const controller = runtime.controller;
+	if (controller === null) return null;
+	const claim = runtime.getMainClaim?.() ?? null;
+	if (
+		claim !== null &&
+		runtime.isCurrentMainClaim !== undefined &&
+		!runtime.isCurrentMainClaim(claim)
+	) {
+		return null;
+	}
+	return { controller, claim };
+}
+
 async function handleLock(
 	runtime: MainCommandRuntime,
 	ctx: ExtensionCommandContext,
 ): Promise<void> {
-	if (!runtime.isCurrentMain()) return;
+	const control = currentControllerClaim(runtime);
+	if (control === null) return;
 	// Fresh lock transition first, then operational cleanup, effects/notify, reconcile.
-	const transition = runtime.controller.lock();
+	const transition = control.controller.lock();
+	if (
+		control.claim !== null &&
+		runtime.isCurrentMainClaim !== undefined &&
+		!runtime.isCurrentMainClaim(control.claim)
+	) {
+		return;
+	}
 	runtime.clearOperationalPendingWork();
-	await applyControllerEffects(transition.effects, runtime, ctx, undefined);
+	await applyControllerEffects(
+		transition.effects,
+		runtime,
+		ctx,
+		undefined,
+		control.claim,
+	);
 	runtime.reconcileIdle?.();
 }
 
@@ -204,14 +248,33 @@ async function handleUnlock(
 	args: string,
 	ctx: ExtensionCommandContext,
 ): Promise<void> {
-	if (!runtime.isCurrentMain()) return;
+	const control = currentControllerClaim(runtime);
+	if (control === null) return;
 	// Unlock first (locked=false authoritative), then cleanup, effects, notify last.
-	const transition = runtime.controller.unlock();
+	const transition = control.controller.unlock();
+	if (
+		control.claim !== null &&
+		runtime.isCurrentMainClaim !== undefined &&
+		!runtime.isCurrentMainClaim(control.claim)
+	) {
+		return;
+	}
 	runtime.clearOperationalPendingWork();
 
 	const reason = normaliseHumanUnlockReason(args);
-	await applyControllerEffects(transition.effects, runtime, ctx, reason);
-	if (reason !== undefined) {
+	await applyControllerEffects(
+		transition.effects,
+		runtime,
+		ctx,
+		reason,
+		control.claim,
+	);
+	if (
+		reason !== undefined &&
+		(control.claim === null ||
+			runtime.isCurrentMainClaim === undefined ||
+			runtime.isCurrentMainClaim(control.claim))
+	) {
 		// appendEntry writes a CustomEntry, which Pi excludes from LLM context.
 		pi.appendEntry<HumanUnlockEntry>(HUMAN_UNLOCK_ENTRY_TYPE, { reason });
 	}

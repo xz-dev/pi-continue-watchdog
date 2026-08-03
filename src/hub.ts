@@ -378,13 +378,26 @@ export function createObservableAgentHub(): ObservableAgentHub {
 }
 
 /**
- * Returns the process-local hub shared by every activation of this module.
- * Pi caches one package module export across activations; a module-level
- * singleton is enough. Physical copies of this file are not supported.
+ * Realm-wide process domain key. Independent jiti/module evaluations and
+ * compatible physical copies in one JS realm resolve the same symbol and share
+ * one ObservableAgentHub on globalThis. No plugin coupling — ordinary JS realm
+ * state only.
  */
-let processHub: ObservableAgentHub | undefined;
+const PROCESS_OBSERVABLE_AGENT_DOMAIN = Symbol.for(
+	"pi-continue-watchdog:observable-agent-domain:v1",
+);
 
+type ProcessObservableAgentDomainHost = typeof globalThis & {
+	[PROCESS_OBSERVABLE_AGENT_DOMAIN]?: ObservableAgentHub;
+};
+
+/**
+ * Returns the realm-wide process hub shared by every same-process evaluation of
+ * this extension. The process hub may remain empty for process lifetime after
+ * detach; use createObservableAgentHub() for isolated unit-test instances.
+ */
 export function getProcessObservableAgentHub(): ObservableAgentHub {
-	processHub ??= createObservableAgentHub();
-	return processHub;
+	const host = globalThis as ProcessObservableAgentDomainHost;
+	host[PROCESS_OBSERVABLE_AGENT_DOMAIN] ??= createObservableAgentHub();
+	return host[PROCESS_OBSERVABLE_AGENT_DOMAIN];
 }

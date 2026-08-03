@@ -38,6 +38,11 @@ interface Harness {
 	throwNextGetActiveTools(): void;
 	throwRegisterTool(name: string): void;
 	throwNextSetActiveTools(): void;
+	/** Synchronous demotion hook fired inside the named Pi API call. */
+	onRegisterTool(name: string, hook: () => void): void;
+	onSetActiveTools(hook: (toolNames: readonly string[]) => void): void;
+	/** Claim-fenced activation using the harness live-main flag. */
+	activate(stillOwns?: () => boolean): boolean;
 	activeTools(): readonly string[];
 }
 
@@ -53,6 +58,9 @@ function createHarness(
 	let throwGetActiveTools = false;
 	let throwRegisterToolName: string | null = null;
 	let throwSetActiveTools = false;
+	const registerHooks = new Map<string, () => void>();
+	let setActiveToolsHook: ((toolNames: readonly string[]) => void) | null =
+		null;
 
 	const continueResult: AgentToolResult<DecisionDetails> = {
 		content: [{ type: "text", text: "continue result" }],
@@ -69,6 +77,11 @@ function createHarness(
 				throwRegisterToolName = null;
 				throw new Error("registerTool failed");
 			}
+			const hook = registerHooks.get(tool.name);
+			if (hook !== undefined) {
+				registerHooks.delete(tool.name);
+				hook();
+			}
 			tools.set(tool.name, tool);
 			// Stock Pi registers custom definitions into the initial active set.
 			if (activateRegisteredTools && !activeTools.includes(tool.name)) {
@@ -84,6 +97,11 @@ function createHarness(
 		},
 		setActiveTools(toolNames: string[]): void {
 			setActiveCalls.push([...toolNames]);
+			if (setActiveToolsHook !== null) {
+				const hook = setActiveToolsHook;
+				setActiveToolsHook = null;
+				hook(toolNames);
+			}
 			if (throwSetActiveTools) {
 				throwSetActiveTools = false;
 				throw new Error("setActiveTools failed");
@@ -125,6 +143,15 @@ function createHarness(
 		},
 		throwNextSetActiveTools(): void {
 			throwSetActiveTools = true;
+		},
+		onRegisterTool(name: string, hook: () => void): void {
+			registerHooks.set(name, hook);
+		},
+		onSetActiveTools(hook: (toolNames: readonly string[]) => void): void {
+			setActiveToolsHook = hook;
+		},
+		activate(stillOwns?: () => boolean): boolean {
+			return activation.activateDecisionTools(stillOwns ?? (() => currentMain));
 		},
 		activeTools(): readonly string[] {
 			return [...activeTools];
@@ -172,7 +199,7 @@ test("construction and session initialization register nothing and leave active 
 test("decision schemas, descriptions, and prompt snippets define the automated protocol", () => {
 	const harness = createHarness();
 	initializeDecisionTools(harness);
-	assert.equal(harness.activation.activateDecisionTools(), true);
+	assert.equal(harness.activate(), true);
 	const continueTool = registeredTool(harness, CONTINUE_WATCHDOG_TOOL_NAME);
 	const unlockTool = registeredTool(
 		harness,
@@ -209,7 +236,7 @@ test("decision schemas, descriptions, and prompt snippets define the automated p
 test("registered continue tool uses the compact configured-prompt renderer", () => {
 	const harness = createHarness();
 	initializeDecisionTools(harness);
-	assert.equal(harness.activation.activateDecisionTools(), true);
+	assert.equal(harness.activate(), true);
 	const continueTool = registeredTool(harness, CONTINUE_WATCHDOG_TOOL_NAME);
 	assert.ok(continueTool.renderCall);
 	assert.ok(continueTool.renderResult);
@@ -236,7 +263,7 @@ test("registered continue tool uses the compact configured-prompt renderer", () 
 test("registered unlock tool hides its automated decision trace", () => {
 	const harness = createHarness();
 	initializeDecisionTools(harness);
-	assert.equal(harness.activation.activateDecisionTools(), true);
+	assert.equal(harness.activate(), true);
 	const unlockTool = registeredTool(
 		harness,
 		UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
@@ -289,13 +316,13 @@ test("activation lazily registers once and restores an ordered normal-only basel
 	const initial = ["read", "bash", "read"];
 	const harness = createHarness(initial);
 
-	assert.equal(harness.activation.activateDecisionTools(), false);
+	assert.equal(harness.activate(), false);
 	assert.deepEqual([...harness.tools.keys()], []);
 	initializeDecisionTools(harness);
 	assert.deepEqual([...harness.tools.keys()], []);
 	assert.deepEqual(harness.activeTools(), initial);
 
-	assert.equal(harness.activation.activateDecisionTools(), true);
+	assert.equal(harness.activate(), true);
 	assert.deepEqual(
 		[...harness.tools.keys()],
 		[CONTINUE_WATCHDOG_TOOL_NAME, UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME],
@@ -306,7 +333,7 @@ test("activation lazily registers once and restores an ordered normal-only basel
 
 	// A second activation while already active is inert.
 	harness.setActiveTools(["hostile-normal-tool"]);
-	assert.equal(harness.activation.activateDecisionTools(), false);
+	assert.equal(harness.activate(), false);
 	assert.deepEqual(harness.activation.getCapturedActiveTools(), initial);
 
 	assert.equal(harness.activation.restoreDecisionTools(), true);
@@ -315,7 +342,7 @@ test("activation lazily registers once and restores an ordered normal-only basel
 	assert.equal(harness.activation.getCapturedActiveTools(), null);
 	assert.equal(harness.activation.restoreDecisionTools(), false);
 
-	assert.equal(harness.activation.activateDecisionTools(), true);
+	assert.equal(harness.activate(), true);
 	assert.deepEqual(
 		[...harness.tools.keys()],
 		[CONTINUE_WATCHDOG_TOOL_NAME, UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME],
@@ -328,7 +355,7 @@ test("non-main attachments initialize inactive and never register decision tools
 	harness.setCurrentMain(false);
 
 	initializeDecisionTools(harness);
-	assert.equal(harness.activation.activateDecisionTools(), false);
+	assert.equal(harness.activate(), false);
 	assert.deepEqual([...harness.tools.keys()], []);
 	assert.equal(harness.activation.isActive(), false);
 	assert.deepEqual(harness.activeTools(), ["read", "bash"]);
@@ -338,7 +365,7 @@ test("non-main attachments initialize inactive and never register decision tools
 test("demoted active attachment still restores its original normal set", () => {
 	const harness = createHarness(["read", "bash"]);
 	initializeDecisionTools(harness);
-	assert.equal(harness.activation.activateDecisionTools(), true);
+	assert.equal(harness.activate(), true);
 	harness.setCurrentMain(false);
 
 	assert.equal(harness.activation.restoreDecisionTools(), true);
@@ -351,7 +378,7 @@ test("active main decision tools delegate the exact validated call", async () =>
 	const context = { marker: "decision-context" } as unknown as ExtensionContext;
 
 	initializeDecisionTools(harness);
-	assert.equal(harness.activation.activateDecisionTools(), true);
+	assert.equal(harness.activate(), true);
 	const continueTool = registeredTool(harness, CONTINUE_WATCHDOG_TOOL_NAME);
 	const unlockTool = registeredTool(
 		harness,
@@ -394,7 +421,7 @@ test("inactive or demoted execution returns the fixed terminating stale result",
 	const context = {} as ExtensionContext;
 
 	initializeDecisionTools(harness);
-	assert.equal(harness.activation.activateDecisionTools(), true);
+	assert.equal(harness.activate(), true);
 	const continueTool = registeredTool(harness, CONTINUE_WATCHDOG_TOOL_NAME);
 	assert.equal(harness.activation.restoreDecisionTools(), true);
 
@@ -412,7 +439,7 @@ test("inactive or demoted execution returns the fixed terminating stale result",
 	});
 	assert.deepEqual(harness.delegated, []);
 
-	assert.equal(harness.activation.activateDecisionTools(), true);
+	assert.equal(harness.activate(), true);
 	harness.setCurrentMain(false);
 	const demoted = await continueTool.execute(
 		"demoted-call",
@@ -432,24 +459,18 @@ test("Pi registration and active-tool failures restore normal tools and remain r
 	assert.deepEqual(harness.activeTools(), ["read", "bash", "edit"]);
 
 	harness.throwRegisterTool(UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME);
-	assert.throws(
-		() => harness.activation.activateDecisionTools(),
-		/registerTool failed/,
-	);
+	assert.throws(() => harness.activate(), /registerTool failed/);
 	assert.deepEqual(harness.activeTools(), ["read", "bash", "edit"]);
 	assert.equal(harness.activation.isActive(), false);
 	assert.equal(harness.activation.getCapturedActiveTools(), null);
 
 	harness.throwNextSetActiveTools();
-	assert.throws(
-		() => harness.activation.activateDecisionTools(),
-		/setActiveTools failed/,
-	);
+	assert.throws(() => harness.activate(), /setActiveTools failed/);
 	assert.deepEqual(harness.activeTools(), ["read", "bash", "edit"]);
 	assert.equal(harness.activation.isActive(), false);
 	assert.equal(harness.activation.getCapturedActiveTools(), null);
 
-	assert.equal(harness.activation.activateDecisionTools(), true);
+	assert.equal(harness.activate(), true);
 	assert.deepEqual(harness.activation.getCapturedActiveTools(), [
 		"read",
 		"bash",
@@ -464,4 +485,59 @@ test("Pi registration and active-tool failures restore normal tools and remain r
 	assert.equal(harness.activation.isActive(), true);
 	assert.equal(harness.activation.restoreDecisionTools(), true);
 	assert.deepEqual(harness.activeTools(), ["read", "bash", "edit"]);
+});
+
+test("claim fence demotion during first registerTool skips second tool and restores baseline", () => {
+	const harness = createHarness(["read", "bash"]);
+	initializeDecisionTools(harness);
+
+	harness.onRegisterTool(CONTINUE_WATCHDOG_TOOL_NAME, () => {
+		harness.setCurrentMain(false);
+	});
+
+	assert.equal(harness.activate(), false);
+	assert.equal(harness.tools.has(CONTINUE_WATCHDOG_TOOL_NAME), true);
+	assert.equal(harness.tools.has(UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME), false);
+	assert.equal(harness.activation.isActive(), false);
+	assert.equal(harness.activation.getCapturedActiveTools(), null);
+	assert.deepEqual(harness.activeTools(), ["read", "bash"]);
+	// Decision definitions must not remain active after abandon.
+	assert.ok(
+		!harness.activeTools().includes(CONTINUE_WATCHDOG_TOOL_NAME),
+		"demoted first registration must not leave continue active",
+	);
+});
+
+test("claim fence demotion during setActiveTools restores baseline and stays inactive", () => {
+	const harness = createHarness(["read", "bash"]);
+	initializeDecisionTools(harness);
+
+	harness.onSetActiveTools((toolNames) => {
+		if (
+			toolNames.length === DECISION_TOOL_NAMES.length &&
+			toolNames[0] === CONTINUE_WATCHDOG_TOOL_NAME
+		) {
+			harness.setCurrentMain(false);
+		}
+	});
+
+	assert.equal(harness.activate(), false);
+	assert.deepEqual(
+		[...harness.tools.keys()],
+		[CONTINUE_WATCHDOG_TOOL_NAME, UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME],
+	);
+	assert.equal(harness.activation.isActive(), false);
+	assert.equal(harness.activation.getCapturedActiveTools(), null);
+	assert.deepEqual(harness.activeTools(), ["read", "bash"]);
+});
+
+test("claim-fenced activation still succeeds exactly once for a live owner", () => {
+	const harness = createHarness(["read", "bash"]);
+	initializeDecisionTools(harness);
+
+	assert.equal(harness.activate(), true);
+	assert.deepEqual(harness.activeTools(), [...DECISION_TOOL_NAMES]);
+	assert.equal(harness.activate(), false);
+	assert.equal(harness.activation.restoreDecisionTools(), true);
+	assert.deepEqual(harness.activeTools(), ["read", "bash"]);
 });

@@ -14,7 +14,13 @@ import {
 	DECISION_MESSAGE_TYPE,
 } from "../src/context-fold.js";
 import { createLockDecisionController } from "../src/controller.js";
-import type { DecisionToolActivation } from "../src/decision-tools.js";
+import {
+	CONTINUE_WATCHDOG_TOOL_NAME,
+	createDecisionToolActivation,
+	DECISION_TOOL_NAMES,
+	type DecisionToolActivation,
+	UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
+} from "../src/decision-tools.js";
 import {
 	createHubAttachmentInstance,
 	createObservableAgentHub,
@@ -121,6 +127,8 @@ function createHarness(options?: {
 	readonly activationThrows?: boolean;
 	readonly sendThrows?: boolean;
 	readonly hasUI?: boolean;
+	/** Invoked after a successful tool restore; useful for re-entrant demotion. */
+	readonly afterRestoreDecisionTools?: () => void;
 }): Harness {
 	const config: ContinueWatchdogConfig = {
 		idleDelaySeconds: options?.config?.idleDelaySeconds ?? 3,
@@ -146,17 +154,23 @@ function createHarness(options?: {
 			initialized = true;
 			return true;
 		},
-		activateDecisionTools(): boolean {
+		activateDecisionTools(stillOwns: () => boolean): boolean {
 			if (options?.activationThrows) throw new Error("activation failed");
-			if (!initialized || captured !== null) return false;
+			if (!initialized || captured !== null || !stillOwns()) return false;
 			captured = [...activeTools];
 			activeTools = ["continue_watchdog", "unlock_continue_watchdog"];
+			if (!stillOwns()) {
+				activeTools = captured;
+				captured = null;
+				return false;
+			}
 			return true;
 		},
 		restoreDecisionTools(): boolean {
 			if (captured === null) return false;
 			activeTools = captured;
 			captured = null;
+			options?.afterRestoreDecisionTools?.();
 			return true;
 		},
 		isActive: () => initialized && captured !== null,
@@ -982,7 +996,8 @@ test("child completion only makes aggregate idle; exactly one inquiry comes from
 		let active = false;
 		const tools: DecisionToolActivation = {
 			initializeDecisionToolsInactive: () => true,
-			activateDecisionTools(): boolean {
+			activateDecisionTools(stillOwns: () => boolean): boolean {
+				if (!stillOwns()) return false;
 				activatedBy.push(sessionId);
 				active = true;
 				return true;
@@ -1055,17 +1070,15 @@ test("child completion only makes aggregate idle; exactly one inquiry comes from
 	assert.deepEqual(sentBy, []);
 
 	await firstChild.emit("agent_settled");
-	assert.equal(clock.records[1]?.delayMs, 0);
-	clock.fire(1);
+	assert.equal(clock.records.length, 1);
 	assert.deepEqual(sentBy, []);
 
 	await lastChild.emit("agent_settled");
-	assert.equal(clock.records[2]?.delayMs, 3000);
-	assert.equal(clock.records[3]?.delayMs, 0);
-	clock.fire(3);
+	assert.equal(clock.records[1]?.delayMs, 3000);
+	assert.equal(clock.records.length, 2);
 	assert.deepEqual(sentBy, []);
 	assert.deepEqual(activatedBy, []);
-	clock.fire(2);
+	clock.fire(1);
 	assert.deepEqual(activatedBy, ["main"]);
 	assert.deepEqual(sentBy, ["main"]);
 });
@@ -1090,10 +1103,15 @@ test("shared hub reclaims main after UI shutdown then prefers a new UI bind", as
 			initializeDecisionToolsInactive(): boolean {
 				return true;
 			},
-			activateDecisionTools(): boolean {
-				if (captured !== null) return false;
+			activateDecisionTools(stillOwns: () => boolean): boolean {
+				if (captured !== null || !stillOwns()) return false;
 				captured = [...activeTools];
 				activeTools = ["continue_watchdog", "unlock_continue_watchdog"];
+				if (!stillOwns()) {
+					activeTools = captured;
+					captured = null;
+					return false;
+				}
 				return true;
 			},
 			restoreDecisionTools(): boolean {
@@ -1236,6 +1254,274 @@ test("effective config loads before binding is reconciled and shutdown blocks la
 	await pending;
 
 	assert.equal(runtime.config.idleDelaySeconds, 3);
-	assert.equal(holder.controller.snapshot.locked, false);
+	assert.equal(holder.controller, null);
 	assert.equal(base.clock.records.length, 0);
+});
+
+test("re-entrant demotion during restoreDecisionTools stops later continue delivery", async () => {
+	const harness = createHarness({
+		hasUI: false,
+		afterRestoreDecisionTools: () => {
+			// Synchronous UI bind demotes this headless main mid-delivery.
+			harness.hub.bind({
+				instance: createHubAttachmentInstance(),
+				sessionId: "ui-thief",
+				hasUI: true,
+				initialBusy: false,
+			});
+		},
+	});
+	await startIdle(harness);
+	harness.openDecision();
+	await harness.executeContinue();
+
+	const sentBefore = harness.sent.length;
+	const notificationsBefore = harness.notifications.length;
+	const entriesBefore = harness.entries.length;
+	const turnsBefore = harness.triggeredTurns;
+
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [assistant([toolCall("continue-1", "continue_watchdog", {})])],
+	});
+	harness.streaming = false;
+	await settleOnly(harness);
+
+	assert.equal(harness.runtime.isCurrentMain(), false);
+	assert.equal(harness.sent.length, sentBefore);
+	assert.equal(harness.triggeredTurns, turnsBefore);
+	assert.equal(harness.notifications.length, notificationsBefore);
+	assert.equal(harness.entries.length, entriesBefore);
+	assert.deepEqual(harness.activeTools, ["read", "bash"]);
+});
+
+test("re-entrant demotion during restoreDecisionTools stops later unlock message and entry", async () => {
+	const harness = createHarness({
+		hasUI: false,
+		afterRestoreDecisionTools: () => {
+			harness.hub.bind({
+				instance: createHubAttachmentInstance(),
+				sessionId: "ui-thief-unlock",
+				hasUI: true,
+				initialBusy: false,
+			});
+		},
+	});
+	await startIdle(harness);
+	harness.openDecision();
+	await harness.executeUnlock("done for now");
+
+	const sentBefore = harness.sent.length;
+	const notificationsBefore = harness.notifications.length;
+	const entriesBefore = harness.entries.length;
+
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [
+			assistant([
+				toolCall("unlock-1", "unlock_continue_watchdog", {
+					reason: "done for now",
+				}),
+			]),
+		],
+	});
+	harness.streaming = false;
+	await settleOnly(harness);
+
+	assert.equal(harness.runtime.isCurrentMain(), false);
+	assert.equal(harness.sent.length, sentBefore);
+	assert.equal(harness.notifications.length, notificationsBefore);
+	assert.equal(harness.entries.length, entriesBefore);
+	assert.deepEqual(harness.activeTools, ["read", "bash"]);
+});
+
+/**
+ * Real decision-tool activation + runtime openDecision claim fence harness.
+ * Demotion hooks fire inside Pi API calls so re-entrancy matches production.
+ */
+function createRealActivationHarness(options?: {
+	readonly demoteOnRegisterTool?: string;
+	readonly demoteOnDecisionSetActiveTools?: boolean;
+}): {
+	readonly sent: SentMessage[];
+	readonly activeTools: () => readonly string[];
+	readonly registeredTools: () => readonly string[];
+	readonly controller: ReturnType<typeof createLockDecisionController>;
+	readonly runtime: ReturnType<typeof createDecisionRuntime>;
+	readonly openDecision: () => void;
+	readonly start: () => Promise<void>;
+} {
+	const config: ContinueWatchdogConfig = {
+		idleDelaySeconds: 3,
+		maxRetries: 3,
+		decisionPrompt: "Decide now.",
+		continuePrompt: "Continue compactly.",
+	};
+	const hub = createObservableAgentHub();
+	const controller = createLockDecisionController(config);
+	const holder = { controller };
+	const handlers = new Map<string, Handler[]>();
+	const clock = new FakeClock();
+	const sent: SentMessage[] = [];
+	const registered = new Map<string, unknown>();
+	let activeTools = ["read", "bash"];
+	let runtime: ReturnType<typeof createDecisionRuntime>;
+
+	const demoteToUi = (): void => {
+		hub.bind({
+			instance: createHubAttachmentInstance(),
+			sessionId: "ui-thief-activation",
+			hasUI: true,
+			initialBusy: false,
+		});
+	};
+
+	const pi = {
+		on(name: string, handler: Handler): void {
+			const list = handlers.get(name) ?? [];
+			list.push(handler);
+			handlers.set(name, list);
+		},
+		registerTool(tool: { readonly name: string }): void {
+			if (options?.demoteOnRegisterTool === tool.name) {
+				demoteToUi();
+			}
+			registered.set(tool.name, tool);
+			if (!activeTools.includes(tool.name)) {
+				activeTools.push(tool.name);
+			}
+		},
+		getActiveTools(): string[] {
+			return [...activeTools];
+		},
+		setActiveTools(toolNames: string[]): void {
+			if (
+				options?.demoteOnDecisionSetActiveTools === true &&
+				toolNames.length === DECISION_TOOL_NAMES.length &&
+				toolNames[0] === CONTINUE_WATCHDOG_TOOL_NAME
+			) {
+				demoteToUi();
+			}
+			activeTools = [...toolNames];
+		},
+		sendMessage(
+			message: SentMessage["message"],
+			sendOptions?: SentMessage["options"],
+		): void {
+			sent.push({ message, options: sendOptions, streaming: false });
+		},
+		appendEntry(): void {},
+	} as unknown as ExtensionAPI;
+
+	const decisionTools = createDecisionToolActivation(pi, {
+		isCurrentMain: () => runtime?.isCurrentMain() === true,
+		getContinuePrompt: () => config.continuePrompt,
+		executeContinue: async () => ({
+			content: [{ type: "text", text: "continue" }],
+			details: { kind: "continue" },
+		}),
+		executeUnlock: async () => ({
+			content: [{ type: "text", text: "unlock" }],
+			details: { kind: "unlock" },
+			terminate: true,
+		}),
+	});
+
+	runtime = createDecisionRuntime({
+		pi,
+		hub,
+		attachmentInstance: createHubAttachmentInstance(),
+		controllerHolder: holder,
+		decisionTools,
+		injectedController: true,
+		initialConfig: config,
+		clock,
+		createExchangeId: () => "exchange-real",
+	});
+	runtime.registerLifecycle();
+
+	const ctx = {
+		hasUI: false,
+		cwd: "/project",
+		isIdle: () => true,
+		isProjectTrusted: () => true,
+		sessionManager: { getSessionId: () => "main-headless" },
+		ui: { notify(): void {} },
+	} as unknown as ExtensionContext;
+
+	return {
+		sent,
+		activeTools: () => [...activeTools],
+		registeredTools: () => [...registered.keys()],
+		controller,
+		runtime,
+		async start(): Promise<void> {
+			for (const handler of handlers.get("session_start") ?? []) {
+				await handler({ type: "session_start" } as never, ctx);
+			}
+		},
+		openDecision(): void {
+			runtime.applyTransition(controller.lock(), undefined, {
+				suppressNotify: true,
+			});
+			runtime.reconcileIdle();
+			clock.fire(clock.records.length - 1);
+		},
+	};
+}
+
+test("re-entrant demotion during first registerTool abandons openDecision without inquiry", async () => {
+	const harness = createRealActivationHarness({
+		demoteOnRegisterTool: CONTINUE_WATCHDOG_TOOL_NAME,
+	});
+	await harness.start();
+	harness.openDecision();
+
+	assert.equal(harness.runtime.isCurrentMain(), false);
+	assert.equal(harness.sent.length, 0);
+	assert.equal(
+		harness.registeredTools().includes(CONTINUE_WATCHDOG_TOOL_NAME),
+		true,
+	);
+	assert.equal(
+		harness.registeredTools().includes(UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME),
+		false,
+	);
+	assert.deepEqual(harness.activeTools(), ["read", "bash"]);
+	// Headless claim lost ownership; controller is dropped/unlocked.
+	assert.equal(harness.controller.snapshot.locked, false);
+});
+
+test("re-entrant demotion during setActiveTools abandons openDecision without inquiry", async () => {
+	const harness = createRealActivationHarness({
+		demoteOnDecisionSetActiveTools: true,
+	});
+	await harness.start();
+	harness.openDecision();
+
+	assert.equal(harness.runtime.isCurrentMain(), false);
+	assert.equal(harness.sent.length, 0);
+	assert.deepEqual(harness.registeredTools(), [
+		CONTINUE_WATCHDOG_TOOL_NAME,
+		UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
+	]);
+	assert.deepEqual(harness.activeTools(), ["read", "bash"]);
+	assert.equal(harness.controller.snapshot.locked, false);
+});
+
+test("real activation openDecision still sends exactly one inquiry when ownership holds", async () => {
+	const harness = createRealActivationHarness();
+	await harness.start();
+	harness.openDecision();
+
+	assert.equal(harness.runtime.isCurrentMain(), true);
+	assert.equal(harness.sent.length, 1);
+	assert.equal(harness.sent[0]?.message.customType, DECISION_MESSAGE_TYPE);
+	assert.deepEqual(harness.activeTools(), [...DECISION_TOOL_NAMES]);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.decisionOpen, true);
 });

@@ -143,10 +143,15 @@ function createSemanticHarness(options?: {
 			initialized = true;
 			return true;
 		},
-		activateDecisionTools(): boolean {
-			if (!initialized || captured !== null) return false;
+		activateDecisionTools(stillOwns: () => boolean): boolean {
+			if (!initialized || captured !== null || !stillOwns()) return false;
 			captured = [...activeTools];
 			activeTools = ["continue_watchdog", "unlock_continue_watchdog"];
+			if (!stillOwns()) {
+				activeTools = captured;
+				captured = null;
+				return false;
+			}
 			return true;
 		},
 		restoreDecisionTools(): boolean {
@@ -706,8 +711,10 @@ test("pending AI unlock intent is cleared by external lock/ownership transitions
 		assert.equal(harness.runtime.isCurrentMain(), false);
 		harness.hub.markIdle(child);
 		harness.runtime.reconcileIdle();
-		// Demoted attachment may still schedule a deferred wake; it must no-op publish.
-		await settleOnly(harness);
+		// Observer-only demoted attachments schedule no deferred control wake.
+		const timersBefore = harness.clock.records.length;
+		await harness.fire("agent_settled", { type: "agent_settled" });
+		assert.equal(harness.clock.records.length, timersBefore);
 		assert.equal(aiUnlockCount(harness.received), 0);
 		assert.equal(harness.received.length, 0);
 		harness.hub.detach(usurper);

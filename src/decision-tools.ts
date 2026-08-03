@@ -95,10 +95,13 @@ export interface DecisionToolActivation {
 	readonly initializeDecisionToolsInactive: () => boolean;
 	/**
 	 * Snapshot currently active normal tools and replace them with exactly the pair.
-	 * Inert until initialization succeeds; non-main attachments and a duplicate
-	 * active entry are also inert.
+	 * `stillOwns` is the exact current-main claim fence from the caller (typically
+	 * `{attachmentId,generation}`); it is revalidated around every re-entrant Pi
+	 * call. Inert until initialization succeeds, when already active, or when the
+	 * claim is already stale. On mid-activation demotion restores the baseline
+	 * best-effort and returns false without leaving the decision pair active.
 	 */
-	readonly activateDecisionTools: () => boolean;
+	readonly activateDecisionTools: (stillOwns: () => boolean) => boolean;
 	/**
 	 * Restore the exact prior normal-tool set. Remains available after demotion so
 	 * lifecycle cleanup cannot strand the decision pair. A thrown Pi API call
@@ -167,13 +170,13 @@ export function createDecisionToolActivation(
 	pi: ExtensionAPI,
 	options: DecisionToolActivationOptions,
 ): DecisionToolActivation {
-	let registered = false;
+	let registeredContinue = false;
+	let registeredUnlock = false;
 	let initialized = false;
 	let capturedActiveTools: readonly string[] | null = null;
 
-	const registerDecisionTools = (): void => {
-		if (registered) return;
-
+	const registerContinueTool = (): void => {
+		if (registeredContinue) return;
 		pi.registerTool({
 			name: CONTINUE_WATCHDOG_TOOL_NAME,
 			label: "Continue Watchdog",
@@ -192,6 +195,11 @@ export function createDecisionToolActivation(
 				return options.executeContinue(toolCallId, ctx);
 			},
 		});
+		registeredContinue = true;
+	};
+
+	const registerUnlockTool = (): void => {
+		if (registeredUnlock) return;
 		pi.registerTool({
 			name: UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
 			label: "Unlock Continue Watchdog",
@@ -211,7 +219,23 @@ export function createDecisionToolActivation(
 				return options.executeUnlock(toolCallId, params.reason, ctx);
 			},
 		});
-		registered = true;
+		registeredUnlock = true;
+	};
+
+	/**
+	 * Best-effort return to the pre-activation normal-tool baseline. Clears the
+	 * capture when restore succeeds so a later cleanup path is not left holding
+	 * a phantom active window. Keeps the capture when setActiveTools throws so a
+	 * later restoreDecisionTools call can retry.
+	 */
+	const abandonActivation = (baseline: readonly string[]): false => {
+		try {
+			pi.setActiveTools([...baseline]);
+			capturedActiveTools = null;
+		} catch {
+			// Retain the capture so a later cleanup attempt can restore it.
+		}
+		return false;
 	};
 
 	return {
@@ -221,27 +245,34 @@ export function createDecisionToolActivation(
 			initialized = true;
 			return true;
 		},
-		activateDecisionTools(): boolean {
-			if (
-				!initialized ||
-				!options.isCurrentMain() ||
-				capturedActiveTools !== null
-			) {
+		activateDecisionTools(stillOwns: () => boolean): boolean {
+			if (!initialized || capturedActiveTools !== null || !stillOwns()) {
 				return false;
 			}
 
 			// Capture the normal baseline before registration because stock Pi activates
-			// newly registered custom tools by default.
+			// newly registered custom tools by default. Revalidate around the read in
+			// case getActiveTools is itself re-entrant.
+			if (!stillOwns()) return false;
 			const baseline = [...pi.getActiveTools()].filter(
 				(name) => !isDecisionToolName(name),
 			);
-			// Publish the captured baseline before registration because stock Pi activates
-			// each newly registered custom tool. Any partial registration or active-set
-			// failure can then be restored by the runtime's normal cleanup path.
+			if (!stillOwns()) return false;
+
+			// Publish the captured baseline before registration so any partial
+			// registration or demotion can restore the exact pre-activation set.
 			capturedActiveTools = baseline;
 			try {
-				registerDecisionTools();
+				if (!stillOwns()) return abandonActivation(baseline);
+				registerContinueTool();
+				// Stop before the second definition when the first registration demoted us.
+				if (!stillOwns()) return abandonActivation(baseline);
+				registerUnlockTool();
+				if (!stillOwns()) return abandonActivation(baseline);
+
+				if (!stillOwns()) return abandonActivation(baseline);
 				pi.setActiveTools([...DECISION_TOOL_NAMES]);
+				if (!stillOwns()) return abandonActivation(baseline);
 			} catch (error) {
 				try {
 					pi.setActiveTools([...baseline]);

@@ -40,7 +40,7 @@ export interface MainAbortUnlockRuntime {
 	getMainClaim(): HubMainClaim | null;
 	/** True only when the stored claim still identifies the current main. */
 	isCurrentMainClaim(claim: HubMainClaim): boolean;
-	readonly controller: LockDecisionController;
+	readonly controller: LockDecisionController | null;
 	/**
 	 * Drop pending decision finalization after the abort unlock transition so a
 	 * later settle path cannot continue after abort unlock.
@@ -119,8 +119,10 @@ async function applyUnlockEffects(
 	transition: ControllerTransition,
 	runtime: MainAbortUnlockRuntime,
 	ctx: ExtensionContext,
+	claim: HubMainClaim,
 ): Promise<void> {
 	for (const effect of transition.effects) {
+		if (!runtime.isCurrentMainClaim(claim)) return;
 		if (effect.kind === "notify") {
 			// Reasonless abort unlock always uses the exact bare notification.
 			if (effect.notification === "unlocked") {
@@ -189,11 +191,15 @@ export function registerMainAbortUnlock(
 		);
 		if (outcome !== "aborted") return;
 
+		const controller = runtime.controller;
+		if (controller === null || !runtime.isCurrentMainClaim(active.claim))
+			return;
 		// Unlock first (locked=false authoritative), then operational cleanup,
 		// restore tools, and bare notify last.
-		const transition = runtime.controller.unlock();
+		const transition = controller.unlock();
+		if (!runtime.isCurrentMainClaim(active.claim)) return;
 		runtime.clearOperationalPendingWork();
-		await applyUnlockEffects(transition, runtime, ctx);
+		await applyUnlockEffects(transition, runtime, ctx, active.claim);
 	});
 
 	return { clear };

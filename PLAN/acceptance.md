@@ -468,6 +468,30 @@ Only AI decision unlock retains a publication intent/reason until the resulting 
 - is installed only as the unpinned live Git package `pi install git:github.com/xz-dev/pi-continue-watchdog`
 - has no npm publication, version tags, or GitHub Releases; users track the latest `master` commit
 
+### Example 15 — One realm-wide process domain across independent ResourceLoaders
+
+Pi may load this extension through independent `DefaultResourceLoader` instances and independent module evaluations in the **same process** (for example a UI-bound root and later headless children whose loaders use distinct `cwd` values). Those evaluations must still share **one** process-local observable-agent domain for attachment membership, main election, and all-observable-idle aggregation.
+
+**Given** two or more same-process extension activations whose modules were evaluated independently (including via public Pi `DefaultResourceLoader` loads under distinct `cwd` values)
+**When** each activation binds an attachment and reports busy/idle through ordinary Pi lifecycle events
+**Then**
+
+- every such attachment is visible in **one** realm-wide process domain (not one hub per module evaluation / ResourceLoader)
+- main election spans the whole domain and still follows the existing pure-headless policy: UI-bound wins when present; with no UI-bound attachment, first-bound remains best-effort main and later non-UI attachments do not steal
+- only the current main may open a decision inquiry; non-main children never expose or originate inquiry
+- intermediate settles while any observable attachment remains busy arm **no** main inquiry; only after the final busy attachment settles (and the configured idle delay elapses with every observable attachment still idle) may the current main open **exactly one** inquiry
+
+**Minimal multi-attachment idle shape:**
+
+**Given** one UI root and two headless children are all initially busy on the shared domain
+**When** the root settles, then the first child settles
+**Then** the root opens **no** decision inquiry and neither child opens an inquiry
+
+**When** the final child settles and the idle delay elapses with every observable attachment still idle
+**Then** the root opens **exactly one** decision inquiry and children still open none
+
+Isolated, out-of-process, or non-extension children remain outside coverage. This example does **not** change pure-headless election or require another plugin.
+
 ---
 
 ## Pi limitations (document in README; behavior-level)

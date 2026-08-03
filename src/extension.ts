@@ -12,10 +12,7 @@ import type {
 	LoadRuntimeConfigOptions,
 } from "./config-loader.js";
 import { registerDecisionContextFolding } from "./context-fold.js";
-import {
-	createLockDecisionController,
-	type LockDecisionController,
-} from "./controller.js";
+import type { LockDecisionController } from "./controller.js";
 import {
 	createDecisionToolActivation,
 	type DecisionToolActivation,
@@ -52,9 +49,7 @@ export function createContinueWatchdogExtension(
 	const hub = options.hub ?? getProcessObservableAgentHub();
 	const attachmentInstance = createHubAttachmentInstance();
 	const holder: RuntimeControllerHolder = {
-		controller:
-			options.controller ??
-			createLockDecisionController(options.config ?? BUILT_IN_CONFIG),
+		controller: options.controller ?? null,
 	};
 
 	return (pi: ExtensionAPI): void => {
@@ -108,6 +103,8 @@ export function createContinueWatchdogExtension(
 				return holder.controller;
 			},
 			isCurrentMain: runtime.isCurrentMain,
+			getMainClaim: runtime.getMainClaim,
+			isCurrentMainClaim: runtime.isCurrentMainClaim,
 			clearOperationalPendingWork: () => runtime?.clearOperationalPendingWork(),
 			applyEffect: runtime.applyEffect,
 			reconcileIdle: runtime.reconcileIdle,
@@ -117,11 +114,22 @@ export function createContinueWatchdogExtension(
 		registerMainUserAutoLock(pi, {
 			isCurrentMain: runtime.isCurrentMain,
 			onMainUserMessageStart(): void {
+				const claim = runtime?.getMainClaim();
+				const controller = holder.controller;
+				if (
+					claim === null ||
+					claim === undefined ||
+					controller === null ||
+					!runtime?.isCurrentMainClaim(claim)
+				) {
+					return;
+				}
 				// Fresh silent /lock: controller first, then cleanup, then effects.
-				const transition = holder.controller.onMainUserMessageStart();
-				runtime?.clearOperationalPendingWork();
-				runtime?.applyTransition(transition, undefined, {
+				const transition = controller.onMainUserMessageStart();
+				runtime.clearOperationalPendingWork();
+				runtime.applyTransition(transition, undefined, {
 					suppressNotify: true,
+					claim,
 				});
 			},
 		});
