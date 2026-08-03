@@ -53,7 +53,7 @@ Any acceptance text, test name, README, or implementation that still requires th
 | Default `continuePrompt` | `Continue until user assistance is required.` | Compact model-visible replacement after valid continue fold |
 | Lock TUI notify | `Continue watchdog locked` | User-only TUI notify |
 | Unlock TUI notify (no reason) | `Continue watchdog unlocked` | User-only TUI notify |
-| Unlock TUI notify (with reason) | `Continue watchdog unlocked: <reason>` | User-only TUI notify |
+| Unlock TUI-only entry (with reason) | `Continue watchdog unlocked · <reason>` | Muted persistent user-only history entry |
 | Decision-failed TUI warning | `Continue watchdog decision failed after 3 attempts: <last error>` | User-only TUI notify/warning |
 | Main-run abort unlock | same behavior as reasonless `/unlock-continue-watchdog` | Automatic when Pi reports the main run as aborted |
 
@@ -214,8 +214,8 @@ On invalid decision:
 
 - Restore normal tools
 - Set unlocked first; then cancel timers and clean operational decision state while preserving attempts/failures
-- TUI notify exactly: `Continue watchdog unlocked: <reason>`
-- Append a **persisted TUI-only** reason entry (user-visible history, not model-bound as ordinary assistant prose)
+- Append exactly one muted **persisted TUI-only** reason entry, `Continue watchdog unlocked · <reason>` (user-visible history, not model-bound as ordinary assistant prose)
+- Do **not** also emit a transient reasoned unlock notification
 - **No further work turn** is started for that unlock decision
 - **Future model-bound context** removes the **entire** decision exchange (decision prompt, model reply, tool call(s), tool result(s)) and **inserts nothing** in its place
 - Raw session may still preserve protocol records; folding is model-bound context only
@@ -235,12 +235,12 @@ On invalid decision:
 
 ### Human `/unlock-continue-watchdog [reason]`
 
-Always assigns `locked=false` first, then cancels timers and cleans operational decision state while preserving cycle accounting, and notifies—even if already unlocked.
+Always assigns `locked=false` first, then cancels timers and cleans operational decision state while preserving cycle accounting—even if already unlocked.
 
 | Human reason input | TUI notify | TUI-only reason entry |
 |---|---|---|
 | Empty / blank / omitted | exactly `Continue watchdog unlocked` | none (no reason) |
-| Nonblank | trim; **automatically truncate** to first **500** Unicode characters (may be multiline); notify `Continue watchdog unlocked: <reason>` | append TUI-only entry with that reason |
+| Nonblank | none | trim; **automatically truncate** to first **500** Unicode characters (may be multiline); append muted `Continue watchdog unlocked · <reason>` |
 
 Human unlock is **not** subject to the AI decision-window invalid re-ask protocol.
 
@@ -301,9 +301,9 @@ These examples are the accepted product contract. Each is externally observable 
 
 - unlocked as above
 - reason is trimmed and truncated to the first 500 Unicode characters if longer
-- TUI notifies exactly: `Continue watchdog unlocked: <reason>`
-- a TUI-only reason entry is appended
-- same-state unlock still assigns and still notifies
+- no transient notification is emitted
+- exactly one muted TUI-only reason entry, `Continue watchdog unlocked · <reason>`, is appended
+- same-state unlock still assigns and still persists the entry
 
 ### Example 4 — An actually aborted main run automatically unlocks
 
@@ -348,15 +348,15 @@ With defaults, delays for successive continue attempts begin **3s, 6s, 12s, 24s,
 - one exponential retry is consumed
 - after settle, if still locked and all observable idle, the **next** exponential delay arms
 
-### Example 7 — Valid unlock: reason notify, fold to nothing, no further work turn
+### Example 7 — Valid unlock: one muted reason entry, fold to nothing, no further work turn
 
 **Given** a decision window is open
 **When** the main agent returns a valid `unlock_continue_watchdog` with reason e.g. `Waiting for user confirmation on deploy.`
 **Then**
 
 - normal tools restored; `locked=false`; timers and operational decision state cancelled; attempts/failures preserved
-- TUI notifies exactly: `Continue watchdog unlocked: Waiting for user confirmation on deploy.`
-- TUI-only reason entry appended
+- no transient reasoned unlock notification is emitted
+- exactly one muted TUI-only entry is appended: `Continue watchdog unlocked · Waiting for user confirmation on deploy.`
 - **no further work turn** starts from that unlock decision
 - future model-bound context removes the entire decision exchange and inserts **nothing**
 - raw session may still contain protocol tool records

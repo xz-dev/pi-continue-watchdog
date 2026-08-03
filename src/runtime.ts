@@ -578,13 +578,7 @@ export function createDecisionRuntime(
 		} catch {
 			// The controller is already unlocked and must not be re-armed.
 		}
-		// Controller already transitioned at agent_end; emit the reasoned TUI
-		// notification once at settled delivery (not the generic unlock text).
-		try {
-			ctx.ui.notify(`Continue watchdog unlocked: ${reason}`);
-		} catch {
-			// Non-TUI hosts may reject notify; unlock state is already committed.
-		}
+		// The persisted TUI-only entry is the sole visible reasoned unlock output.
 		return false;
 	};
 

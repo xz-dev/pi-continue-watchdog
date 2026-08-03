@@ -109,7 +109,7 @@ function createStaticTextComponent(
 			const lines = wrapTuiText(text, width);
 			return theme === undefined
 				? lines
-				: lines.map((line) => theme.fg("success", line));
+				: lines.map((line) => theme.fg("toolOutput", line));
 		},
 		invalidate(): void {
 			// This immutable component has no cached render state.
@@ -139,8 +139,8 @@ export function createHumanUnlockEntryRenderer(): EntryRenderer<HumanUnlockEntry
 	return (entry, _options, theme) => {
 		const reason = getHumanUnlockReason(entry);
 		const text = reason
-			? `✓ Watchdog unlocked · ${reason}`
-			: "✓ Watchdog unlocked";
+			? `Continue watchdog unlocked · ${reason}`
+			: "Continue watchdog unlocked";
 		return createStaticTextComponent(text, theme);
 	};
 }
@@ -174,11 +174,11 @@ async function applyControllerEffects(
 ): Promise<void> {
 	for (const effect of effects) {
 		if (effect.kind === "notify") {
-			const notification =
-				effect.notification === "unlocked" && unlockReason !== undefined
-					? `Continue watchdog unlocked: ${unlockReason}`
-					: notificationFor(effect);
-			ctx.ui.notify(notification);
+			// A reason is persisted as the sole visible unlock output below.
+			if (effect.notification === "unlocked" && unlockReason !== undefined) {
+				continue;
+			}
+			ctx.ui.notify(notificationFor(effect));
 			continue;
 		}
 

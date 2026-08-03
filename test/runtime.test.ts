@@ -532,14 +532,10 @@ test("valid unlock folds without a turn and leaves one compact persisted result"
 			data: { reason: "waiting for user" },
 		},
 	]);
-	// Settled delivery restores tools then notifies once with the validated reason.
+	// Settled delivery restores tools and persists the reason without a duplicate notification.
 	assert.deepEqual(harness.activeTools, ["read", "bash"]);
 	assert.equal(harness.controller.snapshot.locked, false);
-	assert.equal(harness.notifications.length, 1);
-	assert.equal(
-		harness.notifications[0]?.message,
-		"Continue watchdog unlocked: waiting for user",
-	);
+	assert.deepEqual(harness.notifications, []);
 });
 
 test("invalid decisions reask only after settle and third failure stays stopped", async () => {

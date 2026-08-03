@@ -1,6 +1,6 @@
 # Implementation plan — pi-continue-watchdog
 
-**Status:** Public live Git package on `master`. Slices 0–15 are complete; npm, tags, and GitHub Releases are intentionally not used.
+**Status:** Public live Git package on `master`. Slices 0–16 are complete; npm, tags, and GitHub Releases are intentionally not used.
 **Method:** One vertical behavior slice per branch; RED → GREEN → review (when functional) → merge → next branch
 **Language:** English only for all project artifacts
 
@@ -39,6 +39,7 @@ Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would ch
 | 13 | Publication readiness | Complete (public live Git package) |
 | 14 | Neutral `user-ready` semantic producer | Complete |
 | 15 | Universal idle lifecycle state machine | Complete |
+| 16 | Unified reasoned unlock UI | Complete |
 
 **Current architecture (indicative filenames; may still be simplified):**
 
@@ -168,6 +169,12 @@ Publishes a generic same-process semantic hook only for terminal AI unlock, exha
 - Main abort unlocks immediately; child stop reasons are ignored
 - Every true-idle settle reconciles aggregate idle without compaction/error classification
 - A decision turn with no verifiable result uses the existing three-attempt invalid budget
+
+### Slice 16 — Unified reasoned unlock UI — Complete
+
+- Human and AI reasoned unlocks emit no transient reason notification
+- Both persist exactly one muted TUI-only `Continue watchdog unlocked · <reason>` entry
+- Reasonless manual/abort unlock notifications remain unchanged
 
 ---
 

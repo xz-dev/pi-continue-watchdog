@@ -163,8 +163,10 @@ function armDecision(
 	return decision.decisionId;
 }
 
+const entryThemeColors: string[] = [];
 const ENTRY_THEME = {
-	fg(_color: string, text: string): string {
+	fg(color: string, text: string): string {
+		entryThemeColors.push(color);
 		return text;
 	},
 };
@@ -294,7 +296,7 @@ test("Examples 2-3 RED: command transitions reset exhausted or decision-failed s
 	]);
 });
 
-test("Example 3 RED: blank reason appends no entry, while a trimmed reason notifies and persists TUI-only data", async () => {
+test("Example 3 RED: blank reason notifies, while a trimmed reason only persists muted TUI-only data", async () => {
 	const harness = createHarness();
 
 	await harness.invoke(UNLOCK_CONTINUE_WATCHDOG_COMMAND, " \n\t ");
@@ -305,10 +307,7 @@ test("Example 3 RED: blank reason appends no entry, while a trimmed reason notif
 		UNLOCK_CONTINUE_WATCHDOG_COMMAND,
 		"  Waiting for input  ",
 	);
-	assert.deepEqual(harness.notifications, [
-		"Continue watchdog unlocked",
-		"Continue watchdog unlocked: Waiting for input",
-	]);
+	assert.deepEqual(harness.notifications, ["Continue watchdog unlocked"]);
 	assert.deepEqual(harness.entries, [
 		{
 			customType: "pi-continue-watchdog:unlock",
@@ -319,7 +318,21 @@ test("Example 3 RED: blank reason appends no entry, while a trimmed reason notif
 	const renderer = harness.entryRenderers.get(HUMAN_UNLOCK_ENTRY_TYPE);
 	assert.ok(renderer);
 	const rendered = renderer({ data: harness.entries[0].data }).render(10_000);
-	assert.equal(rendered.join("\n"), "✓ Watchdog unlocked · Waiting for input");
+	assert.equal(
+		rendered.join("\n"),
+		"Continue watchdog unlocked · Waiting for input",
+	);
+	entryThemeColors.splice(0);
+	createHumanUnlockEntryRenderer()(
+		{ data: harness.entries[0].data } as never,
+		{ expanded: false } as never,
+		ENTRY_THEME as never,
+	)?.render(10_000);
+	assert.equal(entryThemeColors.length > 0, true);
+	assert.equal(
+		entryThemeColors.every((color) => color === "toolOutput"),
+		true,
+	);
 });
 
 test("Example 3 RED: human reason truncation is code-point safe at 500 Unicode characters", async () => {
@@ -332,9 +345,7 @@ test("Example 3 RED: human reason truncation is code-point safe at 500 Unicode c
 	const reason = emoji.repeat(500);
 	assert.equal(Array.from(harness.entries[0].data?.reason ?? "").length, 500);
 	assert.equal(harness.entries[0].data?.reason, reason);
-	assert.deepEqual(harness.notifications, [
-		`Continue watchdog unlocked: ${reason}`,
-	]);
+	assert.deepEqual(harness.notifications, []);
 });
 
 test("Example 3 RED: human reason preserves internal multiline content", async () => {
@@ -344,10 +355,7 @@ test("Example 3 RED: human reason preserves internal multiline content", async (
 	await harness.invoke(UNLOCK_CONTINUE_WATCHDOG_COMMAND, ` \n${reason}\n `);
 
 	assert.equal(harness.entries[0].data?.reason, reason);
-	assert.equal(
-		harness.notifications[0],
-		`Continue watchdog unlocked: ${reason}`,
-	);
+	assert.deepEqual(harness.notifications, []);
 	const renderer = createHumanUnlockEntryRenderer();
 	assert.equal(
 		renderer(
@@ -357,15 +365,15 @@ test("Example 3 RED: human reason preserves internal multiline content", async (
 		)
 			?.render(10_000)
 			.join("\n"),
-		`✓ Watchdog unlocked · ${reason}`,
+		`Continue watchdog unlocked · ${reason}`,
 	);
 });
 
 test("Slice 4 RED: unlock-reason entry wraps ASCII text to the current terminal width", () => {
 	assert.deepEqual(renderHumanUnlockEntry({ reason: "alpha" }, 12), [
-		"✓ Watchdog u",
-		"nlocked · al",
-		"pha",
+		"Continue wat",
+		"chdog unlock",
+		"ed · alpha",
 	]);
 });
 
@@ -401,9 +409,10 @@ test("I1 RED: unlock-reason entry uses Pi widths for multi-spacing-mark Thai, La
 
 test("Slice 4 RED: unlock-reason entry preserves multiline empty lines while wrapping", () => {
 	assert.deepEqual(renderHumanUnlockEntry({ reason: "first\n\nthird" }, 10), [
-		"✓ Watchdog",
-		" unlocked ",
-		"· first",
+		"Continue w",
+		"atchdog un",
+		"locked · f",
+		"irst",
 		"",
 		"third",
 	]);
@@ -412,13 +421,13 @@ test("Slice 4 RED: unlock-reason entry preserves multiline empty lines while wra
 test("Slice 4 RED: unlock-reason entry safely falls back for malformed data and sanitizes terminal controls", () => {
 	for (const data of [undefined, null, {}, { reason: null }, { reason: 42 }]) {
 		assert.deepEqual(renderHumanUnlockEntry(data, 10_000), [
-			"✓ Watchdog unlocked",
+			"Continue watchdog unlocked",
 		]);
 	}
 
 	assert.deepEqual(
 		renderHumanUnlockEntry({ reason: "safe\u001b[31mred\u0007\t" }, 10_000),
-		["✓ Watchdog unlocked · safe?[31mred??"],
+		["Continue watchdog unlocked · safe?[31mred??"],
 	);
 });
 

@@ -34,7 +34,7 @@ Observable behavior only (implementation details may change):
    - `continue_watchdog` — keep working
    - `unlock_continue_watchdog` with a concise reason — stop automatic checks
 4. **Continue** injects the compact prompt `Continue until user assistance is required.` (configurable) and ordinary work resumes without further user input.
-5. **Unlock** shows one compact persistent TUI line, `✓ Watchdog unlocked · <reason>`, and does **not** start another work turn. Future model context drops the decision exchange.
+5. **Unlock with a reason** shows one muted persistent TUI line, `Continue watchdog unlocked · <reason>`, with no duplicate transient notification, and does **not** start another work turn. Future model context drops the decision exchange.
 6. A decision gets up to **3 total attempts**. A decision turn that settles without a verifiable result counts as invalid. After the third invalid/no-result response, the extension stays locked/failed until a new main user message or manual lock.
 7. After each valid continue, the next idle delay doubles: default **3s, 6s, 12s, …** up to **10** valid continues per lock cycle.
 8. An **aborted** main run unlocks immediately (reasonless). Child stop reasons are never inspected.
@@ -46,7 +46,7 @@ Design note: the extension does **not** blindly continue. It asks first so compl
 | Command | Effect |
 |---|---|
 | `/lock-continue-watchdog` | Lock, reset attempt counters, TUI: `Continue watchdog locked` |
-| `/unlock-continue-watchdog [reason]` | Set unlocked, cancel pending checks while preserving cycle counters/failure state, TUI: `Continue watchdog unlocked` or `Continue watchdog unlocked: <reason>` |
+| `/unlock-continue-watchdog [reason]` | Set unlocked and cancel pending checks while preserving cycle counters/failure state. Blank reason: notify `Continue watchdog unlocked`; nonblank reason: persist one muted `Continue watchdog unlocked · <reason>` entry |
 
 Same-state commands still assign and still notify (no silent no-op). Only `/lock-continue-watchdog` semantics reset the cycle; a real main user message applies those semantics silently.
 
