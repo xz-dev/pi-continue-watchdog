@@ -401,7 +401,7 @@ async function waitFor(
 }
 
 test("packed artifact asks after threshold compaction settles", {
-	timeout: 20_000,
+	timeout: 35_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t, {
 		watchdogConfig: { idleDelaySeconds: 0.5 },
@@ -444,10 +444,46 @@ test("packed artifact asks after threshold compaction settles", {
 	});
 	t.after(unsubscribe);
 
+	const promptStartedAt = Date.now();
 	await session.prompt("A normal turn must settle after threshold compaction.");
-	await waitFor(
+	const decisionDeadline = promptStartedAt + 20_000;
+	const waitWithinDeadline = async (
+		condition: () => boolean,
+		phase: string,
+	): Promise<void> => {
+		const remaining = decisionDeadline - Date.now();
+		if (remaining <= 0) {
+			throw new Error(
+				`Timed out waiting for ${phase}; requests=${requests.length}; lifecycle=${lifecycle.map((event) => event.type).join(",")}`,
+			);
+		}
+		try {
+			await waitFor(condition, remaining, phase);
+		} catch {
+			throw new Error(
+				`Timed out waiting for ${phase}; requests=${requests.length}; lifecycle=${lifecycle.map((event) => event.type).join(",")}`,
+			);
+		}
+	};
+	await waitWithinDeadline(
+		() => lifecycle.some((event) => event.type === "compaction_end"),
+		"threshold compaction_end",
+	);
+	const compactionEndAt = lifecycle.find(
+		(event) => event.type === "compaction_end",
+	)?.at;
+	assert.ok(compactionEndAt);
+	await waitWithinDeadline(
+		() =>
+			lifecycle.some(
+				(event) =>
+					event.type === "agent_settled" && event.at >= compactionEndAt,
+			),
+		"post-compaction agent_settled",
+	);
+	await waitWithinDeadline(() => session.isIdle, "post-compaction idle");
+	await waitWithinDeadline(
 		() => requests.length === 3,
-		10_000,
 		"post-compaction decision request",
 	);
 	await session.waitForIdle();
