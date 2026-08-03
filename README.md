@@ -28,16 +28,16 @@ Reload Pi extensions or start a new session after install.
 
 Observable behavior only (implementation details may change):
 
-1. When a **main** user message actually starts processing, the continue watchdog **auto-locks**.
-2. While locked, after **all observable** same-process agents stay idle for the current delay, the extension opens a short **decision check** on main.
+1. Whenever the **main agent starts running**, the continue watchdog ensures it is locked. If already locked, the current cycle is preserved. A real main user message silently starts a fresh lock cycle.
+2. While locked, after **all observable** same-process agents stay idle for the current delay, the extension re-checks true idle and opens a short **decision check** on main—regardless of whether Pi stopped normally, after compaction, or because of a Provider/extension error.
 3. The decision is a **hidden automated** custom message (not a user message). For that check only, the model may call exactly one of:
    - `continue_watchdog` — keep working
    - `unlock_continue_watchdog` with a concise reason — stop automatic checks
 4. **Continue** injects the compact prompt `Continue until user assistance is required.` (configurable) and ordinary work resumes without further user input.
 5. **Unlock** shows one compact persistent TUI line, `✓ Watchdog unlocked · <reason>`, and does **not** start another work turn. Future model context drops the decision exchange.
-6. A decision gets up to **3 total attempts**. After the third invalid response, the extension stays locked/failed until a new main user message or manual lock.
+6. A decision gets up to **3 total attempts**. A decision turn that settles without a verifiable result counts as invalid. After the third invalid/no-result response, the extension stays locked/failed until a new main user message or manual lock.
 7. After each valid continue, the next idle delay doubles: default **3s, 6s, 12s, …** up to **10** valid continues per lock cycle.
-8. An **aborted** main run unlocks automatically (reasonless), same as manual unlock without a reason.
+8. An **aborted** main run unlocks immediately (reasonless). Child stop reasons are never inspected.
 
 Design note: the extension does **not** blindly continue. It asks first so completed or intentionally waiting work can unlock cleanly.
 
@@ -46,9 +46,9 @@ Design note: the extension does **not** blindly continue. It asks first so compl
 | Command | Effect |
 |---|---|
 | `/lock-continue-watchdog` | Lock, reset attempt counters, TUI: `Continue watchdog locked` |
-| `/unlock-continue-watchdog [reason]` | Unlock, cancel pending checks, TUI: `Continue watchdog unlocked` or `Continue watchdog unlocked: <reason>` |
+| `/unlock-continue-watchdog [reason]` | Set unlocked, cancel pending checks while preserving cycle counters/failure state, TUI: `Continue watchdog unlocked` or `Continue watchdog unlocked: <reason>` |
 
-Same-state commands still assign and still notify (no silent no-op).
+Same-state commands still assign and still notify (no silent no-op). Only `/lock-continue-watchdog` semantics reset the cycle; a real main user message applies those semantics silently.
 
 Human unlock reason is optional: trimmed and truncated to 500 Unicode characters; multiline allowed. Nonblank reasons also appear as a TUI-only history entry (not model context).
 
@@ -132,7 +132,7 @@ Publication is at most once per such terminal idle epoch. It does **not** publis
 
 - **“All agents”** means same-process sessions that loaded this extension and are known to its process-local hub. Isolated, out-of-process, or non-extension children may be absent.
 - **Main election:** UI-bound session wins; pure headless uses first-bound attachment as best-effort main.
-- **Lock state is runtime-only.** It resets unlocked on reload, new session, resume, restart, and shutdown. Nothing is written to disk for lock state.
+- **Lock state is runtime-only.** A new process/session attachment begins unlocked until its current main agent starts. Nothing is written to disk, and shutdown cancels runtime activity.
 - **No dependence** on pi-subagents, pi-watchdog, pi-notify, or any other plugin.
 - Decision tools are main-only controls during the decision window.
 

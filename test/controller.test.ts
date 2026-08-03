@@ -99,8 +99,34 @@ test("manual lock and main user start always reset, cancel pending work, and not
 	assert.equal(state.snapshot.decisionOpen, false);
 });
 
-test("unlock is unconditional and cancels or restores pending work", () => {
-	const state = controller();
+test("ensureLocked is a no-op when locked and a silent fresh lock when unlocked", () => {
+	const state = controller({ idleDelaySeconds: 3, maxRetries: 2 });
+
+	const fromUnlocked = state.ensureLocked();
+	assert.equal(fromUnlocked.applied, true);
+	assert.equal(state.snapshot.locked, true);
+	assert.deepEqual(fromUnlocked.effects, [
+		{ kind: "notify", notification: "locked" },
+	]);
+
+	const { decisionId: openId, timerId } = openDecision(state);
+	state.recordInvalidDecision(openId, "first");
+	assert.equal(state.snapshot.invalidDecisionAttempts, 1);
+	assert.equal(state.snapshot.decisionOpen, true);
+
+	const alreadyLocked = state.ensureLocked();
+	assert.equal(alreadyLocked.applied, false);
+	assert.deepEqual(alreadyLocked.effects, []);
+	assert.equal(state.snapshot.locked, true);
+	assert.equal(state.snapshot.decisionOpen, true);
+	assert.equal(state.snapshot.invalidDecisionAttempts, 1);
+	assert.equal(state.snapshot.idleTimer, null);
+	// Already-consumed timer id must stay inert while decision remains open.
+	assert.equal(state.beginDecision(timerId).applied, false);
+});
+
+test("unlock clears pending controller work but preserves attempt and exhaustion", () => {
+	const state = controller({ idleDelaySeconds: 3, maxRetries: 2 });
 
 	const alreadyUnlocked = state.unlock();
 	assert.equal(alreadyUnlocked.applied, true);
@@ -109,38 +135,84 @@ test("unlock is unconditional and cancels or restores pending work", () => {
 	]);
 
 	state.lock();
+	const firstDecision = openDecision(state).decisionId;
+	state.recordValidContinue(firstDecision);
+	assert.equal(state.snapshot.attempt, 1);
 	const pending = armEffect(state.onAllObservableIdle());
 	const duringDelay = state.unlock();
 	assert.deepEqual(duringDelay.effects, [
 		{ kind: "cancelIdleTimer", timerId: pending.timerId },
 		{ kind: "notify", notification: "unlocked" },
 	]);
+	assert.equal(state.snapshot.locked, false);
+	assert.equal(state.snapshot.attempt, 1);
+	assert.equal(state.snapshot.exhausted, false);
+	assert.equal(state.snapshot.idleTimer, null);
 
 	state.lock();
+	state.recordValidContinue(openDecision(state).decisionId);
+	state.recordValidContinue(openDecision(state).decisionId);
+	assert.equal(state.snapshot.exhausted, true);
+	assert.equal(state.snapshot.attempt, 2);
+	assert.equal(state.onAllObservableIdle().applied, false);
+	state.unlock();
+	assert.equal(state.snapshot.locked, false);
+	assert.equal(state.snapshot.exhausted, true);
+	assert.equal(state.snapshot.attempt, 2);
+});
+
+test("unlock during decision and valid unlock preserve counters and failures", () => {
+	const state = controller({ idleDelaySeconds: 3, maxRetries: 2 });
+	state.lock();
+	const first = openDecision(state).decisionId;
+	state.recordValidContinue(first);
+	assert.equal(state.snapshot.attempt, 1);
 	const { decisionId: openDecisionId } = openDecision(state);
+	state.recordInvalidDecision(openDecisionId, "blank reason");
+	assert.equal(state.snapshot.invalidDecisionAttempts, 1);
+	assert.equal(state.snapshot.lastInvalidDecisionError, "blank reason");
+
 	const duringDecision = state.unlock();
 	assert.deepEqual(duringDecision.effects, [
 		{ kind: "restoreDecisionTools", decisionId: openDecisionId },
 		{ kind: "notify", notification: "unlocked" },
 	]);
+	assert.equal(state.snapshot.locked, false);
+	assert.equal(state.snapshot.attempt, 1);
+	assert.equal(state.snapshot.decisionOpen, false);
+	assert.equal(state.snapshot.invalidDecisionAttempts, 1);
+	assert.equal(state.snapshot.lastInvalidDecisionError, "blank reason");
+	assert.equal(state.snapshot.decisionFailed, false);
 
+	// decision-failed then unlock preserves failure flags
 	state.lock();
+	const failedId = openDecision(state).decisionId;
+	state.recordInvalidDecision(failedId, "one");
+	state.recordInvalidDecision(failedId, "two");
+	state.recordInvalidDecision(failedId, "three");
+	assert.equal(state.snapshot.decisionFailed, true);
+	assert.equal(state.snapshot.invalidDecisionAttempts, 3);
+	state.unlock();
+	assert.equal(state.snapshot.locked, false);
+	assert.equal(state.snapshot.decisionFailed, true);
+	assert.equal(state.snapshot.invalidDecisionAttempts, 3);
+	assert.equal(state.snapshot.lastInvalidDecisionError, "three");
+
+	// valid AI unlock preserves attempt accounting
+	state.lock();
+	const continued = openDecision(state).decisionId;
+	state.recordValidContinue(continued);
 	const { decisionId: validUnlockDecisionId } = openDecision(state);
 	const validUnlock = state.recordValidUnlock(validUnlockDecisionId);
 	assert.deepEqual(validUnlock.effects, [
 		{ kind: "restoreDecisionTools", decisionId: validUnlockDecisionId },
 		{ kind: "notify", notification: "unlocked" },
 	]);
-	assert.deepEqual(state.snapshot, {
-		locked: false,
-		attempt: 0,
-		exhausted: false,
-		decisionFailed: false,
-		invalidDecisionAttempts: 0,
-		lastInvalidDecisionError: null,
-		idleTimer: null,
-		decisionOpen: false,
-	});
+	assert.equal(state.snapshot.locked, false);
+	assert.equal(state.snapshot.attempt, 1);
+	assert.equal(state.snapshot.exhausted, false);
+	assert.equal(state.snapshot.decisionOpen, false);
+	assert.equal(state.snapshot.idleTimer, null);
 });
 
 test("valid continues advance zero-based exponential delays then exhaust", () => {

@@ -27,6 +27,8 @@ import {
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const decisionTools = ["continue_watchdog", "unlock_continue_watchdog"];
+const decisionPrompt =
+	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Call unlock_continue_watchdog with a concise reason if you are intentionally waiting for the user or all tasks are complete. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.";
 const decisionPromptStart =
 	"This is an automated continuation check from the pi-continue-watchdog extension";
 const continuePrompt = "Continue until user assistance is required.";
@@ -44,6 +46,11 @@ interface MockReply {
 	readonly kind: "stop" | "continue" | "unlock" | "delayed";
 	readonly reason?: string;
 	readonly started?: () => void;
+	readonly text?: string;
+	readonly usage?: {
+		readonly promptTokens: number;
+		readonly completionTokens: number;
+	};
 }
 
 interface PackedFixture {
@@ -79,6 +86,7 @@ async function makePackedFixture(
 	options?: {
 		readonly withSemanticProbe?: boolean;
 		readonly watchdogConfig?: Record<string, unknown>;
+		readonly piSettings?: Record<string, unknown>;
 	},
 ): Promise<PackedFixture & { readonly probeOut?: string }> {
 	const root = await mkdtemp(join(tmpdir(), "pi-continue-watchdog-e2e-"));
@@ -118,7 +126,7 @@ async function makePackedFixture(
 			"--no-fund",
 			tarball,
 		],
-		{ cwd: installRoot, timeout: 120_000, maxBuffer: 2 * 1024 * 1024 },
+		{ cwd: installRoot, timeout: 120_000, maxBuffer: 8 * 1024 * 1024 },
 	);
 
 	const manifest = JSON.parse(
@@ -150,7 +158,7 @@ async function makePackedFixture(
 
 	await writeFile(
 		join(agentDir, "settings.json"),
-		JSON.stringify({ extensions }),
+		JSON.stringify({ ...options?.piSettings, extensions }),
 	);
 	return { root, home, agentDir, cwd, packageDir, probeOut };
 }
@@ -260,6 +268,15 @@ async function startMockServer(
 				]);
 				return;
 			}
+			const usage =
+				reply.usage === undefined
+					? undefined
+					: {
+							prompt_tokens: reply.usage.promptTokens,
+							completion_tokens: reply.usage.completionTokens,
+							total_tokens:
+								reply.usage.promptTokens + reply.usage.completionTokens,
+						};
 			sendSse(response, [
 				{
 					id,
@@ -267,7 +284,9 @@ async function startMockServer(
 					choices: [
 						{
 							index: 0,
-							delta: { content: `ordinary-${requests.length}` },
+							delta: {
+								content: reply.text ?? `ordinary-${requests.length}`,
+							},
 							finish_reason: null,
 						},
 					],
@@ -276,6 +295,7 @@ async function startMockServer(
 					id,
 					model: "watchdog-e2e",
 					choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+					...(usage === undefined ? {} : { usage }),
 				},
 			]);
 		});
@@ -295,6 +315,7 @@ async function startMockServer(
 async function createSession(
 	fixture: PackedFixture & { readonly probeOut?: string },
 	baseUrl: string,
+	options?: { readonly contextWindow?: number; readonly maxTokens?: number },
 ): Promise<{ session: AgentSession; extensionPath: string }> {
 	const previousHome = process.env.HOME;
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -338,8 +359,8 @@ async function createSession(
 					reasoning: false,
 					input: ["text"],
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-					contextWindow: 4096,
-					maxTokens: 128,
+					contextWindow: options?.contextWindow ?? 4096,
+					maxTokens: options?.maxTokens ?? 128,
 				},
 			],
 		});
@@ -378,6 +399,100 @@ async function waitFor(
 		await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
 	}
 }
+
+test("packed artifact asks after threshold compaction settles", {
+	timeout: 20_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t, {
+		watchdogConfig: { idleDelaySeconds: 0.5 },
+		piSettings: {
+			compaction: { reserveTokens: 16, keepRecentTokens: 1 },
+			retry: { enabled: false },
+		},
+	});
+	const { baseUrl, requests } = await startMockServer(t, [
+		{
+			kind: "stop",
+			text: "ordinary response",
+			usage: { promptTokens: 52, completionTokens: 4 },
+		},
+		{
+			kind: "stop",
+			text: "## Goal\nPreserve the threshold-compaction test context.",
+			usage: { promptTokens: 8, completionTokens: 4 },
+		},
+		{ kind: "continue" },
+	]);
+	const { session, extensionPath } = await createSession(fixture, baseUrl, {
+		contextWindow: 64,
+		maxTokens: 16,
+	});
+	t.after(() => session.dispose());
+	assert.match(
+		extensionPath,
+		/node_modules\/pi-continue-watchdog\/src\/extension\.ts$/,
+	);
+	const lifecycle: Array<{ readonly type: string; readonly at: number }> = [];
+	const unsubscribe = session.subscribe((event) => {
+		if (
+			event.type === "compaction_start" ||
+			event.type === "compaction_end" ||
+			event.type === "agent_settled"
+		) {
+			lifecycle.push({ type: event.type, at: Date.now() });
+		}
+	});
+	t.after(unsubscribe);
+
+	await session.prompt("A normal turn must settle after threshold compaction.");
+	await waitFor(
+		() => requests.length === 3,
+		10_000,
+		"post-compaction decision request",
+	);
+	await session.waitForIdle();
+
+	assert.equal(
+		lifecycle.some((event) => event.type === "compaction_start"),
+		true,
+	);
+	assert.equal(
+		lifecycle.some((event) => event.type === "compaction_end"),
+		true,
+	);
+	assert.equal(
+		lifecycle.some((event) => event.type === "agent_settled"),
+		true,
+	);
+	const decisionRequest = requests[2];
+	assert.ok(decisionRequest);
+	assert.deepEqual(toolNames(decisionRequest), decisionTools);
+	const ordinaryRequest = requests[0];
+	const summaryRequest = requests[1];
+	assert.ok(ordinaryRequest);
+	assert.ok(summaryRequest);
+	assert.deepEqual(toolNames(ordinaryRequest), [
+		"bash",
+		"edit",
+		"read",
+		"write",
+	]);
+	assert.deepEqual(toolNames(summaryRequest), []);
+	assert.equal(
+		textOf(ordinaryRequest.messages.at(-1) ?? {}).includes(
+			"A normal turn must settle after threshold compaction.",
+		),
+		true,
+	);
+	assert.equal(
+		textOf(summaryRequest.messages.at(-1) ?? {}).includes("<conversation>"),
+		true,
+	);
+	assert.equal(decisionRequest.messages.at(-1)?.role, "user");
+	assert.deepEqual(decisionRequest.messages.at(-1)?.content, [
+		{ type: "text", text: decisionPrompt },
+	]);
+});
 
 test("packed source artifact waits a real 3 seconds, decides continue, and folds context", {
 	timeout: 30_000,

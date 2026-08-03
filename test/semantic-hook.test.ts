@@ -252,6 +252,24 @@ async function startIdle(harness: SemanticHarness): Promise<void> {
 	await harness.fire("session_start", { type: "session_start" });
 }
 
+/**
+ * Fire agent_settled and the deferred 0ms settled-phase wake. Capture before/
+ * after so any idle-timer arming (also 0ms when idleDelaySeconds=0) is not
+ * mistaken for the wake callback; production schedules the wake last.
+ */
+async function settleOnly(harness: SemanticHarness): Promise<void> {
+	const before = harness.clock.records.length;
+	await harness.fire("agent_settled", { type: "agent_settled" });
+	const after = harness.clock.records.length;
+	assert.ok(
+		after > before,
+		"true-idle agent_settled must schedule a deferred settled-phase callback",
+	);
+	const deferred = after - 1;
+	assert.equal(harness.clock.records[deferred]?.delayMs, 0);
+	harness.clock.fire(deferred);
+}
+
 async function settleResponse(
 	harness: SemanticHarness,
 	message: unknown,
@@ -263,7 +281,7 @@ async function settleResponse(
 		messages: [message],
 	});
 	harness.streaming = false;
-	await harness.fire("agent_settled", { type: "agent_settled" });
+	await settleOnly(harness);
 }
 
 function assertFrozenEnvelope(envelope: SemanticHookEnvelope): void {
@@ -343,7 +361,7 @@ test("AI decision unlock publishes exact validated reason once at terminal idle"
 
 	// Same idle epoch reconcile must not republish.
 	harness.runtime.reconcileIdle();
-	await harness.fire("agent_settled", { type: "agent_settled" });
+	await settleOnly(harness);
 	assert.equal(harness.received.length, 1);
 });
 
@@ -373,7 +391,7 @@ test("exhausted and decisionFailed publish exact STOP_KIND envelopes once", asyn
 	assertFrozenEnvelope(exhaustedEnvelope);
 	// Same terminal idle epoch: settled/reconcile without becoming busy again.
 	exhausted.runtime.reconcileIdle();
-	await exhausted.fire("agent_settled", { type: "agent_settled" });
+	await settleOnly(exhausted);
 	assert.equal(exhausted.received.length, 1);
 
 	const failed = createSemanticHarness();
@@ -407,32 +425,34 @@ test("human unlock, abort unlock, continue, and initial unlocked idle publish no
 	await startIdle(human);
 	// Initial ordinary unlocked idle.
 	human.runtime.reconcileIdle();
-	await human.fire("agent_settled", { type: "agent_settled" });
+	await settleOnly(human);
 	assert.equal(human.received.length, 0);
 
-	human.runtime.prepareForLockStateChange();
+	human.runtime.applyTransition(human.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	human.runtime.clearOperationalPendingWork();
+	const timersBeforeArm = human.clock.records.length;
+	human.runtime.reconcileIdle();
+	assert.equal(human.clock.records.length, timersBeforeArm + 1);
+	assert.equal(human.clock.records.at(-1)?.delayMs, 3000);
+	human.runtime.applyTransition(human.controller.unlock(), undefined, {
+		suppressNotify: true,
+	});
+	human.runtime.clearOperationalPendingWork();
+	await settleOnly(human);
+	assert.equal(human.received.length, 0);
+
+	// Canonical/manual abort unlock path: unlock first, then operational cleanup.
 	human.runtime.applyTransition(human.controller.lock(), undefined, {
 		suppressNotify: true,
 	});
 	human.runtime.reconcileIdle();
-	assert.equal(human.clock.records.length, 1);
-	human.runtime.prepareForLockStateChange();
 	human.runtime.applyTransition(human.controller.unlock(), undefined, {
 		suppressNotify: true,
 	});
-	await human.fire("agent_settled", { type: "agent_settled" });
-	assert.equal(human.received.length, 0);
-
-	// Canonical/manual abort unlock path: prepare + reasonless unlock.
-	human.runtime.applyTransition(human.controller.lock(), undefined, {
-		suppressNotify: true,
-	});
-	human.runtime.reconcileIdle();
-	human.runtime.prepareForLockStateChange();
-	human.runtime.applyTransition(human.controller.unlock(), undefined, {
-		suppressNotify: true,
-	});
-	await human.fire("agent_settled", { type: "agent_settled" });
+	human.runtime.clearOperationalPendingWork();
+	await settleOnly(human);
 	assert.equal(human.received.length, 0);
 
 	const continued = createSemanticHarness({ config: { maxRetries: 3 } });
@@ -525,7 +545,10 @@ test("main-only ownership, stale demotion, and reload/shutdown publish nothing",
 			]),
 		],
 	});
+	// Shutdown stops lifecycle; settled handlers may still run but must not publish.
+	const timersBefore = reloaded.clock.records.length;
 	await reloaded.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(reloaded.clock.records.length, timersBefore);
 	assert.equal(reloaded.received.length, 0);
 });
 
@@ -633,37 +656,36 @@ function aiUnlockCount(received: readonly SemanticHookEnvelope[]): number {
 }
 
 test("pending AI unlock intent is cleared by external lock/ownership transitions", async () => {
-	// Human/manual unlock seam: prepareForLockStateChange + controller unlock.
-	// Canonical abort also clears via the same prepareForLockStateChange public
-	// seam before unlock; the semantic harness has no sessionManager branch
-	// surface for a full abort capture, so this is the reachable external path.
+	// Human/manual unlock seam: controller unlock first, then operational cleanup.
+	// Canonical abort uses the same post-transition cleanup seam; the semantic
+	// harness has no sessionManager branch surface for a full abort capture.
 	{
 		const { harness, child } = await establishPendingAiUnlock(
 			"pending then human unlock",
 		);
-		harness.runtime.prepareForLockStateChange();
 		harness.runtime.applyTransition(harness.controller.unlock(), undefined, {
 			suppressNotify: true,
 		});
+		harness.runtime.clearOperationalPendingWork();
 		harness.hub.markIdle(child);
 		harness.runtime.reconcileIdle();
-		await harness.fire("agent_settled", { type: "agent_settled" });
+		await settleOnly(harness);
 		assert.equal(aiUnlockCount(harness.received), 0);
 		assert.equal(harness.received.length, 0);
 	}
 
-	// Human/manual lock replaces state after prepare clears retained intent.
+	// Human/manual lock replaces state after transition, then cleanup clears intent.
 	{
 		const { harness, child } = await establishPendingAiUnlock(
 			"pending then human lock",
 		);
-		harness.runtime.prepareForLockStateChange();
 		harness.runtime.applyTransition(harness.controller.lock(), undefined, {
 			suppressNotify: true,
 		});
+		harness.runtime.clearOperationalPendingWork();
 		harness.hub.markIdle(child);
 		harness.runtime.reconcileIdle();
-		await harness.fire("agent_settled", { type: "agent_settled" });
+		await settleOnly(harness);
 		assert.equal(aiUnlockCount(harness.received), 0);
 		// New locked idle may arm a timer, but must never publish the old reason.
 		assert.equal(harness.snapshotController().locked, true);
@@ -685,7 +707,8 @@ test("pending AI unlock intent is cleared by external lock/ownership transitions
 		assert.equal(harness.runtime.isCurrentMain(), false);
 		harness.hub.markIdle(child);
 		harness.runtime.reconcileIdle();
-		await harness.fire("agent_settled", { type: "agent_settled" });
+		// Demoted attachment may still schedule a deferred wake; it must no-op publish.
+		await settleOnly(harness);
 		assert.equal(aiUnlockCount(harness.received), 0);
 		assert.equal(harness.received.length, 0);
 		harness.hub.detach(usurper);
@@ -699,7 +722,9 @@ test("pending AI unlock intent is cleared by external lock/ownership transitions
 		harness.runtime.shutdown();
 		harness.hub.markIdle(child);
 		harness.runtime.reconcileIdle();
+		const timersBefore = harness.clock.records.length;
 		await harness.fire("agent_settled", { type: "agent_settled" });
+		assert.equal(harness.clock.records.length, timersBefore);
 		assert.equal(aiUnlockCount(harness.received), 0);
 		assert.equal(harness.received.length, 0);
 	}

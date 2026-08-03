@@ -60,6 +60,11 @@ export interface ControllerTransition {
 export interface LockDecisionController {
 	readonly snapshot: LockDecisionSnapshot;
 	lock(): ControllerTransition;
+	/**
+	 * Ensure locked without resetting an already active cycle.
+	 * Unlocked => fresh lock; locked => strict no-op.
+	 */
+	ensureLocked(): ControllerTransition;
 	unlock(): ControllerTransition;
 	onMainUserMessageStart(): ControllerTransition;
 	onAllObservableIdle(): ControllerTransition;
@@ -147,9 +152,26 @@ class PureLockDecisionController implements LockDecisionController {
 		return this.applied(effects);
 	}
 
+	public ensureLocked(): ControllerTransition {
+		if (this.state.locked) {
+			return this.noop();
+		}
+		return this.lock();
+	}
+
+	/**
+	 * Assign locked=false, clear pending timer/decision fields, and notify.
+	 * Preserves attempt/backoff, exhaustion, decisionFailed, and invalid counters.
+	 */
 	public unlock(): ControllerTransition {
 		const effects = this.clearPendingIntents();
-		this.state = initialState();
+		this.state = {
+			...this.state,
+			locked: false,
+			idleTimer: null,
+			decisionOpen: false,
+			decisionId: null,
+		};
 		effects.push({ kind: "notify", notification: "unlocked" });
 		return this.applied(effects);
 	}
@@ -278,7 +300,14 @@ class PureLockDecisionController implements LockDecisionController {
 			return this.noop();
 		}
 
-		this.state = initialState();
+		// Same preserved-accounting unlock as unlock(), plus tool restore.
+		this.state = {
+			...this.state,
+			locked: false,
+			idleTimer: null,
+			decisionOpen: false,
+			decisionId: null,
+		};
 		return this.applied([
 			{ kind: "restoreDecisionTools", decisionId },
 			{ kind: "notify", notification: "unlocked" },

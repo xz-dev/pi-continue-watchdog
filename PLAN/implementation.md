@@ -1,6 +1,6 @@
 # Implementation plan — pi-continue-watchdog
 
-**Status:** Public live Git package on `master`. Slices 0–13 are complete; npm, tags, and GitHub Releases are intentionally not used.
+**Status:** Public live Git package on `master`. Slices 0–15 are complete; npm, tags, and GitHub Releases are intentionally not used.
 **Method:** One vertical behavior slice per branch; RED → GREEN → review (when functional) → merge → next branch
 **Language:** English only for all project artifacts
 
@@ -37,7 +37,8 @@ Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would ch
 | 11 | Packed isolated stock-Pi E2E + CI | Complete |
 | 12 | README product docs | Complete |
 | 13 | Publication readiness | Complete (public live Git package) |
-| 14 | Neutral `user-ready` semantic producer | In progress on `feat/neutral-user-ready-hook` |
+| 14 | Neutral `user-ready` semantic producer | Complete |
+| 15 | Universal idle lifecycle state machine | Complete |
 
 **Current architecture (indicative filenames; may still be simplified):**
 
@@ -54,7 +55,7 @@ Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would ch
 | Runtime | `src/runtime.ts` | Timers, decision entry, continue/unlock delivery |
 | Semantic hook | `src/semantic-hook.ts` | Neutral `pi:semantic-hook:v1` / `user-ready` producer helpers |
 | Commands | `src/commands.ts` | `/lock-continue-watchdog`, `/unlock-continue-watchdog` |
-| Auto-lock / abort | `src/auto-lock.ts`, `src/abort-outcome.ts` | Main user start lock; aborted-run unlock |
+| Auto-lock / abort | `src/auto-lock.ts`, `src/abort-outcome.ts` | Main user fresh-cycle lock; current-main aborted-run unlock |
 | Tests / CI | `test/**`, `e2e/**`, `.github/workflows/ci.yml` | Unit + packed stock-Pi E2E |
 
 **Distribution:** public `xz-dev/pi-continue-watchdog`, installed only with the unpinned command `pi install git:github.com/xz-dev/pi-continue-watchdog`. No npm publication, tags, or GitHub Releases.
@@ -76,7 +77,7 @@ Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would ch
 |---|---|
 | pi-watchdog | Process-global hub, UI-first root election, trust-gated config, packed isolated stock-Pi CI |
 | pi-notify | Trust-gated global/project config precedence only |
-| Pi public APIs | Auto-lock on actual main user message start; idle after all observable agents settle; wake via hidden custom message; temporary decision tools; context hooks for model-bound edits; abort unlock from Pi-reported aborted main runs |
+| Pi public APIs | Ensure lock on current-main start; fresh lock on actual main user message start; true idle after all observable agents settle; wake via hidden custom message; temporary decision tools; context hooks for model-bound edits; abort unlock from Pi-reported aborted main runs |
 
 ---
 
@@ -105,7 +106,7 @@ Defaults, global + trusted project merge, invalid field fallback, exact default 
 
 ### Slice 2 — Lock / decision state machine — Complete
 
-Pure controller: lock/unlock/auto-lock, exponential delays, exhaustion, invalid re-asks, decision-failed.
+Pure controller: fresh lock, non-resetting unlock, ensure-lock, exponential delays, exhaustion, invalid/no-result re-asks, decision-failed.
 
 ### Slice 3 — Hub — Complete
 
@@ -154,6 +155,19 @@ Public English install/behavior/commands/config/limitations/CI/license docs.
 - `master` is the live package source
 - Install only with `pi install git:github.com/xz-dev/pi-continue-watchdog`
 - No npm publication, version tags, or GitHub Releases
+
+### Slice 14 — Neutral `user-ready` semantic producer — Complete
+
+Publishes a generic same-process semantic hook only for terminal AI unlock, exhaustion, or decision-failed states without coupling to a consumer plugin.
+
+### Slice 15 — Universal idle lifecycle state machine — Complete
+
+- Every current-main start is covered without resetting an already locked cycle
+- Fresh `/lock` semantics alone reset cycle data; a real main user message invokes them silently
+- Unlock assigns `locked=false` before operational cleanup and preserves cycle accounting
+- Main abort unlocks immediately; child stop reasons are ignored
+- Every true-idle settle reconciles aggregate idle without compaction/error classification
+- A decision turn with no verifiable result uses the existing three-attempt invalid budget
 
 ---
 

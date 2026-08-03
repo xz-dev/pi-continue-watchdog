@@ -108,7 +108,7 @@ export function createContinueWatchdogExtension(
 				return holder.controller;
 			},
 			isCurrentMain: runtime.isCurrentMain,
-			prepareForLockStateChange: () => runtime?.prepareForLockStateChange(),
+			clearOperationalPendingWork: () => runtime?.clearOperationalPendingWork(),
 			applyEffect: runtime.applyEffect,
 			reconcileIdle: runtime.reconcileIdle,
 		});
@@ -117,14 +117,12 @@ export function createContinueWatchdogExtension(
 		registerMainUserAutoLock(pi, {
 			isCurrentMain: runtime.isCurrentMain,
 			onMainUserMessageStart(): void {
-				runtime?.prepareForLockStateChange();
-				runtime?.applyTransition(
-					holder.controller.onMainUserMessageStart(),
-					undefined,
-					{
-						suppressNotify: true,
-					},
-				);
+				// Fresh silent /lock: controller first, then cleanup, then effects.
+				const transition = holder.controller.onMainUserMessageStart();
+				runtime?.clearOperationalPendingWork();
+				runtime?.applyTransition(transition, undefined, {
+					suppressNotify: true,
+				});
 			},
 		});
 
@@ -135,7 +133,7 @@ export function createContinueWatchdogExtension(
 			get controller() {
 				return holder.controller;
 			},
-			prepareForLockStateChange: () => runtime?.prepareForLockStateChange(),
+			clearOperationalPendingWork: () => runtime?.clearOperationalPendingWork(),
 			applyEffect: runtime.applyEffect,
 		});
 

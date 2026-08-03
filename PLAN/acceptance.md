@@ -82,7 +82,9 @@ Continue until user assistance is required.
 3. **Only main** may enter the decision window and receive decision tools. Non-main attachments must not expose decision tools as usable main controls.
 4. **Zero external-plugin dependencies.** Use only Pi public extension APIs plus this plugin’s own hub.
 5. **Lock state is runtime-only** for the current process/session attachment lifecycle. Not written to disk. Not restored on reload/new/resume/restart/shutdown.
-6. **Abort unlock.** When the main run is **actually aborted as Pi reports** (the same outcome the TUI shows as aborted), unlock reasonlessly. Ordinary natural settle does **not** unlock. Do not treat every idle settle as abort. Implementation may inspect Pi’s public session history to detect that aborted outcome; the detection mechanism is replaceable as long as this behavior holds.
+6. **Universal main-run coverage.** Every current-main `agent_start` ensures the watchdog is locked. If already locked, the existing cycle is preserved; watchdog decision and continuation turns do not reset themselves. If unlocked, the start silently begins a fresh lock cycle.
+7. **Abort unlock.** When the current main run is **actually aborted as Pi reports** (the same outcome the TUI shows as aborted), unlock reasonlessly and immediately. Ordinary natural settle does **not** unlock. Never inspect or infer why a child stopped. Implementation may inspect Pi’s public session history to detect the main aborted outcome; the detection mechanism is replaceable as long as this behavior holds.
+8. **Stop-reason-independent idle recovery.** For any non-aborted main stop—including normal completion, Provider/model failure, extension runtime failure, or auto-compaction failure—the plugin uses only Pi's true idle lifecycle. It does not match error strings or special-case compaction.
 
 ---
 
@@ -135,18 +137,24 @@ Per main ownership generation / lock cycle, at least:
 - Actual main user-role message **start of processing** (auto-lock)
 - Manual `/lock-continue-watchdog`
 
-**What unlocks (`locked=false`), cancels timers, resets attempts/failures:**
+**What unlocks without resetting cycle accounting:**
 
 - `/unlock-continue-watchdog [reason]`
 - Valid decision-window `unlock_continue_watchdog({ reason })`
 - Main run actually aborted as Pi reports (reasonless)
 
+Unlock first makes `locked=false`, then cancels every watchdog timer and cleans operational pending decision state while preserving attempt/backoff, exhaustion, decision-failed, and invalid/no-result counters. Only fresh lock semantics reset those fields.
+
+**What auto-locks without resetting an already locked cycle:**
+
+- Any current-main `agent_start`; when unlocked it starts a fresh cycle silently, and when already locked it preserves the cycle
+
 **What does not auto-lock / does not reset the main cycle:**
 
 - Merely queued main input (before processing starts)
 - Child/subagent user-role messages
-- Threshold-style side effects that are not listed above
-- Invalid decision re-asks (they do **not** consume exponential continue retries)
+- Watchdog decision or continuation turns while the current cycle is already locked
+- Invalid or no-result decision re-asks (they do **not** consume exponential continue retries)
 
 ---
 
@@ -205,7 +213,7 @@ On invalid decision:
 **When** the decision is a valid unlock:
 
 - Restore normal tools
-- Set unlocked; cancel timers; reset attempts/failures
+- Set unlocked first; then cancel timers and clean operational decision state while preserving attempts/failures
 - TUI notify exactly: `Continue watchdog unlocked: <reason>`
 - Append a **persisted TUI-only** reason entry (user-visible history, not model-bound as ordinary assistant prose)
 - **No further work turn** is started for that unlock decision
@@ -227,7 +235,7 @@ On invalid decision:
 
 ### Human `/unlock-continue-watchdog [reason]`
 
-Always assigns unlocked, cancels timers, resets attempts/failures, and notifies—even if already unlocked.
+Always assigns `locked=false` first, then cancels timers and cleans operational decision state while preserving cycle accounting, and notifies—even if already unlocked.
 
 | Human reason input | TUI notify | TUI-only reason entry |
 |---|---|---|
@@ -242,14 +250,28 @@ Human unlock is **not** subject to the AI decision-window invalid re-ask protoco
 
 These examples are the accepted product contract. Each is externally observable through public commands, TUI notifies, tool registration, model-bound context after folding, timers, and install/CI artifacts.
 
-### Example 1 — Actual main user message auto-locks
+### Example 1 — Current-main starts are covered; actual main user messages start fresh cycles
 
-**Given** the main session is unlocked or already locked (any prior attempt, exhaustion, or decision-failed state)
+**Given** the main session is unlocked
+**When** any current-main run actually starts
+**Then**
+
+- the watchdog silently starts a fresh locked cycle
+- the main attachment is marked busy
+
+**Given** the watchdog is already locked with any current attempt, exhaustion, decision-failed, timer, or decision window
+**When** another current-main run starts without a new real user message
+**Then**
+
+- the watchdog remains locked
+- existing cycle accounting and decision state are preserved
+- the main attachment is marked busy and any idle delay is cancelled
+
 **When** a **user-role** message actually starts processing on main (not mere queueing)
 **Then**
 
-- `locked` is set to `true` (unconditionally)
-- attempt counter resets to `0`; exhaustion and decision-failed clear; cycle rearmed
+- it silently performs the same fresh-cycle reset as `/lock-continue-watchdog`
+- attempt resets to `0`; exhaustion, decision-failed, and invalid/no-result counts clear; stale timer/decision work is cleaned
 - child-session user messages do **not** change main lock or attempts
 - merely queued (not yet started) main input does **not** lock or reset
 
@@ -270,7 +292,7 @@ These examples are the accepted product contract. Each is externally observable 
 **When** the human runs `/unlock-continue-watchdog` with empty/blank reason
 **Then**
 
-- unlocked; timers cancelled; attempts/failures reset
+- `locked=false` is assigned first; timers and pending operational decision work are then cancelled; attempts/failures are preserved
 - TUI notifies exactly: `Continue watchdog unlocked`
 - no TUI-only reason entry
 
@@ -289,7 +311,7 @@ These examples are the accepted product contract. Each is externally observable 
 **When** that run ends and Pi reports it as **aborted**
 **Then**
 
-- apply the same unconditional state transition as reasonless `/unlock-continue-watchdog`: unlocked; timers/decision state cancelled; attempts/failures reset; prior normal tools restored
+- apply the same unconditional state transition as reasonless `/unlock-continue-watchdog`: assign `locked=false` first; then cancel timers/operational decision state and restore prior normal tools; preserve cycle accounting and failures
 - TUI notifies exactly `Continue watchdog unlocked`, even when already unlocked
 - no unlock reason entry is appended
 - process that aborted run once (no duplicate unlock notification for the same abort)
@@ -332,17 +354,17 @@ With defaults, delays for successive continue attempts begin **3s, 6s, 12s, 24s,
 **When** the main agent returns a valid `unlock_continue_watchdog` with reason e.g. `Waiting for user confirmation on deploy.`
 **Then**
 
-- normal tools restored; unlocked; timers cancelled; attempts/failures reset
+- normal tools restored; `locked=false`; timers and operational decision state cancelled; attempts/failures preserved
 - TUI notifies exactly: `Continue watchdog unlocked: Waiting for user confirmation on deploy.`
 - TUI-only reason entry appended
 - **no further work turn** starts from that unlock decision
 - future model-bound context removes the entire decision exchange and inserts **nothing**
 - raw session may still contain protocol tool records
 
-### Example 8 — Invalid decision re-asks then decision-failed
+### Example 8 — Invalid or no-result decision re-asks then decision-failed
 
 **Given** a decision window is open
-**When** the model responds invalidly (no tool, both tools, unknown tool, prose-only, empty reason, reason > 500 Unicode characters)
+**When** the model responds invalidly (no tool, both tools, unknown tool, prose-only, empty reason, reason > 500 Unicode characters) **or the decision turn truly settles without any verifiable decision response/result**
 **Then**
 
 - immediately re-ask with a hidden prompt that includes the exact previous error and explains invalidity
@@ -365,6 +387,8 @@ With defaults, delays for successive continue attempts begin **3s, 6s, 12s, 24s,
 
 **When** all observable sessions are idle again
 **Then** the **full** delay for the **same** current attempt restarts from zero
+
+At each `agent_settled`, only Pi's live `ctx.isIdle()` truth may mark that attachment idle. Every true-idle settle explicitly reconciles aggregate idle even when the hub already considered the attachment idle. A false-idle outer settle caused by an earlier extension starting a nested turn must not arm; the later true settle must arm normally.
 
 Stale timer callbacks (wrong generation/epoch/ownership) must not open a decision window or wake main.
 

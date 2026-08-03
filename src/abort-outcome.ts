@@ -42,10 +42,10 @@ export interface MainAbortUnlockRuntime {
 	isCurrentMainClaim(claim: HubMainClaim): boolean;
 	readonly controller: LockDecisionController;
 	/**
-	 * Drop any pending decision finalization before the abort unlock transition
-	 * so a later settle path cannot continue after abort unlock.
+	 * Drop pending decision finalization after the abort unlock transition so a
+	 * later settle path cannot continue after abort unlock.
 	 */
-	prepareForLockStateChange(): void;
+	clearOperationalPendingWork(): void;
 	applyEffect(
 		effect: AbortUnlockRuntimeEffect,
 		ctx: ExtensionContext,
@@ -189,8 +189,10 @@ export function registerMainAbortUnlock(
 		);
 		if (outcome !== "aborted") return;
 
-		runtime.prepareForLockStateChange();
+		// Unlock first (locked=false authoritative), then operational cleanup,
+		// restore tools, and bare notify last.
 		const transition = runtime.controller.unlock();
+		runtime.clearOperationalPendingWork();
 		await applyUnlockEffects(transition, runtime, ctx);
 	});
 

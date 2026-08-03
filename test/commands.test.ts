@@ -69,7 +69,7 @@ function createHarness(): CommandHarness {
 	const timeline: string[] = [];
 	const controller = createLockDecisionController({
 		idleDelaySeconds: 3,
-		maxRetries: 1,
+		maxRetries: 2,
 	});
 	let currentMain = true;
 
@@ -98,8 +98,10 @@ function createHarness(): CommandHarness {
 	const runtime: MainCommandRuntime = {
 		controller,
 		isCurrentMain: () => currentMain,
-		prepareForLockStateChange(): void {
-			timeline.push("prepare");
+		clearOperationalPendingWork(): void {
+			timeline.push(
+				`cleanup:locked=${controller.snapshot.locked ? "true" : "false"}`,
+			);
 		},
 		applyEffect: async (effect) => {
 			effects.push(effect);
@@ -227,8 +229,8 @@ test("Examples 2-3 RED: command transitions reset exhausted or decision-failed s
 	const harness = createHarness();
 
 	await harness.invoke(LOCK_CONTINUE_WATCHDOG_COMMAND);
-	const exhaustedDecision = armDecision(harness.controller);
-	harness.controller.recordValidContinue(exhaustedDecision);
+	harness.controller.recordValidContinue(armDecision(harness.controller));
+	harness.controller.recordValidContinue(armDecision(harness.controller));
 	assert.equal(harness.controller.snapshot.exhausted, true);
 	await harness.invoke(LOCK_CONTINUE_WATCHDOG_COMMAND);
 	assert.equal(harness.controller.snapshot.attempt, 0);
@@ -242,6 +244,10 @@ test("Examples 2-3 RED: command transitions reset exhausted or decision-failed s
 	await harness.invoke(LOCK_CONTINUE_WATCHDOG_COMMAND);
 	assert.equal(harness.controller.snapshot.decisionFailed, false);
 
+	// Advance attempt so unlock must preserve cycle accounting.
+	const continued = armDecision(harness.controller);
+	harness.controller.recordValidContinue(continued);
+	assert.equal(harness.controller.snapshot.attempt, 1);
 	const pendingTimer = harness.controller
 		.onAllObservableIdle()
 		.effects.find(
@@ -252,16 +258,19 @@ test("Examples 2-3 RED: command transitions reset exhausted or decision-failed s
 	harness.timeline.splice(0);
 	harness.effects.splice(0);
 	await harness.invoke(UNLOCK_CONTINUE_WATCHDOG_COMMAND);
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.controller.snapshot.attempt, 1);
 	assert.deepEqual(harness.effects, [
 		{ kind: "cancelIdleTimer", timerId: pendingTimer.timerId },
 	]);
 	assert.deepEqual(harness.timeline, [
-		"prepare",
+		"cleanup:locked=false",
 		"cancelIdleTimer",
 		"notify:Continue watchdog unlocked",
 	]);
 
 	await harness.invoke(LOCK_CONTINUE_WATCHDOG_COMMAND);
+	assert.equal(harness.controller.snapshot.attempt, 0);
 	const openDecisionId = armDecision(harness.controller);
 	harness.timeline.splice(0);
 	harness.effects.splice(0);
@@ -270,9 +279,18 @@ test("Examples 2-3 RED: command transitions reset exhausted or decision-failed s
 		{ kind: "restoreDecisionTools", decisionId: openDecisionId },
 	]);
 	assert.deepEqual(harness.timeline, [
-		"prepare",
+		"cleanup:locked=false",
 		"restoreDecisionTools",
 		"notify:Continue watchdog unlocked",
+	]);
+
+	// Manual lock still resets and notifies after cleanup with locked=true.
+	harness.timeline.splice(0);
+	await harness.invoke(LOCK_CONTINUE_WATCHDOG_COMMAND);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.deepEqual(harness.timeline, [
+		"cleanup:locked=true",
+		"notify:Continue watchdog locked",
 	]);
 });
 

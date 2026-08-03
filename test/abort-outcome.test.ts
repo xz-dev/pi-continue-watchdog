@@ -110,7 +110,7 @@ function notifyCtx(
 }
 
 function makeController(): LockDecisionController {
-	return createLockDecisionController({ idleDelaySeconds: 3, maxRetries: 1 });
+	return createLockDecisionController({ idleDelaySeconds: 3, maxRetries: 2 });
 }
 
 function decisionId(controller: LockDecisionController): number {
@@ -185,8 +185,10 @@ function createAbortHarness(
 			return hub.isCurrentMain(claim);
 		},
 		controller,
-		prepareForLockStateChange() {
-			timeline.push("prepare");
+		clearOperationalPendingWork() {
+			timeline.push(
+				`cleanup:locked=${controller.snapshot.locked ? "true" : "false"}`,
+			);
 		},
 		applyEffect(effect) {
 			effects.push(effect);
@@ -314,6 +316,9 @@ test("aborted terminal unlock restores tools then notifies bare text", async () 
 	const harness = createAbortHarness({ locked: true });
 	harness.append(user("u0"));
 	await harness.start();
+	const continued = decisionId(harness.controller);
+	harness.controller.recordValidContinue(continued);
+	assert.equal(harness.controller.snapshot.attempt, 1);
 	decisionId(harness.controller);
 	assert.equal(harness.controller.snapshot.decisionOpen, true);
 
@@ -322,13 +327,14 @@ test("aborted terminal unlock restores tools then notifies bare text", async () 
 
 	assert.equal(harness.controller.snapshot.locked, false);
 	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.controller.snapshot.attempt, 1);
 	assert.deepEqual(harness.notifications, ["Continue watchdog unlocked"]);
 	assert.deepEqual(
 		harness.effects.map((effect) => effect.kind),
 		["restoreDecisionTools"],
 	);
 	assert.deepEqual(harness.timeline, [
-		"prepare",
+		"cleanup:locked=false",
 		"restoreDecisionTools",
 		"notify:Continue watchdog unlocked",
 	]);
@@ -417,8 +423,8 @@ test("demotion/detach/reclaim and child capture stay inert", async () => {
 			return hub.isCurrentMain(claim);
 		},
 		controller,
-		prepareForLockStateChange() {
-			throw new Error("demoted settle must not prepare");
+		clearOperationalPendingWork() {
+			throw new Error("demoted settle must not clear operational work");
 		},
 		applyEffect() {
 			throw new Error("demoted settle must not apply effects");
@@ -454,8 +460,8 @@ test("demotion/detach/reclaim and child capture stay inert", async () => {
 		getMainClaim: () => null,
 		isCurrentMainClaim: () => false,
 		controller: childController,
-		prepareForLockStateChange() {
-			throw new Error("child must not prepare");
+		clearOperationalPendingWork() {
+			throw new Error("child must not clear operational work");
 		},
 		applyEffect() {
 			throw new Error("child must not apply effects");

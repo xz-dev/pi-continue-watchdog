@@ -42,10 +42,10 @@ export interface MainCommandRuntime {
 	readonly controller: LockDecisionController;
 	readonly isCurrentMain: () => boolean;
 	/**
-	 * Invalidate any pending decision finalization/timer before lock or unlock so
-	 * a later settle cannot continue after the human command.
+	 * Invalidate pending decision finalization/timer after lock or unlock so a
+	 * later settle cannot continue after the human command.
 	 */
-	prepareForLockStateChange(): void;
+	clearOperationalPendingWork(): void;
 	applyEffect(
 		effect: CommandRuntimeEffect,
 		ctx: ExtensionCommandContext,
@@ -191,13 +191,10 @@ async function handleLock(
 	ctx: ExtensionCommandContext,
 ): Promise<void> {
 	if (!runtime.isCurrentMain()) return;
-	runtime.prepareForLockStateChange();
-	await applyControllerEffects(
-		runtime.controller.lock().effects,
-		runtime,
-		ctx,
-		undefined,
-	);
+	// Fresh lock transition first, then operational cleanup, effects/notify, reconcile.
+	const transition = runtime.controller.lock();
+	runtime.clearOperationalPendingWork();
+	await applyControllerEffects(transition.effects, runtime, ctx, undefined);
 	runtime.reconcileIdle?.();
 }
 
@@ -208,15 +205,12 @@ async function handleUnlock(
 	ctx: ExtensionCommandContext,
 ): Promise<void> {
 	if (!runtime.isCurrentMain()) return;
-	runtime.prepareForLockStateChange();
+	// Unlock first (locked=false authoritative), then cleanup, effects, notify last.
+	const transition = runtime.controller.unlock();
+	runtime.clearOperationalPendingWork();
 
 	const reason = normaliseHumanUnlockReason(args);
-	await applyControllerEffects(
-		runtime.controller.unlock().effects,
-		runtime,
-		ctx,
-		reason,
-	);
+	await applyControllerEffects(transition.effects, runtime, ctx, reason);
 	if (reason !== undefined) {
 		// appendEntry writes a CustomEntry, which Pi excludes from LLM context.
 		pi.appendEntry<HumanUnlockEntry>(HUMAN_UNLOCK_ENTRY_TYPE, { reason });

@@ -270,6 +270,25 @@ async function startIdle(harness: Harness): Promise<void> {
 	await harness.fire("session_start", { type: "session_start" });
 }
 
+/**
+ * Fire agent_settled and the deferred 0ms settled-phase wake scheduled last by
+ * the production handler. Capture before/after so idle-timer arming (which may
+ * also be 0ms when idleDelaySeconds=0) is not mistaken for the wake callback.
+ */
+async function settleOnly(harness: Harness): Promise<void> {
+	const before = harness.clock.records.length;
+	await harness.fire("agent_settled", { type: "agent_settled" });
+	const after = harness.clock.records.length;
+	assert.ok(
+		after > before,
+		"true-idle agent_settled must schedule a deferred settled-phase callback",
+	);
+	// Production schedules the settled-phase wake after any markIdle side effects.
+	const deferred = after - 1;
+	assert.equal(harness.clock.records[deferred]?.delayMs, 0);
+	harness.clock.fire(deferred);
+}
+
 async function settleResponse(
 	harness: Harness,
 	message: unknown,
@@ -281,7 +300,7 @@ async function settleResponse(
 		messages: [message],
 	});
 	harness.streaming = false;
-	await harness.fire("agent_settled", { type: "agent_settled" });
+	await settleOnly(harness);
 }
 
 test("idle arms one unref timer and opens one hidden decision-only window", async () => {
@@ -437,7 +456,7 @@ test("agent_end finalizes while streaming but settled alone dispatches continue"
 	assert.equal(harness.triggeredTurns, turnsBefore);
 
 	harness.streaming = false;
-	await harness.fire("agent_settled", { type: "agent_settled" });
+	await settleOnly(harness);
 	assert.equal(
 		harness.sent.at(-1)?.message.customType,
 		DECISION_FOLD_MESSAGE_TYPE,
@@ -465,8 +484,12 @@ test("continued settle rearms exponential delay once and exhausts at max", async
 	assert.equal(harness.clock.records.at(-1)?.delayMs, 6000);
 	await harness.fire("agent_start", { type: "agent_start" });
 	assert.equal(harness.clock.records.at(-1)?.cleared, true);
-	await harness.fire("agent_settled", { type: "agent_settled" });
-	const secondTimer = harness.clock.records.length - 1;
+	await settleOnly(harness);
+	assert.equal(harness.controller.snapshot.idleTimer?.delaySeconds, 6);
+	const secondTimer = harness.clock.records.findIndex(
+		(record) => record.delayMs === 6000 && !record.cleared,
+	);
+	assert.ok(secondTimer >= 0);
 	harness.clock.fire(secondTimer);
 	await harness.executeContinue("continue-2");
 	await settleResponse(
@@ -485,6 +508,10 @@ test("valid unlock folds without a turn and leaves one compact persisted result"
 	harness.openDecision();
 	await harness.executeUnlock("  waiting for user  ");
 	const turnsBefore = harness.triggeredTurns;
+	assert.deepEqual(harness.activeTools, [
+		"continue_watchdog",
+		"unlock_continue_watchdog",
+	]);
 	await settleResponse(
 		harness,
 		assistant([
@@ -505,8 +532,14 @@ test("valid unlock folds without a turn and leaves one compact persisted result"
 			data: { reason: "waiting for user" },
 		},
 	]);
-	assert.deepEqual(harness.notifications, []);
+	// Settled delivery restores tools then notifies once with the validated reason.
+	assert.deepEqual(harness.activeTools, ["read", "bash"]);
 	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.notifications.length, 1);
+	assert.equal(
+		harness.notifications[0]?.message,
+		"Continue watchdog unlocked: waiting for user",
+	);
 });
 
 test("invalid decisions reask only after settle and third failure stays stopped", async () => {
@@ -524,7 +557,7 @@ test("invalid decisions reask only after settle and third failure stays stopped"
 		});
 		assert.equal(harness.sent.length, sentBefore);
 		harness.streaming = false;
-		await harness.fire("agent_settled", { type: "agent_settled" });
+		await settleOnly(harness);
 		if (attempt < 3) {
 			assert.match(
 				harness.sent.at(-1)?.message.content ?? "",
@@ -544,7 +577,7 @@ test("invalid decisions reask only after settle and third failure stays stopped"
 	});
 });
 
-test("aborted decision response is left for the canonical abort settle path", async () => {
+test("aborted decision response is not finalized by agent_end (abort path owns unlock)", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
 	harness.openDecision();
@@ -552,10 +585,16 @@ test("aborted decision response is left for the canonical abort settle path", as
 		type: "agent_end",
 		messages: [assistant([], "aborted")],
 	});
-	await harness.fire("agent_settled", { type: "agent_settled" });
-
-	assert.equal(harness.sent.length, 1);
+	// Without the abort-outcome handler, true-idle settle treats the open decision
+	// as a no-result and reasks once. agent_end itself must not finalize abort.
 	assert.equal(harness.controller.snapshot.decisionOpen, true);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
+	await settleOnly(harness);
+	assert.match(
+		harness.sent.at(-1)?.message.content ?? "",
+		/previous decision response was invalid/,
+	);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
 });
 
 test("demotion, shutdown, stale timer, activation and send failures cleanly unlock", async () => {
@@ -617,14 +656,16 @@ test("external unlock after agent_end cancels pending continue before settle", a
 	const sentBefore = harness.sent.length;
 	const turnsBefore = harness.triggeredTurns;
 
-	harness.runtime.prepareForLockStateChange();
+	// Transition first (locked=false), then operational cleanup.
 	harness.runtime.applyTransition(harness.controller.unlock(), undefined, {
 		suppressNotify: true,
 	});
+	assert.equal(harness.controller.snapshot.locked, false);
+	harness.runtime.clearOperationalPendingWork();
 	assert.deepEqual(harness.activeTools, ["read", "bash"]);
 
 	harness.streaming = false;
-	await harness.fire("agent_settled", { type: "agent_settled" });
+	await settleOnly(harness);
 	assert.equal(harness.sent.length, sentBefore);
 	assert.equal(harness.triggeredTurns, turnsBefore);
 	assert.equal(harness.controller.snapshot.locked, false);
@@ -645,20 +686,287 @@ test("manual lock after pending continue clears fold and rearms base idle delay"
 	});
 	const sentBefore = harness.sent.length;
 
-	harness.runtime.prepareForLockStateChange();
 	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
 		suppressNotify: true,
 	});
+	harness.runtime.clearOperationalPendingWork();
 	assert.deepEqual(harness.activeTools, ["read", "bash"]);
 	assert.equal(harness.controller.snapshot.attempt, 0);
 
 	harness.streaming = false;
-	await harness.fire("agent_settled", { type: "agent_settled" });
+	await settleOnly(harness);
 	assert.equal(harness.sent.length, sentBefore);
 	harness.runtime.reconcileIdle();
-	assert.equal(harness.clock.records.at(-1)?.delayMs, 3000);
+	assert.equal(harness.controller.snapshot.idleTimer?.delaySeconds, 3);
+	assert.equal(
+		harness.clock.records.some(
+			(record) => record.delayMs === 3000 && !record.cleared,
+		),
+		true,
+	);
 	assert.equal(harness.controller.snapshot.locked, true);
 	assert.equal(harness.controller.snapshot.attempt, 0);
+});
+
+test("unlocked main agent_start silently locks; locked start preserves cycle and decision", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	assert.equal(harness.controller.snapshot.locked, false);
+
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.deepEqual(harness.notifications, []);
+
+	harness.streaming = false;
+	await settleOnly(harness);
+	// True idle after silent lock arms the base delay (possibly before deferred wake).
+	assert.equal(harness.controller.snapshot.idleTimer?.delaySeconds, 3);
+	const idleTimerIndex = harness.clock.records.findIndex(
+		(record) => record.delayMs === 3000 && !record.cleared,
+	);
+	assert.ok(idleTimerIndex >= 0);
+	harness.clock.fire(idleTimerIndex);
+	assert.equal(harness.controller.snapshot.decisionOpen, true);
+	const openAttempt = harness.controller.snapshot.invalidDecisionAttempts;
+
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.decisionOpen, true);
+	assert.equal(
+		harness.controller.snapshot.invalidDecisionAttempts,
+		openAttempt,
+	);
+	assert.deepEqual(harness.activeTools, [
+		"continue_watchdog",
+		"unlock_continue_watchdog",
+	]);
+});
+
+test("false-idle settle schedules no deferred callback; later true settle reconciles", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	// Attachment already idle from session_start; mark busy then leave hub idle.
+	await harness.fire("agent_start", { type: "agent_start" });
+	assert.equal(harness.hub.snapshot.allObservableIdle, false);
+
+	// Nested false-idle outer settle must not schedule deferred wake or arm.
+	harness.streaming = true;
+	const timersBefore = harness.clock.records.length;
+	await harness.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(harness.hub.snapshot.allObservableIdle, false);
+	assert.equal(harness.clock.records.length, timersBefore);
+
+	// True settle: deferred wake finalizes/reconciles (and markIdle may arm too).
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.equal(harness.hub.snapshot.allObservableIdle, true);
+	assert.notEqual(harness.controller.snapshot.idleTimer, null);
+
+	// Cancel via busy, re-idle, then clear the timer without a hub edge and
+	// prove true-idle settle still arms again via deferred reconcile.
+	await harness.fire("agent_start", { type: "agent_start" });
+	assert.equal(harness.controller.snapshot.idleTimer, null);
+	harness.streaming = false;
+	await settleOnly(harness);
+	const armed = harness.controller.snapshot.idleTimer;
+	assert.ok(armed);
+	// Force controller timer cleared without hub notification (no-op markIdle path).
+	harness.controller.onObservableBusy();
+	assert.equal(harness.controller.snapshot.idleTimer, null);
+	assert.equal(harness.hub.snapshot.allObservableIdle, true);
+	await settleOnly(harness);
+	assert.notEqual(harness.controller.snapshot.idleTimer, null);
+});
+
+test("deferred settled wake is inert after later agent_start; next true settle works", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.openDecision();
+
+	// Open decision run with no agent_end so a true settle would synthesize no-result.
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	harness.streaming = false;
+	const before = harness.clock.records.length;
+	const sentBefore = harness.sent.length;
+	await harness.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(harness.clock.records.length, before + 1);
+	assert.equal(harness.clock.records[before]?.delayMs, 0);
+	const deferred = before;
+
+	// Nested/later start before the deferred settled-phase callback.
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	assert.equal(harness.hub.snapshot.allObservableIdle, false);
+	harness.clock.fire(deferred);
+
+	// Must not finalize no-result or reask while busy.
+	assert.equal(harness.sent.length, sentBefore);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
+	assert.equal(harness.controller.snapshot.decisionOpen, true);
+
+	// Later true settle finalizes once.
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.match(
+		harness.sent.at(-1)?.message.content ?? "",
+		/previous decision response was invalid/,
+	);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
+});
+
+test("stale deferred settle is inert after later start+settle even when ctx is idle again", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.openDecision();
+
+	// Run A: open decision turn, settle without agent_end, leave callback A unfired.
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	harness.streaming = false;
+	const settleABefore = harness.clock.records.length;
+	const sentBefore = harness.sent.length;
+	await harness.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(harness.clock.records.length, settleABefore + 1);
+	assert.equal(harness.clock.records[settleABefore]?.delayMs, 0);
+	const deferredA = settleABefore;
+
+	// Run B starts and true-idles before callback A fires. ctx is idle again.
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	harness.streaming = false;
+	const settleBBefore = harness.clock.records.length;
+	await harness.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(harness.clock.records.length, settleBBefore + 1);
+	assert.equal(harness.clock.records[settleBBefore]?.delayMs, 0);
+	const deferredB = settleBBefore;
+	assert.equal(harness.hub.snapshot.allObservableIdle, true);
+
+	// Stale callback A must not finalize/count/send/arm while B is the latest settle.
+	harness.clock.fire(deferredA);
+	assert.equal(harness.sent.length, sentBefore);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
+	assert.equal(harness.controller.snapshot.decisionOpen, true);
+	assert.equal(
+		harness.clock.records.some(
+			(record, index) =>
+				index > deferredB && record.delayMs === 3000 && !record.cleared,
+		),
+		false,
+	);
+
+	// Latest callback B finalizes exactly once.
+	harness.clock.fire(deferredB);
+	assert.match(
+		harness.sent.at(-1)?.message.content ?? "",
+		/previous decision response was invalid/,
+	);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
+	assert.equal(harness.sent.length, sentBefore + 1);
+});
+
+test("duplicate true-idle settles schedule two wakes but only the latest acts", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.openDecision();
+
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	// No agent_end: both settles would synthesize no-result if both acted.
+	harness.streaming = false;
+	const firstBefore = harness.clock.records.length;
+	const sentBefore = harness.sent.length;
+	await harness.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(harness.clock.records.length, firstBefore + 1);
+	const deferredFirst = firstBefore;
+
+	const secondBefore = harness.clock.records.length;
+	await harness.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(harness.clock.records.length, secondBefore + 1);
+	const deferredSecond = secondBefore;
+
+	// Older duplicate settle is inert.
+	harness.clock.fire(deferredFirst);
+	assert.equal(harness.sent.length, sentBefore);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
+
+	// Latest settle acts once.
+	harness.clock.fire(deferredSecond);
+	assert.match(
+		harness.sent.at(-1)?.message.content ?? "",
+		/previous decision response was invalid/,
+	);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
+	assert.equal(harness.sent.length, sentBefore + 1);
+});
+
+test("decision settle without agent_end reasks twice then decision-fails without double count", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.openDecision();
+
+	for (let attempt = 1; attempt <= 3; attempt += 1) {
+		const sentBefore = harness.sent.length;
+		harness.streaming = true;
+		await harness.fire("agent_start", { type: "agent_start" });
+		// No agent_end: true-idle settle must synthesize one malformed/no-result.
+		harness.streaming = false;
+		await settleOnly(harness);
+		if (attempt < 3) {
+			assert.match(
+				harness.sent.at(-1)?.message.content ?? "",
+				/previous decision response was invalid/,
+			);
+			assert.equal(
+				harness.controller.snapshot.invalidDecisionAttempts,
+				attempt,
+			);
+			assert.equal(harness.sent.length, sentBefore + 1);
+		}
+	}
+
+	assert.equal(harness.controller.snapshot.decisionFailed, true);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 3);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.deepEqual(harness.activeTools, ["read", "bash"]);
+	assert.deepEqual(harness.notifications.at(-1), {
+		message:
+			"Continue watchdog decision failed after 3 attempts: The decision response was malformed. Call exactly one decision tool.",
+		level: "warning",
+	});
+});
+
+test("pending valid continue keeps reconcile inert until fold delivery", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.openDecision();
+	await harness.executeContinue();
+
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [assistant([toolCall("continue-1", "continue_watchdog", {})])],
+	});
+	// Pending finalization must not arm a next delay yet.
+	const timersAfterEnd = harness.clock.records.length;
+	harness.runtime.reconcileIdle();
+	assert.equal(harness.clock.records.length, timersAfterEnd);
+	assert.equal(harness.controller.snapshot.idleTimer, null);
+
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.equal(
+		harness.sent.at(-1)?.message.customType,
+		DECISION_FOLD_MESSAGE_TYPE,
+	);
+	assert.equal(harness.clock.records.at(-1)?.delayMs, 6000);
 });
 
 test("shared hub reclaims main after UI shutdown then prefers a new UI bind", async () => {

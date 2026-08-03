@@ -106,10 +106,10 @@ export interface DecisionRuntime {
 	getMainClaim(): HubMainClaim | null;
 	isCurrentMainClaim(claim: HubMainClaim): boolean;
 	/**
-	 * Drop any in-flight decision finalization/timer before an external lock
-	 * transition so a later settle cannot continue after human unlock/lock/abort.
+	 * Drop in-flight decision finalization/timer/tools after a controller
+	 * lock/unlock transition so a later settle cannot continue stale work.
 	 */
-	prepareForLockStateChange(): void;
+	clearOperationalPendingWork(): void;
 	applyEffect(
 		effect: Exclude<ControllerEffect, { kind: "notify" }>,
 		ctx?: RuntimeContext,
@@ -182,6 +182,10 @@ export function createDecisionRuntime(
 	let ownedMain = false;
 	let configReady = options.injectedController === true;
 	let lifecycleGeneration = 0;
+	/** Bumps on every agent_start so deferred settled wakes cannot outlive that run. */
+	let agentActivityGeneration = 0;
+	/** Bumps when a deferred settled-phase callback is scheduled; only the latest acts. */
+	let settledCallbackGeneration = 0;
 	let stopped = false;
 	let armedTimer: ArmedTimer | null = null;
 	let activeDecision: ActiveDecision | null = null;
@@ -215,10 +219,10 @@ export function createDecisionRuntime(
 	};
 
 	/**
-	 * Invalidate runtime-local decision state before an external controller
-	 * transition. Does not unlock the controller itself.
+	 * Invalidate runtime-local decision state after a controller transition.
+	 * Does not change controller lock/cycle accounting.
 	 */
-	const prepareForLockStateChange = (): void => {
+	const clearOperationalPendingWork = (): void => {
 		clearArmedTimer();
 		restoreDecisionTools();
 		activeDecision = null;
@@ -228,15 +232,9 @@ export function createDecisionRuntime(
 	};
 
 	const silentlyAbandonDecision = (): void => {
-		const transition = options.controllerHolder.controller.unlock();
-		for (const effect of transition.effects) {
-			if (effect.kind === "cancelIdleTimer") clearArmedTimer(effect.timerId);
-		}
-		clearArmedTimer();
-		restoreDecisionTools();
-		activeDecision = null;
-		pendingFinalization = null;
-		pendingAiUnlockReason = null;
+		// Unlock first so locked=false is authoritative, then clear runtime work.
+		options.controllerHolder.controller.unlock();
+		clearOperationalPendingWork();
 	};
 
 	/**
@@ -398,7 +396,8 @@ export function createDecisionRuntime(
 			stopped ||
 			!configReady ||
 			!isCurrentMain() ||
-			!options.hub.snapshot.allObservableIdle
+			!options.hub.snapshot.allObservableIdle ||
+			pendingFinalization !== null
 		) {
 			return;
 		}
@@ -454,14 +453,11 @@ export function createDecisionRuntime(
 		ensureMain();
 		const current = isCurrentMain();
 		if (ownedMain && !current) {
+			// Demotion: unlock first (preserve cycle accounting), then cleanup.
 			applyTransition(options.controllerHolder.controller.unlock(), undefined, {
 				suppressNotify: true,
 			});
-			clearArmedTimer();
-			restoreDecisionTools();
-			activeDecision = null;
-			pendingFinalization = null;
-			pendingAiUnlockReason = null;
+			clearOperationalPendingWork();
 			publishedForIdleEpoch = false;
 		}
 		ownedMain = current;
@@ -582,10 +578,23 @@ export function createDecisionRuntime(
 		} catch {
 			// The controller is already unlocked and must not be re-armed.
 		}
+		// Controller already transitioned at agent_end; emit the reasoned TUI
+		// notification once at settled delivery (not the generic unlock text).
+		try {
+			ctx.ui.notify(`Continue watchdog unlocked: ${reason}`);
+		} catch {
+			// Non-TUI hosts may reject notify; unlock state is already committed.
+		}
 		return false;
 	};
 
-	const handleAgentEnd = (event: AgentEndEvent): void => {
+	/**
+	 * Idempotent finalization for the active current decision. Safe to call from
+	 * agent_end and true-idle settle; no-ops when already finalized or inactive.
+	 */
+	const finalizeActiveDecision = (
+		response: ReturnType<typeof normalizeAssistantDecisionResponse> | "missing",
+	): void => {
 		const active = activeDecision;
 		if (
 			active === null ||
@@ -594,17 +603,28 @@ export function createDecisionRuntime(
 		) {
 			return;
 		}
-		const assistant = terminalAssistant(event.messages);
-		if (assistant === undefined || isAbortedAssistant(assistant)) return;
 		const cycleId = active.protocol.currentCycleId;
 		pendingFinalization = {
 			active,
 			cycleId,
 			finalization: active.protocol.finalizeResponse(
 				cycleId,
-				normalizeAssistantDecisionResponse(assistant),
+				response === "missing"
+					? { content: [{ type: "malformed" }] }
+					: response,
 			),
 		};
+	};
+
+	const handleAgentEnd = (event: AgentEndEvent): void => {
+		const assistant = terminalAssistant(event.messages);
+		// Aborted terminal assistants are owned by the abort-outcome path.
+		if (assistant !== undefined && isAbortedAssistant(assistant)) return;
+		finalizeActiveDecision(
+			assistant === undefined
+				? "missing"
+				: normalizeAssistantDecisionResponse(assistant),
+		);
 	};
 
 	const registerLifecycle = (): void => {
@@ -648,16 +668,65 @@ export function createDecisionRuntime(
 		});
 
 		options.pi.on("agent_start", () => {
+			// Invalidate any deferred settled wake from a previous run on this attachment.
+			agentActivityGeneration += 1;
+			if (isCurrentMain()) {
+				const transition = options.controllerHolder.controller.ensureLocked();
+				if (transition.applied) {
+					// Fresh silent lock: controller first, then operational cleanup.
+					clearOperationalPendingWork();
+					applyTransition(transition, undefined, {
+						suppressNotify: true,
+					});
+				}
+				// Already locked: preserve cycle/decision; do not clear active work.
+			}
 			if (attachment !== null) options.hub.markBusy(attachment);
 		});
 
 		options.pi.on("agent_end", handleAgentEnd);
 
 		options.pi.on("agent_settled", (_event, ctx: ExtensionContext) => {
+			// Only Pi's live idle truth may mark this attachment idle. Another
+			// extension can start a nested run from an earlier settled handler.
+			if (stopped || !ctx.isIdle()) return;
+
 			if (attachment !== null) options.hub.markIdle(attachment);
-			const continued = deliverPending(ctx);
-			// Valid continue remains intermediate; wait for the next real idle epoch.
-			if (!continued) maybePublishUserReady();
+
+			// Pi marks the session idle before emitting agent_settled. Defer the
+			// wake check until every settled handler has returned so a later handler
+			// can start a run without racing an eager triggerTurn from this handler.
+			// Capture per-run and per-settle identity: a later agent_start or a newer
+			// true-idle settle must leave this callback inert even if ctx is idle again.
+			const settledClaim = getMainClaim();
+			const settledLifecycleGeneration = lifecycleGeneration;
+			const settledActivityGeneration = agentActivityGeneration;
+			const settledToken = ++settledCallbackGeneration;
+			const handle = clock.setTimeout(() => {
+				// Later agent_start, a newer settle, session rebind, demotion, or nested
+				// busy cancels this wake so no-result is not double-counted. Child busy
+				// alone must not block delivery; publish still waits for aggregate idle.
+				if (
+					stopped ||
+					settledLifecycleGeneration !== lifecycleGeneration ||
+					settledActivityGeneration !== agentActivityGeneration ||
+					settledToken !== settledCallbackGeneration ||
+					settledClaim === null ||
+					!options.hub.isCurrentMain(settledClaim) ||
+					!ctx.isIdle()
+				) {
+					return;
+				}
+
+				// No agent_end / no pending finalization => one malformed no-result.
+				finalizeActiveDecision("missing");
+				const continued = deliverPending(ctx);
+				// Explicit reconcile even when hub markIdle was a no-op edge.
+				reconcileIdle();
+				// Valid continue remains intermediate; wait for the next real idle epoch.
+				if (!continued) maybePublishUserReady();
+			}, 0);
+			handle.unref?.();
 		});
 	};
 
@@ -665,17 +734,14 @@ export function createDecisionRuntime(
 		if (stopped) return;
 		stopped = true;
 		lifecycleGeneration += 1;
-		clearArmedTimer();
-		restoreDecisionTools();
-		activeDecision = null;
-		pendingFinalization = null;
-		pendingAiUnlockReason = null;
+		// Unlock first (preserve cycle accounting), then clear operational work.
+		options.controllerHolder.controller.unlock();
+		clearOperationalPendingWork();
 		publishedForIdleEpoch = false;
 		if (attachment !== null) options.hub.detach(attachment);
 		attachment = null;
 		ownedMain = false;
 		unsubscribe();
-		options.controllerHolder.controller.unlock();
 	};
 
 	return {
@@ -688,7 +754,7 @@ export function createDecisionRuntime(
 		isCurrentMain,
 		getMainClaim,
 		isCurrentMainClaim: (claim) => options.hub.isCurrentMain(claim),
-		prepareForLockStateChange,
+		clearOperationalPendingWork,
 		applyEffect,
 		applyTransition,
 		reconcileIdle,
