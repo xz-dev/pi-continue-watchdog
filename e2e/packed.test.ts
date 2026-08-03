@@ -421,7 +421,7 @@ test("packed artifact asks after threshold compaction settles", {
 			text: "## Goal\nPreserve the threshold-compaction test context.",
 			usage: { promptTokens: 8, completionTokens: 4 },
 		},
-		{ kind: "continue" },
+		{ kind: "unlock", reason: "threshold compaction recovery proven" },
 	]);
 	const { session, extensionPath } = await createSession(fixture, baseUrl, {
 		contextWindow: 64,
@@ -481,9 +481,23 @@ test("packed artifact asks after threshold compaction settles", {
 			),
 		"post-compaction agent_settled",
 	);
+	const postCompactionSettledAt = lifecycle.find(
+		(event) => event.type === "agent_settled" && event.at >= compactionEndAt,
+	)?.at;
+	assert.ok(postCompactionSettledAt);
 	await waitWithinDeadline(() => session.isIdle, "post-compaction idle");
+	const isDecisionRequest = (request: RequestRecord): boolean =>
+		decisionTools.every((name) => toolNames(request).includes(name)) &&
+		request.messages.some((message) =>
+			textOf(message).includes(decisionPromptStart),
+		);
 	await waitWithinDeadline(
-		() => requests.length === 3,
+		() =>
+			requests.some(
+				(request) =>
+					request.receivedAt >= postCompactionSettledAt &&
+					isDecisionRequest(request),
+			),
 		"post-compaction decision request",
 	);
 	await session.waitForIdle();
@@ -500,8 +514,13 @@ test("packed artifact asks after threshold compaction settles", {
 		lifecycle.some((event) => event.type === "agent_settled"),
 		true,
 	);
-	const decisionRequest = requests[2];
+	const decisionRequests = requests.filter(isDecisionRequest);
+	assert.equal(decisionRequests.length, 1);
+	const decisionRequest = decisionRequests[0];
 	assert.ok(decisionRequest);
+	assert.equal(decisionRequest.receivedAt >= compactionEndAt, true);
+	assert.equal(decisionRequest.receivedAt >= postCompactionSettledAt, true);
+	assert.equal(requests.at(-1), decisionRequest);
 	assert.deepEqual(toolNames(decisionRequest), decisionTools);
 	const ordinaryRequest = requests[0];
 	const summaryRequest = requests[1];
