@@ -110,6 +110,14 @@ export interface DecisionRuntime {
 	 * lock/unlock transition so a later settle cannot continue stale work.
 	 */
 	clearOperationalPendingWork(): void;
+	/**
+	 * Start a fresh cycle through the full silent unlock-cleanup-lock sequence.
+	 * The exact current-main claim is fenced across every re-entrant effect.
+	 */
+	restartLockCycle(
+		ctx?: RuntimeContext,
+		options?: { readonly notifyLocked?: boolean },
+	): void;
 	applyEffect(
 		effect: Exclude<ControllerEffect, { kind: "notify" }>,
 		ctx?: RuntimeContext,
@@ -233,6 +241,7 @@ export function createDecisionRuntime(
 	};
 
 	const restoreDecisionTools = (): void => {
+		if (!options.decisionTools.isActive()) return;
 		try {
 			options.decisionTools.restoreDecisionTools();
 		} catch {
@@ -453,6 +462,41 @@ export function createDecisionRuntime(
 			return;
 		}
 		applyTransition(controller.onAllObservableIdle(), undefined, { claim });
+	};
+
+	/**
+	 * Fresh lock is deliberately a real unlock followed by cleanup and a new
+	 * lock. Capturing one claim prevents either a command or message_start from
+	 * transferring control to a replacement main halfway through the sequence.
+	 */
+	const restartLockCycle = (
+		ctx?: RuntimeContext,
+		restartOptions?: { readonly notifyLocked?: boolean },
+	): void => {
+		const claim = getMainClaim();
+		const controller = currentController(claim);
+		if (claim === null || controller === null || !owns(claim)) return;
+
+		const unlockTransition = controller.unlock();
+		if (stopIfStale(claim)) return;
+
+		clearOperationalPendingWork();
+		if (stopIfStale(claim)) return;
+
+		applyTransition(unlockTransition, ctx, {
+			suppressNotify: true,
+			claim,
+		});
+		if (stopIfStale(claim)) return;
+
+		const lockTransition = controller.lock();
+		if (stopIfStale(claim)) return;
+		applyTransition(lockTransition, ctx, {
+			suppressNotify: restartOptions?.notifyLocked !== true,
+			claim,
+		});
+		if (stopIfStale(claim)) return;
+		reconcileIdle();
 	};
 
 	/**
@@ -892,6 +936,7 @@ export function createDecisionRuntime(
 		getMainClaim,
 		isCurrentMainClaim: (claim) => options.hub.isCurrentMain(claim),
 		clearOperationalPendingWork,
+		restartLockCycle,
 		applyEffect,
 		applyTransition,
 		reconcileIdle,

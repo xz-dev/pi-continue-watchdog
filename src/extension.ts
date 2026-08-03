@@ -105,6 +105,8 @@ export function createContinueWatchdogExtension(
 			isCurrentMain: runtime.isCurrentMain,
 			getMainClaim: runtime.getMainClaim,
 			isCurrentMainClaim: runtime.isCurrentMainClaim,
+			restartLockCycle: (ctx, restartOptions) =>
+				runtime?.restartLockCycle(ctx, restartOptions),
 			clearOperationalPendingWork: () => runtime?.clearOperationalPendingWork(),
 			applyEffect: runtime.applyEffect,
 			reconcileIdle: runtime.reconcileIdle,
@@ -114,23 +116,7 @@ export function createContinueWatchdogExtension(
 		registerMainUserAutoLock(pi, {
 			isCurrentMain: runtime.isCurrentMain,
 			onMainUserMessageStart(): void {
-				const claim = runtime?.getMainClaim();
-				const controller = holder.controller;
-				if (
-					claim === null ||
-					claim === undefined ||
-					controller === null ||
-					!runtime?.isCurrentMainClaim(claim)
-				) {
-					return;
-				}
-				// Fresh silent /lock: controller first, then cleanup, then effects.
-				const transition = controller.onMainUserMessageStart();
-				runtime.clearOperationalPendingWork();
-				runtime.applyTransition(transition, undefined, {
-					suppressNotify: true,
-					claim,
-				});
+				runtime?.restartLockCycle(undefined, { notifyLocked: false });
 			},
 		});
 

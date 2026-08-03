@@ -203,9 +203,45 @@ test("actual main user message_start locks without a command notification", () =
 		decisionFailed: false,
 		invalidDecisionAttempts: 0,
 		lastInvalidDecisionError: null,
-		idleTimer: null,
+		idleTimer: {
+			id: 1,
+			attempt: 0,
+			delaySeconds: 3,
+		},
 		decisionOpen: false,
 	});
+});
+
+test("Example 1: a new main user message performs silent unlock cleanup before fresh lock", () => {
+	const harness = createHarness();
+	const { controller } = harness;
+	controller.lock();
+	const openDecision = decisionId(controller);
+	controller.recordInvalidDecision(openDecision, "invalid once");
+	assert.equal(controller.snapshot.decisionOpen, true);
+	assert.equal(controller.snapshot.invalidDecisionAttempts, 1);
+
+	const timeline: string[] = [];
+	const unlock = controller.unlock.bind(controller);
+	const lock = controller.lock.bind(controller);
+	controller.unlock = () => {
+		timeline.push(`unlock:locked=${controller.snapshot.locked}`);
+		return unlock();
+	};
+	controller.lock = () => {
+		timeline.push(`lock:locked=${controller.snapshot.locked}`);
+		return lock();
+	};
+
+	harness.fire(userMessageStart());
+
+	assert.deepEqual(timeline, ["unlock:locked=true", "lock:locked=false"]);
+	assert.equal(controller.snapshot.locked, true);
+	assert.equal(controller.snapshot.attempt, 0);
+	assert.equal(controller.snapshot.exhausted, false);
+	assert.equal(controller.snapshot.decisionFailed, false);
+	assert.equal(controller.snapshot.invalidDecisionAttempts, 0);
+	assert.equal(controller.snapshot.decisionOpen, false);
 });
 
 test("every actual main user start resets exhausted and decision-failed cycles", () => {

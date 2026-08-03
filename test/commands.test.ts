@@ -98,6 +98,14 @@ function createHarness(): CommandHarness {
 	const runtime: MainCommandRuntime = {
 		controller,
 		isCurrentMain: () => currentMain,
+		restartLockCycle(ctx, options): void {
+			if (!currentMain) return;
+			timeline.push(`restartLockCycle:notifyLocked=${options.notifyLocked}`);
+			// Runtime sequencing has its own focused tests; this command fake only
+			// preserves the seam's externally observable fresh-state result.
+			controller.lock();
+			if (options.notifyLocked) ctx.ui.notify("Continue watchdog locked");
+		},
 		clearOperationalPendingWork(): void {
 			timeline.push(
 				`cleanup:locked=${controller.snapshot.locked ? "true" : "false"}`,
@@ -286,12 +294,12 @@ test("Examples 2-3 RED: command transitions reset exhausted or decision-failed s
 		"notify:Continue watchdog unlocked",
 	]);
 
-	// Manual lock still resets and notifies after cleanup with locked=true.
+	// Manual lock delegates once to the runtime fresh-cycle seam and notifies once.
 	harness.timeline.splice(0);
 	await harness.invoke(LOCK_CONTINUE_WATCHDOG_COMMAND);
 	assert.equal(harness.controller.snapshot.locked, true);
 	assert.deepEqual(harness.timeline, [
-		"cleanup:locked=true",
+		"restartLockCycle:notifyLocked=true",
 		"notify:Continue watchdog locked",
 	]);
 });

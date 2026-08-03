@@ -130,9 +130,20 @@ Per main ownership generation / lock cycle, at least:
 | pending idle timer | One-shot timer for the current attempt |
 | decision window | Temporary tool set + hidden decision prompt in flight / re-ask |
 
-**Unconditional assignment:** manual lock/unlock **never** no-op on same-state. They always assign the target state and always emit the corresponding TUI notification. No “already locked/unlocked” short-circuit that suppresses notify.
+**Unconditional assignment:** manual lock/unlock **never** no-op on same-state. They always assign the target state. A direct manual unlock emits its corresponding TUI output; a manual lock emits only its final lock notification. The silent prerequisite unlock of a fresh lock cycle never emits unlock output. No “already locked/unlocked” short-circuit may skip either transition.
 
-**What resets attempt to 0, clears exhaustion and decision-failed, and (re)arms lock:**
+**Fresh lock-cycle transition (manual lock or actual main user-role message start):**
+
+1. Capture the exact current-main ownership claim.
+2. Assign unlocked first.
+3. Cancel every timer and clean pending finalization/decision state, restore decision tools, and clear pending AI-unlock publication intent by dispatching the normal **non-notify** unlock cleanup effects.
+4. Revalidate the same exact ownership claim after any awaited or re-entrant cleanup effect. A stale/demoted owner stops here without locking or notifying.
+5. Assign a fresh lock, resetting attempt to `0` and clearing exhaustion, decision-failed, and invalid/no-result accounting.
+6. Dispatch lock effects and reconcile idle.
+
+Manual `/lock-continue-watchdog` emits exactly one final `Continue watchdog locked` notification. Actual main user-role `message_start` suppresses both prerequisite-unlock and final-lock notifications. This sequence runs even when the watchdog was already unlocked or already locked; fresh lock never fakes cleanup by calling lock alone.
+
+**What performs that full silent-unlock-cleanup → fresh-lock sequence:**
 
 - Actual main user-role message **start of processing** (auto-lock)
 - Manual `/lock-continue-watchdog`
@@ -270,21 +281,30 @@ These examples are the accepted product contract. Each is externally observable 
 **When** a **user-role** message actually starts processing on main (not mere queueing)
 **Then**
 
-- it silently performs the same fresh-cycle reset as `/lock-continue-watchdog`
-- attempt resets to `0`; exhaustion, decision-failed, and invalid/no-result counts clear; stale timer/decision work is cleaned
+- it captures and fences the exact current-main claim
+- it first assigns unlocked and dispatches full non-notify unlock cleanup: cancel stale timer/finalization/decision work, restore decision tools, and clear pending AI-unlock publication intent
+- after revalidating the exact claim, it assigns a fresh lock; attempt resets to `0`, and exhaustion, decision-failed, and invalid/no-result counts clear
+- both prerequisite-unlock and fresh-lock notifications are suppressed
+- it reconciles idle after locking
+- if ownership becomes stale/demoted during prerequisite cleanup, it stops before fresh lock and emits no notification
 - child-session user messages do **not** change main lock or attempts
 - merely queued (not yet started) main input does **not** lock or reset
 
-### Example 2 — Manual lock always assigns and notifies
+### Example 2 — Manual lock silently cleans up through unlock first, then locks and notifies once
 
-**Given** main is locked or unlocked
+**Given** main is locked or unlocked, including with an open decision, pending timer/finalization, exhausted/decision-failed state, invalid accounting, active decision tools, or pending AI-unlock publication intent
 **When** the human runs `/lock-continue-watchdog`
 **Then**
 
-- `locked` is set to `true`
-- attempts reset; exhaustion and decision-failed clear (new lock cycle)
-- TUI notifies exactly: `Continue watchdog locked`
-- same-state lock (already locked) still assigns and still notifies the same text
+- it captures and fences the exact current-main claim
+- it first assigns unlocked and dispatches the normal non-notify unlock cleanup effects before any fresh-lock transition or lock effect
+- no prerequisite `Continue watchdog unlocked` notification or reason entry is emitted
+- after revalidating the same claim, it assigns a fresh lock and dispatches lock effects
+- attempts reset to `0`; exhaustion, decision-failed, and invalid/no-result accounting clear; timers and pending operational decision/finalization state are gone; normal tools are restored; pending AI-unlock publication intent is cleared
+- TUI notifies exactly once: `Continue watchdog locked`
+- idle is reconciled after locking
+- already-unlocked and already-locked starting states both execute the full unlock-cleanup → lock sequence
+- if ownership becomes stale/demoted during prerequisite cleanup, it stops before lock effects and notification
 
 ### Example 3 — Manual unlock with optional reason
 

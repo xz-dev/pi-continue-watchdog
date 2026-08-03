@@ -1,6 +1,6 @@
 # Implementation plan — pi-continue-watchdog
 
-**Status:** Public live Git package on `master`. Slices 0–17 are complete; npm, tags, and GitHub Releases are intentionally not used.
+**Status:** Public live Git package on `master`. Slices 0–18 are complete; npm, tags, and GitHub Releases are intentionally not used.
 **Method:** One vertical behavior slice per branch; RED → GREEN → review (when functional) → merge → next branch
 **Language:** English only for all project artifacts
 
@@ -41,6 +41,7 @@ Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would ch
 | 15 | Universal idle lifecycle state machine | Complete |
 | 16 | Unified reasoned unlock UI | Complete |
 | 17 | Realm-wide process domain + root-only control | Complete |
+| 18 | Fresh lock uses silent unlock cleanup first | Complete |
 
 **Current architecture (indicative filenames; may still be simplified):**
 
@@ -54,10 +55,10 @@ Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would ch
 | Decision tools | `src/decision-tools.ts` | Definitions + temporary active set (main decision window only) |
 | Context fold | `src/context-fold.ts` | Model-bound remove/replace of decision exchanges |
 | Render | `src/render.ts` | Compact continue TUI line |
-| Runtime | `src/runtime.ts` | Lifecycle observe/report for every attachment; config/controller/timer/decision tools/messages/UI/`user-ready` only under exact current-main generation claim |
+| Runtime | `src/runtime.ts` | Lifecycle observe/report for every attachment; exact-claim fenced `restartLockCycle` unlock-cleanup-lock seam; config/controller/timer/decision tools/messages/UI/`user-ready` only under exact current-main generation claim |
 | Semantic hook | `src/semantic-hook.ts` | Neutral `pi:semantic-hook:v1` / `user-ready` producer helpers via ResourceLoader-local `pi.events` (delivery only, not process coordination) |
-| Commands | `src/commands.ts` | `/lock-continue-watchdog`, `/unlock-continue-watchdog` (main-owned) |
-| Auto-lock / abort | `src/auto-lock.ts`, `src/abort-outcome.ts` | Main user fresh-cycle lock; current-main aborted-run unlock |
+| Commands | `src/commands.ts` | `/lock-continue-watchdog`, `/unlock-continue-watchdog` (main-owned); manual lock delegates to the runtime fresh-cycle seam |
+| Auto-lock / abort | `src/auto-lock.ts`, `src/abort-outcome.ts` | Main user fresh-cycle request through the same runtime seam; current-main aborted-run unlock |
 | Tests / CI | `test/**`, `e2e/**`, `.github/workflows/ci.yml` | Unit + packed stock-Pi E2E (incl. multi-ResourceLoader / distinct-cwd) |
 
 **Distribution:** public `xz-dev/pi-continue-watchdog`, installed only with the unpinned command `pi install git:github.com/xz-dev/pi-continue-watchdog`. No npm publication, tags, or GitHub Releases.
@@ -198,6 +199,14 @@ Publishes a generic same-process semantic hook only for terminal AI unlock, exha
 - Unit: process-domain loading under public multi-`DefaultResourceLoader` / distinct-cwd independent evaluations; observer-only control (config unread, no decision-tool registration, root-only effects)
 - Packed stock-Pi E2E: multi-ResourceLoader / distinct-cwd path asserts shared aggregate idle and root-only decision/control effects
 - Acceptance Example 15 remains the product contract
+
+### Slice 18 — Fresh lock uses silent unlock cleanup first — Complete
+
+- One runtime `restartLockCycle(ctx?, { notifyLocked })` seam captures the exact current-main claim and owns unlock → non-notify cleanup effects → claim revalidation → fresh lock → lock effects → optional locked notify → idle reconciliation.
+- The prerequisite unlock is real even from already-unlocked state; it cancels timers and pending finalization/decision work, restores decision tools, and clears AI-unlock publication intent before fresh lock resets cycle accounting.
+- `/lock-continue-watchdog` delegates to the seam and emits only `Continue watchdog locked`; new main user-role `message_start` delegates silently.
+- Re-entrant demotion during prerequisite cleanup stops before fresh lock/notify. Ordinary current-main `agent_start` retains existing ensure-lock semantics and preserves an already locked cycle.
+- Focused tests prove ordering, open-decision/timer cleanup, unlocked restart, silent auto-lock, demotion fencing, and unchanged ordinary-start behavior.
 
 ---
 

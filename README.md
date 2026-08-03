@@ -28,7 +28,7 @@ Reload Pi extensions or start a new session after install.
 
 Observable behavior only (implementation details may change):
 
-1. Whenever the **main agent starts running**, the continue watchdog ensures it is locked. If already locked, the current cycle is preserved. A real main user message silently starts a fresh lock cycle.
+1. Whenever the **main agent starts running**, the continue watchdog ensures it is locked. If already locked, the current cycle is preserved. A real main user message starts a fresh cycle by silently performing a full unlock cleanup first—canceling timers/pending decision work and restoring normal tools—then locking again to reset old cycle accounting, without either notification.
 2. While locked, after **all observable** same-process agents stay idle for the current delay, the extension re-checks true idle and opens a short **decision check** on main—regardless of whether Pi stopped normally, after compaction, or because of a Provider/extension error.
 3. The decision is a **hidden automated** custom message (not a user message). For that check only, the model may call exactly one of:
    - `continue_watchdog` — keep working
@@ -45,10 +45,10 @@ Design note: the extension does **not** blindly continue. It asks first so compl
 
 | Command | Effect |
 |---|---|
-| `/lock-continue-watchdog` | Lock, reset attempt counters, TUI: `Continue watchdog locked` |
+| `/lock-continue-watchdog` | Silently perform full unlock cleanup first, then start a fresh lock cycle and emit exactly one TUI notification: `Continue watchdog locked` |
 | `/unlock-continue-watchdog [reason]` | Set unlocked and cancel pending checks while preserving cycle counters/failure state. Blank reason: notify `Continue watchdog unlocked`; nonblank reason: persist one muted `Continue watchdog unlocked · <reason>` entry |
 
-Same-state commands still assign and still notify (no silent no-op). Only `/lock-continue-watchdog` semantics reset the cycle; a real main user message applies those semantics silently.
+Same-state commands still assign (no silent no-op). A manual lock always runs the complete unlock-cleanup → fresh-lock sequence even when already unlocked or locked, suppresses prerequisite unlock output, and emits only `Continue watchdog locked`. A direct manual unlock still emits its normal output. Only fresh lock semantics reset the cycle; a real main user message applies the same full sequence with both notifications suppressed. Ordinary main `agent_start` without a new user message remains ensure-lock behavior and preserves an already locked cycle.
 
 Human unlock reason is optional: trimmed and truncated to 500 Unicode characters; multiline allowed. Nonblank reasons also appear as a TUI-only history entry (not model context).
 

@@ -127,8 +127,11 @@ function createHarness(options?: {
 	readonly activationThrows?: boolean;
 	readonly sendThrows?: boolean;
 	readonly hasUI?: boolean;
+	/** Invoked for every operational tool cleanup attempt. */
+	readonly beforeRestoreDecisionTools?: () => void;
 	/** Invoked after a successful tool restore; useful for re-entrant demotion. */
 	readonly afterRestoreDecisionTools?: () => void;
+	readonly onNotify?: (message: string) => void;
 }): Harness {
 	const config: ContinueWatchdogConfig = {
 		idleDelaySeconds: options?.config?.idleDelaySeconds ?? 3,
@@ -167,6 +170,7 @@ function createHarness(options?: {
 			return true;
 		},
 		restoreDecisionTools(): boolean {
+			options?.beforeRestoreDecisionTools?.();
 			if (captured === null) return false;
 			activeTools = captured;
 			captured = null;
@@ -231,6 +235,7 @@ function createHarness(options?: {
 		ui: {
 			notify(message: string, level?: string): void {
 				notifications.push({ message, level });
+				options?.onNotify?.(message);
 			},
 		},
 	} as unknown as ExtensionContext;
@@ -681,6 +686,99 @@ test("external unlock after agent_end cancels pending continue before settle", a
 	assert.equal(harness.controller.snapshot.idleTimer, null);
 });
 
+test("Examples 1-2: restart lock cycle unlocks before cleanup, clears an open decision, then locks and notifies once", async () => {
+	const timeline: string[] = [];
+	let harness: Harness;
+	harness = createHarness({
+		beforeRestoreDecisionTools: () => {
+			timeline.push(
+				`cleanup-tools:locked=${harness.controller.snapshot.locked}`,
+			);
+		},
+		onNotify: (message) => {
+			timeline.push(
+				`notify:${message}:locked=${harness.controller.snapshot.locked}`,
+			);
+		},
+	});
+	await startIdle(harness);
+	harness.openDecision();
+	// One invalid response represents open-decision accounting that fresh lock clears.
+	harness.controller.recordInvalidDecision(1, "bad decision");
+	assert.equal(harness.controller.snapshot.decisionOpen, true);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
+	assert.deepEqual(harness.activeTools, DECISION_TOOL_NAMES);
+
+	await harness.runtime.restartLockCycle(harness.ctx, { notifyLocked: true });
+
+	assert.deepEqual(timeline, [
+		"cleanup-tools:locked=false",
+		"notify:Continue watchdog locked:locked=true",
+	]);
+	assert.deepEqual(harness.notifications, [
+		{ message: "Continue watchdog locked", level: undefined },
+	]);
+	assert.deepEqual(harness.activeTools, ["read", "bash"]);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.controller.snapshot.exhausted, false);
+	assert.equal(harness.controller.snapshot.decisionFailed, false);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.controller.snapshot.idleTimer?.delaySeconds, 3);
+});
+
+test("Example 2: restart from unlocked still performs silent unlock cleanup before fresh lock", async () => {
+	const timeline: string[] = [];
+	let harness: Harness;
+	harness = createHarness({
+		beforeRestoreDecisionTools: () => {
+			timeline.push(
+				`cleanup-tools:locked=${harness.controller.snapshot.locked}`,
+			);
+		},
+		onNotify: (message) => timeline.push(`notify:${message}`),
+	});
+	await startIdle(harness);
+	assert.equal(harness.controller.snapshot.locked, false);
+
+	await harness.runtime.restartLockCycle(harness.ctx, { notifyLocked: true });
+
+	assert.deepEqual(timeline, ["notify:Continue watchdog locked"]);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.deepEqual(harness.notifications, [
+		{ message: "Continue watchdog locked", level: undefined },
+	]);
+});
+
+test("Examples 1-2: re-entrant demotion during prerequisite unlock cleanup stops before lock and notify", async () => {
+	let harness: Harness;
+	let demoted = false;
+	harness = createHarness({
+		hasUI: false,
+		afterRestoreDecisionTools: () => {
+			if (demoted) return;
+			demoted = true;
+			harness.hub.bind({
+				instance: createHubAttachmentInstance(),
+				sessionId: "replacement-ui-main",
+				hasUI: true,
+				initialBusy: false,
+			});
+		},
+	});
+	await startIdle(harness);
+	harness.openDecision();
+
+	await harness.runtime.restartLockCycle(harness.ctx, { notifyLocked: true });
+
+	assert.equal(demoted, true);
+	assert.equal(harness.runtime.controller, null);
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.deepEqual(harness.notifications, []);
+	assert.deepEqual(harness.activeTools, ["read", "bash"]);
+});
+
 test("manual lock after pending continue clears fold and rearms base idle delay", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
@@ -695,10 +793,7 @@ test("manual lock after pending continue clears fold and rearms base idle delay"
 	});
 	const sentBefore = harness.sent.length;
 
-	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
-		suppressNotify: true,
-	});
-	harness.runtime.clearOperationalPendingWork();
+	harness.runtime.restartLockCycle(undefined, { notifyLocked: false });
 	assert.deepEqual(harness.activeTools, ["read", "bash"]);
 	assert.equal(harness.controller.snapshot.attempt, 0);
 
@@ -717,7 +812,33 @@ test("manual lock after pending continue clears fold and rearms base idle delay"
 	assert.equal(harness.controller.snapshot.attempt, 0);
 });
 
-test("unlocked main agent_start silently locks; locked start preserves cycle and decision", async () => {
+test("restart lock cycle cancels an old idle timer and reconciles one fresh base timer", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	harness.runtime.reconcileIdle();
+	const oldTimer = harness.clock.records[0];
+	assert.ok(oldTimer);
+	assert.equal(oldTimer.cleared, false);
+
+	harness.runtime.restartLockCycle(undefined, { notifyLocked: false });
+
+	assert.equal(oldTimer.cleared, true);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.controller.snapshot.idleTimer?.delaySeconds, 3);
+	assert.equal(
+		harness.clock.records.filter(
+			(record) => record.delayMs === 3000 && !record.cleared,
+		).length,
+		1,
+	);
+	assert.deepEqual(harness.notifications, []);
+});
+
+test("ordinary unlocked main agent_start silently locks; locked start preserves cycle and decision", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
 	assert.equal(harness.controller.snapshot.locked, false);

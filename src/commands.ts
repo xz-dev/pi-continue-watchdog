@@ -45,10 +45,12 @@ export interface MainCommandRuntime {
 	/** Capture and revalidate the exact current ownership generation. */
 	readonly getMainClaim?: () => HubMainClaim | null;
 	readonly isCurrentMainClaim?: (claim: HubMainClaim) => boolean;
-	/**
-	 * Invalidate pending decision finalization/timer after lock or unlock so a
-	 * later settle cannot continue after the human command.
-	 */
+	/** Own the exact-claim fenced unlock-cleanup-lock sequence for fresh cycles. */
+	restartLockCycle(
+		ctx: ExtensionCommandContext,
+		options: { readonly notifyLocked: boolean },
+	): Promise<void> | void;
+	/** Invalidate pending runtime work after a direct human unlock. */
 	clearOperationalPendingWork(): void;
 	applyEffect(
 		effect: CommandRuntimeEffect,
@@ -220,26 +222,7 @@ async function handleLock(
 	runtime: MainCommandRuntime,
 	ctx: ExtensionCommandContext,
 ): Promise<void> {
-	const control = currentControllerClaim(runtime);
-	if (control === null) return;
-	// Fresh lock transition first, then operational cleanup, effects/notify, reconcile.
-	const transition = control.controller.lock();
-	if (
-		control.claim !== null &&
-		runtime.isCurrentMainClaim !== undefined &&
-		!runtime.isCurrentMainClaim(control.claim)
-	) {
-		return;
-	}
-	runtime.clearOperationalPendingWork();
-	await applyControllerEffects(
-		transition.effects,
-		runtime,
-		ctx,
-		undefined,
-		control.claim,
-	);
-	runtime.reconcileIdle?.();
+	await runtime.restartLockCycle(ctx, { notifyLocked: true });
 }
 
 async function handleUnlock(
