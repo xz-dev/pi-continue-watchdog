@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_REASON_TYPES } from "../src/config.js";
 import { createLockDecisionController } from "../src/controller.js";
 import {
 	buildDecisionReaskPrompt,
@@ -14,6 +15,7 @@ import {
 	type DecisionResponse,
 	formatDecisionFailedNotification,
 	INVALID_UNLOCK_REASON_ERROR,
+	INVALID_UNLOCK_REASON_TYPE_ERROR,
 	MALFORMED_DECISION_RESPONSE_ERROR,
 	MULTIPLE_DECISION_TOOLS_ERROR,
 	NO_DECISION_TOOL_ERROR,
@@ -24,10 +26,14 @@ import {
 	UNSUPPORTED_DECISION_CONTENT_ERROR,
 	validateDecisionResponse,
 } from "../src/decision-protocol.js";
-import { createDecisionToolExecutors } from "../src/decision-tools.js";
+import {
+	createDecisionToolExecutors,
+	type DecisionToolCall,
+} from "../src/decision-tools.js";
 
 const DECISION_PROMPT = "Decision prompt from configuration.";
 const CONTEXT = {} as ExtensionContext;
+const REASON_TYPES = DEFAULT_REASON_TYPES;
 
 function response(content: DecisionResponse["content"]): DecisionResponse {
 	return { content };
@@ -48,16 +54,31 @@ function continueCall(
 function unlockCall(
 	id = "unlock-1",
 	reason: unknown = "All tasks are complete.",
+	reasonType: unknown = "JOB_DONE",
 ): DecisionResponse["content"][number] {
 	return {
 		type: "toolCall",
 		toolCallId: id,
 		name: "unlock_continue_watchdog",
-		arguments: { reason },
+		arguments: { reasonType, reason },
 	};
 }
 
-function openDecision() {
+function unlockToolCall(
+	toolCallId: string,
+	reasonType: string,
+	reason: string,
+): DecisionToolCall {
+	return {
+		kind: "unlock",
+		toolCallId,
+		reasonType,
+		reason,
+		ctx: CONTEXT,
+	};
+}
+
+function openDecision(reasonTypes: readonly string[] = REASON_TYPES) {
 	const controller = createLockDecisionController({
 		idleDelaySeconds: 3,
 		maxRetries: 2,
@@ -77,6 +98,7 @@ function openDecision() {
 			controller,
 			decisionId: opened.decisionId,
 			decisionPrompt: DECISION_PROMPT,
+			reasonTypes,
 		}),
 	};
 }
@@ -102,6 +124,7 @@ test("validator accepts exactly one continue or unlock and ignores thinking", ()
 				{ type: "text", text: " \n\t" },
 				continueCall(),
 			]),
+			REASON_TYPES,
 		),
 		{
 			valid: true,
@@ -116,17 +139,115 @@ test("validator accepts exactly one continue or unlock and ignores thinking", ()
 		validateDecisionResponse(
 			response([
 				{ type: "thinking" },
-				unlockCall("unlock-1", " \nWaiting for confirmation.\n "),
+				unlockCall(
+					"unlock-1",
+					" \nWaiting for confirmation.\n ",
+					" wait_user ",
+				),
 			]),
+			REASON_TYPES,
 		),
 		{
 			valid: true,
 			decision: {
 				kind: "unlock",
 				toolCallId: "unlock-1",
+				reasonType: "WAIT_USER",
 				reason: "Waiting for confirmation.",
 			},
 		},
+	);
+});
+
+test("unlock reasonType is case-insensitive and emits uppercased matched configured value", () => {
+	assert.deepEqual(
+		validateDecisionResponse(
+			response([
+				unlockCall(
+					"typed",
+					"All requested package bumps are merged.",
+					"job_done",
+				),
+			]),
+			REASON_TYPES,
+		),
+		{
+			valid: true,
+			decision: {
+				kind: "unlock",
+				toolCallId: "typed",
+				reasonType: "JOB_DONE",
+				reason: "All requested package bumps are merged.",
+			},
+		},
+	);
+
+	const custom = ["NeedReview", "shipped"] as const;
+	assert.deepEqual(
+		validateDecisionResponse(
+			response([
+				unlockCall("custom", "PR is open for human review.", "needreview"),
+			]),
+			custom,
+		),
+		{
+			valid: true,
+			decision: {
+				kind: "unlock",
+				toolCallId: "custom",
+				reasonType: "NEEDREVIEW",
+				reason: "PR is open for human review.",
+			},
+		},
+	);
+	assert.deepEqual(
+		validateDecisionResponse(
+			response([
+				unlockCall("default-gone", "Still using defaults.", "JOB_DONE"),
+			]),
+			custom,
+		),
+		{ valid: false, error: INVALID_UNLOCK_REASON_TYPE_ERROR },
+	);
+
+	for (const reasonType of ["", "   ", "UNKNOWN", null, 1]) {
+		assert.deepEqual(
+			validateDecisionResponse(
+				response([unlockCall("bad-type", "Done.", reasonType)]),
+				REASON_TYPES,
+			),
+			{ valid: false, error: INVALID_UNLOCK_REASON_TYPE_ERROR },
+			String(reasonType),
+		);
+	}
+
+	assert.deepEqual(
+		validateDecisionResponse(
+			response([
+				{
+					type: "toolCall",
+					toolCallId: "missing-type",
+					name: "unlock_continue_watchdog",
+					arguments: { reason: "Done." },
+				},
+			]),
+			REASON_TYPES,
+		),
+		{ valid: false, error: INVALID_UNLOCK_REASON_TYPE_ERROR },
+	);
+	assert.deepEqual(
+		validateDecisionResponse(
+			response([
+				{
+					type: "toolCall",
+					toolCallId: "undefined-type",
+					name: "unlock_continue_watchdog",
+					arguments: { reasonType: undefined, reason: "Done." },
+				},
+			]),
+			REASON_TYPES,
+		),
+		{ valid: false, error: INVALID_UNLOCK_REASON_TYPE_ERROR },
 	);
 });
 
@@ -137,33 +258,43 @@ test("unlock reason is trimmed, counts Unicode code points, and never truncates"
 	assert.deepEqual(
 		validateDecisionResponse(
 			response([unlockCall("unicode", `\n${exactly500}\n`)]),
+			REASON_TYPES,
 		),
 		{
 			valid: true,
 			decision: {
 				kind: "unlock",
 				toolCallId: "unicode",
+				reasonType: "JOB_DONE",
 				reason: exactly500,
 			},
 		},
 	);
 	assert.deepEqual(
-		validateDecisionResponse(response([unlockCall("over-limit", over500)])),
+		validateDecisionResponse(
+			response([unlockCall("over-limit", over500)]),
+			REASON_TYPES,
+		),
 		{ valid: false, error: INVALID_UNLOCK_REASON_ERROR },
 	);
 	assert.deepEqual(
-		validateDecisionResponse(response([unlockCall("blank", " \n\t ")])),
+		validateDecisionResponse(
+			response([unlockCall("blank", " \n\t ")]),
+			REASON_TYPES,
+		),
 		{ valid: false, error: INVALID_UNLOCK_REASON_ERROR },
 	);
 	assert.deepEqual(
 		validateDecisionResponse(
 			response([unlockCall("multiline", "First line.\nSecond line.")]),
+			REASON_TYPES,
 		),
 		{
 			valid: true,
 			decision: {
 				kind: "unlock",
 				toolCallId: "multiline",
+				reasonType: "JOB_DONE",
 				reason: "First line.\nSecond line.",
 			},
 		},
@@ -240,16 +371,20 @@ test("validator rejects non-exactly-one and prose responses with fixed errors", 
 			error: CONTINUE_ARGUMENTS_ERROR,
 		},
 		{
-			name: "unlock without exactly its reason property",
+			name: "unlock without exactly reasonType and reason",
 			value: response([
 				{
 					type: "toolCall",
 					toolCallId: "unlock-extra",
 					name: "unlock_continue_watchdog",
-					arguments: { reason: "Done.", extra: true },
+					arguments: {
+						reasonType: "JOB_DONE",
+						reason: "Done.",
+						extra: true,
+					},
 				},
 			]),
-			error: INVALID_UNLOCK_REASON_ERROR,
+			error: INVALID_UNLOCK_REASON_TYPE_ERROR,
 		},
 		{
 			name: "unsupported assistant content",
@@ -260,7 +395,7 @@ test("validator rejects non-exactly-one and prose responses with fixed errors", 
 
 	for (const entry of cases) {
 		assert.deepEqual(
-			validateDecisionResponse(entry.value),
+			validateDecisionResponse(entry.value, REASON_TYPES),
 			{
 				valid: false,
 				error: entry.error,
@@ -284,7 +419,7 @@ test("Pi AssistantMessage normalization maps ordinary text/thinking/toolCall sha
 			},
 		],
 	});
-	assert.deepEqual(validateDecisionResponse(normalized), {
+	assert.deepEqual(validateDecisionResponse(normalized, REASON_TYPES), {
 		valid: true,
 		decision: { kind: "continue", toolCallId: "pi-call" },
 	});
@@ -292,6 +427,7 @@ test("Pi AssistantMessage normalization maps ordinary text/thinking/toolCall sha
 	assert.deepEqual(
 		validateDecisionResponse(
 			normalizeAssistantDecisionResponse({ role: "user", content: [] }),
+			REASON_TYPES,
 		),
 		{ valid: false, error: MALFORMED_DECISION_RESPONSE_ERROR },
 	);
@@ -301,6 +437,7 @@ test("Pi AssistantMessage normalization maps ordinary text/thinking/toolCall sha
 				role: "assistant",
 				content: [{ type: "toolCall", id: 1, name: "continue_watchdog" }],
 			}),
+			REASON_TYPES,
 		),
 		{ valid: false, error: MALFORMED_DECISION_RESPONSE_ERROR },
 	);
@@ -310,6 +447,7 @@ test("Pi AssistantMessage normalization maps ordinary text/thinking/toolCall sha
 				role: "assistant",
 				content: [{ type: "image", url: "x" }],
 			}),
+			REASON_TYPES,
 		),
 		{ valid: false, error: UNSUPPORTED_DECISION_CONTENT_ERROR },
 	);
@@ -513,12 +651,9 @@ test("validation requires collected execution to match the complete assistant to
 	assert.equal(missing.controller.snapshot.attempt, 0);
 
 	const mismatch = openDecision();
-	mismatch.protocol.onDecisionToolCall({
-		kind: "unlock",
-		toolCallId: "wrong-call",
-		reason: "Done.",
-		ctx: CONTEXT,
-	});
+	mismatch.protocol.onDecisionToolCall(
+		unlockToolCall("wrong-call", "JOB_DONE", "Done."),
+	);
 	const mismatchedExecution = finalizeCurrent(
 		mismatch.protocol,
 		response([continueCall("right-call")]),
@@ -528,20 +663,28 @@ test("validation requires collected execution to match the complete assistant to
 	assert.equal(mismatch.controller.snapshot.attempt, 0);
 });
 
-test("valid unlock reports normalized reason and fold ids after matching execution", () => {
+test("valid unlock reports normalized reasonType and reason after matching execution", () => {
 	const { controller, protocol } = openDecision();
-	protocol.onDecisionToolCall({
-		kind: "unlock",
-		toolCallId: "unlock-1",
-		reason: " \nWaiting for user confirmation.\n ",
-		ctx: CONTEXT,
-	});
+	protocol.onDecisionToolCall(
+		unlockToolCall(
+			"unlock-1",
+			" job_done ",
+			" \nWaiting for user confirmation.\n ",
+		),
+	);
 
 	const finalized = finalizeCurrent(
 		protocol,
-		response([unlockCall("unlock-1", " \nWaiting for user confirmation.\n ")]),
+		response([
+			unlockCall(
+				"unlock-1",
+				" \nWaiting for user confirmation.\n ",
+				" job_done ",
+			),
+		]),
 	);
 	assert.equal(finalized.outcome, "unlock");
+	assert.equal(finalized.reasonType, "JOB_DONE");
 	assert.equal(finalized.reason, "Waiting for user confirmation.");
 	assert.equal(finalized.toolCallId, "unlock-1");
 	assert.equal(finalized.cycleId, 1);
@@ -552,21 +695,29 @@ test("valid unlock reports normalized reason and fold ids after matching executi
 	assert.equal(controller.snapshot.locked, false);
 });
 
-test("collector rejects unlock when raw executed reason differs from the message", () => {
-	const { controller, protocol } = openDecision();
-	protocol.onDecisionToolCall({
-		kind: "unlock",
-		toolCallId: "unlock-1",
-		reason: "Actual reason.",
-		ctx: CONTEXT,
-	});
-
-	const finalized = finalizeCurrent(
-		protocol,
-		response([unlockCall("unlock-1", "Different reason.")]),
+test("collector rejects unlock when recorded type or reason differs from the message", () => {
+	const reasonMismatch = openDecision();
+	reasonMismatch.protocol.onDecisionToolCall(
+		unlockToolCall("unlock-1", "JOB_DONE", "Actual reason."),
 	);
-	assert.equal(finalized.outcome, "reask");
-	assert.equal(finalized.error, DECISION_TOOLS_MISMATCH_ERROR);
-	assert.equal(controller.snapshot.locked, true);
-	assert.equal(controller.snapshot.attempt, 0);
+	const reasonFinalized = finalizeCurrent(
+		reasonMismatch.protocol,
+		response([unlockCall("unlock-1", "Different reason.", "JOB_DONE")]),
+	);
+	assert.equal(reasonFinalized.outcome, "reask");
+	assert.equal(reasonFinalized.error, DECISION_TOOLS_MISMATCH_ERROR);
+	assert.equal(reasonMismatch.controller.snapshot.locked, true);
+	assert.equal(reasonMismatch.controller.snapshot.attempt, 0);
+
+	const typeMismatch = openDecision();
+	typeMismatch.protocol.onDecisionToolCall(
+		unlockToolCall("unlock-2", "JOB_DONE", "Same reason."),
+	);
+	const typeFinalized = finalizeCurrent(
+		typeMismatch.protocol,
+		response([unlockCall("unlock-2", "Same reason.", "WAIT_USER")]),
+	);
+	assert.equal(typeFinalized.outcome, "reask");
+	assert.equal(typeFinalized.error, DECISION_TOOLS_MISMATCH_ERROR);
+	assert.equal(typeMismatch.controller.snapshot.locked, true);
 });

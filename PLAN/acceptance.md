@@ -46,23 +46,35 @@ Any acceptance text, test name, README, or implementation that still requires th
 | Surface | Exact name / text | Who / channel |
 |---|---|---|
 | Lock command | `/lock-continue-watchdog` | Human (TUI) |
-| Unlock command | `/unlock-continue-watchdog [reason]` | Human (TUI); reason optional |
+| Unlock command | `/unlock-continue-watchdog [reason]` | Human (TUI); reason optional; **untyped** (no `reasonType`) |
 | Continue decision tool | `continue_watchdog` | Main/root only; **decision window only**; empty/minimal args `{}` |
-| Unlock decision tool | `unlock_continue_watchdog` | Main/root only; **decision window only**; required `{ reason: string }` |
+| Unlock decision tool | `unlock_continue_watchdog` | Main/root only; **decision window only**; exact required args `{ reasonType: string, reason: string }` |
 | Default `decisionPrompt` | see exact default below | Hidden custom message during decision window |
 | Default `continuePrompt` | `Continue until user assistance is required.` | Compact model-visible replacement after valid continue fold |
+| Default `reasonTypes` | `JOB_DONE`, `WAIT_USER`, `JOB_BLOCKED` | Built-in allowed AI unlock type list; a valid configured list **replaces** this default |
 | Lock TUI notify | `Continue watchdog locked` | User-only TUI notify |
-| Unlock TUI notify (no reason) | `Continue watchdog unlocked` | User-only TUI notify |
-| Unlock TUI-only entry (with reason) | `Continue watchdog unlocked · <reason>` | Muted persistent user-only history entry |
+| Unlock TUI notify (no reason) | `Continue watchdog unlocked` | User-only TUI notify (human reasonless / abort) |
+| Human unlock TUI-only entry (with reason) | `Continue watchdog unlocked · <reason>` | Muted persistent user-only history entry; human path remains untyped |
+| AI unlock TUI-only entry | `Continue watchdog unlocked · <TYPE> · <reason>` | Muted persistent user-only history entry; `<TYPE>` is the matched configured value uppercased |
 | Decision-failed TUI warning | `Continue watchdog decision failed after 3 attempts: <last error>` | User-only TUI notify/warning |
 | Main-run abort unlock | same behavior as reasonless `/unlock-continue-watchdog` | Automatic when Pi reports the main run as aborted |
 
 Correct all accidental `cointinue` spellings; public names use `continue` only.
 
+### Built-in default `reasonTypes` meanings
+
+| Type | Meaning |
+|---|---|
+| `JOB_DONE` | All work is complete |
+| `WAIT_USER` | User input, approval, or action is required |
+| `JOB_BLOCKED` | Work remains unfinished and cannot proceed for a non-`WAIT_USER` blocker |
+
+Configured type lists may use ordinary nonblank UTF-8 text. Trust sane user config; do **not** impose identifier-format regexes, artificial length/count caps, or collision hardening beyond the validation rules below.
+
 ### Exact default `decisionPrompt`
 
 ```text
-This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Call unlock_continue_watchdog with a concise reason if you are intentionally waiting for the user or all tasks are complete. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.
+This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Call unlock_continue_watchdog with an allowed reasonType and a concise reason if you are intentionally waiting for the user, all tasks are complete, or the job cannot continue. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.
 ```
 
 ### Exact default `continuePrompt`
@@ -96,6 +108,7 @@ Continue until user assistance is required.
 | `maxRetries` | `10` | Maximum **valid continue** decisions per lock cycle (not invalid re-asks); safe integer in `[1, 10]` |
 | `decisionPrompt` | exact default above | Hidden custom-role body; explicitly identifies extension automation and says it is not a user message/request; nonblank and at most 16,384 Unicode code points |
 | `continuePrompt` | exact default above | Compact fold-in after valid continue; nonblank and at most 16,384 Unicode code points |
+| `reasonTypes` | `["JOB_DONE","WAIT_USER","JOB_BLOCKED"]` | Allowed AI unlock types. A valid configured list **replaces** the default (it does not extend it). Valid = nonempty array of strings, each trim-nonblank. No identifier regex; no artificial length/count/collision hardening. |
 
 **Config locations and precedence** (same pattern as sibling Pi plugins):
 
@@ -150,8 +163,8 @@ Manual `/lock-continue-watchdog` emits exactly one final `Continue watchdog lock
 
 **What unlocks without resetting cycle accounting:**
 
-- `/unlock-continue-watchdog [reason]`
-- Valid decision-window `unlock_continue_watchdog({ reason })`
+- `/unlock-continue-watchdog [reason]` (human; untyped optional reason)
+- Valid decision-window `unlock_continue_watchdog({ reasonType, reason })`
 - Main run actually aborted as Pi reports (reasonless)
 
 Unlock first makes `locked=false`, then cancels every watchdog timer and cleans operational pending decision state while preserving attempt/backoff, exhaustion, decision-failed, and invalid/no-result counters. Only fresh lock semantics reset those fields.
@@ -179,8 +192,8 @@ Unlock first makes `locked=false`, then cancels every watchdog timer and cleans 
 
 1. Temporarily offers the main agent **exactly**:
    - `continue_watchdog` with empty/minimal input schema `{}`
-   - `unlock_continue_watchdog` with required `reason: string`
-     Unlock tool text must say the reason is a **concise single-sentence** reason (validation rules below).
+   - `unlock_continue_watchdog` with exact required args `{ reasonType: string, reason: string }`
+     Unlock tool description must list the **effective allowed** `reasonTypes` and say the reason is a **concise single-sentence** reason (validation rules below).
 2. Sends a **hidden custom-role** message—not a user-role message—whose model-visible body is the configured `decisionPrompt` (exact default above). Its default explicitly identifies the extension automation and says it is not a user message or request.
 3. Does **not** send the rejected direct-continuation “keep working / call unlock while tools remain normal” message as the idle wake path.
 
@@ -193,16 +206,24 @@ A decision response is **valid** only if it contains **exactly one** accepted de
 | Outcome | Requirements |
 |---|---|
 | Valid **continue** | Exactly one `continue_watchdog` call; no unlock call; no extra/unknown tools; no prose-only answer |
-| Valid **unlock** | Exactly one `unlock_continue_watchdog` call with a **valid reason**; no continue call; no extra/unknown tools; no prose-only answer |
+| Valid **unlock** | Exactly one `unlock_continue_watchdog` call with a **valid `reasonType` and valid `reason`**; no continue call; no extra/unknown tools; no prose-only answer |
+
+**Unlock `reasonType` validation (AI tool path only):**
+
+- AI type is trimmed, then compared **case-insensitively** by lowercasing against each trimmed configured type
+- On match, emit/display the **uppercase** form of the **matched configured value** (not a free-form re-casing of the AI input beyond that match)
+- Missing, blank-after-trim, or unknown types are **invalid** and count under the existing fixed three invalid attempts total (two re-asks, fail on third)
+- Human `/unlock-continue-watchdog` has **no** `reasonType` and is unchanged
 
 **Unlock reason validation (AI tool path):**
 
 - After trim, reason must be **non-empty**
 - Length ≤ **500 Unicode characters** (count Unicode code points / characters as implemented consistently and tested)
 - May technically contain newlines
-- Empty/blank or overlong reasons are **invalid**
+- Empty/blank or overlong reasons are **invalid** (no truncation on the AI path)
+- Existing reason rules remain; they are independent of type matching
 
-**Invalid includes:** no tool call; both/multiple decision tools; extra or unknown tool; prose-only / no accepted tool; invalid reason.
+**Invalid includes:** no tool call; both/multiple decision tools; extra or unknown tool; prose-only / no accepted tool; missing/blank/unknown `reasonType`; invalid reason.
 
 ### Invalid → re-ask (fixed 3)
 
@@ -225,11 +246,11 @@ On invalid decision:
 
 - Restore normal tools
 - Set unlocked first; then cancel timers and clean operational decision state while preserving attempts/failures
-- Append exactly one muted **persisted TUI-only** reason entry, `Continue watchdog unlocked · <reason>` (user-visible history, not model-bound as ordinary assistant prose)
+- Append exactly one muted **persisted TUI-only** AI unlock entry, `Continue watchdog unlocked · <TYPE> · <reason>`, where `<TYPE>` is the matched configured type uppercased and `<reason>` is the validated reason (user-visible history, not model-bound as ordinary assistant prose)
 - Do **not** also emit a transient reasoned unlock notification
 - **No further work turn** is started for that unlock decision
 - **Future model-bound context** removes the **entire** decision exchange (decision prompt, model reply, tool call(s), tool result(s)) and **inserts nothing** in its place
-- Raw session may still preserve protocol records; folding is model-bound context only
+- Raw session may still preserve protocol records that contain **both** tool args (`reasonType` and `reason`); folding is model-bound context only
 
 ### Valid continue
 
@@ -246,14 +267,14 @@ On invalid decision:
 
 ### Human `/unlock-continue-watchdog [reason]`
 
-Always assigns `locked=false` first, then cancels timers and cleans operational decision state while preserving cycle accounting—even if already unlocked.
+Always assigns `locked=false` first, then cancels timers and cleans operational decision state while preserving cycle accounting—even if already unlocked. The human command remains **untyped**: no `reasonType` argument, no type matching, and no AI typed TUI format.
 
 | Human reason input | TUI notify | TUI-only reason entry |
 |---|---|---|
 | Empty / blank / omitted | exactly `Continue watchdog unlocked` | none (no reason) |
 | Nonblank | none | trim; **automatically truncate** to first **500** Unicode characters (may be multiline); append muted `Continue watchdog unlocked · <reason>` |
 
-Human unlock is **not** subject to the AI decision-window invalid re-ask protocol.
+Human unlock is **not** subject to the AI decision-window invalid re-ask protocol and does **not** publish `user-ready`.
 
 ---
 
@@ -306,7 +327,7 @@ These examples are the accepted product contract. Each is externally observable 
 - already-unlocked and already-locked starting states both execute the full unlock-cleanup → lock sequence
 - if ownership becomes stale/demoted during prerequisite cleanup, it stops before lock effects and notification
 
-### Example 3 — Manual unlock with optional reason
+### Example 3 — Manual unlock with optional reason (untyped regression)
 
 **Given** main is locked or unlocked, with or without a pending idle timer or decision window
 **When** the human runs `/unlock-continue-watchdog` with empty/blank reason
@@ -315,14 +336,17 @@ These examples are the accepted product contract. Each is externally observable 
 - `locked=false` is assigned first; timers and pending operational decision work are then cancelled; attempts/failures are preserved
 - TUI notifies exactly: `Continue watchdog unlocked`
 - no TUI-only reason entry
+- no `reasonType` is required or displayed
+- no `user-ready` envelope is published
 
-**When** the human runs `/unlock-continue-watchdog` with a nonblank reason
+**When** the human runs `/unlock-continue-watchdog` with a nonblank reason e.g. `Taking over manually.`
 **Then**
 
 - unlocked as above
 - reason is trimmed and truncated to the first 500 Unicode characters if longer
 - no transient notification is emitted
-- exactly one muted TUI-only reason entry, `Continue watchdog unlocked · <reason>`, is appended
+- exactly one muted TUI-only reason entry, `Continue watchdog unlocked · Taking over manually.`, is appended
+- the AI typed format `Continue watchdog unlocked · <TYPE> · <reason>` is **not** used
 - same-state unlock still assigns and still persists the entry
 
 ### Example 4 — An actually aborted main run automatically unlocks
@@ -348,10 +372,12 @@ Ordinary natural idle settle never counts as abort.
 
 - exactly one decision window is opened for that attempt (not a direct continue custom message)
 - active tools are temporarily replaced with exactly `continue_watchdog` and `unlock_continue_watchdog`
+- `unlock_continue_watchdog` requires exact args `{ reasonType, reason }`; its description lists the effective allowed `reasonTypes`
 - a **hidden custom-role** decision message uses configured `decisionPrompt` (exact default in Product surface), identifies itself as extension automation, states it is not a user message/request, and is never injected with user role
 - the rejected direct-continuation default
   `Continue the task. If you are intentionally waiting for the user or all tasks are complete, call unlock_continue_watchdog.`
   is **not** used as the idle wake message
+- the rejected untyped decision default that asked only for a concise reason without an allowed `reasonType` is **not** used
 
 With defaults, delays for successive continue attempts begin **3s, 6s, 12s, 24s, …**
 
@@ -368,27 +394,37 @@ With defaults, delays for successive continue attempts begin **3s, 6s, 12s, 24s,
 - one exponential retry is consumed
 - after settle, if still locked and all observable idle, the **next** exponential delay arms
 
-### Example 7 — Valid unlock: one muted reason entry, fold to nothing, no further work turn
+### Example 7 — Valid AI unlock: typed muted entry, fold to nothing, no further work turn
 
-**Given** a decision window is open
-**When** the main agent returns a valid `unlock_continue_watchdog` with reason e.g. `Waiting for user confirmation on deploy.`
+**Given** a decision window is open with default `reasonTypes`
+**When** the main agent returns a valid `unlock_continue_watchdog` with mixed-case type `job_done` and reason `All requested package bumps are merged.`
 **Then**
 
 - normal tools restored; `locked=false`; timers and operational decision state cancelled; attempts/failures preserved
+- type matches case-insensitively to configured `JOB_DONE`; display/emit uses uppercased matched configured value `JOB_DONE`
 - no transient reasoned unlock notification is emitted
-- exactly one muted TUI-only entry is appended: `Continue watchdog unlocked · Waiting for user confirmation on deploy.`
+- exactly one muted TUI-only entry is appended: `Continue watchdog unlocked · JOB_DONE · All requested package bumps are merged.`
 - **no further work turn** starts from that unlock decision
 - future model-bound context removes the entire decision exchange and inserts **nothing**
-- raw session may still contain protocol tool records
+- raw session may still contain the protocol tool record with both args (`reasonType` and `reason`)
+
+**And when** config sets `reasonTypes: ["NeedReview", "shipped"]` (replacing, not extending, the default list)
+**And** the agent unlocks with mixed-case type `needreview` and reason `PR is open for human review.`
+**Then**
+
+- type matches configured `NeedReview` case-insensitively
+- muted TUI-only entry is exactly: `Continue watchdog unlocked · NEEDREVIEW · PR is open for human review.`
+- default types such as `JOB_DONE` are **not** accepted while this custom list is effective
 
 ### Example 8 — Invalid or no-result decision re-asks then decision-failed
 
 **Given** a decision window is open
-**When** the model responds invalidly (no tool, both tools, unknown tool, prose-only, empty reason, reason > 500 Unicode characters) **or the decision turn truly settles without any verifiable decision response/result**
+**When** the model responds invalidly (no tool, both tools, unknown tool, prose-only, missing `reasonType`, blank `reasonType`, unknown `reasonType`, empty reason, reason > 500 Unicode characters) **or the decision turn truly settles without any verifiable decision response/result**
 **Then**
 
 - immediately re-ask with a hidden prompt that includes the exact previous error and explains invalidity
 - temporary decision-only tools remain
+- invalid type and invalid reason both count under the same fixed three invalid attempts total
 - invalid re-asks do **not** advance exponential continue attempt / do not count toward `maxRetries`
 
 **When** the third consecutive invalid decision occurs
@@ -429,14 +465,14 @@ Stale timer callbacks (wrong generation/epoch/ownership) must not open a decisio
 **And** the watchdog has finished every automatic action it can take for that epoch
 **When** the terminal stop is one of:
 
-1. Valid AI decision unlock with a validated reason
+1. Valid AI decision unlock with a validated `reasonType` and reason
 2. Max valid continue attempts exhausted
 3. Third invalid decision becomes decision-failed
 
 **Then** the main attachment publishes exactly one fresh plain-data envelope on Pi's public bus channel `pi:semantic-hook:v1`:
 
 ```json
-{"version":1,"name":"user-ready","values":{"STOP_KIND":"AI_UNLOCK","REASON":"<validated reason>"}}
+{"version":1,"name":"user-ready","values":{"STOP_KIND":"AI_UNLOCK","REASON_TYPE":"<matched TYPE>","REASON":"<validated reason>"}}
 ```
 
 or
@@ -453,7 +489,15 @@ or
 
 **And** it does **not** publish for human `/unlock-continue-watchdog` (with or without reason), canonical/manual/user abort unlock, initial ordinary unlocked idle, valid continue or intermediate decision/settled states, locked normal/pending idle timer, stale/demoted/reloaded ownership, or repeated settled/reconcile in the same terminal epoch.
 
-Only AI decision unlock retains a publication intent/reason until the resulting authoritative aggregate-idle settle. Existing reason validation/trim/length remains authority; decision-failed does not publish last error text. Absence or failure of every consumer must not change watchdog state.
+Only AI decision unlock retains a publication intent carrying **both** matched `REASON_TYPE` and validated `REASON` together until the resulting authoritative aggregate-idle settle; type and reason are retained/cleared together. Other stop kinds remain unchanged and do not invent type/reason fields. Existing type matching plus reason validation/trim/length remain authority; decision-failed does not publish last error text. Absence or failure of every consumer must not change watchdog state.
+
+**Delayed publication while a child is still busy:**
+
+**Given** a valid AI unlock already produced matched type `WAIT_USER` and reason `Need deploy approval.`
+**And** an observable child is still busy at the unlock moment
+**When** the child later settles and the main observes the terminal aggregate-idle epoch for that unlock
+**Then** the published envelope is still exactly one `AI_UNLOCK` payload with `REASON_TYPE` = `WAIT_USER` and `REASON` = `Need deploy approval.`
+**And** no intermediate/extra `user-ready` is published while the child remains busy
 
 ### Example 12 — Runtime-only lock; clean unlocked on session lifecycle edges
 
@@ -470,11 +514,13 @@ Only AI decision unlock retains a publication intent/reason until the resulting 
 ### Example 13 — Trusted config overrides with safe fallback
 
 **Given** global and/or trusted-project `pi-continue-watchdog.json`
-**When** valid `idleDelaySeconds`, `maxRetries`, `decisionPrompt`, and/or `continuePrompt` are provided
+**When** valid `idleDelaySeconds`, `maxRetries`, `decisionPrompt`, `continuePrompt`, and/or `reasonTypes` are provided
 **Then** effective config uses field-level override (trusted project over global over defaults)
+**And** a valid `reasonTypes` list replaces the built-in default list rather than extending it
 
 **When** values are missing, unreadable, or invalid
 **Then** retain valid lower-precedence values / defaults and emit bounded diagnostics (no crash, no silent use of nonsense numbers that would fire immediately in an unbounded way)
+**And** invalid `reasonTypes` (empty array, non-array, or any blank-after-trim entry) do not erase a valid lower-precedence / default type list
 
 ### Example 14 — Publication, language, packaging, CI
 
@@ -563,8 +609,8 @@ These are product constraints, not optional polish. Implementation details are r
 
 For each example above, implementation slices must leave evidence that can be re-run:
 
-- **Unit / component:** pure state machine (including decision-failed and attempt advancement rules), config precedence, reason trim/truncate/length, timer cancel/restart, generation guards, decision validity matrix
-- **Integration / E2E (stock Pi, packed install):** auto-lock on real main user message start; command lock/unlock notifies and optional reason; temporary tool replacement; at least one real timed path into a decision window; continue fold vs unlock fold; third-invalid decision-failed warning; exhaustion or multi-attempt math (real or injected clock, documented)
+- **Unit / component:** pure state machine (including decision-failed and attempt advancement rules), config precedence including `reasonTypes` replace semantics, AI type case-insensitive match + uppercased matched configured value, reason trim/truncate/length (AI no-truncation vs human truncate), timer cancel/restart, generation guards, decision validity matrix (including missing/blank/unknown type)
+- **Integration / E2E (stock Pi, packed install):** auto-lock on real main user message start; command lock/unlock notifies and optional untyped reason; temporary tool replacement with typed unlock args; at least one real timed path into a decision window; continue fold vs typed unlock fold/raw-record retention; delayed `AI_UNLOCK` user-ready while a child is busy; third-invalid decision-failed warning; exhaustion or multi-attempt math (real or injected clock, documented)
 - **Human accept:** product authority reviews evidence against this file; AI does not self-accept
 
 **Contract status:** this file remains the accepted **behavior** contract. Implementation progress is tracked in `PLAN/implementation.md`.

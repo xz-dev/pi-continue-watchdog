@@ -32,9 +32,9 @@ Observable behavior only (implementation details may change):
 2. While locked, after **all observable** same-process agents stay idle for the current delay, the extension re-checks true idle and opens a short **decision check** on main—regardless of whether Pi stopped normally, after compaction, or because of a Provider/extension error.
 3. The decision is a **hidden automated** custom message (not a user message). For that check only, the model may call exactly one of:
    - `continue_watchdog` — keep working
-   - `unlock_continue_watchdog` with a concise reason — stop automatic checks
+   - `unlock_continue_watchdog` with exact arguments `{ "reasonType": string, "reason": string }` — stop automatic checks with an allowed typed reason
 4. **Continue** injects the compact prompt `Continue until user assistance is required.` (configurable) and ordinary work resumes without further user input.
-5. **Unlock with a reason** shows one muted persistent TUI line, `Continue watchdog unlocked · <reason>`, with no duplicate transient notification, and does **not** start another work turn. Future model context drops the decision exchange.
+5. **AI unlock** shows one muted persistent TUI line, `Continue watchdog unlocked · <TYPE> · <reason>`, with no duplicate transient notification, and does **not** start another work turn. Future model context drops the decision exchange. Human command unlock remains untyped.
 6. A decision gets up to **3 total attempts**. A decision turn that settles without a verifiable result counts as invalid. After the third invalid/no-result response, the extension stays locked/failed until a new main user message or manual lock.
 7. After each valid continue, the next idle delay doubles: default **3s, 6s, 12s, …** up to **10** valid continues per lock cycle.
 8. An **aborted** main run unlocks immediately (reasonless). Child stop reasons are never inspected.
@@ -57,14 +57,14 @@ Human unlock reason is optional: trimmed and truncated to 500 Unicode characters
 | Tool | Args | Meaning |
 |---|---|---|
 | `continue_watchdog` | `{}` | Continue work |
-| `unlock_continue_watchdog` | `{ "reason": string }` | Unlock with reason (non-empty, ≤ 500 characters after trim) |
+| `unlock_continue_watchdog` | `{ "reasonType": string, "reason": string }` | Unlock with an allowed type and concise reason (both required; reason non-empty and ≤ 500 Unicode code points after trim) |
 
 Outside a decision window these tools are not part of the normal active tool set. Definitions may remain registered but are not offered for ordinary turns.
 
 Default decision prompt (configurable):
 
 ```text
-This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Call unlock_continue_watchdog with a concise reason if you are intentionally waiting for the user or all tasks are complete. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.
+This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one. Call unlock_continue_watchdog with an allowed reasonType and a concise reason if you are intentionally waiting for the user, every task the user requested is complete, or the job cannot continue. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.
 ```
 
 Default continue prompt (configurable):
@@ -94,8 +94,9 @@ Project config is ignored when the project is untrusted. Missing files are silen
 {
   "idleDelaySeconds": 3,
   "maxRetries": 10,
-  "decisionPrompt": "This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Call unlock_continue_watchdog with a concise reason if you are intentionally waiting for the user or all tasks are complete. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.",
-  "continuePrompt": "Continue until user assistance is required."
+  "decisionPrompt": "This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one. Call unlock_continue_watchdog with an allowed reasonType and a concise reason if you are intentionally waiting for the user, every task the user requested is complete, or the job cannot continue. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.",
+  "continuePrompt": "Continue until user assistance is required.",
+  "reasonTypes": ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"]
 }
 ```
 
@@ -105,6 +106,11 @@ Project config is ignored when the project is untrusted. Missing files are silen
 | `maxRetries` | `10` | Safe integer `1`–`10` (valid continues per lock cycle) |
 | `decisionPrompt` | see above | Non-blank, ≤ **16384** Unicode code points |
 | `continuePrompt` | `Continue until user assistance is required.` | Non-blank, ≤ **16384** Unicode code points |
+| `reasonTypes` | `["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"]` | Nonempty array of trim-nonblank strings. A valid configured list **replaces** the defaults; it does not extend them. |
+
+Default meanings: `JOB_DONE` means all requested work is complete; `WAIT_USER` means progress genuinely requires user input or a user decision; `JOB_BLOCKED` means the job cannot continue for another concrete reason.
+
+For AI unlock, the extension trims the supplied `reasonType`, matches it against the effective list case-insensitively by lowercasing both values, and emits the **matched configured value uppercased**. It trims `reason` but does not truncate it: blank or over-500-code-point AI reasons are invalid and use the decision re-ask protocol. The tool schema deliberately keeps `reasonType` as a string rather than an enum; the effective allowed list is included in its description. Human `/unlock-continue-watchdog [reason]` remains untyped and keeps its separate truncating behavior.
 
 Invalid re-ask budget is fixed at **3** (not configurable).
 
@@ -122,7 +128,7 @@ When the elected main attachment reaches a **terminal aggregate-idle** epoch whe
 - Channel: `pi:semantic-hook:v1`
 - Envelope name: `user-ready`
 - Values by stop kind:
-  - AI decision unlock: `{ "STOP_KIND": "AI_UNLOCK", "REASON": "<validated reason>" }`
+  - AI decision unlock: `{ "STOP_KIND": "AI_UNLOCK", "REASON_TYPE": "<matched TYPE>", "REASON": "<validated reason>" }`
   - Max valid continues exhausted: `{ "STOP_KIND": "EXHAUSTED" }`
   - Third invalid decision: `{ "STOP_KIND": "DECISION_FAILED" }`
 

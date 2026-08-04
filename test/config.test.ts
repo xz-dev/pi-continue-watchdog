@@ -8,6 +8,7 @@ import {
 	BUILT_IN_CONFIG,
 	DEFAULT_CONTINUE_PROMPT,
 	DEFAULT_DECISION_PROMPT,
+	DEFAULT_REASON_TYPES,
 	loadConfigText,
 	MAX_PROMPT_CHARACTERS,
 	MAX_RETRIES,
@@ -21,6 +22,13 @@ import { loadRuntimeConfig } from "../src/config-loader.js";
 /** Rejected direct-continuation reminder (must never be shipped as default). */
 const REJECTED_DIRECT_REMINDER =
 	"Continue the task. If you are intentionally waiting for the user or all tasks are complete, call unlock_continue_watchdog.";
+
+/** Rejected untyped decision default that omits allowed reasonType. */
+const REJECTED_UNTYPED_DECISION_PROMPT =
+	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Call unlock_continue_watchdog with a concise reason if you are intentionally waiting for the user or all tasks are complete. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.";
+
+const ACCEPTED_DECISION_PROMPT =
+	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one. Call unlock_continue_watchdog with an allowed reasonType and a concise reason if you are intentionally waiting for the user, every task the user requested is complete, or the job cannot continue. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.";
 
 async function fixture(
 	t: TestContext,
@@ -39,20 +47,28 @@ async function fixture(
 test("built-in defaults match acceptance and reject the stale direct reminder", () => {
 	assert.equal(BUILT_IN_CONFIG.idleDelaySeconds, 3);
 	assert.equal(BUILT_IN_CONFIG.maxRetries, 10);
-	assert.equal(
-		BUILT_IN_CONFIG.decisionPrompt,
-		"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Call unlock_continue_watchdog with a concise reason if you are intentionally waiting for the user or all tasks are complete. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.",
-	);
+	assert.equal(BUILT_IN_CONFIG.decisionPrompt, ACCEPTED_DECISION_PROMPT);
 	assert.equal(
 		BUILT_IN_CONFIG.continuePrompt,
 		"Continue until user assistance is required.",
 	);
+	assert.deepEqual(BUILT_IN_CONFIG.reasonTypes, [
+		"JOB_DONE",
+		"WAIT_USER",
+		"JOB_BLOCKED",
+	]);
+	assert.deepEqual(DEFAULT_REASON_TYPES, BUILT_IN_CONFIG.reasonTypes);
 	assert.equal(DEFAULT_DECISION_PROMPT, BUILT_IN_CONFIG.decisionPrompt);
 	assert.equal(DEFAULT_CONTINUE_PROMPT, BUILT_IN_CONFIG.continuePrompt);
 	assert.notEqual(BUILT_IN_CONFIG.decisionPrompt, REJECTED_DIRECT_REMINDER);
+	assert.notEqual(
+		BUILT_IN_CONFIG.decisionPrompt,
+		REJECTED_UNTYPED_DECISION_PROMPT,
+	);
 	assert.notEqual(BUILT_IN_CONFIG.continuePrompt, REJECTED_DIRECT_REMINDER);
 	assert.ok(!BUILT_IN_CONFIG.decisionPrompt.includes(REJECTED_DIRECT_REMINDER));
 	assert.ok(!BUILT_IN_CONFIG.continuePrompt.includes(REJECTED_DIRECT_REMINDER));
+	assert.ok(BUILT_IN_CONFIG.decisionPrompt.includes("allowed reasonType"));
 });
 
 test("global and trusted project overrides apply field-by-field", () => {
@@ -67,6 +83,7 @@ test("global and trusted project overrides apply field-by-field", () => {
 		"Custom decision prompt for global.",
 	);
 	assert.equal(globalOnly.config.continuePrompt, DEFAULT_CONTINUE_PROMPT);
+	assert.deepEqual(globalOnly.config.reasonTypes, DEFAULT_REASON_TYPES);
 	assert.deepEqual(globalOnly.diagnostics, []);
 
 	const withProject = mergeConfig(
@@ -75,17 +92,51 @@ test("global and trusted project overrides apply field-by-field", () => {
 			maxRetries: 4,
 			decisionPrompt: "Global decision",
 			continuePrompt: "Global continue",
+			reasonTypes: ["GlobalType"],
 		},
 		{
 			idleDelaySeconds: 9,
 			continuePrompt: "Project continue",
+			reasonTypes: [" ProjectType ", "shipped"],
 		},
 	);
 	assert.equal(withProject.config.idleDelaySeconds, 9);
 	assert.equal(withProject.config.maxRetries, 4);
 	assert.equal(withProject.config.decisionPrompt, "Global decision");
 	assert.equal(withProject.config.continuePrompt, "Project continue");
+	assert.deepEqual(withProject.config.reasonTypes, ["ProjectType", "shipped"]);
 	assert.deepEqual(withProject.diagnostics, []);
+});
+
+test("valid reasonTypes replace defaults and invalid lists fall back", () => {
+	const replaced = mergeConfig({
+		reasonTypes: [" NeedReview ", "shipped"],
+	});
+	assert.deepEqual(replaced.config.reasonTypes, ["NeedReview", "shipped"]);
+	assert.deepEqual(replaced.diagnostics, []);
+	assert.ok(!replaced.config.reasonTypes.includes("JOB_DONE"));
+
+	const invalidProject = mergeConfig(
+		{ reasonTypes: ["GlobalOnly"] },
+		{ reasonTypes: ["ok", "  "] },
+	);
+	assert.deepEqual(invalidProject.config.reasonTypes, ["GlobalOnly"]);
+	assert.ok(
+		invalidProject.diagnostics.some((d) => /reasonTypes/i.test(d.message)),
+	);
+
+	for (const reasonTypes of [[], "JOB_DONE", [""], ["ok", 1], [null], {}]) {
+		const result = validateConfig("project", { reasonTypes });
+		assert.equal(result.config.reasonTypes, undefined);
+		assert.equal(result.diagnostics.length, 1);
+		assert.match(result.diagnostics[0]?.message ?? "", /reasonTypes/i);
+	}
+
+	const preserved = mergeConfig(
+		{ reasonTypes: ["KeepMe"] },
+		{ reasonTypes: [] },
+	);
+	assert.deepEqual(preserved.config.reasonTypes, ["KeepMe"]);
 });
 
 test("invalid higher-precedence fields preserve lower valid values", () => {

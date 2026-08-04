@@ -23,6 +23,9 @@ export interface SemanticHookEnvelope {
 
 export interface UserReadyValues {
 	readonly STOP_KIND: UserReadyStopKind;
+	/** Present only for AI decision unlock; matched configured type uppercased. */
+	readonly REASON_TYPE?: string;
+	/** Present only for AI decision unlock; validated trimmed reason. */
 	readonly REASON?: string;
 }
 
@@ -33,6 +36,9 @@ export interface SemanticHookEventBus {
 
 function freezeValues(values: UserReadyValues): SemanticHookValues {
 	const frozen: Record<string, string> = { STOP_KIND: values.STOP_KIND };
+	if (values.REASON_TYPE !== undefined) {
+		frozen.REASON_TYPE = values.REASON_TYPE;
+	}
 	if (values.REASON !== undefined) {
 		frozen.REASON = values.REASON;
 	}

@@ -1,6 +1,6 @@
 # Implementation plan — pi-continue-watchdog
 
-**Status:** Public live Git package on `master`. Slices 0–18 are complete; npm, tags, and GitHub Releases are intentionally not used.
+**Status:** Public live Git package on `master`. Slices 0–18 are complete. Slice 19 typed unlock reasons is implemented as uncommitted work on feature branch `feat/typed-unlock-reasons` from `c760075`; documentation, packed acceptance coverage, generated dist, and final verification are being completed in the shared working tree. npm, tags, and GitHub Releases are intentionally not used.
 **Method:** One vertical behavior slice per branch; RED → GREEN → review (when functional) → merge → next branch
 **Language:** English only for all project artifacts
 
@@ -15,7 +15,7 @@ Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would ch
 - No hostile Proxy / speculative global hardening required for v1.
 - Prefer simple, obvious modules the human can modify later.
 - Core product goal: prevent unexplained AI stops. Remove complexity that does not serve that goal.
-- A final `merge-code-reviewer` review is mandatory before publication.
+- A final `code-merge-reviewer` review is mandatory before publication.
 
 ---
 
@@ -42,6 +42,7 @@ Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would ch
 | 16 | Unified reasoned unlock UI | Complete |
 | 17 | Realm-wide process domain + root-only control | Complete |
 | 18 | Fresh lock uses silent unlock cleanup first | Complete |
+| 19 | Typed AI unlock reasons | In progress — implementation and focused tests present; docs, packed E2E, dist, and full verification pending |
 
 **Current architecture (indicative filenames; may still be simplified):**
 
@@ -57,7 +58,7 @@ Do **not** expand product scope beyond `PLAN/acceptance.md`. If a slice would ch
 | Render | `src/render.ts` | Compact continue TUI line |
 | Runtime | `src/runtime.ts` | Lifecycle observe/report for every attachment; exact-claim fenced `restartLockCycle` unlock-cleanup-lock seam; config/controller/timer/decision tools/messages/UI/`user-ready` only under exact current-main generation claim |
 | Semantic hook | `src/semantic-hook.ts` | Neutral `pi:semantic-hook:v1` / `user-ready` producer helpers via ResourceLoader-local `pi.events` (delivery only, not process coordination) |
-| Commands | `src/commands.ts` | `/lock-continue-watchdog`, `/unlock-continue-watchdog` (main-owned); manual lock delegates to the runtime fresh-cycle seam |
+| Commands | `src/commands.ts` | `/lock-continue-watchdog`, `/unlock-continue-watchdog` (main-owned and untyped); shared renderer formats typed AI unlock and untyped human unlock entries; manual lock delegates to the runtime fresh-cycle seam |
 | Auto-lock / abort | `src/auto-lock.ts`, `src/abort-outcome.ts` | Main user fresh-cycle request through the same runtime seam; current-main aborted-run unlock |
 | Tests / CI | `test/**`, `e2e/**`, `.github/workflows/ci.yml` | Unit + packed stock-Pi E2E (incl. multi-ResourceLoader / distinct-cwd) |
 
@@ -153,7 +154,7 @@ Public English install/behavior/commands/config/limitations/CI/license docs.
 
 ### Slice 13 — Publication readiness — Complete
 
-- Final `merge-code-reviewer` review approved
+- Final `code-merge-reviewer` review approved
 - Public repository created at `xz-dev/pi-continue-watchdog`
 - `master` is the live package source
 - Install only with `pi install git:github.com/xz-dev/pi-continue-watchdog`
@@ -208,6 +209,16 @@ Publishes a generic same-process semantic hook only for terminal AI unlock, exha
 - Re-entrant demotion during prerequisite cleanup stops before fresh lock/notify. Ordinary current-main `agent_start` retains existing ensure-lock semantics and preserves an already locked cycle.
 - Focused tests prove ordering, open-decision/timer cleanup, unlocked restart, silent auto-lock, demotion fencing, and unchanged ordinary-start behavior.
 
+### Slice 19 — Typed AI unlock reasons — In progress
+
+**Feature branch state:** uncommitted shared-working-tree implementation on `feat/typed-unlock-reasons` at base HEAD `c760075`. The accepted behavior authority is `PLAN/acceptance.md`.
+
+- Config adds replacement-list `reasonTypes`, defaulting to `JOB_DONE`, `WAIT_USER`, and `JOB_BLOCKED`; valid higher-precedence lists replace rather than extend lower-precedence values.
+- The decision tool requires exact `{ reasonType, reason }`. Its schema keeps `reasonType` as `string` (not an enum), while the description exposes the effective allowed list.
+- Protocol matching trims and compares types case-insensitively, returns the matched configured value uppercased, preserves raw tool arguments in persisted protocol records, and folds the completed decision exchange from future model-bound context.
+- AI unlock renders `Continue watchdog unlocked · <TYPE> · <reason>` and carries both `REASON_TYPE` and `REASON` in the terminal aggregate-idle `AI_UNLOCK` semantic hook. Human command unlock remains untyped.
+- Focused config/protocol/tool/runtime/render/command/semantic-hook tests are present in the shared feature work. Task #8 adds post-GREEN packed-isolated stock-Pi integration coverage, updates product docs, regenerates `dist/**`, and runs the full verification and mutation gate. Because implementation was already GREEN before this packed test was added, the packed scenario is honestly integration/regression coverage rather than the original RED test.
+
 ---
 
 ## Testing strategy
@@ -234,10 +245,10 @@ Continue the task. If you are intentionally waiting for the user or all tasks ar
 |---|---|---|
 | Functional slices 1–11 | Required | Approved + checks green |
 | Scaffold 0, docs 12 | Optional | Checks green; human may skim README |
-| Final publication review | `merge-code-reviewer` | Approved + all checks green |
+| Final publication review | `code-merge-reviewer` | Approved + all checks green |
 | Publish | Human product authority | Final review approved + explicit yes |
 
-Independent review contract for functional merges: Critical/Important/Minor; end with `APPROVED` or `CHANGES REQUIRED`. The final publication review must use `merge-code-reviewer`.
+Independent review contract for functional merges: Critical/Important/Minor; end with `APPROVED` or `CHANGES REQUIRED`. The final publication review must use `code-merge-reviewer`.
 
 ---
 

@@ -20,8 +20,13 @@ export const UNLOCK_COMMAND_DESCRIPTION =
 /** Persisted custom-entry type for human-visible unlock reasons. */
 export const HUMAN_UNLOCK_ENTRY_TYPE = "pi-continue-watchdog:unlock";
 
+/**
+ * Shared TUI-only unlock entry. Human unlocks set only `reason`.
+ * AI unlocks set both `reasonType` (matched/uppercased type) and `reason`.
+ */
 export interface HumanUnlockEntry {
 	readonly reason: string;
+	readonly reasonType?: string;
 }
 
 /**
@@ -123,18 +128,50 @@ function createStaticTextComponent(
 	};
 }
 
-function getHumanUnlockReason(entry: unknown): string {
-	if (typeof entry !== "object" || entry === null) return "";
+function getHumanUnlockFields(entry: unknown): {
+	readonly reason: string;
+	readonly reasonType: string;
+} {
+	if (typeof entry !== "object" || entry === null) {
+		return { reason: "", reasonType: "" };
+	}
 
 	try {
 		const data = (entry as { readonly data?: unknown }).data;
-		if (typeof data !== "object" || data === null) return "";
+		if (typeof data !== "object" || data === null) {
+			return { reason: "", reasonType: "" };
+		}
 
-		const reason = (data as { readonly reason?: unknown }).reason;
-		return typeof reason === "string" && reason.length > 0 ? reason : "";
+		const fields = data as {
+			readonly reason?: unknown;
+			readonly reasonType?: unknown;
+		};
+		const reason =
+			typeof fields.reason === "string" && fields.reason.length > 0
+				? fields.reason
+				: "";
+		const reasonType =
+			typeof fields.reasonType === "string" && fields.reasonType.length > 0
+				? fields.reasonType
+				: "";
+		return { reason, reasonType };
 	} catch {
-		return "";
+		return { reason: "", reasonType: "" };
 	}
+}
+
+/** Format the muted TUI-only unlock history line. */
+export function formatUnlockEntryText(
+	reason: string,
+	reasonType?: string,
+): string {
+	if (reasonType !== undefined && reasonType.length > 0 && reason.length > 0) {
+		return `Continue watchdog unlocked · ${reasonType} · ${reason}`;
+	}
+	if (reason.length > 0) {
+		return `Continue watchdog unlocked · ${reason}`;
+	}
+	return "Continue watchdog unlocked";
 }
 
 /**
@@ -143,10 +180,11 @@ function getHumanUnlockReason(entry: unknown): string {
  */
 export function createHumanUnlockEntryRenderer(): EntryRenderer<HumanUnlockEntry> {
 	return (entry, _options, theme) => {
-		const reason = getHumanUnlockReason(entry);
-		const text = reason
-			? `Continue watchdog unlocked · ${reason}`
-			: "Continue watchdog unlocked";
+		const { reason, reasonType } = getHumanUnlockFields(entry);
+		const text = formatUnlockEntryText(
+			reason,
+			reasonType.length > 0 ? reasonType : undefined,
+		);
 		return createStaticTextComponent(text, theme);
 	};
 }

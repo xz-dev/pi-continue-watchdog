@@ -111,6 +111,7 @@ interface Harness {
 	executeUnlock(
 		reason: string,
 		toolCallId?: string,
+		reasonType?: string,
 	): Promise<AgentToolResult<unknown>>;
 }
 
@@ -138,6 +139,11 @@ function createHarness(options?: {
 		maxRetries: options?.config?.maxRetries ?? 3,
 		decisionPrompt: options?.config?.decisionPrompt ?? "Decide now.",
 		continuePrompt: options?.config?.continuePrompt ?? "Continue compactly.",
+		reasonTypes: options?.config?.reasonTypes ?? [
+			"JOB_DONE",
+			"WAIT_USER",
+			"JOB_BLOCKED",
+		],
 	};
 	const hub = createObservableAgentHub();
 	const controller = createLockDecisionController(config);
@@ -273,9 +279,14 @@ function createHarness(options?: {
 			toolCallId,
 			ctx,
 		});
-	harness.executeUnlock = async (reason, toolCallId = "unlock-1") =>
+	harness.executeUnlock = async (
+		reason,
+		toolCallId = "unlock-1",
+		reasonType = "JOB_DONE",
+	) =>
 		runtime.executeDecisionTool({
 			kind: "unlock",
+			reasonType,
 			reason,
 			toolCallId,
 			ctx,
@@ -524,7 +535,7 @@ test("valid unlock folds without a turn and leaves one compact persisted result"
 	const harness = createHarness();
 	await startIdle(harness);
 	harness.openDecision();
-	await harness.executeUnlock("  waiting for user  ");
+	await harness.executeUnlock("  waiting for user  ", "unlock-1", "job_done");
 	const turnsBefore = harness.triggeredTurns;
 	assert.deepEqual(harness.activeTools, [
 		"continue_watchdog",
@@ -534,6 +545,7 @@ test("valid unlock folds without a turn and leaves one compact persisted result"
 		harness,
 		assistant([
 			toolCall("unlock-1", "unlock_continue_watchdog", {
+				reasonType: "job_done",
 				reason: "waiting for user",
 			}),
 		]),
@@ -547,12 +559,48 @@ test("valid unlock folds without a turn and leaves one compact persisted result"
 	assert.deepEqual(harness.entries, [
 		{
 			type: "pi-continue-watchdog:unlock",
-			data: { reason: "waiting for user" },
+			data: {
+				reasonType: "JOB_DONE",
+				reason: "waiting for user",
+			},
 		},
 	]);
-	// Settled delivery restores tools and persists the reason without a duplicate notification.
+	// Settled delivery restores tools and persists the typed reason without a duplicate notification.
 	assert.deepEqual(harness.activeTools, ["read", "bash"]);
 	assert.equal(harness.controller.snapshot.locked, false);
+	assert.deepEqual(harness.notifications, []);
+});
+
+test("Example 7: AI unlock retains typed entry data only; no transient notification", async () => {
+	const harness = createHarness({
+		config: { reasonTypes: ["NeedReview", "shipped"] },
+	});
+	await startIdle(harness);
+	harness.openDecision();
+	await harness.executeUnlock(
+		"PR is open for human review.",
+		"unlock-1",
+		"needreview",
+	);
+	await settleResponse(
+		harness,
+		assistant([
+			toolCall("unlock-1", "unlock_continue_watchdog", {
+				reasonType: "needreview",
+				reason: "PR is open for human review.",
+			}),
+		]),
+	);
+
+	assert.deepEqual(harness.entries, [
+		{
+			type: "pi-continue-watchdog:unlock",
+			data: {
+				reasonType: "NEEDREVIEW",
+				reason: "PR is open for human review.",
+			},
+		},
+	]);
 	assert.deepEqual(harness.notifications, []);
 });
 
@@ -1105,6 +1153,7 @@ test("child completion only makes aggregate idle; exactly one inquiry comes from
 		maxRetries: 2,
 		decisionPrompt: "Decide now.",
 		continuePrompt: "Continue compactly.",
+		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
 	};
 	const hub = createObservableAgentHub();
 	const clock = new FakeClock();
@@ -1212,6 +1261,7 @@ test("shared hub reclaims main after UI shutdown then prefers a new UI bind", as
 		maxRetries: 2,
 		decisionPrompt: "Decide now.",
 		continuePrompt: "Continue compactly.",
+		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
 	};
 
 	function attach(sessionId: string, hasUI: boolean) {
@@ -1369,6 +1419,7 @@ test("effective config loads before binding is reconciled and shutdown blocks la
 			maxRetries: 2,
 			decisionPrompt: "loaded decision",
 			continuePrompt: "loaded continue",
+			reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
 		},
 		diagnostics: [],
 	});
@@ -1445,6 +1496,8 @@ test("re-entrant demotion during restoreDecisionTools stops later unlock message
 		messages: [
 			assistant([
 				toolCall("unlock-1", "unlock_continue_watchdog", {
+					reasonType: "JOB_DONE",
+
 					reason: "done for now",
 				}),
 			]),
@@ -1481,6 +1534,7 @@ function createRealActivationHarness(options?: {
 		maxRetries: 3,
 		decisionPrompt: "Decide now.",
 		continuePrompt: "Continue compactly.",
+		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
 	};
 	const hub = createObservableAgentHub();
 	const controller = createLockDecisionController(config);
@@ -1541,6 +1595,7 @@ function createRealActivationHarness(options?: {
 	const decisionTools = createDecisionToolActivation(pi, {
 		isCurrentMain: () => runtime?.isCurrentMain() === true,
 		getContinuePrompt: () => config.continuePrompt,
+		getReasonTypes: () => config.reasonTypes,
 		executeContinue: async () => ({
 			content: [{ type: "text", text: "continue" }],
 			details: { kind: "continue" },

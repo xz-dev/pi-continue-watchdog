@@ -94,6 +94,7 @@ interface SemanticHarness {
 	executeUnlock(
 		reason: string,
 		toolCallId?: string,
+		reasonType?: string,
 	): Promise<AgentToolResult<unknown>>;
 	snapshotController(): {
 		locked: boolean;
@@ -120,6 +121,11 @@ function createSemanticHarness(options?: {
 		maxRetries: options?.config?.maxRetries ?? 2,
 		decisionPrompt: options?.config?.decisionPrompt ?? "Decide now.",
 		continuePrompt: options?.config?.continuePrompt ?? "Continue compactly.",
+		reasonTypes: options?.config?.reasonTypes ?? [
+			"JOB_DONE",
+			"WAIT_USER",
+			"JOB_BLOCKED",
+		],
 	};
 	const hub = createObservableAgentHub();
 	const controller = createLockDecisionController(config);
@@ -235,9 +241,14 @@ function createSemanticHarness(options?: {
 			toolCallId,
 			ctx,
 		});
-	harness.executeUnlock = async (reason, toolCallId = "unlock-1") =>
+	harness.executeUnlock = async (
+		reason,
+		toolCallId = "unlock-1",
+		reasonType = "JOB_DONE",
+	) =>
 		runtime.executeDecisionTool({
 			kind: "unlock",
+			reasonType,
 			reason,
 			toolCallId,
 			ctx,
@@ -302,6 +313,7 @@ function assertFrozenEnvelope(envelope: SemanticHookEnvelope): void {
 test("protocol builders emit exact three envelopes as fresh frozen plain data", () => {
 	const unlock = createUserReadyEnvelope({
 		STOP_KIND: "AI_UNLOCK",
+		REASON_TYPE: "JOB_DONE",
 		REASON: "waiting for review",
 	});
 	const exhausted = createUserReadyEnvelope({ STOP_KIND: "EXHAUSTED" });
@@ -310,7 +322,11 @@ test("protocol builders emit exact three envelopes as fresh frozen plain data", 
 	assert.deepEqual(unlock, {
 		version: 1,
 		name: USER_READY_HOOK_NAME,
-		values: { STOP_KIND: "AI_UNLOCK", REASON: "waiting for review" },
+		values: {
+			STOP_KIND: "AI_UNLOCK",
+			REASON_TYPE: "JOB_DONE",
+			REASON: "waiting for review",
+		},
 	});
 	assert.deepEqual(exhausted, {
 		version: 1,
@@ -338,15 +354,16 @@ test("protocol builders emit exact three envelopes as fresh frozen plain data", 
 	assert.equal(seen[0], unlock);
 });
 
-test("AI decision unlock publishes exact validated reason once at terminal idle", async () => {
+test("AI decision unlock publishes exact validated reasonType and reason once at terminal idle", async () => {
 	const harness = createSemanticHarness();
 	await startIdle(harness);
 	harness.openDecision();
-	await harness.executeUnlock("  waiting for user  ");
+	await harness.executeUnlock("  waiting for user  ", "unlock-1", "wait_user");
 	await settleResponse(
 		harness,
 		assistant([
 			toolCall("unlock-1", "unlock_continue_watchdog", {
+				reasonType: "wait_user",
 				reason: "waiting for user",
 			}),
 		]),
@@ -358,7 +375,11 @@ test("AI decision unlock publishes exact validated reason once at terminal idle"
 	assert.deepEqual(unlockEnvelope, {
 		version: 1,
 		name: "user-ready",
-		values: { STOP_KIND: "AI_UNLOCK", REASON: "waiting for user" },
+		values: {
+			STOP_KIND: "AI_UNLOCK",
+			REASON_TYPE: "WAIT_USER",
+			REASON: "waiting for user",
+		},
 	});
 	assertFrozenEnvelope(unlockEnvelope);
 	assert.equal(harness.snapshotController().locked, false);
@@ -475,7 +496,7 @@ test("human unlock, abort unlock, continue, and initial unlocked idle publish no
 	assert.equal(continued.received.length, 0);
 });
 
-test("AI unlock intent waits for aggregate idle and publishes only once", async () => {
+test("AI unlock intent waits for aggregate idle and publishes typed pair only once", async () => {
 	const harness = createSemanticHarness();
 	await startIdle(harness);
 	harness.openDecision();
@@ -485,23 +506,25 @@ test("AI unlock intent waits for aggregate idle and publishes only once", async 
 		hasUI: false,
 		initialBusy: true,
 	}).attachment;
-	await harness.executeUnlock("child still busy");
+	await harness.executeUnlock("Need deploy approval.", "unlock-1", "wait_user");
 	await settleResponse(
 		harness,
 		assistant([
 			toolCall("unlock-1", "unlock_continue_watchdog", {
-				reason: "child still busy",
+				reasonType: "wait_user",
+				reason: "Need deploy approval.",
 			}),
 		]),
 	);
-	// Main settled but child busy: retain intent, no publish yet.
+	// Main settled but child busy: retain complete pair, no publish yet.
 	assert.equal(harness.received.length, 0);
 
 	harness.hub.markIdle(child);
 	assert.equal(harness.received.length, 1);
 	assert.deepEqual(harness.received[0]?.values, {
 		STOP_KIND: "AI_UNLOCK",
-		REASON: "child still busy",
+		REASON_TYPE: "WAIT_USER",
+		REASON: "Need deploy approval.",
 	});
 
 	// Same terminal epoch: no second publication.
@@ -544,6 +567,8 @@ test("main-only ownership, stale demotion, and reload/shutdown publish nothing",
 		messages: [
 			assistant([
 				toolCall("unlock-1", "unlock_continue_watchdog", {
+					reasonType: "JOB_DONE",
+
 					reason: "will reload",
 				}),
 			]),
@@ -567,6 +592,8 @@ test("absent and throwing consumers leave controller and results unchanged", asy
 		noConsumer,
 		assistant([
 			toolCall("unlock-1", "unlock_continue_watchdog", {
+				reasonType: "JOB_DONE",
+
 				reason: "silent consumer absence",
 			}),
 		]),
@@ -596,6 +623,8 @@ test("absent and throwing consumers leave controller and results unchanged", asy
 			throwing,
 			assistant([
 				toolCall("unlock-1", "unlock_continue_watchdog", {
+					reasonType: "JOB_DONE",
+
 					reason: "consumer throws",
 				}),
 			]),
@@ -625,13 +654,14 @@ test("absent and throwing consumers leave controller and results unchanged", asy
  */
 async function establishPendingAiUnlock(
 	reason: string,
-	options?: { readonly hasUI?: boolean },
+	options?: { readonly hasUI?: boolean; readonly reasonType?: string },
 ): Promise<{
 	readonly harness: SemanticHarness;
 	readonly child: ReturnType<
 		ReturnType<typeof createObservableAgentHub>["bind"]
 	>["attachment"];
 }> {
+	const reasonType = options?.reasonType ?? "JOB_DONE";
 	const harness = createSemanticHarness({
 		hasUI: options?.hasUI ?? true,
 	});
@@ -643,10 +673,15 @@ async function establishPendingAiUnlock(
 		hasUI: false,
 		initialBusy: true,
 	}).attachment;
-	await harness.executeUnlock(reason);
+	await harness.executeUnlock(reason, "unlock-1", reasonType);
 	await settleResponse(
 		harness,
-		assistant([toolCall("unlock-1", "unlock_continue_watchdog", { reason })]),
+		assistant([
+			toolCall("unlock-1", "unlock_continue_watchdog", {
+				reasonType,
+				reason,
+			}),
+		]),
 	);
 	assert.equal(harness.received.length, 0);
 	assert.equal(harness.snapshotController().locked, false);
@@ -753,6 +788,8 @@ test("async-rejecting bus consumer leaves producer and controller unchanged", as
 			harness,
 			assistant([
 				toolCall("unlock-1", "unlock_continue_watchdog", {
+					reasonType: "JOB_DONE",
+
 					reason: "async reject path",
 				}),
 			]),
@@ -768,7 +805,11 @@ test("async-rejecting bus consumer leaves producer and controller unchanged", as
 	assert.deepEqual(harness.received[0], {
 		version: 1,
 		name: "user-ready",
-		values: { STOP_KIND: "AI_UNLOCK", REASON: "async reject path" },
+		values: {
+			STOP_KIND: "AI_UNLOCK",
+			REASON_TYPE: "JOB_DONE",
+			REASON: "async reject path",
+		},
 	});
 	assert.deepEqual(harness.snapshotController(), {
 		locked: false,

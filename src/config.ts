@@ -6,14 +6,22 @@
  * Validation:
  * - idleDelaySeconds is any finite number >= 0; zero schedules a 0 ms timer.
  * - maxRetries remains a safe integer in [1, 10].
+ * - reasonTypes is a nonempty array of trim-nonblank strings; valid lists replace.
  * Invalid values are rejected (no silent clamp).
  */
 
 export const DEFAULT_DECISION_PROMPT =
-	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Call unlock_continue_watchdog with a concise reason if you are intentionally waiting for the user or all tasks are complete. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.";
+	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one. Call unlock_continue_watchdog with an allowed reasonType and a concise reason if you are intentionally waiting for the user, every task the user requested is complete, or the job cannot continue. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.";
 
 export const DEFAULT_CONTINUE_PROMPT =
 	"Continue until user assistance is required.";
+
+/** Built-in allowed AI unlock reason types; a valid configured list replaces these. */
+export const DEFAULT_REASON_TYPES: readonly string[] = Object.freeze([
+	"JOB_DONE",
+	"WAIT_USER",
+	"JOB_BLOCKED",
+]);
 
 /** Maximum prompt size, measured in Unicode code points, accepted from config. */
 export const MAX_PROMPT_CHARACTERS = 16_384;
@@ -35,6 +43,7 @@ export interface ContinueWatchdogConfig {
 	maxRetries: number;
 	decisionPrompt: string;
 	continuePrompt: string;
+	reasonTypes: readonly string[];
 }
 
 export interface ConfigDiagnostic {
@@ -57,6 +66,7 @@ export const BUILT_IN_CONFIG: Readonly<ContinueWatchdogConfig> = Object.freeze({
 	maxRetries: 10,
 	decisionPrompt: DEFAULT_DECISION_PROMPT,
 	continuePrompt: DEFAULT_CONTINUE_PROMPT,
+	reasonTypes: DEFAULT_REASON_TYPES,
 });
 
 const MAX_DIAGNOSTIC_LENGTH = 240;
@@ -66,6 +76,7 @@ const KNOWN_KEYS = new Set([
 	"maxRetries",
 	"decisionPrompt",
 	"continuePrompt",
+	"reasonTypes",
 ]);
 
 function diagnostic(source: string, message: string): ConfigDiagnostic {
@@ -78,6 +89,7 @@ function copyBuiltIn(): ContinueWatchdogConfig {
 		maxRetries: BUILT_IN_CONFIG.maxRetries,
 		decisionPrompt: BUILT_IN_CONFIG.decisionPrompt,
 		continuePrompt: BUILT_IN_CONFIG.continuePrompt,
+		reasonTypes: [...BUILT_IN_CONFIG.reasonTypes],
 	};
 }
 
@@ -96,6 +108,22 @@ function validMaxRetries(value: unknown): value is number {
 		value >= MIN_RETRIES &&
 		value <= MAX_RETRIES
 	);
+}
+
+/**
+ * Valid = nonempty array of strings, each trim-nonblank.
+ * Stored entries are trimmed. No identifier regex or artificial limits.
+ */
+export function normalizeReasonTypes(value: unknown): readonly string[] | null {
+	if (!Array.isArray(value) || value.length === 0) return null;
+	const normalized: string[] = [];
+	for (const entry of value) {
+		if (typeof entry !== "string") return null;
+		const trimmed = entry.trim();
+		if (trimmed.length === 0) return null;
+		normalized.push(trimmed);
+	}
+	return normalized;
 }
 
 /**
@@ -201,6 +229,20 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 		}
 	}
 
+	if (Object.hasOwn(input, "reasonTypes")) {
+		const reasonTypes = normalizeReasonTypes(input.reasonTypes);
+		if (reasonTypes !== null) {
+			config.reasonTypes = reasonTypes;
+		} else {
+			diagnostics.push(
+				diagnostic(
+					source,
+					"reasonTypes must be a non-empty array of non-blank strings",
+				),
+			);
+		}
+	}
+
 	for (const key of Object.keys(input)) {
 		if (!KNOWN_KEYS.has(key)) {
 			diagnostics.push(diagnostic(source, "ignoring unsupported keys"));
@@ -246,6 +288,9 @@ export function mergeConfig(
 		}
 		if (partial.continuePrompt !== undefined) {
 			config.continuePrompt = partial.continuePrompt;
+		}
+		if (partial.reasonTypes !== undefined) {
+			config.reasonTypes = [...partial.reasonTypes];
 		}
 	}
 

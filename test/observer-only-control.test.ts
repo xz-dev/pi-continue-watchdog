@@ -136,6 +136,7 @@ const CONFIG: LoadedConfig = {
 		maxRetries: 2,
 		decisionPrompt: "Decide now.",
 		continuePrompt: "Continue now.",
+		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
 	},
 	diagnostics: [],
 };

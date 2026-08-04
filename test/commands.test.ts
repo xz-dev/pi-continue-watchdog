@@ -12,6 +12,7 @@ import {
 	type CommandRuntimeEffect,
 	createHumanUnlockEntryRenderer,
 	createMainCommands,
+	formatUnlockEntryText,
 	HUMAN_UNLOCK_ENTRY_TYPE,
 	LOCK_COMMAND_DESCRIPTION,
 	LOCK_CONTINUE_WATCHDOG_COMMAND,
@@ -32,7 +33,10 @@ type RegisteredCommand = {
 	) => Promise<void>;
 };
 
-type HumanUnlockEntry = { readonly reason: string };
+type HumanUnlockEntry = {
+	readonly reason: string;
+	readonly reasonType?: string;
+};
 
 interface CommandHarness {
 	readonly pi: ExtensionAPI;
@@ -437,6 +441,36 @@ test("Slice 4 RED: unlock-reason entry safely falls back for malformed data and 
 		renderHumanUnlockEntry({ reason: "safe\u001b[31mred\u0007\t" }, 10_000),
 		["Continue watchdog unlocked · safe?[31mred??"],
 	);
+});
+
+test("Example 7: AI typed unlock entry renders TYPE · reason; human stays untyped", () => {
+	assert.equal(
+		formatUnlockEntryText(
+			"All requested package bumps are merged.",
+			"JOB_DONE",
+		),
+		"Continue watchdog unlocked · JOB_DONE · All requested package bumps are merged.",
+	);
+	assert.deepEqual(
+		renderHumanUnlockEntry(
+			{
+				reasonType: "NEEDREVIEW",
+				reason: "PR is open for human review.",
+			},
+			10_000,
+		),
+		["Continue watchdog unlocked · NEEDREVIEW · PR is open for human review."],
+	);
+	// Human path: reason only, no reasonType field or type separator pair.
+	assert.equal(
+		formatUnlockEntryText("Waiting for input"),
+		"Continue watchdog unlocked · Waiting for input",
+	);
+	assert.deepEqual(
+		renderHumanUnlockEntry({ reason: "Waiting for input" }, 10_000),
+		["Continue watchdog unlocked · Waiting for input"],
+	);
+	assert.ok(!formatUnlockEntryText("Waiting for input").includes(" · · "));
 });
 
 test("Slice 4 RED: stale or demoted command handlers are inert", async () => {

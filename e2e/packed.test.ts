@@ -29,7 +29,7 @@ const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const decisionTools = ["continue_watchdog", "unlock_continue_watchdog"];
 const decisionPrompt =
-	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Call unlock_continue_watchdog with a concise reason if you are intentionally waiting for the user or all tasks are complete. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.";
+	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one. Call unlock_continue_watchdog with an allowed reasonType and a concise reason if you are intentionally waiting for the user, every task the user requested is complete, or the job cannot continue. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.";
 const decisionPromptStart =
 	"This is an automated continuation check from the pi-continue-watchdog extension";
 const continuePrompt = "Continue until user assistance is required.";
@@ -45,6 +45,7 @@ interface RequestRecord {
 
 interface MockReply {
 	readonly kind: "stop" | "continue" | "unlock" | "delayed";
+	readonly reasonType?: string;
 	readonly reason?: string;
 	readonly started?: () => void;
 	readonly text?: string;
@@ -262,7 +263,10 @@ async function startMockServer(
 				const args =
 					reply.kind === "continue"
 						? "{}"
-						: JSON.stringify({ reason: reply.reason });
+						: JSON.stringify({
+								reasonType: reply.reasonType ?? "JOB_DONE",
+								reason: reply.reason,
+							});
 				sendSse(response, [
 					{
 						id,
@@ -650,6 +654,7 @@ test("packed stock Pi shares aggregate idle and root control across independent 
 				name: "user-ready",
 				values: {
 					STOP_KIND: "AI_UNLOCK",
+					REASON_TYPE: "JOB_DONE",
 					REASON: "aggregate idle proven",
 				},
 			},
@@ -991,7 +996,95 @@ test("packed neutral probe receives AI unlock user-ready and suppresses continue
 			name: "user-ready",
 			values: {
 				STOP_KIND: "AI_UNLOCK",
+				REASON_TYPE: "JOB_DONE",
 				REASON: "waiting for human review",
+			},
+		},
+	]);
+});
+
+test("packed custom reasonTypes replace defaults and match mixed-case input", {
+	timeout: 30_000,
+}, async (t) => {
+	// Post-GREEN integration coverage: the production feature already exists;
+	// this proves config, dynamic tool description, protocol, runtime, and hook
+	// are wired to the same representation through the packed artifact.
+	const fixture = await makePackedFixture(t, {
+		withSemanticProbe: true,
+		watchdogConfig: {
+			idleDelaySeconds: 1,
+			reasonTypes: ["Need Review", "shipped"],
+		},
+	});
+	assert.ok(fixture.probeOut);
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "stop" },
+		{
+			kind: "unlock",
+			reasonType: " need review ",
+			reason: " awaiting review ",
+		},
+	]);
+	const { session } = await createSession(fixture, baseUrl);
+	t.after(() => shutdownSession(session));
+
+	await session.prompt("Unlock with a custom mixed-case reason type.");
+	await waitFor(() => requests.length === 2, 8_000, "unlock decision request");
+	await session.waitForIdle();
+
+	// The decision request advertises only the effective custom list as a plain
+	// string description (no case-sensitive enum), and keeps reasonType a string.
+	const decisionRequest = requests[1];
+	assert.ok(decisionRequest);
+	const unlockTool = (decisionRequest.tools ?? []).find(
+		(tool) => tool.function?.name === "unlock_continue_watchdog",
+	);
+	assert.ok(unlockTool);
+	const serializedUnlockTool = JSON.stringify(unlockTool);
+	assert.equal(
+		serializedUnlockTool.includes("Need Review, shipped"),
+		true,
+		"unlock tool must advertise the effective custom reasonTypes",
+	);
+	assert.equal(
+		serializedUnlockTool.includes("JOB_DONE"),
+		false,
+		"custom reasonTypes replace defaults rather than extend them",
+	);
+	assert.equal(
+		serializedUnlockTool.includes('"enum"'),
+		false,
+		"reasonType must not be a case-sensitive enum",
+	);
+
+	// The raw tool call arguments persist both fields as supplied by the model.
+	const branchAssistants = session.sessionManager
+		.getBranch()
+		.flatMap((entry) =>
+			entry.type === "message" && entry.message.role === "assistant"
+				? [entry.message]
+				: [],
+		);
+	const rawUnlockCall = JSON.stringify(branchAssistants);
+	assert.equal(rawUnlockCall.includes(" need review "), true);
+	assert.equal(rawUnlockCall.includes(" awaiting review "), true);
+
+	// The trimmed, case-insensitively matched, uppercased pair publishes once.
+	const hookDeadline = Date.now() + 3_000;
+	while ((await readProbeEnvelopes(fixture.probeOut)).length < 1) {
+		if (Date.now() >= hookDeadline) {
+			throw new Error("Timed out waiting for custom-type user-ready envelope");
+		}
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	}
+	assert.deepEqual(await readProbeEnvelopes(fixture.probeOut), [
+		{
+			version: 1,
+			name: "user-ready",
+			values: {
+				STOP_KIND: "AI_UNLOCK",
+				REASON_TYPE: "NEED REVIEW",
+				REASON: "awaiting review",
 			},
 		},
 	]);

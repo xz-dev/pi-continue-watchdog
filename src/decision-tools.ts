@@ -32,10 +32,10 @@ export const CONTINUE_WATCHDOG_PROMPT_SNIPPET =
 	"Select continuation for an automated pi-continue-watchdog decision check, not a user request.";
 
 export const UNLOCK_CONTINUE_WATCHDOG_DESCRIPTION =
-	"Select unlock during the automated pi-continue-watchdog decision check. This check is extension automation, not a user request. Provide a concise, clear one-sentence reason that is non-empty and at most 500 characters.";
+	"Select unlock during the automated pi-continue-watchdog decision check. This check is extension automation, not a user request. Provide an allowed reasonType and a concise, clear one-sentence reason that is non-empty and at most 500 characters.";
 
 export const UNLOCK_CONTINUE_WATCHDOG_PROMPT_SNIPPET =
-	"Select unlock with a concise reason for an automated pi-continue-watchdog decision check, not a user request.";
+	"Select unlock with an allowed reasonType and a concise reason for an automated pi-continue-watchdog decision check, not a user request.";
 
 /** A fixed response when a stale decision tool execution cannot control main state. */
 export const STALE_DECISION_TOOL_MESSAGE =
@@ -45,18 +45,33 @@ const CONTINUE_WATCHDOG_PARAMETERS = Type.Object(
 	{},
 	{ additionalProperties: false },
 );
-const UNLOCK_CONTINUE_WATCHDOG_PARAMETERS = Type.Object(
-	{
-		reason: Type.String({ minLength: 1, maxLength: 500 }),
-	},
-	{ additionalProperties: false },
-);
+
+/** Append the effective allowed reasonType list to the stable unlock base description. */
+export function formatUnlockDecisionToolDescription(
+	reasonTypes: readonly string[],
+): string {
+	return `${UNLOCK_CONTINUE_WATCHDOG_DESCRIPTION} Allowed reasonType values: ${reasonTypes.join(", ")}.`;
+}
+
+function createUnlockDecisionParameters(reasonTypes: readonly string[]) {
+	return Type.Object(
+		{
+			reasonType: Type.String({
+				description: `Allowed reasonType values: ${reasonTypes.join(", ")}.`,
+			}),
+			reason: Type.String({ minLength: 1, maxLength: 500 }),
+		},
+		{ additionalProperties: false },
+	);
+}
 
 export type DecisionToolKind = "continue" | "unlock";
 
-/** A validated tool call handed to the decision protocol executor. */
+/** A tool call handed to the decision protocol executor (raw args for unlock). */
 export interface DecisionToolCall {
 	readonly kind: DecisionToolKind;
+	/** Present for unlock; raw model-supplied value, not yet protocol-normalized. */
+	readonly reasonType?: string;
 	readonly reason?: string;
 	readonly toolCallId: string;
 	readonly ctx: ExtensionContext;
@@ -75,6 +90,7 @@ export interface DecisionToolExecutors {
 	) => Promise<AgentToolResult<unknown>>;
 	readonly executeUnlock: (
 		toolCallId: string,
+		reasonType: string,
 		reason: string,
 		ctx: ExtensionContext,
 	) => Promise<AgentToolResult<unknown>>;
@@ -85,6 +101,11 @@ export interface DecisionToolActivationOptions extends DecisionToolExecutors {
 	readonly isCurrentMain: () => boolean;
 	/** Reads the effective config when Pi renders a valid continue decision. */
 	readonly getContinuePrompt: () => string;
+	/**
+	 * Effective allowed reasonTypes at first main decision registration.
+	 * Definitions register once; the description/schema capture this snapshot then.
+	 */
+	readonly getReasonTypes: () => readonly string[];
 }
 
 export interface DecisionToolActivation {
@@ -147,11 +168,13 @@ export function createDecisionToolExecutors(
 		},
 		async executeUnlock(
 			toolCallId: string,
+			reasonType: string,
 			reason: string,
 			ctx: ExtensionContext,
 		): Promise<AgentToolResult<unknown>> {
 			return executor.onDecisionToolCall({
 				kind: "unlock",
+				reasonType,
 				reason,
 				toolCallId,
 				ctx,
@@ -200,12 +223,13 @@ export function createDecisionToolActivation(
 
 	const registerUnlockTool = (): void => {
 		if (registeredUnlock) return;
+		const reasonTypes = options.getReasonTypes();
 		pi.registerTool({
 			name: UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
 			label: "Unlock Continue Watchdog",
-			description: UNLOCK_CONTINUE_WATCHDOG_DESCRIPTION,
+			description: formatUnlockDecisionToolDescription(reasonTypes),
 			promptSnippet: UNLOCK_CONTINUE_WATCHDOG_PROMPT_SNIPPET,
-			parameters: UNLOCK_CONTINUE_WATCHDOG_PARAMETERS,
+			parameters: createUnlockDecisionParameters(reasonTypes),
 			renderShell: "self",
 			...createUnlockToolRenderers(),
 			async execute(toolCallId, params, _signal, _onUpdate, ctx) {
@@ -216,7 +240,13 @@ export function createDecisionToolActivation(
 				) {
 					return staleDecisionToolResult();
 				}
-				return options.executeUnlock(toolCallId, params.reason, ctx);
+				// Forward raw model args; protocol owns case-insensitive type matching.
+				return options.executeUnlock(
+					toolCallId,
+					params.reasonType,
+					params.reason,
+					ctx,
+				);
 			},
 		});
 		registeredUnlock = true;

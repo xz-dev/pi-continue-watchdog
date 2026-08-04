@@ -60,6 +60,8 @@ export function createContinueWatchdogExtension(
 				isCurrentMain: () => runtime?.isCurrentMain() === true,
 				getContinuePrompt: () =>
 					runtime?.config.continuePrompt ?? BUILT_IN_CONFIG.continuePrompt,
+				getReasonTypes: () =>
+					runtime?.config.reasonTypes ?? BUILT_IN_CONFIG.reasonTypes,
 				executeContinue: async (toolCallId, ctx) =>
 					runtime?.executeDecisionTool({
 						kind: "continue",
@@ -70,10 +72,11 @@ export function createContinueWatchdogExtension(
 						details: { kind: "inactive-decision-runtime" },
 						terminate: true,
 					},
-				executeUnlock: async (toolCallId, reason, ctx) =>
+				executeUnlock: async (toolCallId, reasonType, reason, ctx) =>
 					runtime?.executeDecisionTool({
 						kind: "unlock",
 						toolCallId,
+						reasonType,
 						reason,
 						ctx,
 					}) ?? {

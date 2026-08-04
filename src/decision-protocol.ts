@@ -28,6 +28,8 @@ export const PROSE_DECISION_RESPONSE_ERROR =
 	"Do not answer with prose; call exactly one decision tool.";
 export const CONTINUE_ARGUMENTS_ERROR =
 	"continue_watchdog must be called with an empty object.";
+export const INVALID_UNLOCK_REASON_TYPE_ERROR =
+	"unlock_continue_watchdog requires an allowed reasonType.";
 export const INVALID_UNLOCK_REASON_ERROR =
 	"unlock_continue_watchdog requires a non-empty reason of at most 500 Unicode characters.";
 export const UNSUPPORTED_DECISION_CONTENT_ERROR =
@@ -78,6 +80,7 @@ export type ValidDecision =
 	| {
 			readonly kind: "unlock";
 			readonly toolCallId: string;
+			readonly reasonType: string;
 			readonly reason: string;
 	  };
 
@@ -98,6 +101,7 @@ export interface DecisionProtocolFinalization {
 	readonly error?: string;
 	/** Present only for a re-ask, before the runtime dispatches its hidden prompt. */
 	readonly reaskPrompt?: string;
+	readonly reasonType?: string;
 	readonly reason?: string;
 	readonly notification?: string;
 	/** Present for valid continue/unlock so runtime can persist a fold marker. */
@@ -111,6 +115,8 @@ export interface DecisionProtocolSessionOptions {
 	readonly decisionId: number;
 	/** The configured base hidden decision prompt, used only for invalid re-asks. */
 	readonly decisionPrompt: string;
+	/** Effective allowed AI unlock reason types for this decision window. */
+	readonly reasonTypes: readonly string[];
 }
 
 /**
@@ -142,6 +148,7 @@ interface RecordedDecisionToolCall {
 	readonly cycleId: number;
 	readonly kind: "continue" | "unlock";
 	readonly toolCallId: string;
+	readonly reasonType?: string | null;
 	readonly reason?: string | null;
 }
 
@@ -162,6 +169,26 @@ function hasExactlyOwnKeys(
 }
 
 /**
+ * Trim AI reasonType input, match case-insensitively against configured types,
+ * and return the uppercase form of the matched configured entry.
+ */
+export function normalizeDecisionUnlockReasonType(
+	reasonType: unknown,
+	reasonTypes: readonly string[],
+): string | null {
+	if (typeof reasonType !== "string") return null;
+	const trimmed = reasonType.trim();
+	if (trimmed.length === 0) return null;
+	const needle = trimmed.toLowerCase();
+	for (const entry of reasonTypes) {
+		if (entry.toLowerCase() === needle) {
+			return entry.toUpperCase();
+		}
+	}
+	return null;
+}
+
+/**
  * Trim and validate a model-provided unlock reason. Unlike human command input,
  * this never truncates: invalid model output must be re-asked.
  */
@@ -174,6 +201,7 @@ export function normalizeDecisionUnlockReason(reason: unknown): string | null {
 
 function validateToolCall(
 	content: DecisionToolCallContent,
+	reasonTypes: readonly string[],
 ): DecisionValidation {
 	if (content.name === "continue_watchdog") {
 		if (!hasExactlyOwnKeys(content.arguments, [])) {
@@ -186,12 +214,18 @@ function validateToolCall(
 	}
 
 	if (content.name === "unlock_continue_watchdog") {
-		if (!hasExactlyOwnKeys(content.arguments, ["reason"])) {
-			return { valid: false, error: INVALID_UNLOCK_REASON_ERROR };
+		if (!hasExactlyOwnKeys(content.arguments, ["reasonType", "reason"])) {
+			return { valid: false, error: INVALID_UNLOCK_REASON_TYPE_ERROR };
 		}
-		const normalizedReason = normalizeDecisionUnlockReason(
-			(content.arguments as Record<string, unknown>).reason,
+		const args = content.arguments as Record<string, unknown>;
+		const normalizedType = normalizeDecisionUnlockReasonType(
+			args.reasonType,
+			reasonTypes,
 		);
+		if (normalizedType === null) {
+			return { valid: false, error: INVALID_UNLOCK_REASON_TYPE_ERROR };
+		}
+		const normalizedReason = normalizeDecisionUnlockReason(args.reason);
 		if (normalizedReason === null) {
 			return { valid: false, error: INVALID_UNLOCK_REASON_ERROR };
 		}
@@ -200,6 +234,7 @@ function validateToolCall(
 			decision: {
 				kind: "unlock",
 				toolCallId: content.toolCallId,
+				reasonType: normalizedType,
 				reason: normalizedReason,
 			},
 		};
@@ -214,6 +249,7 @@ function validateToolCall(
  */
 export function validateDecisionResponse(
 	response: DecisionResponse,
+	reasonTypes: readonly string[],
 ): DecisionValidation {
 	const toolCalls: DecisionToolCallContent[] = [];
 	const content = response.content;
@@ -258,7 +294,7 @@ export function validateDecisionResponse(
 	if (toolCall === undefined) {
 		return { valid: false, error: NO_DECISION_TOOL_ERROR };
 	}
-	return validateToolCall(toolCall);
+	return validateToolCall(toolCall, reasonTypes);
 }
 
 function malformedResponse(): DecisionResponse {
@@ -363,7 +399,9 @@ function matchesRecordedTool(
 		recordedCall.cycleId !== cycleId ||
 		recordedCall.kind !== decision.kind ||
 		recordedCall.toolCallId !== decision.toolCallId ||
-		(decision.kind === "unlock" && recordedCall.reason !== decision.reason)
+		(decision.kind === "unlock" &&
+			(recordedCall.reasonType !== decision.reasonType ||
+				recordedCall.reason !== decision.reason))
 	) {
 		return DECISION_TOOLS_MISMATCH_ERROR;
 	}
@@ -421,15 +459,24 @@ export function createDecisionProtocolSession(
 		call: DecisionToolCall,
 	): AgentToolResult<unknown> => {
 		if (finalized !== null) return staleDecisionToolResult();
-		recorded.push({
-			cycleId,
-			kind: call.kind,
-			toolCallId: call.toolCallId,
-			reason:
-				call.kind === "unlock"
-					? normalizeDecisionUnlockReason(call.reason)
-					: undefined,
-		});
+		if (call.kind === "unlock") {
+			recorded.push({
+				cycleId,
+				kind: "unlock",
+				toolCallId: call.toolCallId,
+				reasonType: normalizeDecisionUnlockReasonType(
+					call.reasonType,
+					options.reasonTypes,
+				),
+				reason: normalizeDecisionUnlockReason(call.reason),
+			});
+		} else {
+			recorded.push({
+				cycleId,
+				kind: "continue",
+				toolCallId: call.toolCallId,
+			});
+		}
 		return recordedDecisionToolResult();
 	};
 
@@ -440,7 +487,7 @@ export function createDecisionProtocolSession(
 		if (expectedCycleId !== cycleId) return ignoredFinalization();
 		if (finalized !== null) return finalized;
 
-		const validation = validateDecisionResponse(response);
+		const validation = validateDecisionResponse(response, options.reasonTypes);
 		if (!validation.valid) {
 			finalized = finalizeInvalid(validation.error);
 			return finalized;
@@ -476,6 +523,7 @@ export function createDecisionProtocolSession(
 		finalized = {
 			outcome: "unlock",
 			transition,
+			reasonType: validation.decision.reasonType,
 			reason: validation.decision.reason,
 			toolCallId: validation.decision.toolCallId,
 			cycleId,

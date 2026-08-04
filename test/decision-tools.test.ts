@@ -8,6 +8,7 @@ import type {
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 
+import { DEFAULT_REASON_TYPES } from "../src/config.js";
 import {
 	CONTINUE_WATCHDOG_DESCRIPTION,
 	CONTINUE_WATCHDOG_PROMPT_SNIPPET,
@@ -17,6 +18,7 @@ import {
 	DECISION_TOOL_NAMES,
 	type DecisionToolActivation,
 	type DecisionToolCall,
+	formatUnlockDecisionToolDescription,
 	STALE_DECISION_TOOL_MESSAGE,
 	UNLOCK_CONTINUE_WATCHDOG_DESCRIPTION,
 	UNLOCK_CONTINUE_WATCHDOG_PROMPT_SNIPPET,
@@ -35,6 +37,7 @@ interface Harness {
 	readonly activation: DecisionToolActivation;
 	setCurrentMain(current: boolean): void;
 	setActiveTools(activeTools: readonly string[]): void;
+	setReasonTypes(reasonTypes: readonly string[]): void;
 	throwNextGetActiveTools(): void;
 	throwRegisterTool(name: string): void;
 	throwNextSetActiveTools(): void;
@@ -49,12 +52,14 @@ interface Harness {
 function createHarness(
 	initialActiveTools = ["read", "bash", "edit"],
 	activateRegisteredTools = true,
+	initialReasonTypes: readonly string[] = DEFAULT_REASON_TYPES,
 ): Harness {
 	const tools = new Map<string, RegisteredDecisionTool>();
 	const setActiveCalls: string[][] = [];
 	const delegated: DecisionToolCall[] = [];
 	let activeTools = [...initialActiveTools];
 	let currentMain = true;
+	let reasonTypes = [...initialReasonTypes];
 	let throwGetActiveTools = false;
 	let throwRegisterToolName: string | null = null;
 	let throwSetActiveTools = false;
@@ -119,6 +124,7 @@ function createHarness(
 	const activation = createDecisionToolActivation(pi, {
 		isCurrentMain: () => currentMain,
 		getContinuePrompt: () => "Continue from configuration.",
+		getReasonTypes: () => reasonTypes,
 		...executors,
 	});
 
@@ -134,6 +140,9 @@ function createHarness(
 		},
 		setActiveTools(nextActiveTools: readonly string[]): void {
 			activeTools = [...nextActiveTools];
+		},
+		setReasonTypes(nextReasonTypes: readonly string[]): void {
+			reasonTypes = [...nextReasonTypes];
 		},
 		throwNextGetActiveTools(): void {
 			throwGetActiveTools = true;
@@ -216,21 +225,76 @@ test("decision schemas, descriptions, and prompt snippets define the automated p
 		additionalProperties: false,
 	});
 
-	assert.equal(unlockTool.description, UNLOCK_CONTINUE_WATCHDOG_DESCRIPTION);
+	const expectedDescription =
+		formatUnlockDecisionToolDescription(DEFAULT_REASON_TYPES);
+	assert.equal(unlockTool.description, expectedDescription);
 	assert.equal(
 		unlockTool.promptSnippet,
 		UNLOCK_CONTINUE_WATCHDOG_PROMPT_SNIPPET,
 	);
+	assert.match(unlockTool.description, /allowed reasonType/i);
 	assert.match(unlockTool.description, /concise, clear one-sentence/i);
 	assert.match(unlockTool.description, /500 characters/i);
-	assert.deepEqual(schemaJson(unlockTool), {
-		type: "object",
-		required: ["reason"],
-		properties: {
-			reason: { type: "string", minLength: 1, maxLength: 500 },
-		},
-		additionalProperties: false,
+	assert.match(unlockTool.description, /JOB_DONE/);
+	assert.match(unlockTool.description, /WAIT_USER/);
+	assert.match(unlockTool.description, /JOB_BLOCKED/);
+	assert.match(UNLOCK_CONTINUE_WATCHDOG_DESCRIPTION, /allowed reasonType/i);
+	assert.match(UNLOCK_CONTINUE_WATCHDOG_PROMPT_SNIPPET, /allowed reasonType/i);
+
+	const unlockSchema = schemaJson(unlockTool) as {
+		required?: string[];
+		properties?: Record<string, Record<string, unknown>>;
+	};
+	assert.deepEqual(unlockSchema.required?.slice().sort(), [
+		"reason",
+		"reasonType",
+	]);
+	assert.equal(unlockSchema.properties?.reasonType?.type, "string");
+	assert.equal(unlockSchema.properties?.reasonType?.enum, undefined);
+	assert.equal(unlockSchema.properties?.reasonType?.const, undefined);
+	assert.match(
+		String(unlockSchema.properties?.reasonType?.description ?? ""),
+		/JOB_DONE/,
+	);
+	assert.deepEqual(unlockSchema.properties?.reason, {
+		type: "string",
+		minLength: 1,
+		maxLength: 500,
 	});
+	assert.equal(
+		(unlockSchema as { additionalProperties?: boolean }).additionalProperties,
+		false,
+	);
+});
+
+test("unlock description and schema list effective custom reasonTypes at registration", () => {
+	const customTypes = ["NeedReview", "shipped"];
+	const harness = createHarness(["read", "bash"], true, customTypes);
+	initializeDecisionTools(harness);
+	assert.equal(harness.activate(), true);
+	const unlockTool = registeredTool(
+		harness,
+		UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
+	);
+
+	assert.equal(
+		unlockTool.description,
+		formatUnlockDecisionToolDescription(customTypes),
+	);
+	assert.match(unlockTool.description, /NeedReview/);
+	assert.match(unlockTool.description, /shipped/);
+	assert.ok(!unlockTool.description.includes("JOB_DONE"));
+
+	const unlockSchema = schemaJson(unlockTool) as {
+		properties?: Record<string, Record<string, unknown>>;
+	};
+	const reasonTypeDescription = String(
+		unlockSchema.properties?.reasonType?.description ?? "",
+	);
+	assert.match(reasonTypeDescription, /NeedReview/);
+	assert.match(reasonTypeDescription, /shipped/);
+	assert.ok(!reasonTypeDescription.includes("JOB_DONE"));
+	assert.equal(unlockSchema.properties?.reasonType?.enum, undefined);
 });
 
 test("registered continue tool uses the compact configured-prompt renderer", () => {
@@ -278,7 +342,10 @@ test("registered unlock tool hides its automated decision trace", () => {
 		},
 	};
 	const call = unlockTool.renderCall(
-		{ reason: "Waiting for user confirmation." },
+		{
+			reasonType: "WAIT_USER",
+			reason: "Waiting for user confirmation.",
+		},
 		theme as never,
 		{} as never,
 	);
@@ -393,7 +460,7 @@ test("active main decision tools delegate the exact validated call", async () =>
 	);
 	const unlockResult = await unlockTool.execute(
 		"unlock-call",
-		{ reason: "All tasks are complete." },
+		{ reasonType: " job_done ", reason: "All tasks are complete." },
 		undefined,
 		undefined,
 		context,
@@ -409,8 +476,38 @@ test("active main decision tools delegate the exact validated call", async () =>
 		},
 		{
 			kind: "unlock",
+			reasonType: " job_done ",
 			reason: "All tasks are complete.",
 			toolCallId: "unlock-call",
+			ctx: context,
+		},
+	]);
+});
+
+test("unlock execution forwards raw mixed-case reasonType without normalizing", async () => {
+	const harness = createHarness();
+	const context = {} as ExtensionContext;
+	initializeDecisionTools(harness);
+	assert.equal(harness.activate(), true);
+	const unlockTool = registeredTool(
+		harness,
+		UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
+	);
+
+	await unlockTool.execute(
+		"raw-type-call",
+		{ reasonType: "WaIt_UsEr", reason: " Need input. " },
+		undefined,
+		undefined,
+		context,
+	);
+
+	assert.deepEqual(harness.delegated, [
+		{
+			kind: "unlock",
+			reasonType: "WaIt_UsEr",
+			reason: " Need input. ",
+			toolCallId: "raw-type-call",
 			ctx: context,
 		},
 	]);

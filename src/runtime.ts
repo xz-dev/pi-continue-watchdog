@@ -207,7 +207,10 @@ export function createDecisionRuntime(
 	let activeDecision: ActiveDecision | null = null;
 	let pendingFinalization: PendingFinalization | null = null;
 	/** Retained only for AI decision unlock until the next all-idle settle. */
-	let pendingAiUnlockReason: string | null = null;
+	let pendingAiUnlock: {
+		readonly reasonType: string;
+		readonly reason: string;
+	} | null = null;
 	/** At-most-once publication guard for the current aggregate-idle epoch. */
 	let publishedForIdleEpoch = false;
 
@@ -259,7 +262,7 @@ export function createDecisionRuntime(
 		activeDecision = null;
 		pendingFinalization = null;
 		// Human/abort unlock must not inherit a prior AI unlock publication intent.
-		pendingAiUnlockReason = null;
+		pendingAiUnlock = null;
 	};
 
 	const silentlyAbandonDecision = (): void => {
@@ -328,6 +331,7 @@ export function createDecisionRuntime(
 				controller,
 				decisionId,
 				decisionPrompt: config.decisionPrompt,
+				reasonTypes: config.reasonTypes,
 			}),
 		};
 		activeDecision = active;
@@ -521,12 +525,13 @@ export function createDecisionRuntime(
 		if (claim === null || controller === null) return;
 
 		let envelope = null as ReturnType<typeof createUserReadyEnvelope> | null;
-		if (pendingAiUnlockReason !== null) {
+		if (pendingAiUnlock !== null) {
 			envelope = createUserReadyEnvelope({
 				STOP_KIND: "AI_UNLOCK",
-				REASON: pendingAiUnlockReason,
+				REASON_TYPE: pendingAiUnlock.reasonType,
+				REASON: pendingAiUnlock.reason,
 			});
-			pendingAiUnlockReason = null;
+			pendingAiUnlock = null;
 		} else {
 			const snapshot = controller.snapshot;
 			if (snapshot.locked && snapshot.exhausted) {
@@ -759,10 +764,23 @@ export function createDecisionRuntime(
 			return true;
 		}
 
-		const reason = finalization.reason ?? "";
+		// Valid AI unlock must carry both fields; never invent empty fallbacks.
+		const reasonType =
+			typeof finalization.reasonType === "string" &&
+			finalization.reasonType.length > 0
+				? finalization.reasonType
+				: null;
+		const reason =
+			typeof finalization.reason === "string" && finalization.reason.length > 0
+				? finalization.reason
+				: null;
+		if (reasonType === null || reason === null) {
+			stopIfStale(claim);
+			return false;
+		}
 		if (stopIfStale(claim)) return false;
 		// Retain AI unlock publication intent until the authoritative all-idle settle.
-		pendingAiUnlockReason = reason;
+		pendingAiUnlock = { reasonType, reason };
 		try {
 			options.pi.sendMessage(
 				createDecisionFoldMessage({
@@ -776,6 +794,7 @@ export function createDecisionRuntime(
 			if (stopIfStale(claim)) return false;
 			try {
 				options.pi.appendEntry<HumanUnlockEntry>(HUMAN_UNLOCK_ENTRY_TYPE, {
+					reasonType,
 					reason,
 				});
 			} catch {
