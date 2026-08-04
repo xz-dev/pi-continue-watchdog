@@ -300,6 +300,20 @@ test("pure: boundary capture and suffix terminal outcomes", () => {
 		"aborted",
 	);
 	assert.equal(
+		inspectTerminalAssistantOutcome(
+			{ getBranch: () => [assistant("a", "error")] },
+			null,
+		),
+		"error",
+	);
+	assert.equal(
+		inspectTerminalAssistantOutcome(
+			{ getBranch: () => [user("u0"), assistant("a", "error")] },
+			"u0",
+		),
+		"error",
+	);
+	assert.equal(
 		inspectTerminalAssistantOutcome({ getBranch: () => [] }, null),
 		"none",
 	);
@@ -349,8 +363,36 @@ test("already-unlocked abort still notifies bare text", async () => {
 	assert.deepEqual(harness.notifications, ["Continue watchdog unlocked"]);
 });
 
+test("terminal error settle unlocks like abort (retry-exhausted)", async () => {
+	const harness = createAbortHarness({ locked: true });
+	harness.append(user("u0"));
+	await harness.start();
+	const continued = decisionId(harness.controller);
+	harness.controller.recordValidContinue(continued);
+	assert.equal(harness.controller.snapshot.attempt, 1);
+	decisionId(harness.controller);
+	assert.equal(harness.controller.snapshot.decisionOpen, true);
+
+	harness.append(assistant("a1", "error"));
+	await harness.settle();
+
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.controller.snapshot.attempt, 1);
+	assert.deepEqual(harness.notifications, ["Continue watchdog unlocked"]);
+	assert.deepEqual(
+		harness.effects.map((effect) => effect.kind),
+		["restoreDecisionTools"],
+	);
+	assert.deepEqual(harness.timeline, [
+		"cleanup:locked=false",
+		"restoreDecisionTools",
+		"notify:Continue watchdog unlocked",
+	]);
+});
+
 test("non-aborted matrix and no-assistant / missing-boundary stay locked", async () => {
-	for (const stopReason of ["stop", "error", "length", "toolUse"] as const) {
+	for (const stopReason of ["stop", "length", "toolUse"] as const) {
 		const harness = createAbortHarness({ locked: true });
 		await harness.start();
 		harness.append(assistant(`a-${stopReason}`, stopReason));
