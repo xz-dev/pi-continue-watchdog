@@ -28,8 +28,6 @@ import {
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const decisionTools = ["continue_watchdog", "unlock_continue_watchdog"];
-const decisionPrompt =
-	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one. Call unlock_continue_watchdog with an allowed reasonType and a concise reason if you are intentionally waiting for the user, every task the user requested is complete, or the job cannot continue. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.";
 const decisionPromptStart =
 	"This is an automated continuation check from the pi-continue-watchdog extension";
 const continuePrompt = "Continue until user assistance is required.";
@@ -255,17 +253,10 @@ async function startMockServer(
 				return;
 			}
 			if (reply.kind === "continue" || reply.kind === "unlock") {
-				const name =
+				const content =
 					reply.kind === "continue"
-						? "continue_watchdog"
-						: "unlock_continue_watchdog";
-				const args =
-					reply.kind === "continue"
-						? "{}"
-						: JSON.stringify({
-								reasonType: reply.reasonType ?? "JOB_DONE",
-								reason: reply.reason,
-							});
+						? "<watchdog><function>continue_watchdog</function></watchdog>"
+						: `<watchdog><function>unlock_continue_watchdog</function><reason_type>${reply.reasonType ?? "JOB_DONE"}</reason_type><reason_content>${reply.reason ?? "finished"}</reason_content></watchdog>`;
 				sendSse(response, [
 					{
 						id,
@@ -273,16 +264,7 @@ async function startMockServer(
 						choices: [
 							{
 								index: 0,
-								delta: {
-									tool_calls: [
-										{
-											index: 0,
-											id: `${name}-${requests.length}`,
-											type: "function",
-											function: { name, arguments: args },
-										},
-									],
-								},
+								delta: { content },
 								finish_reason: null,
 							},
 						],
@@ -290,7 +272,7 @@ async function startMockServer(
 					{
 						id,
 						model: "watchdog-e2e",
-						choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+						choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
 					},
 				]);
 				return;
@@ -605,11 +587,13 @@ test("packed stock Pi shares aggregate idle and root control across independent 
 		),
 	);
 	assert.equal(decisionRequests.length, 1);
-	assert.deepEqual(
-		toolNames(decisionRequests[0] as RequestRecord),
-		decisionTools,
-	);
-	assert.deepEqual(registeredDecisionTools(root.session), decisionTools);
+	assert.deepEqual(toolNames(decisionRequests[0] as RequestRecord), [
+		"bash",
+		"edit",
+		"read",
+		"write",
+	]);
+	assert.deepEqual(registeredDecisionTools(root.session), []);
 	assert.deepEqual(registeredDecisionTools(childA.session), []);
 	assert.deepEqual(registeredDecisionTools(childB.session), []);
 	assert.equal(
@@ -623,10 +607,7 @@ test("packed stock Pi shares aggregate idle and root control across independent 
 	);
 
 	await waitFor(
-		() =>
-			requests.length === 4 &&
-			root.session.isIdle &&
-			registeredDecisionTools(root.session).length === decisionTools.length,
+		() => requests.length === 4 && root.session.isIdle,
 		2_000,
 		"root unlock completion",
 	);
@@ -748,7 +729,6 @@ test("packed artifact asks after threshold compaction settles", {
 	assert.ok(postCompactionSettledAt);
 	await waitWithinDeadline(() => session.isIdle, "post-compaction idle");
 	const isDecisionRequest = (request: RequestRecord): boolean =>
-		decisionTools.every((name) => toolNames(request).includes(name)) &&
 		request.messages.some((message) =>
 			textOf(message).includes(decisionPromptStart),
 		);
@@ -782,7 +762,12 @@ test("packed artifact asks after threshold compaction settles", {
 	assert.equal(decisionRequest.receivedAt >= compactionEndAt, true);
 	assert.equal(decisionRequest.receivedAt >= postCompactionSettledAt, true);
 	assert.equal(requests.at(-1), decisionRequest);
-	assert.deepEqual(toolNames(decisionRequest), decisionTools);
+	assert.deepEqual(toolNames(decisionRequest), [
+		"bash",
+		"edit",
+		"read",
+		"write",
+	]);
 	const ordinaryRequest = requests[0];
 	const summaryRequest = requests[1];
 	assert.ok(ordinaryRequest);
@@ -805,9 +790,16 @@ test("packed artifact asks after threshold compaction settles", {
 		true,
 	);
 	assert.equal(decisionRequest.messages.at(-1)?.role, "user");
-	assert.deepEqual(decisionRequest.messages.at(-1)?.content, [
-		{ type: "text", text: decisionPrompt },
-	]);
+	const decisionContent = textOf(decisionRequest.messages.at(-1) ?? {});
+	assert.equal(decisionContent.includes(decisionPromptStart), true);
+	assert.equal(decisionContent.includes("Do not call tools"), true);
+	assert.equal(decisionContent.includes("Do not output multiple"), true);
+	assert.equal(
+		decisionContent.includes(
+			'[\\"JOB_DONE\\",\\"WAIT_USER\\",\\"JOB_BLOCKED\\"]',
+		),
+		true,
+	);
 });
 
 test("packed source artifact waits a real 3 seconds, decides continue, and folds context", {
@@ -843,7 +835,12 @@ test("packed source artifact waits a real 3 seconds, decides continue, and folds
 	assert.ok(decisionRequest);
 	assert.ok(continuedRequest);
 	assert.deepEqual(toolNames(firstRequest), ["bash", "edit", "read", "write"]);
-	assert.deepEqual(toolNames(decisionRequest), decisionTools);
+	assert.deepEqual(toolNames(decisionRequest), [
+		"bash",
+		"edit",
+		"read",
+		"write",
+	]);
 	assert.deepEqual(toolNames(continuedRequest), [
 		"bash",
 		"edit",
@@ -1006,7 +1003,7 @@ test("packed custom reasonTypes replace defaults and match mixed-case input", {
 	timeout: 30_000,
 }, async (t) => {
 	// Post-GREEN integration coverage: the production feature already exists;
-	// this proves config, dynamic tool description, protocol, runtime, and hook
+	// this proves config, dynamic XML instructions, protocol, runtime, and hook
 	// are wired to the same representation through the packed artifact.
 	const fixture = await makePackedFixture(t, {
 		withSemanticProbe: true,
@@ -1031,32 +1028,28 @@ test("packed custom reasonTypes replace defaults and match mixed-case input", {
 	await waitFor(() => requests.length === 2, 8_000, "unlock decision request");
 	await session.waitForIdle();
 
-	// The decision request advertises only the effective custom list as a plain
-	// string description (no case-sensitive enum), and keeps reasonType a string.
+	// The hidden prompt advertises only the effective custom list while ordinary
+	// tools remain unchanged for prompt-prefix stability.
 	const decisionRequest = requests[1];
 	assert.ok(decisionRequest);
-	const unlockTool = (decisionRequest.tools ?? []).find(
-		(tool) => tool.function?.name === "unlock_continue_watchdog",
-	);
-	assert.ok(unlockTool);
-	const serializedUnlockTool = JSON.stringify(unlockTool);
+	assert.deepEqual(toolNames(decisionRequest), [
+		"bash",
+		"edit",
+		"read",
+		"write",
+	]);
+	const serializedDecisionMessages = JSON.stringify(decisionRequest.messages);
 	assert.equal(
-		serializedUnlockTool.includes("Need Review, shipped"),
+		serializedDecisionMessages.includes('[\\"Need Review\\",\\"shipped\\"]'),
 		true,
-		"unlock tool must advertise the effective custom reasonTypes",
 	);
+	assert.equal(serializedDecisionMessages.includes("JOB_DONE"), false);
 	assert.equal(
-		serializedUnlockTool.includes("JOB_DONE"),
-		false,
-		"custom reasonTypes replace defaults rather than extend them",
-	);
-	assert.equal(
-		serializedUnlockTool.includes('"enum"'),
-		false,
-		"reasonType must not be a case-sensitive enum",
+		serializedDecisionMessages.includes("Do not output multiple"),
+		true,
 	);
 
-	// The raw tool call arguments persist both fields as supplied by the model.
+	// The raw XML persists both fields as supplied by the model.
 	const branchAssistants = session.sessionManager
 		.getBranch()
 		.flatMap((entry) =>
@@ -1064,9 +1057,9 @@ test("packed custom reasonTypes replace defaults and match mixed-case input", {
 				? [entry.message]
 				: [],
 		);
-	const rawUnlockCall = JSON.stringify(branchAssistants);
-	assert.equal(rawUnlockCall.includes(" need review "), true);
-	assert.equal(rawUnlockCall.includes(" awaiting review "), true);
+	const rawUnlockXml = JSON.stringify(branchAssistants);
+	assert.equal(rawUnlockXml.includes(" need review "), true);
+	assert.equal(rawUnlockXml.includes(" awaiting review "), true);
 
 	// The trimmed, case-insensitively matched, uppercased pair publishes once.
 	const hookDeadline = Date.now() + 3_000;

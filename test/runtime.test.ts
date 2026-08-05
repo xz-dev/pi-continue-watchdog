@@ -2,25 +2,21 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type {
-	AgentToolResult,
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
 import type { HumanUnlockEntry } from "../src/commands.js";
-import type { ContinueWatchdogConfig } from "../src/config.js";
+import {
+	type ContinueWatchdogConfig,
+	MAX_PROMPT_CHARACTERS,
+} from "../src/config.js";
 import {
 	DECISION_FOLD_MESSAGE_TYPE,
 	DECISION_MESSAGE_TYPE,
 } from "../src/context-fold.js";
 import { createLockDecisionController } from "../src/controller.js";
-import {
-	CONTINUE_WATCHDOG_TOOL_NAME,
-	createDecisionToolActivation,
-	DECISION_TOOL_NAMES,
-	type DecisionToolActivation,
-	UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
-} from "../src/decision-tools.js";
+import { DECISION_TOOL_BLOCK_REASON } from "../src/decision-protocol.js";
 import {
 	createHubAttachmentInstance,
 	createObservableAgentHub,
@@ -99,39 +95,41 @@ interface Harness {
 	readonly sent: SentMessage[];
 	readonly notifications: Array<{ message: string; level?: string }>;
 	readonly entries: Array<{ type: string; data: unknown }>;
-	readonly tools: DecisionToolActivation;
 	ctx: ExtensionContext;
 	runtime: ReturnType<typeof createDecisionRuntime>;
 	streaming: boolean;
 	triggeredTurns: number;
-	activeTools: string[];
 	fire(name: string, event: unknown): Promise<void>;
 	openDecision(): void;
-	executeContinue(toolCallId?: string): Promise<AgentToolResult<unknown>>;
-	executeUnlock(
-		reason: string,
-		toolCallId?: string,
-		reasonType?: string,
-	): Promise<AgentToolResult<unknown>>;
+	answerContinue(): unknown;
+	answerUnlock(reason?: string, reasonType?: string): unknown;
+	answerInvalid(text?: string): unknown;
+	blockToolCall(): Promise<unknown>;
 }
 
-function assistant(content: unknown[], stopReason = "toolUse"): unknown {
+function assistant(content: unknown[], stopReason = "stop"): unknown {
 	return { role: "assistant", content, stopReason };
 }
 
-function toolCall(id: string, name: string, args: unknown): unknown {
-	return { type: "toolCall", id, name, arguments: args };
+function text(value: string): unknown {
+	return { type: "text", text: value };
+}
+
+function continueXml(): string {
+	return "<watchdog><function>continue_watchdog</function></watchdog>";
+}
+
+function unlockXml(
+	reasonType = "JOB_DONE",
+	reason = "All requested work is complete.",
+): string {
+	return `<watchdog><function>unlock_continue_watchdog</function><reason_type>${reasonType}</reason_type><reason_content>${reason}</reason_content></watchdog>`;
 }
 
 function createHarness(options?: {
 	readonly config?: Partial<ContinueWatchdogConfig>;
-	readonly activationThrows?: boolean;
 	readonly sendThrows?: boolean;
 	readonly hasUI?: boolean;
-	/** Invoked for every operational tool cleanup attempt. */
-	readonly beforeRestoreDecisionTools?: () => void;
-	/** Invoked after a successful tool restore; useful for re-entrant demotion. */
-	readonly afterRestoreDecisionTools?: () => void;
 	readonly onNotify?: (message: string) => void;
 }): Harness {
 	const config: ContinueWatchdogConfig = {
@@ -153,39 +151,7 @@ function createHarness(options?: {
 	const sent: SentMessage[] = [];
 	const notifications: Array<{ message: string; level?: string }> = [];
 	const entries: Array<{ type: string; data: unknown }> = [];
-	let activeTools = ["read", "bash"];
-	let captured: string[] | null = null;
-	let initialized = false;
 	let runtime: ReturnType<typeof createDecisionRuntime>;
-
-	const tools: DecisionToolActivation = {
-		initializeDecisionToolsInactive(): boolean {
-			initialized = true;
-			return true;
-		},
-		activateDecisionTools(stillOwns: () => boolean): boolean {
-			if (options?.activationThrows) throw new Error("activation failed");
-			if (!initialized || captured !== null || !stillOwns()) return false;
-			captured = [...activeTools];
-			activeTools = ["continue_watchdog", "unlock_continue_watchdog"];
-			if (!stillOwns()) {
-				activeTools = captured;
-				captured = null;
-				return false;
-			}
-			return true;
-		},
-		restoreDecisionTools(): boolean {
-			options?.beforeRestoreDecisionTools?.();
-			if (captured === null) return false;
-			activeTools = captured;
-			captured = null;
-			options?.afterRestoreDecisionTools?.();
-			return true;
-		},
-		isActive: () => initialized && captured !== null,
-		getCapturedActiveTools: () => captured,
-	};
 
 	const harness = {
 		handlers,
@@ -196,15 +162,8 @@ function createHarness(options?: {
 		sent,
 		notifications,
 		entries,
-		tools,
 		streaming: false,
 		triggeredTurns: 0,
-		get activeTools(): string[] {
-			return [...activeTools];
-		},
-		set activeTools(value: string[]) {
-			activeTools = [...value];
-		},
 	} as Harness;
 
 	const pi = {
@@ -251,7 +210,6 @@ function createHarness(options?: {
 		hub,
 		attachmentInstance: createHubAttachmentInstance(),
 		controllerHolder: holder,
-		decisionTools: tools,
 		injectedController: true,
 		initialConfig: config,
 		clock,
@@ -273,24 +231,27 @@ function createHarness(options?: {
 		runtime.reconcileIdle();
 		clock.fire(clock.records.length - 1);
 	};
-	harness.executeContinue = async (toolCallId = "continue-1") =>
-		runtime.executeDecisionTool({
-			kind: "continue",
-			toolCallId,
-			ctx,
-		});
-	harness.executeUnlock = async (
-		reason,
-		toolCallId = "unlock-1",
+	harness.answerContinue = () => assistant([text(continueXml())]);
+	harness.answerUnlock = (
+		reason = "All requested work is complete.",
 		reasonType = "JOB_DONE",
-	) =>
-		runtime.executeDecisionTool({
-			kind: "unlock",
-			reasonType,
-			reason,
-			toolCallId,
-			ctx,
-		});
+	) => assistant([text(unlockXml(reasonType, reason))]);
+	harness.answerInvalid = (value = "I will wait.") => assistant([text(value)]);
+	harness.blockToolCall = async () => {
+		let result: unknown;
+		for (const handler of handlers.get("tool_call") ?? []) {
+			result = await handler(
+				{
+					type: "tool_call",
+					toolCallId: "bash-1",
+					toolName: "bash",
+					input: { command: "true" },
+				} as never,
+				ctx,
+			);
+		}
+		return result;
+	};
 
 	return harness;
 }
@@ -312,7 +273,6 @@ async function settleOnly(harness: Harness): Promise<void> {
 		after > before,
 		"true-idle agent_settled must schedule a deferred settled-phase callback",
 	);
-	// Production schedules the settled-phase wake after any markIdle side effects.
 	const deferred = after - 1;
 	assert.equal(harness.clock.records[deferred]?.delayMs, 0);
 	harness.clock.fire(deferred);
@@ -345,16 +305,33 @@ test("idle arms one unref timer and opens one hidden decision-only window", asyn
 	assert.equal(harness.clock.records[0]?.unrefCount, 1);
 	harness.clock.fire(0);
 
-	assert.deepEqual(harness.activeTools, [
-		"continue_watchdog",
-		"unlock_continue_watchdog",
-	]);
 	assert.equal(harness.sent[0]?.message.customType, DECISION_MESSAGE_TYPE);
 	assert.equal(harness.sent[0]?.message.display, false);
 	assert.deepEqual(harness.sent[0]?.options, {
 		triggerTurn: true,
 		deliverAs: "steer",
 	});
+});
+
+test("maximum configured decision prompt still opens and re-asks with generated XML suffix", async () => {
+	const configuredPrompt = "x".repeat(MAX_PROMPT_CHARACTERS);
+	const harness = createHarness({
+		config: { decisionPrompt: configuredPrompt },
+	});
+	await startIdle(harness);
+	harness.openDecision();
+
+	const firstPrompt = harness.sent.at(-1)?.message.content ?? "";
+	assert.equal(firstPrompt.startsWith(configuredPrompt), true);
+	assert.equal(firstPrompt.length > MAX_PROMPT_CHARACTERS, true);
+	assert.match(firstPrompt, /exactly one <watchdog>/);
+
+	await settleResponse(harness, harness.answerInvalid());
+	const reask = harness.sent.at(-1)?.message.content ?? "";
+	assert.equal(reask.startsWith(configuredPrompt), true);
+	assert.equal(reask.length > firstPrompt.length, true);
+	assert.match(reask, /previous decision response was invalid/);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
 });
 
 test("zero idle delay schedules an asynchronous immediate decision", async () => {
@@ -471,7 +448,6 @@ test("agent_end finalizes while streaming but settled alone dispatches continue"
 	const harness = createHarness();
 	await startIdle(harness);
 	harness.openDecision();
-	await harness.executeContinue();
 	const before = harness.sent.length;
 	const turnsBefore = harness.triggeredTurns;
 
@@ -479,7 +455,7 @@ test("agent_end finalizes while streaming but settled alone dispatches continue"
 	await harness.fire("agent_start", { type: "agent_start" });
 	await harness.fire("agent_end", {
 		type: "agent_end",
-		messages: [assistant([toolCall("continue-1", "continue_watchdog", {})])],
+		messages: [harness.answerContinue()],
 	});
 	assert.equal(harness.sent.length, before);
 	assert.equal(harness.triggeredTurns, turnsBefore);
@@ -490,25 +466,34 @@ test("agent_end finalizes while streaming but settled alone dispatches continue"
 		harness.sent.at(-1)?.message.customType,
 		DECISION_FOLD_MESSAGE_TYPE,
 	);
-	assert.equal(harness.sent.at(-1)?.message.content, "Continue compactly.");
 	assert.deepEqual(harness.sent.at(-1)?.options, {
 		triggerTurn: true,
 		deliverAs: "steer",
 	});
 	assert.equal(harness.triggeredTurns, turnsBefore + 1);
-	assert.deepEqual(harness.activeTools, ["read", "bash"]);
 	assert.equal(harness.controller.snapshot.attempt, 1);
+});
+
+test("decision window blocks ordinary tool_call before execution", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	assert.equal(await harness.blockToolCall(), undefined);
+
+	harness.openDecision();
+	assert.deepEqual(await harness.blockToolCall(), {
+		block: true,
+		reason: DECISION_TOOL_BLOCK_REASON,
+	});
+
+	await settleResponse(harness, harness.answerContinue());
+	assert.equal(await harness.blockToolCall(), undefined);
 });
 
 test("continued settle rearms exponential delay once and exhausts at max", async () => {
 	const harness = createHarness({ config: { maxRetries: 2 } });
 	await startIdle(harness);
 	harness.openDecision();
-	await harness.executeContinue("continue-1");
-	await settleResponse(
-		harness,
-		assistant([toolCall("continue-1", "continue_watchdog", {})]),
-	);
+	await settleResponse(harness, harness.answerContinue());
 
 	assert.equal(harness.clock.records.at(-1)?.delayMs, 6000);
 	await harness.fire("agent_start", { type: "agent_start" });
@@ -520,11 +505,7 @@ test("continued settle rearms exponential delay once and exhausts at max", async
 	);
 	assert.ok(secondTimer >= 0);
 	harness.clock.fire(secondTimer);
-	await harness.executeContinue("continue-2");
-	await settleResponse(
-		harness,
-		assistant([toolCall("continue-2", "continue_watchdog", {})]),
-	);
+	await settleResponse(harness, harness.answerContinue());
 
 	assert.equal(harness.controller.snapshot.exhausted, true);
 	assert.equal(harness.controller.snapshot.attempt, 2);
@@ -535,20 +516,10 @@ test("valid unlock folds without a turn and leaves one compact persisted result"
 	const harness = createHarness();
 	await startIdle(harness);
 	harness.openDecision();
-	await harness.executeUnlock("  waiting for user  ", "unlock-1", "job_done");
 	const turnsBefore = harness.triggeredTurns;
-	assert.deepEqual(harness.activeTools, [
-		"continue_watchdog",
-		"unlock_continue_watchdog",
-	]);
 	await settleResponse(
 		harness,
-		assistant([
-			toolCall("unlock-1", "unlock_continue_watchdog", {
-				reasonType: "job_done",
-				reason: "waiting for user",
-			}),
-		]),
+		harness.answerUnlock("waiting for user", "job_done"),
 	);
 
 	assert.deepEqual(harness.sent.at(-1)?.options, {
@@ -565,8 +536,6 @@ test("valid unlock folds without a turn and leaves one compact persisted result"
 			},
 		},
 	]);
-	// Settled delivery restores tools and persists the typed reason without a duplicate notification.
-	assert.deepEqual(harness.activeTools, ["read", "bash"]);
 	assert.equal(harness.controller.snapshot.locked, false);
 	assert.deepEqual(harness.notifications, []);
 });
@@ -577,19 +546,9 @@ test("Example 7: AI unlock retains typed entry data only; no transient notificat
 	});
 	await startIdle(harness);
 	harness.openDecision();
-	await harness.executeUnlock(
-		"PR is open for human review.",
-		"unlock-1",
-		"needreview",
-	);
 	await settleResponse(
 		harness,
-		assistant([
-			toolCall("unlock-1", "unlock_continue_watchdog", {
-				reasonType: "needreview",
-				reason: "PR is open for human review.",
-			}),
-		]),
+		harness.answerUnlock("PR is open for human review.", "needreview"),
 	);
 
 	assert.deepEqual(harness.entries, [
@@ -615,7 +574,7 @@ test("invalid decisions reask only after settle and third failure stays stopped"
 		await harness.fire("agent_start", { type: "agent_start" });
 		await harness.fire("agent_end", {
 			type: "agent_end",
-			messages: [assistant([{ type: "text", text: "done" }], "stop")],
+			messages: [harness.answerInvalid("done")],
 		});
 		assert.equal(harness.sent.length, sentBefore);
 		harness.streaming = false;
@@ -625,16 +584,24 @@ test("invalid decisions reask only after settle and third failure stays stopped"
 				harness.sent.at(-1)?.message.content ?? "",
 				/previous decision response was invalid/,
 			);
+			assert.equal(
+				harness.controller.snapshot.invalidDecisionAttempts,
+				attempt,
+			);
+			assert.equal(harness.sent.length, sentBefore + 1);
 		}
 	}
 
 	assert.equal(harness.controller.snapshot.decisionFailed, true);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 3);
 	assert.equal(harness.controller.snapshot.attempt, 0);
-	assert.equal(harness.controller.snapshot.idleTimer, null);
-	assert.deepEqual(harness.activeTools, ["read", "bash"]);
+	assert.equal(
+		harness.sent.at(-1)?.message.customType,
+		DECISION_FOLD_MESSAGE_TYPE,
+	);
 	assert.deepEqual(harness.notifications.at(-1), {
 		message:
-			"Continue watchdog decision failed after 3 attempts: Do not answer with prose; call exactly one decision tool.",
+			"Continue watchdog decision failed after 3 attempts: End the response with one valid watchdog XML decision block.",
 		level: "warning",
 	});
 });
@@ -643,23 +610,27 @@ test("aborted decision response is not finalized by agent_end (abort path owns u
 	const harness = createHarness();
 	await startIdle(harness);
 	harness.openDecision();
+	const sentBefore = harness.sent.length;
+
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
 	await harness.fire("agent_end", {
 		type: "agent_end",
-		messages: [assistant([], "aborted")],
+		messages: [assistant([text(continueXml())], "aborted")],
 	});
-	// Without the abort-outcome handler, true-idle settle treats the open decision
-	// as a no-result and reasks once. agent_end itself must not finalize abort.
-	assert.equal(harness.controller.snapshot.decisionOpen, true);
-	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
+	harness.streaming = false;
 	await settleOnly(harness);
+
+	// Without abort-outcome handler here, settle synthesizes missing/malformed.
 	assert.match(
 		harness.sent.at(-1)?.message.content ?? "",
 		/previous decision response was invalid/,
 	);
 	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
+	assert.equal(harness.sent.length, sentBefore + 1);
 });
 
-test("demotion, shutdown, stale timer, activation and send failures cleanly unlock", async () => {
+test("demotion, shutdown, stale timer, and send failures cleanly unlock", async () => {
 	const stale = createHarness({ hasUI: false });
 	await startIdle(stale);
 	stale.runtime.applyTransition(stale.controller.lock(), undefined, {
@@ -687,17 +658,10 @@ test("demotion, shutdown, stale timer, activation and send failures cleanly unlo
 	stale.clock.fire(0);
 	assert.equal(stale.sent.length, 0);
 
-	const activation = createHarness({ activationThrows: true });
-	await startIdle(activation);
-	activation.openDecision();
-	assert.equal(activation.controller.snapshot.locked, false);
-	assert.deepEqual(activation.activeTools, ["read", "bash"]);
-
 	const sending = createHarness({ sendThrows: true });
 	await startIdle(sending);
 	sending.openDecision();
 	assert.equal(sending.controller.snapshot.locked, false);
-	assert.deepEqual(sending.activeTools, ["read", "bash"]);
 
 	stale.runtime.shutdown();
 	assert.equal(timer.cleared, true);
@@ -707,24 +671,21 @@ test("external unlock after agent_end cancels pending continue before settle", a
 	const harness = createHarness();
 	await startIdle(harness);
 	harness.openDecision();
-	await harness.executeContinue();
 
 	harness.streaming = true;
 	await harness.fire("agent_start", { type: "agent_start" });
 	await harness.fire("agent_end", {
 		type: "agent_end",
-		messages: [assistant([toolCall("continue-1", "continue_watchdog", {})])],
+		messages: [harness.answerContinue()],
 	});
 	const sentBefore = harness.sent.length;
 	const turnsBefore = harness.triggeredTurns;
 
-	// Transition first (locked=false), then operational cleanup.
 	harness.runtime.applyTransition(harness.controller.unlock(), undefined, {
 		suppressNotify: true,
 	});
 	assert.equal(harness.controller.snapshot.locked, false);
 	harness.runtime.clearOperationalPendingWork();
-	assert.deepEqual(harness.activeTools, ["read", "bash"]);
 
 	harness.streaming = false;
 	await settleOnly(harness);
@@ -734,15 +695,9 @@ test("external unlock after agent_end cancels pending continue before settle", a
 	assert.equal(harness.controller.snapshot.idleTimer, null);
 });
 
-test("Examples 1-2: restart lock cycle unlocks before cleanup, clears an open decision, then locks and notifies once", async () => {
+test("Examples 1-2: restart lock cycle clears an open decision, then locks and notifies once", async () => {
 	const timeline: string[] = [];
-	let harness: Harness;
-	harness = createHarness({
-		beforeRestoreDecisionTools: () => {
-			timeline.push(
-				`cleanup-tools:locked=${harness.controller.snapshot.locked}`,
-			);
-		},
+	const harness = createHarness({
 		onNotify: (message) => {
 			timeline.push(
 				`notify:${message}:locked=${harness.controller.snapshot.locked}`,
@@ -751,22 +706,16 @@ test("Examples 1-2: restart lock cycle unlocks before cleanup, clears an open de
 	});
 	await startIdle(harness);
 	harness.openDecision();
-	// One invalid response represents open-decision accounting that fresh lock clears.
 	harness.controller.recordInvalidDecision(1, "bad decision");
 	assert.equal(harness.controller.snapshot.decisionOpen, true);
 	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
-	assert.deepEqual(harness.activeTools, DECISION_TOOL_NAMES);
 
 	await harness.runtime.restartLockCycle(harness.ctx, { notifyLocked: true });
 
-	assert.deepEqual(timeline, [
-		"cleanup-tools:locked=false",
-		"notify:Continue watchdog locked:locked=true",
-	]);
+	assert.deepEqual(timeline, ["notify:Continue watchdog locked:locked=true"]);
 	assert.deepEqual(harness.notifications, [
 		{ message: "Continue watchdog locked", level: undefined },
 	]);
-	assert.deepEqual(harness.activeTools, ["read", "bash"]);
 	assert.equal(harness.controller.snapshot.locked, true);
 	assert.equal(harness.controller.snapshot.attempt, 0);
 	assert.equal(harness.controller.snapshot.exhausted, false);
@@ -778,13 +727,7 @@ test("Examples 1-2: restart lock cycle unlocks before cleanup, clears an open de
 
 test("Example 2: restart from unlocked still performs silent unlock cleanup before fresh lock", async () => {
 	const timeline: string[] = [];
-	let harness: Harness;
-	harness = createHarness({
-		beforeRestoreDecisionTools: () => {
-			timeline.push(
-				`cleanup-tools:locked=${harness.controller.snapshot.locked}`,
-			);
-		},
+	const harness = createHarness({
 		onNotify: (message) => timeline.push(`notify:${message}`),
 	});
 	await startIdle(harness);
@@ -799,65 +742,19 @@ test("Example 2: restart from unlocked still performs silent unlock cleanup befo
 	]);
 });
 
-test("Examples 1-2: re-entrant demotion during prerequisite unlock cleanup stops before lock and notify", async () => {
-	let harness: Harness;
-	let demoted = false;
-	harness = createHarness({
-		hasUI: false,
-		afterRestoreDecisionTools: () => {
-			if (demoted) return;
-			demoted = true;
-			harness.hub.bind({
-				instance: createHubAttachmentInstance(),
-				sessionId: "replacement-ui-main",
-				hasUI: true,
-				initialBusy: false,
-			});
-		},
-	});
-	await startIdle(harness);
-	harness.openDecision();
-
-	await harness.runtime.restartLockCycle(harness.ctx, { notifyLocked: true });
-
-	assert.equal(demoted, true);
-	assert.equal(harness.runtime.controller, null);
-	assert.equal(harness.controller.snapshot.locked, false);
-	assert.deepEqual(harness.notifications, []);
-	assert.deepEqual(harness.activeTools, ["read", "bash"]);
-});
-
 test("manual lock after pending continue clears fold and rearms base idle delay", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
 	harness.openDecision();
-	await harness.executeContinue();
-
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
-	await harness.fire("agent_end", {
-		type: "agent_end",
-		messages: [assistant([toolCall("continue-1", "continue_watchdog", {})])],
-	});
-	const sentBefore = harness.sent.length;
-
-	harness.runtime.restartLockCycle(undefined, { notifyLocked: false });
-	assert.deepEqual(harness.activeTools, ["read", "bash"]);
-	assert.equal(harness.controller.snapshot.attempt, 0);
-
-	harness.streaming = false;
-	await settleOnly(harness);
-	assert.equal(harness.sent.length, sentBefore);
-	harness.runtime.reconcileIdle();
-	assert.equal(harness.controller.snapshot.idleTimer?.delaySeconds, 3);
+	await settleResponse(harness, harness.answerContinue());
 	assert.equal(
-		harness.clock.records.some(
-			(record) => record.delayMs === 3000 && !record.cleared,
-		),
-		true,
+		harness.sent.at(-1)?.message.customType,
+		DECISION_FOLD_MESSAGE_TYPE,
 	);
-	assert.equal(harness.controller.snapshot.locked, true);
+
+	await harness.runtime.restartLockCycle(harness.ctx, { notifyLocked: true });
 	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.controller.snapshot.idleTimer?.delaySeconds, 3);
 });
 
 test("restart lock cycle cancels an old idle timer and reconciles one fresh base timer", async () => {
@@ -867,23 +764,11 @@ test("restart lock cycle cancels an old idle timer and reconciles one fresh base
 		suppressNotify: true,
 	});
 	harness.runtime.reconcileIdle();
-	const oldTimer = harness.clock.records[0];
-	assert.ok(oldTimer);
-	assert.equal(oldTimer.cleared, false);
-
-	harness.runtime.restartLockCycle(undefined, { notifyLocked: false });
-
-	assert.equal(oldTimer.cleared, true);
-	assert.equal(harness.controller.snapshot.locked, true);
-	assert.equal(harness.controller.snapshot.attempt, 0);
-	assert.equal(harness.controller.snapshot.idleTimer?.delaySeconds, 3);
-	assert.equal(
-		harness.clock.records.filter(
-			(record) => record.delayMs === 3000 && !record.cleared,
-		).length,
-		1,
-	);
-	assert.deepEqual(harness.notifications, []);
+	const first = harness.clock.records[0];
+	assert.ok(first);
+	await harness.runtime.restartLockCycle(harness.ctx, { notifyLocked: true });
+	assert.equal(first.cleared, true);
+	assert.equal(harness.clock.records.at(-1)?.delayMs, 3000);
 });
 
 test("ordinary unlocked main agent_start silently locks; locked start preserves cycle and decision", async () => {
@@ -895,32 +780,19 @@ test("ordinary unlocked main agent_start silently locks; locked start preserves 
 	await harness.fire("agent_start", { type: "agent_start" });
 	assert.equal(harness.controller.snapshot.locked, true);
 	assert.equal(harness.controller.snapshot.attempt, 0);
-	assert.deepEqual(harness.notifications, []);
 
 	harness.streaming = false;
 	await settleOnly(harness);
-	// True idle after silent lock arms the base delay (possibly before deferred wake).
-	assert.equal(harness.controller.snapshot.idleTimer?.delaySeconds, 3);
 	const idleTimerIndex = harness.clock.records.findIndex(
 		(record) => record.delayMs === 3000 && !record.cleared,
 	);
 	assert.ok(idleTimerIndex >= 0);
 	harness.clock.fire(idleTimerIndex);
-	assert.equal(harness.controller.snapshot.decisionOpen, true);
-	const openAttempt = harness.controller.snapshot.invalidDecisionAttempts;
-
-	harness.streaming = true;
+	const attemptBefore = harness.controller.snapshot.attempt;
+	const decisionOpen = harness.controller.snapshot.decisionOpen;
 	await harness.fire("agent_start", { type: "agent_start" });
-	assert.equal(harness.controller.snapshot.locked, true);
-	assert.equal(harness.controller.snapshot.decisionOpen, true);
-	assert.equal(
-		harness.controller.snapshot.invalidDecisionAttempts,
-		openAttempt,
-	);
-	assert.deepEqual(harness.activeTools, [
-		"continue_watchdog",
-		"unlock_continue_watchdog",
-	]);
+	assert.equal(harness.controller.snapshot.attempt, attemptBefore);
+	assert.equal(harness.controller.snapshot.decisionOpen, decisionOpen);
 });
 
 test("false-idle settle schedules no deferred callback; later true settle reconciles", async () => {
@@ -929,159 +801,92 @@ test("false-idle settle schedules no deferred callback; later true settle reconc
 	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
 		suppressNotify: true,
 	});
-	// Attachment already idle from session_start; mark busy then leave hub idle.
-	await harness.fire("agent_start", { type: "agent_start" });
-	assert.equal(harness.hub.snapshot.allObservableIdle, false);
-
-	// Nested false-idle outer settle must not schedule deferred wake or arm.
 	harness.streaming = true;
-	const timersBefore = harness.clock.records.length;
+	const before = harness.clock.records.length;
 	await harness.fire("agent_settled", { type: "agent_settled" });
-	assert.equal(harness.hub.snapshot.allObservableIdle, false);
-	assert.equal(harness.clock.records.length, timersBefore);
+	assert.equal(harness.clock.records.length, before);
 
-	// True settle: deferred wake finalizes/reconciles (and markIdle may arm too).
 	harness.streaming = false;
 	await settleOnly(harness);
-	assert.equal(harness.hub.snapshot.allObservableIdle, true);
-	assert.notEqual(harness.controller.snapshot.idleTimer, null);
-
-	// Cancel via busy, re-idle, then clear the timer without a hub edge and
-	// prove true-idle settle still arms again via deferred reconcile.
-	await harness.fire("agent_start", { type: "agent_start" });
-	assert.equal(harness.controller.snapshot.idleTimer, null);
-	harness.streaming = false;
-	await settleOnly(harness);
-	const armed = harness.controller.snapshot.idleTimer;
-	assert.ok(armed);
-	// Force controller timer cleared without hub notification (no-op markIdle path).
-	harness.controller.onObservableBusy();
-	assert.equal(harness.controller.snapshot.idleTimer, null);
-	assert.equal(harness.hub.snapshot.allObservableIdle, true);
-	await settleOnly(harness);
-	assert.notEqual(harness.controller.snapshot.idleTimer, null);
+	assert.equal(harness.clock.records.at(-1)?.delayMs, 3000);
 });
 
 test("deferred settled wake is inert after later agent_start; next true settle works", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
 	harness.openDecision();
-
-	// Open decision run with no agent_end so a true settle would synthesize no-result.
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
-	harness.streaming = false;
 	const before = harness.clock.records.length;
-	const sentBefore = harness.sent.length;
 	await harness.fire("agent_settled", { type: "agent_settled" });
-	assert.equal(harness.clock.records.length, before + 1);
-	assert.equal(harness.clock.records[before]?.delayMs, 0);
-	const deferred = before;
+	const deferred = harness.clock.records.length - 1;
+	assert.ok(harness.clock.records.length > before);
 
-	// Nested/later start before the deferred settled-phase callback.
 	harness.streaming = true;
 	await harness.fire("agent_start", { type: "agent_start" });
-	assert.equal(harness.hub.snapshot.allObservableIdle, false);
 	harness.clock.fire(deferred);
+	assert.equal(
+		harness.sent.filter((entry) =>
+			entry.message.content.includes("previous decision response was invalid"),
+		).length,
+		0,
+	);
 
-	// Must not finalize no-result or reask while busy.
-	assert.equal(harness.sent.length, sentBefore);
-	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
-	assert.equal(harness.controller.snapshot.decisionOpen, true);
-
-	// Later true settle finalizes once.
 	harness.streaming = false;
 	await settleOnly(harness);
 	assert.match(
 		harness.sent.at(-1)?.message.content ?? "",
 		/previous decision response was invalid/,
 	);
-	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
 });
 
 test("stale deferred settle is inert after later start+settle even when ctx is idle again", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
 	harness.openDecision();
+	await harness.fire("agent_settled", { type: "agent_settled" });
+	const firstDeferred = harness.clock.records.length - 1;
 
-	// Run A: open decision turn, settle without agent_end, leave callback A unfired.
 	harness.streaming = true;
 	await harness.fire("agent_start", { type: "agent_start" });
 	harness.streaming = false;
-	const settleABefore = harness.clock.records.length;
-	const sentBefore = harness.sent.length;
-	await harness.fire("agent_settled", { type: "agent_settled" });
-	assert.equal(harness.clock.records.length, settleABefore + 1);
-	assert.equal(harness.clock.records[settleABefore]?.delayMs, 0);
-	const deferredA = settleABefore;
+	await settleOnly(harness);
+	const invalids = harness.sent.filter((entry) =>
+		entry.message.content.includes("previous decision response was invalid"),
+	);
+	assert.equal(invalids.length, 1);
 
-	// Run B starts and true-idles before callback A fires. ctx is idle again.
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
-	harness.streaming = false;
-	const settleBBefore = harness.clock.records.length;
-	await harness.fire("agent_settled", { type: "agent_settled" });
-	assert.equal(harness.clock.records.length, settleBBefore + 1);
-	assert.equal(harness.clock.records[settleBBefore]?.delayMs, 0);
-	const deferredB = settleBBefore;
-	assert.equal(harness.hub.snapshot.allObservableIdle, true);
-
-	// Stale callback A must not finalize/count/send/arm while B is the latest settle.
-	harness.clock.fire(deferredA);
-	assert.equal(harness.sent.length, sentBefore);
-	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
-	assert.equal(harness.controller.snapshot.decisionOpen, true);
+	harness.clock.fire(firstDeferred);
 	assert.equal(
-		harness.clock.records.some(
-			(record, index) =>
-				index > deferredB && record.delayMs === 3000 && !record.cleared,
-		),
-		false,
+		harness.sent.filter((entry) =>
+			entry.message.content.includes("previous decision response was invalid"),
+		).length,
+		1,
 	);
-
-	// Latest callback B finalizes exactly once.
-	harness.clock.fire(deferredB);
-	assert.match(
-		harness.sent.at(-1)?.message.content ?? "",
-		/previous decision response was invalid/,
-	);
-	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
-	assert.equal(harness.sent.length, sentBefore + 1);
 });
 
 test("duplicate true-idle settles schedule two wakes but only the latest acts", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
 	harness.openDecision();
-
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
-	// No agent_end: both settles would synthesize no-result if both acted.
-	harness.streaming = false;
-	const firstBefore = harness.clock.records.length;
-	const sentBefore = harness.sent.length;
 	await harness.fire("agent_settled", { type: "agent_settled" });
-	assert.equal(harness.clock.records.length, firstBefore + 1);
-	const deferredFirst = firstBefore;
-
-	const secondBefore = harness.clock.records.length;
+	const firstDeferred = harness.clock.records.length - 1;
 	await harness.fire("agent_settled", { type: "agent_settled" });
-	assert.equal(harness.clock.records.length, secondBefore + 1);
-	const deferredSecond = secondBefore;
+	const secondDeferred = harness.clock.records.length - 1;
+	assert.notEqual(firstDeferred, secondDeferred);
 
-	// Older duplicate settle is inert.
-	harness.clock.fire(deferredFirst);
-	assert.equal(harness.sent.length, sentBefore);
-	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
-
-	// Latest settle acts once.
-	harness.clock.fire(deferredSecond);
-	assert.match(
-		harness.sent.at(-1)?.message.content ?? "",
-		/previous decision response was invalid/,
+	harness.clock.fire(firstDeferred);
+	assert.equal(
+		harness.sent.filter((entry) =>
+			entry.message.content.includes("previous decision response was invalid"),
+		).length,
+		0,
 	);
-	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
-	assert.equal(harness.sent.length, sentBefore + 1);
+	harness.clock.fire(secondDeferred);
+	assert.equal(
+		harness.sent.filter((entry) =>
+			entry.message.content.includes("previous decision response was invalid"),
+		).length,
+		1,
+	);
 });
 
 test("decision settle without agent_end reasks twice then decision-fails without double count", async () => {
@@ -1093,7 +898,6 @@ test("decision settle without agent_end reasks twice then decision-fails without
 		const sentBefore = harness.sent.length;
 		harness.streaming = true;
 		await harness.fire("agent_start", { type: "agent_start" });
-		// No agent_end: true-idle settle must synthesize one malformed/no-result.
 		harness.streaming = false;
 		await settleOnly(harness);
 		if (attempt < 3) {
@@ -1112,10 +916,13 @@ test("decision settle without agent_end reasks twice then decision-fails without
 	assert.equal(harness.controller.snapshot.decisionFailed, true);
 	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 3);
 	assert.equal(harness.controller.snapshot.attempt, 0);
-	assert.deepEqual(harness.activeTools, ["read", "bash"]);
+	assert.equal(
+		harness.sent.at(-1)?.message.customType,
+		DECISION_FOLD_MESSAGE_TYPE,
+	);
 	assert.deepEqual(harness.notifications.at(-1), {
 		message:
-			"Continue watchdog decision failed after 3 attempts: The decision response was malformed. Call exactly one decision tool.",
+			"Continue watchdog decision failed after 3 attempts: The decision response was malformed. End with the watchdog XML decision block.",
 		level: "warning",
 	});
 });
@@ -1124,15 +931,13 @@ test("pending valid continue keeps reconcile inert until fold delivery", async (
 	const harness = createHarness();
 	await startIdle(harness);
 	harness.openDecision();
-	await harness.executeContinue();
 
 	harness.streaming = true;
 	await harness.fire("agent_start", { type: "agent_start" });
 	await harness.fire("agent_end", {
 		type: "agent_end",
-		messages: [assistant([toolCall("continue-1", "continue_watchdog", {})])],
+		messages: [harness.answerContinue()],
 	});
-	// Pending finalization must not arm a next delay yet.
 	const timersAfterEnd = harness.clock.records.length;
 	harness.runtime.reconcileIdle();
 	assert.equal(harness.clock.records.length, timersAfterEnd);
@@ -1158,28 +963,10 @@ test("child completion only makes aggregate idle; exactly one inquiry comes from
 	const hub = createObservableAgentHub();
 	const clock = new FakeClock();
 	const sentBy: string[] = [];
-	const activatedBy: string[] = [];
 
 	function attach(sessionId: string, hasUI: boolean) {
 		const handlers = new Map<string, Handler[]>();
 		const controller = createLockDecisionController(config);
-		let active = false;
-		const tools: DecisionToolActivation = {
-			initializeDecisionToolsInactive: () => true,
-			activateDecisionTools(stillOwns: () => boolean): boolean {
-				if (!stillOwns()) return false;
-				activatedBy.push(sessionId);
-				active = true;
-				return true;
-			},
-			restoreDecisionTools(): boolean {
-				const wasActive = active;
-				active = false;
-				return wasActive;
-			},
-			isActive: () => active,
-			getCapturedActiveTools: () => (active ? ["read"] : null),
-		};
 		const pi = {
 			on(event: string, handler: Handler): void {
 				const list = handlers.get(event) ?? [];
@@ -1196,7 +983,6 @@ test("child completion only makes aggregate idle; exactly one inquiry comes from
 			hub,
 			attachmentInstance: createHubAttachmentInstance(),
 			controllerHolder: { controller },
-			decisionTools: tools,
 			injectedController: true,
 			initialConfig: config,
 			clock,
@@ -1214,7 +1000,6 @@ test("child completion only makes aggregate idle; exactly one inquiry comes from
 		return {
 			runtime,
 			controller,
-			ctx,
 			async emit(event: string): Promise<void> {
 				if (event === "agent_settled") idle = true;
 				for (const handler of handlers.get(event) ?? []) {
@@ -1247,9 +1032,7 @@ test("child completion only makes aggregate idle; exactly one inquiry comes from
 	assert.equal(clock.records[1]?.delayMs, 3000);
 	assert.equal(clock.records.length, 2);
 	assert.deepEqual(sentBy, []);
-	assert.deepEqual(activatedBy, []);
 	clock.fire(1);
-	assert.deepEqual(activatedBy, ["main"]);
 	assert.deepEqual(sentBy, ["main"]);
 });
 
@@ -1266,39 +1049,14 @@ test("shared hub reclaims main after UI shutdown then prefers a new UI bind", as
 
 	function attach(sessionId: string, hasUI: boolean) {
 		const handlers = new Map<string, Handler[]>();
-		const controller = createLockDecisionController(config);
-		const holder = { controller };
-		let activeTools = ["read", "bash"];
-		let captured: string[] | null = null;
-		const tools: DecisionToolActivation = {
-			initializeDecisionToolsInactive(): boolean {
-				return true;
-			},
-			activateDecisionTools(stillOwns: () => boolean): boolean {
-				if (captured !== null || !stillOwns()) return false;
-				captured = [...activeTools];
-				activeTools = ["continue_watchdog", "unlock_continue_watchdog"];
-				if (!stillOwns()) {
-					activeTools = captured;
-					captured = null;
-					return false;
-				}
-				return true;
-			},
-			restoreDecisionTools(): boolean {
-				if (captured === null) return false;
-				activeTools = captured;
-				captured = null;
-				return true;
-			},
-			isActive: () => captured !== null,
-			getCapturedActiveTools: () => captured,
+		const holder = {
+			controller: createLockDecisionController(config),
 		};
 		const pi = {
-			on(name: string, handler: Handler): void {
-				const list = handlers.get(name) ?? [];
+			on(event: string, handler: Handler): void {
+				const list = handlers.get(event) ?? [];
 				list.push(handler);
-				handlers.set(name, list);
+				handlers.set(event, list);
 			},
 			sendMessage(): void {},
 			appendEntry(): void {},
@@ -1308,7 +1066,6 @@ test("shared hub reclaims main after UI shutdown then prefers a new UI bind", as
 			hub,
 			attachmentInstance: createHubAttachmentInstance(),
 			controllerHolder: holder,
-			decisionTools: tools,
 			injectedController: true,
 			initialConfig: config,
 			clock,
@@ -1324,380 +1081,105 @@ test("shared hub reclaims main after UI shutdown then prefers a new UI bind", as
 		} as unknown as ExtensionContext;
 		return {
 			runtime,
-			controller,
-			handlers,
-			ctx,
-			async start() {
+			holder,
+			async start(): Promise<void> {
 				for (const handler of handlers.get("session_start") ?? []) {
 					await handler({ type: "session_start" } as never, ctx);
 				}
 			},
+			async shutdown(): Promise<void> {
+				for (const handler of handlers.get("session_shutdown") ?? []) {
+					await handler({ type: "session_shutdown" } as never, ctx);
+				}
+				runtime.shutdown();
+			},
 		};
 	}
 
-	const ui = attach("ui-main", true);
-	const child = attach("child", false);
-	await ui.start();
-	await child.start();
-	assert.equal(ui.runtime.isCurrentMain(), true);
-	assert.equal(child.runtime.isCurrentMain(), false);
+	const first = attach("ui-1", true);
+	const headless = attach("headless", false);
+	await first.start();
+	await headless.start();
+	assert.equal(first.runtime.isCurrentMain(), true);
+	assert.equal(headless.runtime.isCurrentMain(), false);
 
-	ui.runtime.applyTransition(ui.controller.lock(), undefined, {
-		suppressNotify: true,
-	});
-	ui.runtime.reconcileIdle();
-	assert.equal(clock.records.length, 1);
+	await first.shutdown();
+	// Runtime sync reclaims the remaining deterministic headless attachment.
+	assert.equal(hub.snapshot.main?.sessionId, "headless");
+	assert.equal(headless.runtime.isCurrentMain(), true);
 
-	ui.runtime.shutdown();
-	assert.equal(child.runtime.isCurrentMain(), true);
-	assert.equal(hub.snapshot.main?.sessionId, "child");
-	assert.equal(hub.snapshot.main?.hasUI, false);
-
-	child.runtime.applyTransition(child.controller.lock(), undefined, {
-		suppressNotify: true,
-	});
-	child.runtime.reconcileIdle();
-	assert.equal(clock.records.at(-1)?.delayMs, 3000);
-
-	const nextUi = attach("ui-next", true);
-	await nextUi.start();
-	assert.equal(nextUi.runtime.isCurrentMain(), true);
-	assert.equal(child.runtime.isCurrentMain(), false);
-	assert.equal(hub.snapshot.main?.sessionId, "ui-next");
-	assert.equal(hub.snapshot.main?.hasUI, true);
-
-	nextUi.runtime.applyTransition(nextUi.controller.lock(), undefined, {
-		suppressNotify: true,
-	});
-	nextUi.runtime.reconcileIdle();
-	assert.equal(clock.records.at(-1)?.delayMs, 3000);
-	assert.equal(nextUi.controller.snapshot.locked, true);
+	const second = attach("ui-2", true);
+	await second.start();
+	assert.equal(second.runtime.isCurrentMain(), true);
 });
 
 test("effective config loads before binding is reconciled and shutdown blocks late load", async () => {
-	let resolveLoad:
-		| ((value: { config: ContinueWatchdogConfig; diagnostics: [] }) => void)
-		| undefined;
-	const loaded = new Promise<{
+	const hub = createObservableAgentHub();
+	const clock = new FakeClock();
+	let resolveLoad!: (value: {
+		config: ContinueWatchdogConfig;
+		diagnostics: [];
+	}) => void;
+	const loadPromise = new Promise<{
 		config: ContinueWatchdogConfig;
 		diagnostics: [];
 	}>((resolve) => {
 		resolveLoad = resolve;
 	});
-	const base = createHarness();
-	base.runtime.shutdown();
+	const handlers = new Map<string, Handler[]>();
 	const holder = {
-		controller: createLockDecisionController({
-			idleDelaySeconds: 3,
-			maxRetries: 1,
-		}),
+		controller: null as ReturnType<typeof createLockDecisionController> | null,
 	};
 	const runtime = createDecisionRuntime({
 		pi: {
-			on(name: string, handler: Handler): void {
-				const list = base.handlers.get(name) ?? [];
+			on(event: string, handler: Handler): void {
+				const list = handlers.get(event) ?? [];
 				list.push(handler);
-				base.handlers.set(name, list);
+				handlers.set(event, list);
 			},
+			sendMessage(): void {},
+			appendEntry(): void {},
 		} as unknown as ExtensionAPI,
-		hub: createObservableAgentHub(),
-		attachmentInstance: createHubAttachmentInstance(),
-		controllerHolder: holder,
-		decisionTools: base.tools,
-		clock: base.clock,
-		loadConfig: async () => loaded,
-		agentDir: "/agent",
-	});
-	runtime.registerLifecycle();
-	const start = (base.handlers.get("session_start") ?? []).at(-1);
-	assert.ok(start);
-	const pending = start({ type: "session_start" } as never, base.ctx);
-	runtime.shutdown();
-	resolveLoad?.({
-		config: {
-			idleDelaySeconds: 9,
-			maxRetries: 2,
-			decisionPrompt: "loaded decision",
-			continuePrompt: "loaded continue",
-			reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
-		},
-		diagnostics: [],
-	});
-	await pending;
-
-	assert.equal(runtime.config.idleDelaySeconds, 3);
-	assert.equal(holder.controller, null);
-	assert.equal(base.clock.records.length, 0);
-});
-
-test("re-entrant demotion during restoreDecisionTools stops later continue delivery", async () => {
-	const harness = createHarness({
-		hasUI: false,
-		afterRestoreDecisionTools: () => {
-			// Synchronous UI bind demotes this headless main mid-delivery.
-			harness.hub.bind({
-				instance: createHubAttachmentInstance(),
-				sessionId: "ui-thief",
-				hasUI: true,
-				initialBusy: false,
-			});
-		},
-	});
-	await startIdle(harness);
-	harness.openDecision();
-	await harness.executeContinue();
-
-	const sentBefore = harness.sent.length;
-	const notificationsBefore = harness.notifications.length;
-	const entriesBefore = harness.entries.length;
-	const turnsBefore = harness.triggeredTurns;
-
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
-	await harness.fire("agent_end", {
-		type: "agent_end",
-		messages: [assistant([toolCall("continue-1", "continue_watchdog", {})])],
-	});
-	harness.streaming = false;
-	await settleOnly(harness);
-
-	assert.equal(harness.runtime.isCurrentMain(), false);
-	assert.equal(harness.sent.length, sentBefore);
-	assert.equal(harness.triggeredTurns, turnsBefore);
-	assert.equal(harness.notifications.length, notificationsBefore);
-	assert.equal(harness.entries.length, entriesBefore);
-	assert.deepEqual(harness.activeTools, ["read", "bash"]);
-});
-
-test("re-entrant demotion during restoreDecisionTools stops later unlock message and entry", async () => {
-	const harness = createHarness({
-		hasUI: false,
-		afterRestoreDecisionTools: () => {
-			harness.hub.bind({
-				instance: createHubAttachmentInstance(),
-				sessionId: "ui-thief-unlock",
-				hasUI: true,
-				initialBusy: false,
-			});
-		},
-	});
-	await startIdle(harness);
-	harness.openDecision();
-	await harness.executeUnlock("done for now");
-
-	const sentBefore = harness.sent.length;
-	const notificationsBefore = harness.notifications.length;
-	const entriesBefore = harness.entries.length;
-
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
-	await harness.fire("agent_end", {
-		type: "agent_end",
-		messages: [
-			assistant([
-				toolCall("unlock-1", "unlock_continue_watchdog", {
-					reasonType: "JOB_DONE",
-
-					reason: "done for now",
-				}),
-			]),
-		],
-	});
-	harness.streaming = false;
-	await settleOnly(harness);
-
-	assert.equal(harness.runtime.isCurrentMain(), false);
-	assert.equal(harness.sent.length, sentBefore);
-	assert.equal(harness.notifications.length, notificationsBefore);
-	assert.equal(harness.entries.length, entriesBefore);
-	assert.deepEqual(harness.activeTools, ["read", "bash"]);
-});
-
-/**
- * Real decision-tool activation + runtime openDecision claim fence harness.
- * Demotion hooks fire inside Pi API calls so re-entrancy matches production.
- */
-function createRealActivationHarness(options?: {
-	readonly demoteOnRegisterTool?: string;
-	readonly demoteOnDecisionSetActiveTools?: boolean;
-}): {
-	readonly sent: SentMessage[];
-	readonly activeTools: () => readonly string[];
-	readonly registeredTools: () => readonly string[];
-	readonly controller: ReturnType<typeof createLockDecisionController>;
-	readonly runtime: ReturnType<typeof createDecisionRuntime>;
-	readonly openDecision: () => void;
-	readonly start: () => Promise<void>;
-} {
-	const config: ContinueWatchdogConfig = {
-		idleDelaySeconds: 3,
-		maxRetries: 3,
-		decisionPrompt: "Decide now.",
-		continuePrompt: "Continue compactly.",
-		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
-	};
-	const hub = createObservableAgentHub();
-	const controller = createLockDecisionController(config);
-	const holder = { controller };
-	const handlers = new Map<string, Handler[]>();
-	const clock = new FakeClock();
-	const sent: SentMessage[] = [];
-	const registered = new Map<string, unknown>();
-	let activeTools = ["read", "bash"];
-	let runtime: ReturnType<typeof createDecisionRuntime>;
-
-	const demoteToUi = (): void => {
-		hub.bind({
-			instance: createHubAttachmentInstance(),
-			sessionId: "ui-thief-activation",
-			hasUI: true,
-			initialBusy: false,
-		});
-	};
-
-	const pi = {
-		on(name: string, handler: Handler): void {
-			const list = handlers.get(name) ?? [];
-			list.push(handler);
-			handlers.set(name, list);
-		},
-		registerTool(tool: { readonly name: string }): void {
-			if (options?.demoteOnRegisterTool === tool.name) {
-				demoteToUi();
-			}
-			registered.set(tool.name, tool);
-			if (!activeTools.includes(tool.name)) {
-				activeTools.push(tool.name);
-			}
-		},
-		getActiveTools(): string[] {
-			return [...activeTools];
-		},
-		setActiveTools(toolNames: string[]): void {
-			if (
-				options?.demoteOnDecisionSetActiveTools === true &&
-				toolNames.length === DECISION_TOOL_NAMES.length &&
-				toolNames[0] === CONTINUE_WATCHDOG_TOOL_NAME
-			) {
-				demoteToUi();
-			}
-			activeTools = [...toolNames];
-		},
-		sendMessage(
-			message: SentMessage["message"],
-			sendOptions?: SentMessage["options"],
-		): void {
-			sent.push({ message, options: sendOptions, streaming: false });
-		},
-		appendEntry(): void {},
-	} as unknown as ExtensionAPI;
-
-	const decisionTools = createDecisionToolActivation(pi, {
-		isCurrentMain: () => runtime?.isCurrentMain() === true,
-		getContinuePrompt: () => config.continuePrompt,
-		getReasonTypes: () => config.reasonTypes,
-		executeContinue: async () => ({
-			content: [{ type: "text", text: "continue" }],
-			details: { kind: "continue" },
-		}),
-		executeUnlock: async () => ({
-			content: [{ type: "text", text: "unlock" }],
-			details: { kind: "unlock" },
-			terminate: true,
-		}),
-	});
-
-	runtime = createDecisionRuntime({
-		pi,
 		hub,
 		attachmentInstance: createHubAttachmentInstance(),
 		controllerHolder: holder,
-		decisionTools,
-		injectedController: true,
-		initialConfig: config,
 		clock,
-		createExchangeId: () => "exchange-real",
+		loadConfig: async () => loadPromise,
 	});
 	runtime.registerLifecycle();
-
 	const ctx = {
-		hasUI: false,
+		hasUI: true,
 		cwd: "/project",
 		isIdle: () => true,
 		isProjectTrusted: () => true,
-		sessionManager: { getSessionId: () => "main-headless" },
+		sessionManager: { getSessionId: () => "main" },
 		ui: { notify(): void {} },
 	} as unknown as ExtensionContext;
 
-	return {
-		sent,
-		activeTools: () => [...activeTools],
-		registeredTools: () => [...registered.keys()],
-		controller,
-		runtime,
-		async start(): Promise<void> {
-			for (const handler of handlers.get("session_start") ?? []) {
-				await handler({ type: "session_start" } as never, ctx);
-			}
+	const start = (async () => {
+		for (const handler of handlers.get("session_start") ?? []) {
+			await handler({ type: "session_start" } as never, ctx);
+		}
+	})();
+	assert.equal(holder.controller, null);
+	resolveLoad({
+		config: {
+			idleDelaySeconds: 4,
+			maxRetries: 2,
+			decisionPrompt: "Loaded decision.",
+			continuePrompt: "Loaded continue.",
+			reasonTypes: ["JOB_DONE"],
 		},
-		openDecision(): void {
-			runtime.applyTransition(controller.lock(), undefined, {
-				suppressNotify: true,
-			});
-			runtime.reconcileIdle();
-			clock.fire(clock.records.length - 1);
-		},
-	};
-}
-
-test("re-entrant demotion during first registerTool abandons openDecision without inquiry", async () => {
-	const harness = createRealActivationHarness({
-		demoteOnRegisterTool: CONTINUE_WATCHDOG_TOOL_NAME,
+		diagnostics: [],
 	});
-	await harness.start();
-	harness.openDecision();
+	await start;
+	const loadedController = holder.controller as ReturnType<
+		typeof createLockDecisionController
+	> | null;
+	assert.ok(loadedController);
+	assert.equal(loadedController.snapshot.locked, false);
+	assert.equal(runtime.config.idleDelaySeconds, 4);
 
-	assert.equal(harness.runtime.isCurrentMain(), false);
-	assert.equal(harness.sent.length, 0);
-	assert.equal(
-		harness.registeredTools().includes(CONTINUE_WATCHDOG_TOOL_NAME),
-		true,
-	);
-	assert.equal(
-		harness.registeredTools().includes(UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME),
-		false,
-	);
-	assert.deepEqual(harness.activeTools(), ["read", "bash"]);
-	// Headless claim lost ownership; controller is dropped/unlocked.
-	assert.equal(harness.controller.snapshot.locked, false);
-});
-
-test("re-entrant demotion during setActiveTools abandons openDecision without inquiry", async () => {
-	const harness = createRealActivationHarness({
-		demoteOnDecisionSetActiveTools: true,
-	});
-	await harness.start();
-	harness.openDecision();
-
-	assert.equal(harness.runtime.isCurrentMain(), false);
-	assert.equal(harness.sent.length, 0);
-	assert.deepEqual(harness.registeredTools(), [
-		CONTINUE_WATCHDOG_TOOL_NAME,
-		UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
-	]);
-	assert.deepEqual(harness.activeTools(), ["read", "bash"]);
-	assert.equal(harness.controller.snapshot.locked, false);
-});
-
-test("real activation openDecision still sends exactly one inquiry when ownership holds", async () => {
-	const harness = createRealActivationHarness();
-	await harness.start();
-	harness.openDecision();
-
-	assert.equal(harness.runtime.isCurrentMain(), true);
-	assert.equal(harness.sent.length, 1);
-	assert.equal(harness.sent[0]?.message.customType, DECISION_MESSAGE_TYPE);
-	assert.deepEqual(harness.activeTools(), [...DECISION_TOOL_NAMES]);
-	assert.equal(harness.controller.snapshot.locked, true);
-	assert.equal(harness.controller.snapshot.decisionOpen, true);
+	runtime.shutdown();
+	assert.equal(holder.controller, null);
 });

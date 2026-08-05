@@ -28,7 +28,7 @@ const REJECTED_UNTYPED_DECISION_PROMPT =
 	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Call unlock_continue_watchdog with a concise reason if you are intentionally waiting for the user or all tasks are complete. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.";
 
 const ACCEPTED_DECISION_PROMPT =
-	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one. Call unlock_continue_watchdog with an allowed reasonType and a concise reason if you are intentionally waiting for the user, every task the user requested is complete, or the job cannot continue. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.";
+	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one.";
 
 async function fixture(
 	t: TestContext,
@@ -68,7 +68,7 @@ test("built-in defaults match acceptance and reject the stale direct reminder", 
 	assert.notEqual(BUILT_IN_CONFIG.continuePrompt, REJECTED_DIRECT_REMINDER);
 	assert.ok(!BUILT_IN_CONFIG.decisionPrompt.includes(REJECTED_DIRECT_REMINDER));
 	assert.ok(!BUILT_IN_CONFIG.continuePrompt.includes(REJECTED_DIRECT_REMINDER));
-	assert.ok(BUILT_IN_CONFIG.decisionPrompt.includes("allowed reasonType"));
+	assert.ok(!BUILT_IN_CONFIG.decisionPrompt.includes("call tools"));
 });
 
 test("global and trusted project overrides apply field-by-field", () => {

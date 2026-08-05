@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 
 import {
 	type AgentEndEvent,
-	type AgentToolResult,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
@@ -23,16 +22,14 @@ import {
 	type LockDecisionController,
 } from "./controller.js";
 import {
+	buildDecisionPrompt,
 	createDecisionProtocolSession,
+	DECISION_TOOL_BLOCK_REASON,
 	type DecisionProtocolFinalization,
 	type DecisionProtocolSession,
 	formatDecisionFailedNotification,
 	normalizeAssistantDecisionResponse,
 } from "./decision-protocol.js";
-import type {
-	DecisionToolActivation,
-	DecisionToolCall,
-} from "./decision-tools.js";
 import type {
 	HubAttachment,
 	HubAttachmentInstance,
@@ -90,7 +87,6 @@ export interface DecisionRuntimeOptions {
 	readonly hub: ObservableAgentHub;
 	readonly attachmentInstance: HubAttachmentInstance;
 	readonly controllerHolder: RuntimeControllerHolder;
-	readonly decisionTools: DecisionToolActivation;
 	readonly injectedController?: boolean;
 	readonly initialConfig?: ContinueWatchdogConfig;
 	readonly clock?: RuntimeClock;
@@ -106,7 +102,7 @@ export interface DecisionRuntime {
 	getMainClaim(): HubMainClaim | null;
 	isCurrentMainClaim(claim: HubMainClaim): boolean;
 	/**
-	 * Drop in-flight decision finalization/timer/tools after a controller
+	 * Drop in-flight decision finalization/timer work after a controller
 	 * lock/unlock transition so a later settle cannot continue stale work.
 	 */
 	clearOperationalPendingWork(): void;
@@ -131,26 +127,8 @@ export interface DecisionRuntime {
 		},
 	): void;
 	reconcileIdle(): void;
-	executeDecisionTool(
-		call: DecisionToolCall,
-	): AgentToolResult<unknown> | Promise<AgentToolResult<unknown>>;
 	registerLifecycle(): void;
 	shutdown(): void;
-}
-
-function inactiveDecisionResult(): AgentToolResult<{
-	readonly kind: "inactive-decision-runtime";
-}> {
-	return {
-		content: [
-			{
-				type: "text",
-				text: "The pi-continue-watchdog decision runtime is not active.",
-			},
-		],
-		details: { kind: "inactive-decision-runtime" },
-		terminate: true,
-	};
 }
 
 function terminalAssistant(messages: readonly unknown[]): unknown | undefined {
@@ -243,22 +221,12 @@ export function createDecisionRuntime(
 		armedTimer = null;
 	};
 
-	const restoreDecisionTools = (): void => {
-		if (!options.decisionTools.isActive()) return;
-		try {
-			options.decisionTools.restoreDecisionTools();
-		} catch {
-			// Cleanup remains best effort if Pi rejects an active-tool update.
-		}
-	};
-
 	/**
 	 * Invalidate runtime-local decision state after a controller transition.
 	 * Does not change controller lock/cycle accounting.
 	 */
 	const clearOperationalPendingWork = (): void => {
 		clearArmedTimer();
-		restoreDecisionTools();
 		activeDecision = null;
 		pendingFinalization = null;
 		// Human/abort unlock must not inherit a prior AI unlock publication intent.
@@ -306,23 +274,12 @@ export function createDecisionRuntime(
 		}
 		const stillOwns = (): boolean => owns(claim);
 
-		let activated = false;
-		try {
-			activated = options.decisionTools.activateDecisionTools(stillOwns);
-		} catch {
-			activated = false;
-		}
-		// Revalidate after activation before constructing/storing activeDecision.
-		// Activation already restored the baseline on stale ownership; if a race
-		// left tools active under a dead claim, clear them before abandoning.
-		if (!activated || !stillOwns()) {
-			if (options.decisionTools.isActive()) {
-				restoreDecisionTools();
-			}
-			silentlyAbandonDecision();
-			return;
-		}
-
+		// Keep ordinary active tools and system prompt unchanged. Decision answers
+		// are final XML text, not temporary decision tools.
+		const decisionPrompt = buildDecisionPrompt(
+			config.decisionPrompt,
+			config.reasonTypes,
+		);
 		const active: ActiveDecision = {
 			decisionId,
 			exchangeId: createExchangeId(),
@@ -330,7 +287,7 @@ export function createDecisionRuntime(
 			protocol: createDecisionProtocolSession({
 				controller,
 				decisionId,
-				decisionPrompt: config.decisionPrompt,
+				decisionPrompt,
 				reasonTypes: config.reasonTypes,
 			}),
 		};
@@ -343,7 +300,7 @@ export function createDecisionRuntime(
 			sendDecisionPrompt(
 				active,
 				active.protocol.currentCycleId,
-				config.decisionPrompt,
+				decisionPrompt,
 			);
 			// A demotion that lands during/after send must not leave a live exchange.
 			if (!stillOwns()) {
@@ -413,7 +370,7 @@ export function createDecisionRuntime(
 				openDecision(effect.decisionId);
 				break;
 			case "restoreDecisionTools":
-				restoreDecisionTools();
+				// Historical effect name: closes the decision window; no tool swap.
 				if (activeDecision?.decisionId === effect.decisionId) {
 					activeDecision = null;
 					pendingFinalization = null;
@@ -581,7 +538,6 @@ export function createDecisionRuntime(
 	const acquireControl = (claim: HubMainClaim): void => {
 		if (stopped || !options.hub.isCurrentMain(claim)) return;
 		ownedClaim = claim;
-		options.decisionTools.initializeDecisionToolsInactive();
 		if (options.injectedController) {
 			options.controllerHolder.controller = injectedController;
 			configReady = injectedController !== null;
@@ -712,11 +668,23 @@ export function createDecisionRuntime(
 		}
 
 		if (stopIfStale(claim)) return false;
-		restoreDecisionTools();
-		if (stopIfStale(claim)) return false;
 		activeDecision = null;
 
 		if (finalization.outcome === "decision-failed") {
+			if (finalization.cycleId === undefined) return false;
+			if (stopIfStale(claim)) return false;
+			try {
+				options.pi.sendMessage(
+					createDecisionFoldMessage({
+						exchangeId: active.exchangeId,
+						cycleId: finalization.cycleId,
+						outcome: "decision-failed",
+					}),
+					{ triggerTurn: false, deliverAs: "steer" },
+				);
+			} catch {
+				// Fold is best effort; decision-failed state remains authoritative.
+			}
 			if (stopIfStale(claim)) return false;
 			try {
 				ctx.ui.notify(
@@ -736,7 +704,6 @@ export function createDecisionRuntime(
 		if (
 			(finalization.outcome !== "continue" &&
 				finalization.outcome !== "unlock") ||
-			finalization.toolCallId === undefined ||
 			finalization.cycleId === undefined
 		) {
 			return false;
@@ -750,7 +717,6 @@ export function createDecisionRuntime(
 						exchangeId: active.exchangeId,
 						cycleId: finalization.cycleId,
 						outcome: "continue",
-						toolCallId: finalization.toolCallId,
 						continuePrompt: config.continuePrompt,
 					}),
 					{ triggerTurn: true, deliverAs: "steer" },
@@ -787,7 +753,6 @@ export function createDecisionRuntime(
 					exchangeId: active.exchangeId,
 					cycleId: finalization.cycleId,
 					outcome: "unlock",
-					toolCallId: finalization.toolCallId,
 				}),
 				{ triggerTurn: false, deliverAs: "steer" },
 			);
@@ -885,6 +850,23 @@ export function createDecisionRuntime(
 
 		options.pi.on("agent_end", handleAgentEnd);
 
+		// While a decision is open, block ordinary tools before execution. The
+		// agent loop continues so the final assistant XML can still be validated.
+		options.pi.on("tool_call", (_event) => {
+			const active = activeDecision;
+			if (
+				active === null ||
+				pendingFinalization !== null ||
+				!options.hub.isCurrentMain(active.claim)
+			) {
+				return;
+			}
+			return {
+				block: true,
+				reason: DECISION_TOOL_BLOCK_REASON,
+			};
+		});
+
 		options.pi.on("agent_settled", (_event, ctx: ExtensionContext) => {
 			// Only Pi's live idle truth may mark this attachment idle. Another
 			// extension can start a nested run from an earlier settled handler.
@@ -959,17 +941,6 @@ export function createDecisionRuntime(
 		applyEffect,
 		applyTransition,
 		reconcileIdle,
-		executeDecisionTool(call) {
-			const active = activeDecision;
-			if (
-				active === null ||
-				!options.hub.isCurrentMain(active.claim) ||
-				!options.decisionTools.isActive()
-			) {
-				return inactiveDecisionResult();
-			}
-			return active.protocol.onDecisionToolCall(call);
-		},
 		registerLifecycle,
 		shutdown,
 	};

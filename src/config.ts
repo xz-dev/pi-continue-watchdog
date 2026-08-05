@@ -11,7 +11,7 @@
  */
 
 export const DEFAULT_DECISION_PROMPT =
-	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one. Call unlock_continue_watchdog with an allowed reasonType and a concise reason if you are intentionally waiting for the user, every task the user requested is complete, or the job cannot continue. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.";
+	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one.";
 
 export const DEFAULT_CONTINUE_PROMPT =
 	"Continue until user assistance is required.";

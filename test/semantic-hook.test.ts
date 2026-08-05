@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type {
-	AgentToolResult,
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
@@ -9,7 +8,6 @@ import { createEventBus } from "@earendil-works/pi-coding-agent";
 
 import type { ContinueWatchdogConfig } from "../src/config.js";
 import { createLockDecisionController } from "../src/controller.js";
-import type { DecisionToolActivation } from "../src/decision-tools.js";
 import {
 	createHubAttachmentInstance,
 	createObservableAgentHub,
@@ -87,15 +85,10 @@ interface SemanticHarness {
 	ctx: ExtensionContext;
 	runtime: ReturnType<typeof createDecisionRuntime>;
 	streaming: boolean;
-	activeTools: string[];
 	fire(name: string, event: unknown): Promise<void>;
 	openDecision(): void;
-	executeContinue(toolCallId?: string): Promise<AgentToolResult<unknown>>;
-	executeUnlock(
-		reason: string,
-		toolCallId?: string,
-		reasonType?: string,
-	): Promise<AgentToolResult<unknown>>;
+	answerContinue(): unknown;
+	answerUnlock(reason?: string, reasonType?: string): unknown;
 	snapshotController(): {
 		locked: boolean;
 		exhausted: boolean;
@@ -104,12 +97,23 @@ interface SemanticHarness {
 	};
 }
 
-function assistant(content: unknown[], stopReason = "toolUse"): unknown {
+function assistant(content: unknown[], stopReason = "stop"): unknown {
 	return { role: "assistant", content, stopReason };
 }
 
-function toolCall(id: string, name: string, args: unknown): unknown {
-	return { type: "toolCall", id, name, arguments: args };
+function text(value: string): unknown {
+	return { type: "text", text: value };
+}
+
+function continueXml(): string {
+	return "<watchdog><function>continue_watchdog</function></watchdog>";
+}
+
+function unlockXml(
+	reasonType = "JOB_DONE",
+	reason = "All requested work is complete.",
+): string {
+	return `<watchdog><function>unlock_continue_watchdog</function><reason_type>${reasonType}</reason_type><reason_content>${reason}</reason_content></watchdog>`;
 }
 
 function createSemanticHarness(options?: {
@@ -135,40 +139,11 @@ function createSemanticHarness(options?: {
 	const received: SemanticHookEnvelope[] = [];
 	const bus = createEventBus();
 	const notifications: Array<{ message: string; level?: string }> = [];
-	let activeTools = ["read", "bash"];
-	let captured: string[] | null = null;
-	let initialized = false;
 	let runtime: ReturnType<typeof createDecisionRuntime>;
 
 	bus.on(SEMANTIC_HOOK_CHANNEL, (data) => {
 		received.push(data as SemanticHookEnvelope);
 	});
-
-	const tools: DecisionToolActivation = {
-		initializeDecisionToolsInactive(): boolean {
-			initialized = true;
-			return true;
-		},
-		activateDecisionTools(stillOwns: () => boolean): boolean {
-			if (!initialized || captured !== null || !stillOwns()) return false;
-			captured = [...activeTools];
-			activeTools = ["continue_watchdog", "unlock_continue_watchdog"];
-			if (!stillOwns()) {
-				activeTools = captured;
-				captured = null;
-				return false;
-			}
-			return true;
-		},
-		restoreDecisionTools(): boolean {
-			if (captured === null) return false;
-			activeTools = captured;
-			captured = null;
-			return true;
-		},
-		isActive: () => initialized && captured !== null,
-		getCapturedActiveTools: () => captured,
-	};
 
 	const harness = {
 		handlers,
@@ -179,9 +154,6 @@ function createSemanticHarness(options?: {
 		bus,
 		notifications,
 		streaming: false,
-		get activeTools(): string[] {
-			return [...activeTools];
-		},
 	} as SemanticHarness;
 
 	const pi = {
@@ -213,7 +185,6 @@ function createSemanticHarness(options?: {
 		hub,
 		attachmentInstance: createHubAttachmentInstance(),
 		controllerHolder: holder,
-		decisionTools: tools,
 		injectedController: true,
 		initialConfig: config,
 		clock,
@@ -235,24 +206,11 @@ function createSemanticHarness(options?: {
 		runtime.reconcileIdle();
 		clock.fire(clock.records.length - 1);
 	};
-	harness.executeContinue = async (toolCallId = "continue-1") =>
-		runtime.executeDecisionTool({
-			kind: "continue",
-			toolCallId,
-			ctx,
-		});
-	harness.executeUnlock = async (
-		reason,
-		toolCallId = "unlock-1",
+	harness.answerContinue = () => assistant([text(continueXml())]);
+	harness.answerUnlock = (
+		reason = "All requested work is complete.",
 		reasonType = "JOB_DONE",
-	) =>
-		runtime.executeDecisionTool({
-			kind: "unlock",
-			reasonType,
-			reason,
-			toolCallId,
-			ctx,
-		});
+	) => assistant([text(unlockXml(reasonType, reason))]);
 	harness.snapshotController = () => ({
 		locked: controller.snapshot.locked,
 		exhausted: controller.snapshot.exhausted,
@@ -358,15 +316,9 @@ test("AI decision unlock publishes exact validated reasonType and reason once at
 	const harness = createSemanticHarness();
 	await startIdle(harness);
 	harness.openDecision();
-	await harness.executeUnlock("  waiting for user  ", "unlock-1", "wait_user");
 	await settleResponse(
 		harness,
-		assistant([
-			toolCall("unlock-1", "unlock_continue_watchdog", {
-				reasonType: "wait_user",
-				reason: "waiting for user",
-			}),
-		]),
+		harness.answerUnlock("waiting for user", "wait_user"),
 	);
 
 	assert.equal(harness.received.length, 1);
@@ -394,11 +346,7 @@ test("exhausted and decisionFailed publish exact STOP_KIND envelopes once", asyn
 	const exhausted = createSemanticHarness({ config: { maxRetries: 1 } });
 	await startIdle(exhausted);
 	exhausted.openDecision();
-	await exhausted.executeContinue("continue-1");
-	await settleResponse(
-		exhausted,
-		assistant([toolCall("continue-1", "continue_watchdog", {})]),
-	);
+	await settleResponse(exhausted, exhausted.answerContinue());
 	assert.equal(exhausted.snapshotController().exhausted, true);
 	// Continue turn settles into terminal exhausted idle.
 	await settleResponse(
@@ -483,11 +431,7 @@ test("human unlock, abort unlock, continue, and initial unlocked idle publish no
 	const continued = createSemanticHarness({ config: { maxRetries: 3 } });
 	await startIdle(continued);
 	continued.openDecision();
-	await continued.executeContinue("continue-1");
-	await settleResponse(
-		continued,
-		assistant([toolCall("continue-1", "continue_watchdog", {})]),
-	);
+	await settleResponse(continued, continued.answerContinue());
 	// Intermediate post-continue rearm must not publish.
 	assert.equal(continued.received.length, 0);
 	assert.notEqual(continued.controller.snapshot.idleTimer, null);
@@ -506,15 +450,9 @@ test("AI unlock intent waits for aggregate idle and publishes typed pair only on
 		hasUI: false,
 		initialBusy: true,
 	}).attachment;
-	await harness.executeUnlock("Need deploy approval.", "unlock-1", "wait_user");
 	await settleResponse(
 		harness,
-		assistant([
-			toolCall("unlock-1", "unlock_continue_watchdog", {
-				reasonType: "wait_user",
-				reason: "Need deploy approval.",
-			}),
-		]),
+		harness.answerUnlock("Need deploy approval.", "wait_user"),
 	);
 	// Main settled but child busy: retain complete pair, no publish yet.
 	assert.equal(harness.received.length, 0);
@@ -559,20 +497,11 @@ test("main-only ownership, stale demotion, and reload/shutdown publish nothing",
 	const reloaded = createSemanticHarness();
 	await startIdle(reloaded);
 	reloaded.openDecision();
-	await reloaded.executeUnlock("will reload");
 	// Shutdown before settle clears ownership generation bookkeeping.
 	reloaded.runtime.shutdown();
 	await reloaded.fire("agent_end", {
 		type: "agent_end",
-		messages: [
-			assistant([
-				toolCall("unlock-1", "unlock_continue_watchdog", {
-					reasonType: "JOB_DONE",
-
-					reason: "will reload",
-				}),
-			]),
-		],
+		messages: [reloaded.answerUnlock("will reload", "JOB_DONE")],
 	});
 	// Shutdown stops lifecycle; settled handlers may still run but must not publish.
 	const timersBefore = reloaded.clock.records.length;
@@ -587,16 +516,9 @@ test("absent and throwing consumers leave controller and results unchanged", asy
 	noConsumer.bus.clear();
 	await startIdle(noConsumer);
 	noConsumer.openDecision();
-	await noConsumer.executeUnlock("silent consumer absence");
 	await settleResponse(
 		noConsumer,
-		assistant([
-			toolCall("unlock-1", "unlock_continue_watchdog", {
-				reasonType: "JOB_DONE",
-
-				reason: "silent consumer absence",
-			}),
-		]),
+		noConsumer.answerUnlock("silent consumer absence", "JOB_DONE"),
 	);
 	assert.deepEqual(noConsumer.snapshotController(), {
 		locked: false,
@@ -618,16 +540,9 @@ test("absent and throwing consumers leave controller and results unchanged", asy
 	try {
 		await startIdle(throwing);
 		throwing.openDecision();
-		await throwing.executeUnlock("consumer throws");
 		await settleResponse(
 			throwing,
-			assistant([
-				toolCall("unlock-1", "unlock_continue_watchdog", {
-					reasonType: "JOB_DONE",
-
-					reason: "consumer throws",
-				}),
-			]),
+			throwing.answerUnlock("consumer throws", "JOB_DONE"),
 		);
 	} finally {
 		console.error = originalError;
@@ -673,16 +588,7 @@ async function establishPendingAiUnlock(
 		hasUI: false,
 		initialBusy: true,
 	}).attachment;
-	await harness.executeUnlock(reason, "unlock-1", reasonType);
-	await settleResponse(
-		harness,
-		assistant([
-			toolCall("unlock-1", "unlock_continue_watchdog", {
-				reasonType,
-				reason,
-			}),
-		]),
-	);
+	await settleResponse(harness, harness.answerUnlock(reason, reasonType));
 	assert.equal(harness.received.length, 0);
 	assert.equal(harness.snapshotController().locked, false);
 	return { harness, child };
@@ -783,16 +689,9 @@ test("async-rejecting bus consumer leaves producer and controller unchanged", as
 	try {
 		await startIdle(harness);
 		harness.openDecision();
-		await harness.executeUnlock("async reject path");
 		await settleResponse(
 			harness,
-			assistant([
-				toolCall("unlock-1", "unlock_continue_watchdog", {
-					reasonType: "JOB_DONE",
-
-					reason: "async reject path",
-				}),
-			]),
+			harness.answerUnlock("async reject path", "JOB_DONE"),
 		);
 		// Flush the bus's async safeHandler microtask so rejection is contained.
 		await Promise.resolve();

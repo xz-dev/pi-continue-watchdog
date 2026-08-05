@@ -6,17 +6,13 @@ import type {
 import { registerMainAbortUnlock } from "./abort-outcome.js";
 import { registerMainUserAutoLock } from "./auto-lock.js";
 import { createMainCommands } from "./commands.js";
-import { BUILT_IN_CONFIG, type ContinueWatchdogConfig } from "./config.js";
+import type { ContinueWatchdogConfig } from "./config.js";
 import type {
 	LoadedConfig,
 	LoadRuntimeConfigOptions,
 } from "./config-loader.js";
 import { registerDecisionContextFolding } from "./context-fold.js";
 import type { LockDecisionController } from "./controller.js";
-import {
-	createDecisionToolActivation,
-	type DecisionToolActivation,
-} from "./decision-tools.js";
 import {
 	createHubAttachmentInstance,
 	getProcessObservableAgentHub,
@@ -53,46 +49,11 @@ export function createContinueWatchdogExtension(
 	};
 
 	return (pi: ExtensionAPI): void => {
-		let runtime: ReturnType<typeof createDecisionRuntime> | null = null;
-		const decisionTools: DecisionToolActivation = createDecisionToolActivation(
-			pi,
-			{
-				isCurrentMain: () => runtime?.isCurrentMain() === true,
-				getContinuePrompt: () =>
-					runtime?.config.continuePrompt ?? BUILT_IN_CONFIG.continuePrompt,
-				getReasonTypes: () =>
-					runtime?.config.reasonTypes ?? BUILT_IN_CONFIG.reasonTypes,
-				executeContinue: async (toolCallId, ctx) =>
-					runtime?.executeDecisionTool({
-						kind: "continue",
-						toolCallId,
-						ctx,
-					}) ?? {
-						content: [{ type: "text", text: "Decision runtime inactive." }],
-						details: { kind: "inactive-decision-runtime" },
-						terminate: true,
-					},
-				executeUnlock: async (toolCallId, reasonType, reason, ctx) =>
-					runtime?.executeDecisionTool({
-						kind: "unlock",
-						toolCallId,
-						reasonType,
-						reason,
-						ctx,
-					}) ?? {
-						content: [{ type: "text", text: "Decision runtime inactive." }],
-						details: { kind: "inactive-decision-runtime" },
-						terminate: true,
-					},
-			},
-		);
-
-		runtime = createDecisionRuntime({
+		const runtime = createDecisionRuntime({
 			pi,
 			hub,
 			attachmentInstance,
 			controllerHolder: holder,
-			decisionTools,
 			injectedController: options.controller !== undefined,
 			initialConfig: options.config,
 			clock: options.clock,
@@ -109,8 +70,8 @@ export function createContinueWatchdogExtension(
 			getMainClaim: runtime.getMainClaim,
 			isCurrentMainClaim: runtime.isCurrentMainClaim,
 			restartLockCycle: (ctx, restartOptions) =>
-				runtime?.restartLockCycle(ctx, restartOptions),
-			clearOperationalPendingWork: () => runtime?.clearOperationalPendingWork(),
+				runtime.restartLockCycle(ctx, restartOptions),
+			clearOperationalPendingWork: () => runtime.clearOperationalPendingWork(),
 			applyEffect: runtime.applyEffect,
 			reconcileIdle: runtime.reconcileIdle,
 		});
@@ -119,7 +80,7 @@ export function createContinueWatchdogExtension(
 		registerMainUserAutoLock(pi, {
 			isCurrentMain: runtime.isCurrentMain,
 			onMainUserMessageStart(): void {
-				runtime?.restartLockCycle(undefined, { notifyLocked: false });
+				runtime.restartLockCycle(undefined, { notifyLocked: false });
 			},
 		});
 
@@ -130,7 +91,7 @@ export function createContinueWatchdogExtension(
 			get controller() {
 				return holder.controller;
 			},
-			clearOperationalPendingWork: () => runtime?.clearOperationalPendingWork(),
+			clearOperationalPendingWork: () => runtime.clearOperationalPendingWork(),
 			applyEffect: runtime.applyEffect,
 		});
 
@@ -139,7 +100,7 @@ export function createContinueWatchdogExtension(
 
 		pi.on("session_shutdown", (_event, _ctx: ExtensionContext) => {
 			abortUnlock.clear();
-			runtime?.shutdown();
+			runtime.shutdown();
 		});
 	};
 }

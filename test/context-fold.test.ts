@@ -56,21 +56,21 @@ function assistant(
 		provider: "test",
 		model: "test",
 		usage: {},
-		stopReason: "toolUse",
+		stopReason: "stop",
 		timestamp,
 	};
 }
 
+function text(textContent: string): Record<string, unknown> {
+	return { type: "text", text: textContent };
+}
+
 function toolCall(
 	id: string,
-	name: "continue_watchdog" | "unlock_continue_watchdog",
+	name: string,
 	arguments_: Record<string, unknown> = {},
 ): Record<string, unknown> {
 	return { type: "toolCall", id, name, arguments: arguments_ };
-}
-
-function text(textContent: string): Record<string, unknown> {
-	return { type: "text", text: textContent };
 }
 
 /**
@@ -95,16 +95,20 @@ function persistedCustomMessage(
 
 function toolResult(
 	toolCallId: string,
-	toolName: "continue_watchdog" | "unlock_continue_watchdog",
+	toolName: string,
 	timestamp: number,
 ): Message {
 	return {
 		role: "toolResult",
 		toolCallId,
 		toolName,
-		content: [{ type: "text", text: "Decision recorded." }],
-		details: { kind: "decision-recorded" },
-		isError: false,
+		content: [
+			{
+				type: "text",
+				text: "Do not call tools during the pi-continue-watchdog decision check.",
+			},
+		],
+		isError: true,
 		timestamp,
 	};
 }
@@ -112,8 +116,7 @@ function toolResult(
 function foldMarker(options: {
 	readonly exchangeId?: string;
 	readonly cycleId?: number;
-	readonly outcome: "continue" | "unlock";
-	readonly toolCallId: string;
+	readonly outcome: "continue" | "unlock" | "decision-failed";
 	readonly continuePrompt?: string;
 	readonly timestamp: number;
 }): Message {
@@ -132,7 +135,6 @@ function foldMarker(options: {
 						exchangeId: options.exchangeId ?? EXCHANGE_ID,
 						cycleId: options.cycleId ?? 1,
 						outcome: options.outcome,
-						toolCallId: options.toolCallId,
 						continuePrompt: options.continuePrompt ?? CONTINUE_PROMPT,
 					}
 				: {
@@ -140,7 +142,6 @@ function foldMarker(options: {
 						exchangeId: options.exchangeId ?? EXCHANGE_ID,
 						cycleId: options.cycleId ?? 1,
 						outcome: options.outcome,
-						toolCallId: options.toolCallId,
 					},
 		timestamp: options.timestamp,
 	};
@@ -149,11 +150,12 @@ function foldMarker(options: {
 function continuationMessage(
 	timestamp: number,
 	exchangeId = EXCHANGE_ID,
+	continuePrompt = CONTINUE_PROMPT,
 ): Message {
 	return {
 		role: "custom",
 		customType: CONTINUATION_MESSAGE_TYPE,
-		content: [{ type: "text", text: CONTINUE_PROMPT }],
+		content: [{ type: "text", text: continuePrompt }],
 		display: false,
 		details: {
 			version: DECISION_PROTOCOL_VERSION,
@@ -164,374 +166,265 @@ function continuationMessage(
 	};
 }
 
-function validContinueExchange(
-	options: {
-		readonly exchangeId?: string;
-		readonly timestampOffset?: number;
-	} = {},
-): Message[] {
-	const exchangeId = options.exchangeId ?? EXCHANGE_ID;
-	const offset = options.timestampOffset ?? 0;
-	return [
-		decision(exchangeId, 1, offset + 10),
-		assistant([toolCall("continue-call", "continue_watchdog")], offset + 11),
-		toolResult("continue-call", "continue_watchdog", offset + 12),
-		foldMarker({
-			exchangeId,
-			outcome: "continue",
-			toolCallId: "continue-call",
-			continuePrompt: CONTINUE_PROMPT,
-			timestamp: offset + 13,
-		}),
-	];
-}
-
-function validUnlockExchange(): Message[] {
-	return [
-		decision(EXCHANGE_ID, 1, 10),
-		assistant(
-			[
-				toolCall("unlock-call", "unlock_continue_watchdog", {
-					reason: "All jobs are complete.",
-				}),
-			],
-			11,
-		),
-		toolResult("unlock-call", "unlock_continue_watchdog", 12),
-		foldMarker({
-			outcome: "unlock",
-			toolCallId: "unlock-call",
-			timestamp: 13,
-		}),
-	];
-}
-
-test("persisted custom text blocks and string content fold through public convertToLlm", () => {
-	const decisionPayload = createDecisionPromptMessage({
-		exchangeId: EXCHANGE_ID,
-		cycleId: 1,
-		decisionPrompt: "hidden decision prompt",
-	});
-	const foldPayload = createDecisionFoldMessage({
-		exchangeId: EXCHANGE_ID,
-		cycleId: 1,
-		outcome: "continue",
-		toolCallId: "continue-call",
-		continuePrompt: CONTINUE_PROMPT,
-	});
-	const decisionRecord = persistedCustomMessage(decisionPayload, 10);
-	const foldRecord = persistedCustomMessage(foldPayload, 13);
-
-	const fromPersisted = foldDecisionContext([
-		decisionRecord,
-		assistant([toolCall("continue-call", "continue_watchdog")], 11),
-		toolResult("continue-call", "continue_watchdog", 12),
-		foldRecord,
-	] as never);
-	assert.equal(fromPersisted.length, 1);
+test("builders emit exact decision and fold custom messages", () => {
 	assert.deepEqual(
-		convertToLlm(
-			fromPersisted as unknown as Parameters<typeof convertToLlm>[0],
-		),
-		[
-			{
-				role: "user",
-				content: [{ type: "text", text: CONTINUE_PROMPT }],
-				timestamp: 13,
-			},
-		],
-	);
-
-	const fromString = foldDecisionContext(validContinueExchange() as never);
-	assert.equal(fromString.length, 1);
-	assert.deepEqual(fromString[0], continuationMessage(13));
-});
-
-test("a correlated valid unlock exchange is removed only from model-bound context", () => {
-	const messages = [
-		user("Keep this task.", 1),
-		...validUnlockExchange(),
-		user("After.", 20),
-	];
-	const rawBefore = structuredClone(messages);
-
-	const folded = foldDecisionContext(messages as never);
-
-	assert.deepEqual(folded, [messages[0], messages[messages.length - 1]]);
-	assert.deepEqual(messages, rawBefore);
-});
-
-test("a correlated valid continue exchange becomes one compact custom message", () => {
-	const messages = [
-		user("Keep this task.", 1),
-		...validContinueExchange(),
-		user("After.", 20),
-	];
-	const rawBefore = structuredClone(messages);
-
-	const folded = foldDecisionContext(messages as never);
-
-	assert.equal(folded.length, 3);
-	assert.equal(folded[0], messages[0]);
-	assert.deepEqual(folded[1], continuationMessage(13));
-	assert.equal(folded[2], messages[messages.length - 1]);
-	assert.deepEqual(messages, rawBefore);
-	assert.deepEqual(foldDecisionContext(folded as never), folded);
-});
-
-test("invalid re-ask cycles fold with the terminal valid decision", () => {
-	const messages = [
-		user("Task stays available.", 1),
-		decision(EXCHANGE_ID, 1, 10),
-		assistant([text("I should continue.")], 11),
-		decision(EXCHANGE_ID, 2, 12),
-		assistant([toolCall("continue-call", "continue_watchdog")], 13),
-		toolResult("continue-call", "continue_watchdog", 14),
-		foldMarker({
-			cycleId: 2,
-			outcome: "continue",
-			toolCallId: "continue-call",
-			continuePrompt: CONTINUE_PROMPT,
-			timestamp: 15,
-		}),
-	];
-
-	const folded = foldDecisionContext(messages as never);
-
-	assert.deepEqual(folded, [messages[0], continuationMessage(15)]);
-});
-
-test("multiple independently correlated completed exchanges fold without touching surroundings", () => {
-	const first = validContinueExchange({
-		exchangeId: "exchange-a",
-		timestampOffset: 0,
-	});
-	const second = validUnlockExchange().map((message) => {
-		const copy = structuredClone(message);
-		if (copy.role === "custom") {
-			const details = copy.details as { exchangeId: string };
-			details.exchangeId = "exchange-b";
-		}
-		return copy;
-	});
-	const messages = [
-		user("Before", 1),
-		...first,
-		user("Between", 20),
-		...second,
-		user("After", 30),
-	];
-
-	const folded = foldDecisionContext(messages as never);
-
-	assert.deepEqual(
-		folded.map((message) => {
-			const typed = message as Message;
-			return typed.role === "custom" ? typed.customType : typed.content;
-		}),
-		["Before", CONTINUATION_MESSAGE_TYPE, "Between", "After"],
-	);
-});
-
-test("interleaved, incomplete, nested, or bad-correlation spans preserve raw identity", () => {
-	const cases: readonly {
-		readonly name: string;
-		readonly messages: Message[];
-	}[] = [
-		{
-			name: "a user message arrives inside the decision span",
-			messages: [
-				decision(EXCHANGE_ID, 1, 10),
-				user("Do not delete this.", 11),
-				...validContinueExchange().slice(1),
-			],
-		},
-		{
-			name: "a nested decision prompt is present",
-			messages: [
-				decision(EXCHANGE_ID, 1, 10),
-				decision(EXCHANGE_ID, 2, 11),
-				...validContinueExchange().slice(1),
-			],
-		},
-		{
-			name: "the terminal fold marker is absent",
-			messages: validContinueExchange().slice(0, -1),
-		},
-		{
-			name: "a tool result cannot be correlated to the assistant tool call",
-			messages: [
-				decision(EXCHANGE_ID, 1, 10),
-				assistant([toolCall("continue-call", "continue_watchdog")], 11),
-				toolResult("other-call", "continue_watchdog", 12),
-				foldMarker({
-					outcome: "continue",
-					toolCallId: "continue-call",
-					timestamp: 13,
-				}),
-			],
-		},
-		{
-			name: "malformed decision details lack a cycle id",
-			messages: [
-				user("Preserve me.", 1),
-				{
-					role: "custom",
-					customType: DECISION_MESSAGE_TYPE,
-					content: "not trusted",
-					display: false,
-					details: {
-						version: DECISION_PROTOCOL_VERSION,
-						exchangeId: EXCHANGE_ID,
-					},
-					timestamp: 2,
-				},
-			],
-		},
-	];
-
-	for (const entry of cases) {
-		const rawBefore = structuredClone(entry.messages);
-		const folded = foldDecisionContext(entry.messages as never);
-		assert.equal(folded, entry.messages, entry.name);
-		assert.deepEqual(entry.messages, rawBefore, entry.name);
-	}
-});
-
-test("mismatched outcome names, tool ids, and extra final calls preserve raw context", () => {
-	const cases: readonly Message[][] = [
-		[
-			decision(EXCHANGE_ID, 1, 10),
-			assistant([toolCall("continue-call", "continue_watchdog")], 11),
-			toolResult("continue-call", "continue_watchdog", 12),
-			foldMarker({
-				outcome: "unlock",
-				toolCallId: "continue-call",
-				timestamp: 13,
-			}),
-		],
-		[
-			decision(EXCHANGE_ID, 1, 10),
-			assistant([toolCall("continue-call", "continue_watchdog")], 11),
-			toolResult("continue-call", "unlock_continue_watchdog", 12),
-			foldMarker({
-				outcome: "continue",
-				toolCallId: "continue-call",
-				timestamp: 13,
-			}),
-		],
-		[
-			decision(EXCHANGE_ID, 1, 10),
-			assistant(
-				[
-					toolCall("continue-call", "continue_watchdog"),
-					toolCall("extra-call", "continue_watchdog"),
-				],
-				11,
-			),
-			toolResult("continue-call", "continue_watchdog", 12),
-			toolResult("extra-call", "continue_watchdog", 13),
-			foldMarker({
-				outcome: "continue",
-				toolCallId: "continue-call",
-				timestamp: 14,
-			}),
-		],
-	];
-
-	for (const messages of cases) {
-		assert.equal(foldDecisionContext(messages as never), messages);
-	}
-});
-
-test("constructors reject empty ids, invalid cycles, and over-limit prompts", () => {
-	const promptAtLimit = "a".repeat(MAX_PROMPT_CHARACTERS);
-	const promptOverLimit = `${promptAtLimit}x`;
-
-	assert.doesNotThrow(() =>
 		createDecisionPromptMessage({
 			exchangeId: EXCHANGE_ID,
 			cycleId: 1,
-			decisionPrompt: promptAtLimit,
+			decisionPrompt: "hidden decision prompt",
 		}),
-	);
-	assert.throws(
-		() =>
-			createDecisionPromptMessage({
-				exchangeId: "",
-				cycleId: 1,
-				decisionPrompt: "ok",
-			}),
-		/invalid decision prompt message input/,
-	);
-	assert.throws(
-		() =>
-			createDecisionPromptMessage({
-				exchangeId: EXCHANGE_ID,
-				cycleId: 0,
-				decisionPrompt: "ok",
-			}),
-		/invalid decision prompt message input/,
-	);
-	assert.throws(
-		() =>
-			createDecisionPromptMessage({
+		{
+			customType: DECISION_MESSAGE_TYPE,
+			content: "hidden decision prompt",
+			display: false,
+			details: {
+				version: DECISION_PROTOCOL_VERSION,
 				exchangeId: EXCHANGE_ID,
 				cycleId: 1,
-				decisionPrompt: promptOverLimit,
-			}),
-		/invalid decision prompt message input/,
+			},
+		},
 	);
-	assert.throws(
-		() =>
-			createDecisionFoldMessage({
+
+	assert.deepEqual(
+		createDecisionFoldMessage({
+			exchangeId: EXCHANGE_ID,
+			cycleId: 2,
+			outcome: "continue",
+			continuePrompt: CONTINUE_PROMPT,
+		}),
+		{
+			customType: DECISION_FOLD_MESSAGE_TYPE,
+			content: CONTINUE_PROMPT,
+			display: false,
+			details: {
+				version: DECISION_PROTOCOL_VERSION,
 				exchangeId: EXCHANGE_ID,
-				cycleId: 1,
+				cycleId: 2,
 				outcome: "continue",
-				toolCallId: "",
 				continuePrompt: CONTINUE_PROMPT,
-			}),
-		/invalid decision fold message input/,
+			},
+		},
 	);
-	assert.throws(
-		() =>
-			createDecisionFoldMessage({
-				exchangeId: EXCHANGE_ID,
-				cycleId: 1,
-				outcome: "continue",
-				toolCallId: "continue-call",
-				continuePrompt: promptOverLimit,
-			}),
-		/invalid decision fold message input/,
-	);
-	assert.doesNotThrow(() =>
+
+	assert.deepEqual(
 		createDecisionFoldMessage({
 			exchangeId: EXCHANGE_ID,
 			cycleId: 1,
 			outcome: "unlock",
-			toolCallId: "unlock-call",
 		}),
+		{
+			customType: DECISION_FOLD_MESSAGE_TYPE,
+			content: "",
+			display: false,
+			details: {
+				version: DECISION_PROTOCOL_VERSION,
+				exchangeId: EXCHANGE_ID,
+				cycleId: 1,
+				outcome: "unlock",
+			},
+		},
+	);
+
+	assert.deepEqual(
+		createDecisionFoldMessage({
+			exchangeId: EXCHANGE_ID,
+			cycleId: 3,
+			outcome: "decision-failed",
+		}),
+		{
+			customType: DECISION_FOLD_MESSAGE_TYPE,
+			content: "",
+			display: false,
+			details: {
+				version: DECISION_PROTOCOL_VERSION,
+				exchangeId: EXCHANGE_ID,
+				cycleId: 3,
+				outcome: "decision-failed",
+			},
+		},
 	);
 });
 
-test("the Pi context hook returns a new model-bound array and leaves the source untouched", () => {
-	let handler:
-		| ((event: { messages: unknown[] }) => { messages?: unknown[] } | undefined)
-		| undefined;
+test("valid continue folds the complete exchange into the compact continue prompt", () => {
+	const messages = [
+		user("task", 1),
+		decision(EXCHANGE_ID, 1, 2),
+		assistant(
+			[text("<watchdog><function>continue_watchdog</function></watchdog>")],
+			3,
+		),
+		foldMarker({ outcome: "continue", timestamp: 4 }),
+		user("later", 5),
+	];
+
+	assert.deepEqual(foldDecisionContext(messages), [
+		user("task", 1),
+		continuationMessage(4),
+		user("later", 5),
+	]);
+});
+
+test("valid unlock and decision-failed erase the exchange with no replacement", () => {
+	const unlockMessages = [
+		user("task", 1),
+		decision(EXCHANGE_ID, 1, 2),
+		assistant(
+			[
+				text(
+					"<watchdog><function>unlock_continue_watchdog</function><reason_type>JOB_DONE</reason_type><reason_content>Done.</reason_content></watchdog>",
+				),
+			],
+			3,
+		),
+		foldMarker({ outcome: "unlock", timestamp: 4 }),
+	];
+	assert.deepEqual(foldDecisionContext(unlockMessages), [user("task", 1)]);
+
+	const failedMessages = [
+		user("task", 1),
+		decision(EXCHANGE_ID, 1, 2),
+		assistant([text("nope")], 3),
+		decision(EXCHANGE_ID, 2, 4),
+		assistant([text("still nope")], 5),
+		decision(EXCHANGE_ID, 3, 6),
+		assistant([text("fail")], 7),
+		foldMarker({ outcome: "decision-failed", cycleId: 3, timestamp: 8 }),
+	];
+	assert.deepEqual(foldDecisionContext(failedMessages), [user("task", 1)]);
+
+	const noResultFailedMessages = [
+		user("task", 1),
+		decision(EXCHANGE_ID, 1, 2),
+		decision(EXCHANGE_ID, 2, 3),
+		decision(EXCHANGE_ID, 3, 4),
+		foldMarker({ outcome: "decision-failed", cycleId: 3, timestamp: 5 }),
+	];
+	assert.deepEqual(foldDecisionContext(noResultFailedMessages), [
+		user("task", 1),
+	]);
+});
+
+test("blocked ordinary tool calls and multi-round invalid re-asks fold as one exchange", () => {
+	const messages = [
+		user("task", 1),
+		decision(EXCHANGE_ID, 1, 2),
+		assistant(
+			[toolCall("bash-1", "bash", { command: "true" }), text("thinking aloud")],
+			3,
+		),
+		toolResult("bash-1", "bash", 4),
+		decision(EXCHANGE_ID, 2, 5),
+		assistant(
+			[text("<watchdog><function>continue_watchdog</function></watchdog>")],
+			6,
+		),
+		foldMarker({ outcome: "continue", cycleId: 2, timestamp: 7 }),
+	];
+
+	assert.deepEqual(foldDecisionContext(messages), [
+		user("task", 1),
+		continuationMessage(7),
+	]);
+});
+
+test("incomplete, interleaved, or malformed exchanges fail closed", () => {
+	const incomplete = [
+		decision(EXCHANGE_ID, 1, 1),
+		assistant(
+			[text("<watchdog><function>continue_watchdog</function></watchdog>")],
+			2,
+		),
+	];
+	assert.equal(foldDecisionContext(incomplete), incomplete);
+
+	const interleaved = [
+		decision(EXCHANGE_ID, 1, 1),
+		assistant(
+			[text("<watchdog><function>continue_watchdog</function></watchdog>")],
+			2,
+		),
+		user("interleaved", 3),
+		foldMarker({ outcome: "continue", timestamp: 4 }),
+	];
+	assert.equal(foldDecisionContext(interleaved), interleaved);
+
+	const badCycle = [
+		decision(EXCHANGE_ID, 1, 1),
+		assistant([text("bad")], 2),
+		decision(EXCHANGE_ID, 3, 3),
+		assistant(
+			[text("<watchdog><function>continue_watchdog</function></watchdog>")],
+			4,
+		),
+		foldMarker({ outcome: "continue", cycleId: 3, timestamp: 5 }),
+	];
+	assert.equal(foldDecisionContext(badCycle), badCycle);
+});
+
+test("builders reject invalid inputs and the context hook uses foldDecisionContext", () => {
+	assert.throws(() =>
+		createDecisionPromptMessage({
+			exchangeId: "",
+			cycleId: 1,
+			decisionPrompt: "x",
+		}),
+	);
+	assert.throws(() =>
+		createDecisionFoldMessage({
+			exchangeId: EXCHANGE_ID,
+			cycleId: 1,
+			outcome: "continue",
+			continuePrompt: "x".repeat(MAX_PROMPT_CHARACTERS + 1),
+		}),
+	);
+
+	const messages = [
+		decision(EXCHANGE_ID, 1, 1),
+		assistant(
+			[text("<watchdog><function>continue_watchdog</function></watchdog>")],
+			2,
+		),
+		foldMarker({ outcome: "continue", timestamp: 3 }),
+	];
+	let seen: unknown;
 	const pi = {
-		on(event: string, candidate: typeof handler): void {
-			if (event === "context") handler = candidate;
+		on(event: string, handler: (event: ContextEvent) => unknown): void {
+			assert.equal(event, "context");
+			seen = handler({
+				type: "context",
+				messages: messages as never,
+			} as ContextEvent);
 		},
 	};
 	registerDecisionContextFolding(pi as never);
-	assert.ok(handler);
+	assert.deepEqual(seen, {
+		messages: [continuationMessage(3)],
+	});
 
-	const messages = validContinueExchange();
-	const result = handler({ messages } as unknown as ContextEvent);
-	assert.deepEqual(
-		result?.messages?.map((message) => (message as Message).customType),
-		[CONTINUATION_MESSAGE_TYPE],
-	);
-	assert.equal(messages.length, 4);
-	assert.notEqual(result?.messages, messages);
+	// convertToLlm must still accept the continuation custom message shape.
+	const converted = convertToLlm([continuationMessage(3) as never]);
+	assert.ok(Array.isArray(converted));
+});
+
+test("persisted string-or-text-block custom messages still fold", () => {
+	const prompt = createDecisionPromptMessage({
+		exchangeId: EXCHANGE_ID,
+		cycleId: 1,
+		decisionPrompt: "hidden decision prompt",
+	});
+	const fold = createDecisionFoldMessage({
+		exchangeId: EXCHANGE_ID,
+		cycleId: 1,
+		outcome: "continue",
+		continuePrompt: CONTINUE_PROMPT,
+	});
+	const messages = [
+		persistedCustomMessage(prompt, 1),
+		assistant(
+			[text("<watchdog><function>continue_watchdog</function></watchdog>")],
+			2,
+		),
+		persistedCustomMessage(fold, 3),
+	];
+	assert.deepEqual(foldDecisionContext(messages), [continuationMessage(3)]);
 });

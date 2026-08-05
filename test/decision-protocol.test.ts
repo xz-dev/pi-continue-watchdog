@@ -1,81 +1,45 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_REASON_TYPES } from "../src/config.js";
 import { createLockDecisionController } from "../src/controller.js";
 import {
+	buildDecisionPrompt,
 	buildDecisionReaskPrompt,
-	CONTINUE_ARGUMENTS_ERROR,
 	createDecisionProtocolSession,
 	DECISION_INVALID_ATTEMPT_LIMIT,
-	DECISION_TOOL_NOT_EXECUTED_ERROR,
-	DECISION_TOOL_RESULT_MESSAGE,
-	DECISION_TOOLS_MISMATCH_ERROR,
 	type DecisionResponse,
 	formatDecisionFailedNotification,
+	INVALID_DECISION_XML_ERROR,
 	INVALID_UNLOCK_REASON_ERROR,
 	INVALID_UNLOCK_REASON_TYPE_ERROR,
 	MALFORMED_DECISION_RESPONSE_ERROR,
-	MULTIPLE_DECISION_TOOLS_ERROR,
-	NO_DECISION_TOOL_ERROR,
+	MISSING_UNLOCK_FIELDS_ERROR,
 	normalizeAssistantDecisionResponse,
-	PROSE_DECISION_RESPONSE_ERROR,
-	STALE_DECISION_TOOL_RESULT_MESSAGE,
-	UNKNOWN_DECISION_TOOL_ERROR,
 	UNSUPPORTED_DECISION_CONTENT_ERROR,
 	validateDecisionResponse,
 } from "../src/decision-protocol.js";
-import {
-	createDecisionToolExecutors,
-	type DecisionToolCall,
-} from "../src/decision-tools.js";
 
 const DECISION_PROMPT = "Decision prompt from configuration.";
-const CONTEXT = {} as ExtensionContext;
 const REASON_TYPES = DEFAULT_REASON_TYPES;
 
 function response(content: DecisionResponse["content"]): DecisionResponse {
 	return { content };
 }
 
-function continueCall(
-	id = "continue-1",
-	arguments_: unknown = {},
-): DecisionResponse["content"][number] {
-	return {
-		type: "toolCall",
-		toolCallId: id,
-		name: "continue_watchdog",
-		arguments: arguments_,
-	};
+function text(value: string): DecisionResponse["content"][number] {
+	return { type: "text", text: value };
 }
 
-function unlockCall(
-	id = "unlock-1",
-	reason: unknown = "All tasks are complete.",
-	reasonType: unknown = "JOB_DONE",
-): DecisionResponse["content"][number] {
-	return {
-		type: "toolCall",
-		toolCallId: id,
-		name: "unlock_continue_watchdog",
-		arguments: { reasonType, reason },
-	};
+function continueXml(extra = ""): string {
+	return `<watchdog><function>continue_watchdog</function>${extra}</watchdog>`;
 }
 
-function unlockToolCall(
-	toolCallId: string,
-	reasonType: string,
-	reason: string,
-): DecisionToolCall {
-	return {
-		kind: "unlock",
-		toolCallId,
-		reasonType,
-		reason,
-		ctx: CONTEXT,
-	};
+function unlockXml(
+	reasonType = "JOB_DONE",
+	reasonContent = "All requested work is complete.",
+): string {
+	return `<watchdog><function>unlock_continue_watchdog</function><reason_type>${reasonType}</reason_type><reason_content>${reasonContent}</reason_content></watchdog>`;
 }
 
 function openDecision(reasonTypes: readonly string[] = REASON_TYPES) {
@@ -116,33 +80,58 @@ function advanceReask(
 	assert.equal(protocol.advanceAfterReask(protocol.currentCycleId), true);
 }
 
-test("validator accepts exactly one continue or unlock and ignores thinking", () => {
+test("validator accepts one trailing continue XML block after narration and ignores thinking plus surrounding whitespace", () => {
 	assert.deepEqual(
 		validateDecisionResponse(
 			response([
 				{ type: "thinking" },
-				{ type: "text", text: " \n\t" },
-				continueCall(),
+				text(`I checked the existing conversation.\n\n${continueXml()}\n `),
 			]),
 			REASON_TYPES,
 		),
-		{
-			valid: true,
-			decision: {
-				kind: "continue",
-				toolCallId: "continue-1",
-			},
-		},
+		{ valid: true, decision: { kind: "continue" } },
 	);
+});
 
+test("validator rejects multiple watchdog blocks anywhere in one response", () => {
+	for (const value of [
+		`${continueXml()}\n${continueXml()}`,
+		`Earlier candidate: ${continueXml()}\nFinal candidate: ${continueXml()}`,
+		`<watchdog><function>continue_watchdog</function></watchdog></watchdog>`,
+	]) {
+		assert.deepEqual(
+			validateDecisionResponse(response([text(value)]), REASON_TYPES),
+			{ valid: false, error: INVALID_DECISION_XML_ERROR },
+		);
+	}
+});
+
+test("continue XML ignores optional reason fields and extra keys", () => {
+	assert.deepEqual(
+		validateDecisionResponse(
+			response([
+				text(
+					continueXml(
+						"<reason_type>anything</reason_type><reason_content>anything</reason_content><extra_key>ignored</extra_key>",
+					),
+				),
+			]),
+			REASON_TYPES,
+		),
+		{ valid: true, decision: { kind: "continue" } },
+	);
+});
+
+test("validator accepts unlock XML with entity decoding and case-insensitive reason_type", () => {
 	assert.deepEqual(
 		validateDecisionResponse(
 			response([
 				{ type: "thinking" },
-				unlockCall(
-					"unlock-1",
-					" \nWaiting for confirmation.\n ",
-					" wait_user ",
+				text(
+					unlockXml(
+						" wait_user ",
+						" Waiting for &lt;user&gt; confirmation.&amp; ",
+					),
 				),
 			]),
 			REASON_TYPES,
@@ -151,120 +140,52 @@ test("validator accepts exactly one continue or unlock and ignores thinking", ()
 			valid: true,
 			decision: {
 				kind: "unlock",
-				toolCallId: "unlock-1",
 				reasonType: "WAIT_USER",
-				reason: "Waiting for confirmation.",
+				reason: "Waiting for <user> confirmation.&",
 			},
 		},
 	);
 });
 
-test("unlock reasonType is case-insensitive and emits uppercased matched configured value", () => {
-	assert.deepEqual(
-		validateDecisionResponse(
-			response([
-				unlockCall(
-					"typed",
-					"All requested package bumps are merged.",
-					"job_done",
-				),
-			]),
-			REASON_TYPES,
-		),
-		{
-			valid: true,
-			decision: {
-				kind: "unlock",
-				toolCallId: "typed",
-				reasonType: "JOB_DONE",
-				reason: "All requested package bumps are merged.",
-			},
-		},
-	);
-
+test("unlock reason_type matches configured values case-insensitively and emits uppercased match", () => {
 	const custom = ["NeedReview", "shipped"] as const;
 	assert.deepEqual(
 		validateDecisionResponse(
-			response([
-				unlockCall("custom", "PR is open for human review.", "needreview"),
-			]),
+			response([text(unlockXml("needreview", "PR is open for human review."))]),
 			custom,
 		),
 		{
 			valid: true,
 			decision: {
 				kind: "unlock",
-				toolCallId: "custom",
 				reasonType: "NEEDREVIEW",
 				reason: "PR is open for human review.",
 			},
 		},
 	);
+
 	assert.deepEqual(
 		validateDecisionResponse(
-			response([
-				unlockCall("default-gone", "Still using defaults.", "JOB_DONE"),
-			]),
+			response([text(unlockXml("JOB_DONE", "Still using defaults."))]),
 			custom,
-		),
-		{ valid: false, error: INVALID_UNLOCK_REASON_TYPE_ERROR },
-	);
-
-	for (const reasonType of ["", "   ", "UNKNOWN", null, 1]) {
-		assert.deepEqual(
-			validateDecisionResponse(
-				response([unlockCall("bad-type", "Done.", reasonType)]),
-				REASON_TYPES,
-			),
-			{ valid: false, error: INVALID_UNLOCK_REASON_TYPE_ERROR },
-			String(reasonType),
-		);
-	}
-
-	assert.deepEqual(
-		validateDecisionResponse(
-			response([
-				{
-					type: "toolCall",
-					toolCallId: "missing-type",
-					name: "unlock_continue_watchdog",
-					arguments: { reason: "Done." },
-				},
-			]),
-			REASON_TYPES,
-		),
-		{ valid: false, error: INVALID_UNLOCK_REASON_TYPE_ERROR },
-	);
-	assert.deepEqual(
-		validateDecisionResponse(
-			response([
-				{
-					type: "toolCall",
-					toolCallId: "undefined-type",
-					name: "unlock_continue_watchdog",
-					arguments: { reasonType: undefined, reason: "Done." },
-				},
-			]),
-			REASON_TYPES,
 		),
 		{ valid: false, error: INVALID_UNLOCK_REASON_TYPE_ERROR },
 	);
 });
 
-test("unlock reason is trimmed, counts Unicode code points, and never truncates", () => {
-	const exactly500 = "😀".repeat(500);
-	const over500 = `${exactly500}😀`;
+test("unlock reason_content is trimmed, counts Unicode code points, and never truncates", () => {
+	const exactly500 = "世".repeat(500);
+	const over500 = `${exactly500}界`;
 
 	assert.deepEqual(
 		validateDecisionResponse(
-			response([unlockCall("unicode", `\n${exactly500}\n`)]),
+			response([text(unlockXml("JOB_DONE", `\n${exactly500}\n`))]),
 			REASON_TYPES,
 		),
 		{
 			valid: true,
 			decision: {
 				kind: "unlock",
-				toolCallId: "unicode",
 				reasonType: "JOB_DONE",
 				reason: exactly500,
 			},
@@ -272,119 +193,85 @@ test("unlock reason is trimmed, counts Unicode code points, and never truncates"
 	);
 	assert.deepEqual(
 		validateDecisionResponse(
-			response([unlockCall("over-limit", over500)]),
+			response([text(unlockXml("JOB_DONE", over500))]),
 			REASON_TYPES,
 		),
 		{ valid: false, error: INVALID_UNLOCK_REASON_ERROR },
 	);
 	assert.deepEqual(
 		validateDecisionResponse(
-			response([unlockCall("blank", " \n\t ")]),
+			response([text(unlockXml("JOB_DONE", " \n\t "))]),
 			REASON_TYPES,
 		),
 		{ valid: false, error: INVALID_UNLOCK_REASON_ERROR },
-	);
-	assert.deepEqual(
-		validateDecisionResponse(
-			response([unlockCall("multiline", "First line.\nSecond line.")]),
-			REASON_TYPES,
-		),
-		{
-			valid: true,
-			decision: {
-				kind: "unlock",
-				toolCallId: "multiline",
-				reasonType: "JOB_DONE",
-				reason: "First line.\nSecond line.",
-			},
-		},
 	);
 });
 
-test("validator rejects non-exactly-one and prose responses with fixed errors", () => {
+test("blocked ordinary toolCall blocks do not invalidate a final valid XML answer", () => {
+	assert.deepEqual(
+		validateDecisionResponse(
+			response([
+				{
+					type: "toolCall",
+					toolCallId: "bash-1",
+					name: "bash",
+					arguments: { command: "true" },
+				},
+				text(continueXml()),
+			]),
+			REASON_TYPES,
+		),
+		{ valid: true, decision: { kind: "continue" } },
+	);
+});
+
+test("validator rejects non-XML, fences, prose, and malformed documents with fixed errors", () => {
 	const cases: readonly {
 		readonly name: string;
 		readonly value: DecisionResponse;
 		readonly error: string;
 	}[] = [
 		{
-			name: "no decision tool",
+			name: "thinking only",
 			value: response([{ type: "thinking" }]),
-			error: NO_DECISION_TOOL_ERROR,
+			error: INVALID_DECISION_XML_ERROR,
 		},
 		{
-			name: "prose-only response",
-			value: response([{ type: "text", text: "I will wait." }]),
-			error: PROSE_DECISION_RESPONSE_ERROR,
+			name: "prose only",
+			value: response([text("I will wait.")]),
+			error: INVALID_DECISION_XML_ERROR,
 		},
 		{
-			name: "prose beside a tool call",
+			name: "markdown fence",
+			value: response([text(`\`\`\`xml\n${continueXml()}\n\`\`\``)]),
+			error: INVALID_DECISION_XML_ERROR,
+		},
+		{
+			name: "duplicate function",
 			value: response([
-				{ type: "text", text: "Continuing now." },
-				continueCall(),
+				text(
+					"<watchdog><function>continue_watchdog</function><function>unlock_continue_watchdog</function></watchdog>",
+				),
 			]),
-			error: PROSE_DECISION_RESPONSE_ERROR,
+			error: INVALID_DECISION_XML_ERROR,
 		},
 		{
-			name: "both decision tools",
-			value: response([continueCall(), unlockCall()]),
-			error: MULTIPLE_DECISION_TOOLS_ERROR,
-		},
-		{
-			name: "unknown tool beside a decision tool",
+			name: "root attributes",
 			value: response([
-				continueCall(),
-				{
-					type: "toolCall",
-					toolCallId: "unknown-extra",
-					name: "bash",
-					arguments: {},
-				},
+				text(
+					'<watchdog id="x"><function>continue_watchdog</function></watchdog>',
+				),
 			]),
-			error: UNKNOWN_DECISION_TOOL_ERROR,
+			error: INVALID_DECISION_XML_ERROR,
 		},
 		{
-			name: "same decision tool twice",
-			value: response([continueCall("one"), continueCall("two")]),
-			error: MULTIPLE_DECISION_TOOLS_ERROR,
-		},
-		{
-			name: "unknown extra tool",
+			name: "unlock missing fields",
 			value: response([
-				{
-					type: "toolCall",
-					toolCallId: "unknown",
-					name: "bash",
-					arguments: {},
-				},
+				text(
+					"<watchdog><function>unlock_continue_watchdog</function><reason_type>JOB_DONE</reason_type></watchdog>",
+				),
 			]),
-			error: UNKNOWN_DECISION_TOOL_ERROR,
-		},
-		{
-			name: "continue arguments",
-			value: response([continueCall("continue-extra", { extra: true })]),
-			error: CONTINUE_ARGUMENTS_ERROR,
-		},
-		{
-			name: "continue array arguments",
-			value: response([continueCall("continue-array", [])]),
-			error: CONTINUE_ARGUMENTS_ERROR,
-		},
-		{
-			name: "unlock without exactly reasonType and reason",
-			value: response([
-				{
-					type: "toolCall",
-					toolCallId: "unlock-extra",
-					name: "unlock_continue_watchdog",
-					arguments: {
-						reasonType: "JOB_DONE",
-						reason: "Done.",
-						extra: true,
-					},
-				},
-			]),
-			error: INVALID_UNLOCK_REASON_TYPE_ERROR,
+			error: MISSING_UNLOCK_FIELDS_ERROR,
 		},
 		{
 			name: "unsupported assistant content",
@@ -396,10 +283,7 @@ test("validator rejects non-exactly-one and prose responses with fixed errors", 
 	for (const entry of cases) {
 		assert.deepEqual(
 			validateDecisionResponse(entry.value, REASON_TYPES),
-			{
-				valid: false,
-				error: entry.error,
-			},
+			{ valid: false, error: entry.error },
 			entry.name,
 		);
 	}
@@ -410,33 +294,23 @@ test("Pi AssistantMessage normalization maps ordinary text/thinking/toolCall sha
 		role: "assistant",
 		content: [
 			{ type: "thinking", thinking: "private reasoning" },
-			{ type: "text", text: " " },
+			{ type: "text", text: ` \n${continueXml()}\n ` },
 			{
 				type: "toolCall",
-				id: "pi-call",
-				name: "continue_watchdog",
-				arguments: {},
+				id: "bash-1",
+				name: "bash",
+				arguments: { command: "echo hi" },
 			},
 		],
 	});
 	assert.deepEqual(validateDecisionResponse(normalized, REASON_TYPES), {
 		valid: true,
-		decision: { kind: "continue", toolCallId: "pi-call" },
+		decision: { kind: "continue" },
 	});
 
 	assert.deepEqual(
 		validateDecisionResponse(
 			normalizeAssistantDecisionResponse({ role: "user", content: [] }),
-			REASON_TYPES,
-		),
-		{ valid: false, error: MALFORMED_DECISION_RESPONSE_ERROR },
-	);
-	assert.deepEqual(
-		validateDecisionResponse(
-			normalizeAssistantDecisionResponse({
-				role: "assistant",
-				content: [{ type: "toolCall", id: 1, name: "continue_watchdog" }],
-			}),
 			REASON_TYPES,
 		),
 		{ valid: false, error: MALFORMED_DECISION_RESPONSE_ERROR },
@@ -453,42 +327,54 @@ test("Pi AssistantMessage normalization maps ordinary text/thinking/toolCall sha
 	);
 });
 
-test("re-ask prompt embeds the fixed previous error", () => {
+test("fixed prompt suffix requires exactly one final XML block and lists effective reason types", () => {
+	const prompt = buildDecisionPrompt(DECISION_PROMPT, [
+		"JOB_DONE",
+		"WAIT_USER",
+	]);
+	assert.match(prompt, /Do not call tools/);
+	assert.match(prompt, /existing conversation context/);
+	assert.match(prompt, /exactly one <watchdog>\.\.\.<\/watchdog>/);
+	assert.match(prompt, /very end of your response/);
+	assert.match(prompt, /Do not output multiple/);
+	assert.match(prompt, /\["JOB_DONE","WAIT_USER"\]/);
+	assert.match(prompt, /<function>continue_watchdog<\/function>/);
+	assert.match(prompt, /<function>unlock_continue_watchdog<\/function>/);
+	assert.equal(/extra|ignored|unknown child/i.test(prompt), false);
+});
+
+test("fixed prompt suffix XML-escapes an arbitrary reason type and lists types unambiguously", () => {
+	const prompt = buildDecisionPrompt(DECISION_PROMPT, [
+		"Need <Review & Approval",
+		"comma, type",
+	]);
+	assert.match(prompt, /\["Need <Review & Approval","comma, type"\]/);
+	assert.match(
+		prompt,
+		/<reason_type>Need &lt;Review &amp; Approval<\/reason_type>/,
+	);
+	assert.equal(prompt.includes("<reason_type>Need <Review & Approval"), false);
+});
+
+test("re-ask prompt embeds the fixed previous error and keeps the XML block last rule", () => {
 	assert.equal(
-		buildDecisionReaskPrompt(DECISION_PROMPT, NO_DECISION_TOOL_ERROR),
-		"Decision prompt from configuration.\n\nYour previous decision response was invalid: Call exactly one decision tool.\nCorrect it now: call exactly one decision tool and do not answer with prose.",
+		buildDecisionReaskPrompt(DECISION_PROMPT, INVALID_DECISION_XML_ERROR),
+		"Decision prompt from configuration.\n\nYour previous decision response was invalid: End the response with one valid watchdog XML decision block.\nCorrect it now without calling tools. You may explain first, but the watchdog XML block must be at the very end of your response.",
 	);
 });
 
-test("collector records neutral terminating results and finalizes valid continue with fold ids", async () => {
+test("session finalizes valid continue without temporary decision tools", () => {
 	const { controller, protocol } = openDecision();
-	const executors = createDecisionToolExecutors(protocol);
-
-	const result = await executors.executeContinue("continue-1", CONTEXT);
-	assert.deepEqual(result, {
-		content: [{ type: "text", text: DECISION_TOOL_RESULT_MESSAGE }],
-		details: { kind: "decision-recorded" },
-		terminate: true,
-	});
-	assert.equal(controller.snapshot.attempt, 0);
 	assert.equal(controller.snapshot.decisionOpen, true);
 
 	const finalized = finalizeCurrent(
 		protocol,
 		normalizeAssistantDecisionResponse({
 			role: "assistant",
-			content: [
-				{
-					type: "toolCall",
-					id: "continue-1",
-					name: "continue_watchdog",
-					arguments: {},
-				},
-			],
+			content: [{ type: "text", text: continueXml() }],
 		}),
 	);
 	assert.equal(finalized.outcome, "continue");
-	assert.equal(finalized.toolCallId, "continue-1");
 	assert.equal(finalized.cycleId, 1);
 	assert.deepEqual(finalized.transition.effects, [
 		{ kind: "restoreDecisionTools", decisionId: 1 },
@@ -497,10 +383,7 @@ test("collector records neutral terminating results and finalizes valid continue
 	assert.equal(controller.snapshot.invalidDecisionAttempts, 0);
 	assert.equal(controller.snapshot.decisionOpen, false);
 
-	const duplicate = finalizeCurrent(
-		protocol,
-		response([continueCall("continue-1")]),
-	);
+	const duplicate = finalizeCurrent(protocol, response([text(continueXml())]));
 	assert.equal(duplicate, finalized);
 	assert.equal(controller.snapshot.attempt, 1);
 	assert.equal(protocol.advanceAfterReask(protocol.currentCycleId), false);
@@ -509,40 +392,29 @@ test("collector records neutral terminating results and finalizes valid continue
 test("invalid decisions re-ask without consuming a valid continue retry", () => {
 	const { controller, protocol } = openDecision();
 
-	const invalid = finalizeCurrent(
-		protocol,
-		response([{ type: "text", text: "I'll wait." }]),
-	);
+	const invalid = finalizeCurrent(protocol, response([text("I'll wait.")]));
 	assert.equal(invalid.outcome, "reask");
-	assert.equal(invalid.error, PROSE_DECISION_RESPONSE_ERROR);
+	assert.equal(invalid.error, INVALID_DECISION_XML_ERROR);
 	assert.equal(invalid.cycleId, 1);
 	assert.equal(
 		invalid.reaskPrompt,
-		buildDecisionReaskPrompt(DECISION_PROMPT, PROSE_DECISION_RESPONSE_ERROR),
+		buildDecisionReaskPrompt(DECISION_PROMPT, INVALID_DECISION_XML_ERROR),
 	);
 	assert.equal(controller.snapshot.attempt, 0);
 	assert.equal(controller.snapshot.invalidDecisionAttempts, 1);
 	assert.equal(controller.snapshot.decisionOpen, true);
 
 	advanceReask(protocol);
-	protocol.onDecisionToolCall({
-		kind: "continue",
-		toolCallId: "continue-after-invalid",
-		ctx: CONTEXT,
-	});
-	const valid = finalizeCurrent(
-		protocol,
-		response([continueCall("continue-after-invalid")]),
-	);
+	const valid = finalizeCurrent(protocol, response([text(continueXml())]));
 	assert.equal(valid.outcome, "continue");
 	assert.equal(controller.snapshot.attempt, 1);
 	assert.equal(controller.snapshot.invalidDecisionAttempts, 0);
 });
 
-test("finalization caches each cycle, rejects stale work, and advances only after reask ack", () => {
+test("finalization caches each cycle and advances only after reask ack", () => {
 	const { controller, protocol } = openDecision();
 	const firstCycleId = protocol.currentCycleId;
-	const invalidResponse = response([{ type: "text", text: "I will wait." }]);
+	const invalidResponse = response([text("I will wait.")]);
 
 	const first = protocol.finalizeResponse(firstCycleId, invalidResponse);
 	assert.equal(first.outcome, "reask");
@@ -555,18 +427,6 @@ test("finalization caches each cycle, rejects stale work, and advances only afte
 	}
 	assert.equal(controller.snapshot.invalidDecisionAttempts, 1);
 
-	assert.deepEqual(
-		protocol.onDecisionToolCall({
-			kind: "continue",
-			toolCallId: "late-before-advance",
-			ctx: CONTEXT,
-		}),
-		{
-			content: [{ type: "text", text: STALE_DECISION_TOOL_RESULT_MESSAGE }],
-			details: { kind: "stale-decision-tool" },
-			terminate: true,
-		},
-	);
 	assert.equal(protocol.advanceAfterReask(firstCycleId + 1), false);
 	assert.equal(protocol.advanceAfterReask(firstCycleId), true);
 	assert.equal(protocol.currentCycleId, firstCycleId + 1);
@@ -580,19 +440,12 @@ test("finalization caches each cycle, rejects stale work, and advances only afte
 	assert.equal(staleFinalize.transition.applied, false);
 	assert.equal(controller.snapshot.invalidDecisionAttempts, 1);
 
-	const second = finalizeCurrent(
-		protocol,
-		response([continueCall("late-before-advance")]),
-	);
+	const second = finalizeCurrent(protocol, response([text("Still waiting.")]));
 	assert.equal(second.outcome, "reask");
-	assert.equal(second.error, DECISION_TOOL_NOT_EXECUTED_ERROR);
 	assert.equal(controller.snapshot.invalidDecisionAttempts, 2);
 	advanceReask(protocol);
 
-	const third = finalizeCurrent(
-		protocol,
-		response([{ type: "text", text: "Still waiting." }]),
-	);
+	const third = finalizeCurrent(protocol, response([text("Again.")]));
 	assert.equal(third.outcome, "decision-failed");
 	assert.equal(controller.snapshot.invalidDecisionAttempts, 3);
 });
@@ -600,38 +453,29 @@ test("finalization caches each cycle, rejects stale work, and advances only afte
 test("third invalid response decision-fails without advancing retries", () => {
 	const { controller, protocol } = openDecision();
 
-	const first = finalizeCurrent(
-		protocol,
-		response([{ type: "text", text: "one" }]),
-	);
+	const first = finalizeCurrent(protocol, response([text("one")]));
 	assert.equal(first.outcome, "reask");
 	advanceReask(protocol);
-	const second = finalizeCurrent(
-		protocol,
-		response([{ type: "text", text: "two" }]),
-	);
+	const second = finalizeCurrent(protocol, response([text("two")]));
 	assert.equal(second.outcome, "reask");
 	advanceReask(protocol);
-	const third = finalizeCurrent(
-		protocol,
-		response([{ type: "text", text: "three" }]),
-	);
+	const third = finalizeCurrent(protocol, response([text("three")]));
 
 	assert.equal(third.outcome, "decision-failed");
-	assert.equal(third.error, PROSE_DECISION_RESPONSE_ERROR);
+	assert.equal(third.error, INVALID_DECISION_XML_ERROR);
 	assert.equal(third.cycleId, protocol.currentCycleId);
 	assert.equal(
 		third.notification,
-		"Continue watchdog decision failed after 3 attempts: Do not answer with prose; call exactly one decision tool.",
+		"Continue watchdog decision failed after 3 attempts: End the response with one valid watchdog XML decision block.",
 	);
 	assert.equal(DECISION_INVALID_ATTEMPT_LIMIT, 3);
 	assert.equal(
-		formatDecisionFailedNotification(PROSE_DECISION_RESPONSE_ERROR),
+		formatDecisionFailedNotification(INVALID_DECISION_XML_ERROR),
 		third.notification,
 	);
 	assert.deepEqual(third.transition.effects, [
 		{ kind: "restoreDecisionTools", decisionId: 1 },
-		{ kind: "decisionFailed", error: PROSE_DECISION_RESPONSE_ERROR },
+		{ kind: "decisionFailed", error: INVALID_DECISION_XML_ERROR },
 	]);
 	assert.equal(controller.snapshot.attempt, 0);
 	assert.equal(controller.snapshot.invalidDecisionAttempts, 3);
@@ -640,84 +484,22 @@ test("third invalid response decision-fails without advancing retries", () => {
 	assert.equal(protocol.advanceAfterReask(protocol.currentCycleId), false);
 });
 
-test("validation requires collected execution to match the complete assistant tool call", () => {
-	const missing = openDecision();
-	const missingExecution = finalizeCurrent(
-		missing.protocol,
-		response([continueCall("not-executed")]),
-	);
-	assert.equal(missingExecution.outcome, "reask");
-	assert.equal(missingExecution.error, DECISION_TOOL_NOT_EXECUTED_ERROR);
-	assert.equal(missing.controller.snapshot.attempt, 0);
-
-	const mismatch = openDecision();
-	mismatch.protocol.onDecisionToolCall(
-		unlockToolCall("wrong-call", "JOB_DONE", "Done."),
-	);
-	const mismatchedExecution = finalizeCurrent(
-		mismatch.protocol,
-		response([continueCall("right-call")]),
-	);
-	assert.equal(mismatchedExecution.outcome, "reask");
-	assert.equal(mismatchedExecution.error, DECISION_TOOLS_MISMATCH_ERROR);
-	assert.equal(mismatch.controller.snapshot.attempt, 0);
-});
-
-test("valid unlock reports normalized reasonType and reason after matching execution", () => {
+test("valid unlock reports normalized reason_type and reason_content from XML only", () => {
 	const { controller, protocol } = openDecision();
-	protocol.onDecisionToolCall(
-		unlockToolCall(
-			"unlock-1",
-			" job_done ",
-			" \nWaiting for user confirmation.\n ",
-		),
-	);
 
 	const finalized = finalizeCurrent(
 		protocol,
 		response([
-			unlockCall(
-				"unlock-1",
-				" \nWaiting for user confirmation.\n ",
-				" job_done ",
-			),
+			text(unlockXml(" job_done ", " \nWaiting for user confirmation.\n ")),
 		]),
 	);
 	assert.equal(finalized.outcome, "unlock");
 	assert.equal(finalized.reasonType, "JOB_DONE");
 	assert.equal(finalized.reason, "Waiting for user confirmation.");
-	assert.equal(finalized.toolCallId, "unlock-1");
 	assert.equal(finalized.cycleId, 1);
 	assert.deepEqual(finalized.transition.effects, [
 		{ kind: "restoreDecisionTools", decisionId: 1 },
 		{ kind: "notify", notification: "unlocked" },
 	]);
 	assert.equal(controller.snapshot.locked, false);
-});
-
-test("collector rejects unlock when recorded type or reason differs from the message", () => {
-	const reasonMismatch = openDecision();
-	reasonMismatch.protocol.onDecisionToolCall(
-		unlockToolCall("unlock-1", "JOB_DONE", "Actual reason."),
-	);
-	const reasonFinalized = finalizeCurrent(
-		reasonMismatch.protocol,
-		response([unlockCall("unlock-1", "Different reason.", "JOB_DONE")]),
-	);
-	assert.equal(reasonFinalized.outcome, "reask");
-	assert.equal(reasonFinalized.error, DECISION_TOOLS_MISMATCH_ERROR);
-	assert.equal(reasonMismatch.controller.snapshot.locked, true);
-	assert.equal(reasonMismatch.controller.snapshot.attempt, 0);
-
-	const typeMismatch = openDecision();
-	typeMismatch.protocol.onDecisionToolCall(
-		unlockToolCall("unlock-2", "JOB_DONE", "Same reason."),
-	);
-	const typeFinalized = finalizeCurrent(
-		typeMismatch.protocol,
-		response([unlockCall("unlock-2", "Same reason.", "WAIT_USER")]),
-	);
-	assert.equal(typeFinalized.outcome, "reask");
-	assert.equal(typeFinalized.error, DECISION_TOOLS_MISMATCH_ERROR);
-	assert.equal(typeMismatch.controller.snapshot.locked, true);
 });

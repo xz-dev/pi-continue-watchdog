@@ -25,15 +25,13 @@ export type DecisionFoldDetails =
 			readonly version: typeof DECISION_PROTOCOL_VERSION;
 			readonly exchangeId: string;
 			readonly cycleId: number;
-			readonly outcome: "unlock";
-			readonly toolCallId: string;
+			readonly outcome: "unlock" | "decision-failed";
 	  }
 	| {
 			readonly version: typeof DECISION_PROTOCOL_VERSION;
 			readonly exchangeId: string;
 			readonly cycleId: number;
 			readonly outcome: "continue";
-			readonly toolCallId: string;
 			readonly continuePrompt: string;
 	  };
 
@@ -47,14 +45,12 @@ export type DecisionFoldMessageInput =
 	| {
 			readonly exchangeId: string;
 			readonly cycleId: number;
-			readonly outcome: "unlock";
-			readonly toolCallId: string;
+			readonly outcome: "unlock" | "decision-failed";
 	  }
 	| {
 			readonly exchangeId: string;
 			readonly cycleId: number;
 			readonly outcome: "continue";
-			readonly toolCallId: string;
 			readonly continuePrompt: string;
 	  };
 
@@ -65,8 +61,6 @@ export interface DecisionCustomMessage {
 	readonly display: boolean;
 	readonly details: unknown;
 }
-
-type DecisionToolName = "continue_watchdog" | "unlock_continue_watchdog";
 
 type ParsedDecisionMessage = {
 	readonly type: "decision";
@@ -79,8 +73,7 @@ type ParsedFoldMarker =
 			readonly type: "fold";
 			readonly exchangeId: string;
 			readonly cycleId: number;
-			readonly outcome: "unlock";
-			readonly toolCallId: string;
+			readonly outcome: "unlock" | "decision-failed";
 			readonly timestamp: number;
 	  }
 	| {
@@ -88,7 +81,6 @@ type ParsedFoldMarker =
 			readonly exchangeId: string;
 			readonly cycleId: number;
 			readonly outcome: "continue";
-			readonly toolCallId: string;
 			readonly continuePrompt: string;
 			readonly timestamp: number;
 	  };
@@ -98,16 +90,6 @@ type ParsedPluginMessage =
 	| { readonly type: "invalid" }
 	| ParsedDecisionMessage
 	| ParsedFoldMarker;
-
-type ParsedToolCall = {
-	readonly id: string;
-	readonly name: DecisionToolName;
-};
-
-type ParsedToolResult = {
-	readonly id: string;
-	readonly name: DecisionToolName;
-};
 
 type FoldedSegment<T extends object> = {
 	readonly endIndex: number;
@@ -134,14 +116,6 @@ function validExchangeId(value: unknown): value is string {
 
 function validCycleId(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
-}
-
-function validToolCallId(value: unknown): value is string {
-	return typeof value === "string" && value.length > 0;
-}
-
-function isDecisionToolName(value: unknown): value is DecisionToolName {
-	return value === "continue_watchdog" || value === "unlock_continue_watchdog";
 }
 
 /**
@@ -186,23 +160,20 @@ function foldDetails(input: unknown): DecisionFoldDetails | undefined {
 	if (!isObject(input)) return undefined;
 	const exchangeId = input.exchangeId;
 	const cycleId = input.cycleId;
-	const toolCallId = input.toolCallId;
 	const outcome = input.outcome;
 	if (
 		input.version !== DECISION_PROTOCOL_VERSION ||
 		!validExchangeId(exchangeId) ||
-		!validCycleId(cycleId) ||
-		!validToolCallId(toolCallId)
+		!validCycleId(cycleId)
 	) {
 		return undefined;
 	}
-	if (outcome === "unlock") {
+	if (outcome === "unlock" || outcome === "decision-failed") {
 		return {
 			version: DECISION_PROTOCOL_VERSION,
 			exchangeId,
 			cycleId,
 			outcome,
-			toolCallId,
 		};
 	}
 	if (outcome !== "continue" || !isValidPrompt(input.continuePrompt)) {
@@ -213,7 +184,6 @@ function foldDetails(input: unknown): DecisionFoldDetails | undefined {
 		exchangeId,
 		cycleId,
 		outcome,
-		toolCallId,
 		continuePrompt: input.continuePrompt,
 	};
 }
@@ -235,60 +205,21 @@ function parsePluginMessage(input: unknown): ParsedPluginMessage {
 
 	if (customType === DECISION_MESSAGE_TYPE) {
 		const parsed = decisionDetails(input.details);
-		return parsed === undefined || !isValidPrompt(content)
+		return parsed === undefined || content.trim().length === 0
 			? { type: "invalid" }
 			: { type: "decision", ...parsed };
 	}
 
 	const parsed = foldDetails(input.details);
 	if (parsed === undefined) return { type: "invalid" };
-	if (parsed.outcome === "unlock") {
-		return content.length === 0
+	if (parsed.outcome === "continue") {
+		return content === parsed.continuePrompt
 			? { type: "fold", ...parsed, timestamp }
 			: { type: "invalid" };
 	}
-	return content === parsed.continuePrompt
+	return content.length === 0
 		? { type: "fold", ...parsed, timestamp }
 		: { type: "invalid" };
-}
-
-/**
- * Collect decision tool calls from a normal assistant content array.
- * Unknown block types keep the exchange unfoldable so raw context is retained.
- */
-function parseAssistantToolCalls(
-	input: unknown,
-): readonly ParsedToolCall[] | undefined {
-	if (!isObject(input) || input.role !== "assistant") return undefined;
-	if (!Array.isArray(input.content)) return undefined;
-
-	const calls: ParsedToolCall[] = [];
-	for (const block of input.content) {
-		if (!isObject(block)) return undefined;
-		if (block.type === "text") {
-			if (typeof block.text !== "string") return undefined;
-			continue;
-		}
-		if (block.type === "thinking") {
-			if (typeof block.thinking !== "string") return undefined;
-			continue;
-		}
-		if (block.type !== "toolCall") return undefined;
-
-		const id = asString(block.id);
-		const name = block.name;
-		if (!validToolCallId(id) || !isDecisionToolName(name)) return undefined;
-		calls.push({ id, name });
-	}
-	return calls;
-}
-
-function parseToolResult(input: unknown): ParsedToolResult | undefined {
-	if (!isObject(input) || input.role !== "toolResult") return undefined;
-	const id = asString(input.toolCallId);
-	const name = input.toolName;
-	if (!validToolCallId(id) || !isDecisionToolName(name)) return undefined;
-	return { id, name };
 }
 
 function createContinuationMessage<T extends object>(
@@ -308,15 +239,18 @@ function createContinuationMessage<T extends object>(
 	} as T;
 }
 
+/**
+ * A foldable exchange may contain re-ask decision prompts, assistant answers
+ * (including blocked ordinary tool calls), and tool results. User/system or
+ * unrelated custom messages fail closed so raw context is retained.
+ */
 function findFoldedSegment<T extends object>(
 	messages: readonly T[],
 	startIndex: number,
 	start: ParsedDecisionMessage,
 ): FoldedSegment<T> | undefined {
 	let cycleId = start.cycleId;
-	// Only the final re-ask cycle's call/result pair may validate the fold marker.
-	const calls = new Map<string, ParsedToolCall>();
-	const results = new Map<string, ParsedToolResult>();
+	let sawTerminalAssistant = false;
 
 	for (let index = startIndex + 1; index < messages.length; index += 1) {
 		const message = messages[index];
@@ -331,8 +265,7 @@ function findFoldedSegment<T extends object>(
 				return undefined;
 			}
 			cycleId = pluginMessage.cycleId;
-			calls.clear();
-			results.clear();
+			sawTerminalAssistant = false;
 			continue;
 		}
 
@@ -340,22 +273,7 @@ function findFoldedSegment<T extends object>(
 			if (
 				pluginMessage.exchangeId !== start.exchangeId ||
 				pluginMessage.cycleId !== cycleId ||
-				calls.size !== 1 ||
-				results.size !== 1
-			) {
-				return undefined;
-			}
-			const finalCall = calls.get(pluginMessage.toolCallId);
-			const finalResult = results.get(pluginMessage.toolCallId);
-			const expectedName =
-				pluginMessage.outcome === "continue"
-					? "continue_watchdog"
-					: "unlock_continue_watchdog";
-			if (
-				finalCall === undefined ||
-				finalResult === undefined ||
-				finalCall.name !== finalResult.name ||
-				finalCall.name !== expectedName
+				(pluginMessage.outcome !== "decision-failed" && !sawTerminalAssistant)
 			) {
 				return undefined;
 			}
@@ -370,26 +288,11 @@ function findFoldedSegment<T extends object>(
 
 		if (!isObject(message)) return undefined;
 		if (message.role === "assistant") {
-			const assistantCalls = parseAssistantToolCalls(message);
-			if (assistantCalls === undefined) return undefined;
-			for (const call of assistantCalls) {
-				if (calls.has(call.id)) return undefined;
-				calls.set(call.id, call);
-			}
+			sawTerminalAssistant = true;
 			continue;
 		}
 		if (message.role === "toolResult") {
-			const result = parseToolResult(message);
-			const call = result === undefined ? undefined : calls.get(result.id);
-			if (
-				result === undefined ||
-				call === undefined ||
-				call.name !== result.name ||
-				results.has(result.id)
-			) {
-				return undefined;
-			}
-			results.set(result.id, result);
+			// Blocked ordinary tool results stay inside the foldable exchange.
 			continue;
 		}
 
@@ -410,7 +313,8 @@ export function createDecisionPromptMessage(
 	if (
 		!validExchangeId(input.exchangeId) ||
 		!validCycleId(input.cycleId) ||
-		!isValidPrompt(input.decisionPrompt)
+		typeof input.decisionPrompt !== "string" ||
+		input.decisionPrompt.trim().length === 0
 	) {
 		throw new TypeError("invalid decision prompt message input");
 	}
@@ -433,11 +337,7 @@ export function createDecisionPromptMessage(
 export function createDecisionFoldMessage(
 	input: DecisionFoldMessageInput,
 ): DecisionCustomMessage {
-	if (
-		!validExchangeId(input.exchangeId) ||
-		!validCycleId(input.cycleId) ||
-		!validToolCallId(input.toolCallId)
-	) {
+	if (!validExchangeId(input.exchangeId) || !validCycleId(input.cycleId)) {
 		throw new TypeError("invalid decision fold message input");
 	}
 	if (input.outcome === "continue") {
@@ -453,7 +353,6 @@ export function createDecisionFoldMessage(
 				exchangeId: input.exchangeId,
 				cycleId: input.cycleId,
 				outcome: "continue" as const,
-				toolCallId: input.toolCallId,
 				continuePrompt: input.continuePrompt,
 			},
 		};
@@ -466,8 +365,7 @@ export function createDecisionFoldMessage(
 			version: DECISION_PROTOCOL_VERSION,
 			exchangeId: input.exchangeId,
 			cycleId: input.cycleId,
-			outcome: "unlock" as const,
-			toolCallId: input.toolCallId,
+			outcome: input.outcome,
 		},
 	};
 }
