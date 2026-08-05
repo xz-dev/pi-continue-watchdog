@@ -26,7 +26,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 const execFileAsync = promisify(execFile);
-const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const decisionTools = ["continue_watchdog", "unlock_continue_watchdog"];
 const decisionPrompt =
 	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one. Call unlock_continue_watchdog with an allowed reasonType and a concise reason if you are intentionally waiting for the user, every task the user requested is complete, or the job cannot continue. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.";
@@ -147,7 +147,6 @@ async function makePackedFixture(
 	) as { pi?: { extensions?: string[] } };
 	assert.deepEqual(installedManifest.pi?.extensions, ["./src/extension.ts"]);
 	assert.equal((await readdir(packageDir)).includes("test"), false);
-	assert.equal((await readdir(packageDir)).includes("e2e"), false);
 
 	const extensions: string[] =
 		options?.includeWatchdog === false ? [] : [packageDir];

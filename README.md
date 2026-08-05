@@ -149,6 +149,8 @@ After a valid continue or unlock, future **model-bound** context drops the raw d
 
 ## Development
 
+The detailed accepted behavior contract is maintained in [`docs/behavior-contract.md`](docs/behavior-contract.md).
+
 ```bash
 npm ci
 npm run check      # lint, typecheck, unit tests, build

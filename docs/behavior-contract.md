@@ -613,4 +613,4 @@ For each example above, implementation slices must leave evidence that can be re
 - **Integration / E2E (stock Pi, packed install):** auto-lock on real main user message start; command lock/unlock notifies and optional untyped reason; temporary tool replacement with typed unlock args; at least one real timed path into a decision window; continue fold vs typed unlock fold/raw-record retention; delayed `AI_UNLOCK` user-ready while a child is busy; third-invalid decision-failed warning; exhaustion or multi-attempt math (real or injected clock, documented)
 - **Human accept:** product authority reviews evidence against this file; AI does not self-accept
 
-**Contract status:** this file remains the accepted **behavior** contract. Implementation progress is tracked in `PLAN/implementation.md`.
+**Contract status:** this file remains the accepted **behavior** contract. Implementation history is preserved in Git.
