@@ -86,6 +86,13 @@ interface SentMessage {
 	streaming: boolean;
 }
 
+interface DecisionMessageReplacement {
+	readonly message: {
+		readonly role: "assistant";
+		readonly content: readonly unknown[];
+	};
+}
+
 interface Harness {
 	readonly handlers: Map<string, Handler[]>;
 	readonly clock: FakeClock;
@@ -104,6 +111,7 @@ interface Harness {
 	answerContinue(): unknown;
 	answerUnlock(reason?: string, reasonType?: string): unknown;
 	answerInvalid(text?: string): unknown;
+	endDecisionMessage(message: unknown): Promise<unknown>;
 	blockToolCall(): Promise<unknown>;
 }
 
@@ -237,6 +245,13 @@ function createHarness(options?: {
 		reasonType = "JOB_DONE",
 	) => assistant([text(unlockXml(reasonType, reason))]);
 	harness.answerInvalid = (value = "I will wait.") => assistant([text(value)]);
+	harness.endDecisionMessage = async (message: unknown) => {
+		let result: unknown;
+		for (const handler of handlers.get("message_end") ?? []) {
+			result = await handler({ type: "message_end", message } as never, ctx);
+		}
+		return result;
+	};
 	harness.blockToolCall = async () => {
 		let result: unknown;
 		for (const handler of handlers.get("tool_call") ?? []) {
@@ -472,6 +487,72 @@ test("agent_end finalizes while streaming but settled alone dispatches continue"
 	});
 	assert.equal(harness.triggeredTurns, turnsBefore + 1);
 	assert.equal(harness.controller.snapshot.attempt, 1);
+});
+
+test("decision message_end hides XML, persists a context-excluded audit, and finalizes from the captured response", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	const answer = harness.answerUnlock("Waiting for approval.", "WAIT_USER");
+
+	assert.equal(await harness.endDecisionMessage(answer), undefined);
+	assert.deepEqual(harness.entries, []);
+
+	harness.openDecision();
+	const replacement = (await harness.endDecisionMessage(
+		answer,
+	)) as DecisionMessageReplacement;
+	assert.equal(replacement.message.role, "assistant");
+	assert.deepEqual(replacement.message.content, []);
+	assert.deepEqual(harness.entries.at(-1), {
+		type: "pi-continue-watchdog:decision-audit",
+		data: {
+			version: 1,
+			exchangeId: "exchange-1",
+			cycleId: 1,
+			outcome: "unlock",
+			reasonType: "WAIT_USER",
+			reason: "Waiting for approval.",
+		},
+	});
+
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [replacement.message],
+	});
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.deepEqual(harness.entries.at(-1), {
+		type: "pi-continue-watchdog:unlock",
+		data: { reasonType: "WAIT_USER", reason: "Waiting for approval." },
+	});
+});
+
+test("decision message_end audit records invalid output without retaining raw text", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.openDecision();
+	const replacement = (await harness.endDecisionMessage(
+		harness.answerInvalid("private malformed watchdog answer"),
+	)) as DecisionMessageReplacement;
+
+	assert.deepEqual(replacement.message.content, []);
+	assert.deepEqual(harness.entries.at(-1), {
+		type: "pi-continue-watchdog:decision-audit",
+		data: {
+			version: 1,
+			exchangeId: "exchange-1",
+			cycleId: 1,
+			outcome: "invalid",
+			error: "End the response with one valid watchdog XML decision block.",
+		},
+	});
+	assert.equal(
+		JSON.stringify(harness.entries).includes("private malformed"),
+		false,
+	);
 });
 
 test("decision window blocks ordinary tool_call before execution", async () => {

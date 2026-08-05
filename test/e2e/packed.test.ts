@@ -42,7 +42,7 @@ interface RequestRecord {
 }
 
 interface MockReply {
-	readonly kind: "stop" | "continue" | "unlock" | "delayed";
+	readonly kind: "stop" | "continue" | "unlock" | "invalid" | "delayed";
 	readonly reasonType?: string;
 	readonly reason?: string;
 	readonly started?: () => void;
@@ -252,11 +252,17 @@ async function startMockServer(
 				);
 				return;
 			}
-			if (reply.kind === "continue" || reply.kind === "unlock") {
+			if (
+				reply.kind === "continue" ||
+				reply.kind === "unlock" ||
+				reply.kind === "invalid"
+			) {
 				const content =
 					reply.kind === "continue"
 						? "<watchdog><function>continue_watchdog</function></watchdog>"
-						: `<watchdog><function>unlock_continue_watchdog</function><reason_type>${reply.reasonType ?? "JOB_DONE"}</reason_type><reason_content>${reply.reason ?? "finished"}</reason_content></watchdog>`;
+						: reply.kind === "unlock"
+							? `<watchdog><function>unlock_continue_watchdog</function><reason_type>${reply.reasonType ?? "JOB_DONE"}</reason_type><reason_content>${reply.reason ?? "finished"}</reason_content></watchdog>`
+							: (reply.text ?? "invalid watchdog response");
 				sendSse(response, [
 					{
 						id,
@@ -330,6 +336,7 @@ async function createSession(
 		readonly cwd?: string;
 		readonly uiContext?: ExtensionUIContext;
 		readonly additionalExtensionPaths?: string[];
+		readonly sessionManager?: SessionManager;
 	},
 ): Promise<{
 	session: AgentSession;
@@ -395,7 +402,7 @@ async function createSession(
 			modelRuntime,
 			model,
 			resourceLoader: loader,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: options?.sessionManager ?? SessionManager.inMemory(),
 		});
 		await session.bindExtensions(
 			options?.uiContext === undefined
@@ -425,6 +432,29 @@ async function waitFor(
 			throw new Error(`Timed out waiting for ${label}`);
 		await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
 	}
+}
+
+async function waitForSessionIdle(
+	session: AgentSession,
+	timeoutMs: number,
+	label: string,
+): Promise<void> {
+	await waitFor(() => session.isIdle, timeoutMs, `${label} to become idle`);
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await Promise.race([
+			session.waitForIdle(),
+			new Promise<never>((_resolve, reject) => {
+				timeout = setTimeout(
+					() => reject(new Error(`Timed out waiting for ${label} waitForIdle`)),
+					timeoutMs,
+				);
+			}),
+		]);
+	} finally {
+		if (timeout !== undefined) clearTimeout(timeout);
+	}
+	assert.equal(session.isIdle, true, `${label} remained working`);
 }
 
 async function shutdownSession(session: AgentSession): Promise<void> {
@@ -558,7 +588,10 @@ test("packed stock Pi shares aggregate idle and root control across independent 
 	await childA.session.prompt(
 		"Child-a also settles while child-b remains busy.",
 	);
-	await Promise.all([root.session.waitForIdle(), childA.session.waitForIdle()]);
+	await Promise.all([
+		waitForSessionIdle(root.session, 3_000, "root initial work"),
+		waitForSessionIdle(childA.session, 3_000, "child-a initial work"),
+	]);
 	await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
 
 	assert.equal(requests.length, 3);
@@ -577,9 +610,9 @@ test("packed stock Pi shares aggregate idle and root control across independent 
 
 	await childB.session.abort();
 	await childBPrompt;
-	await childB.session.waitForIdle();
+	await waitForSessionIdle(childB.session, 3_000, "child-b abort");
 	await waitFor(() => requests.length === 4, 5_000, "aggregate-idle decision");
-	await root.session.waitForIdle();
+	await waitForSessionIdle(root.session, 3_000, "root unlock decision");
 
 	const decisionRequests = requests.filter((request) =>
 		request.messages.some((message) =>
@@ -741,7 +774,7 @@ test("packed artifact asks after threshold compaction settles", {
 			),
 		"post-compaction decision request",
 	);
-	await session.waitForIdle();
+	await waitForSessionIdle(session, 3_000, "post-compaction unlock decision");
 
 	assert.equal(
 		lifecycle.some((event) => event.type === "compaction_start"),
@@ -826,7 +859,7 @@ test("packed source artifact waits a real 3 seconds, decides continue, and folds
 
 	await session.prompt("Start a task that must not mysteriously stop.");
 	await waitFor(() => requests.length === 3, 10_000, "continued provider turn");
-	await session.waitForIdle();
+	await waitForSessionIdle(session, 5_000, "continued ordinary work");
 
 	const firstRequest = requests[0];
 	const decisionRequest = requests[1];
@@ -907,7 +940,7 @@ test("packed command unlock and canonical programmatic abort prevent a decision 
 	await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
 	await session.abort();
 	await prompt;
-	await session.waitForIdle();
+	await waitForSessionIdle(session, 3_000, "programmatic abort");
 	const branchAssistants = session.sessionManager
 		.getBranch()
 		.flatMap((entry) =>
@@ -949,7 +982,11 @@ test("packed neutral probe receives AI unlock user-ready and suppresses continue
 		8_000,
 		"continued provider turn with probe",
 	);
-	await continueSession.session.waitForIdle();
+	await waitForSessionIdle(
+		continueSession.session,
+		5_000,
+		"probe continue path",
+	);
 	assert.deepEqual(await readProbeEnvelopes(continueFixture.probeOut), []);
 	await continueSession.session.extensionRunner.emit({
 		type: "session_shutdown",
@@ -978,7 +1015,7 @@ test("packed neutral probe receives AI unlock user-ready and suppresses continue
 		8_000,
 		"unlock decision request",
 	);
-	await unlockSession.session.waitForIdle();
+	await waitForSessionIdle(unlockSession.session, 3_000, "probe unlock path");
 	const unlockDeadline = Date.now() + 3_000;
 	while ((await readProbeEnvelopes(unlockFixture.probeOut)).length < 1) {
 		if (Date.now() >= unlockDeadline) {
@@ -997,6 +1034,110 @@ test("packed neutral probe receives AI unlock user-ready and suppresses continue
 			},
 		},
 	]);
+});
+
+test("packed invalid decisions reask three times and leave Pi idle", {
+	timeout: 20_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t, {
+		watchdogConfig: { idleDelaySeconds: 0.1 },
+	});
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "stop", text: "ordinary work complete" },
+		{ kind: "invalid", text: "private invalid one" },
+		{ kind: "invalid", text: "private invalid two" },
+		{ kind: "invalid", text: "private invalid three" },
+	]);
+	const { session } = await createSession(fixture, baseUrl);
+	t.after(() => shutdownSession(session));
+
+	await session.prompt("Exercise the bounded invalid decision path.");
+	await waitFor(() => requests.length === 4, 8_000, "three invalid decisions");
+	await waitForSessionIdle(session, 3_000, "decision-failed path");
+
+	const branch = session.sessionManager.getBranch();
+	assert.equal(JSON.stringify(branch).includes("private invalid"), false);
+	const audits = branch.flatMap((entry) =>
+		entry.type === "custom" &&
+		entry.customType === "pi-continue-watchdog:decision-audit"
+			? [entry.data]
+			: [],
+	);
+	assert.equal(audits.length, 3);
+	assert.deepEqual(
+		audits.map((audit) =>
+			typeof audit === "object" && audit !== null && "outcome" in audit
+				? audit.outcome
+				: undefined,
+		),
+		["invalid", "invalid", "invalid"],
+	);
+});
+
+test("packed persisted session resumes without watchdog decision context or working hang", {
+	timeout: 30_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t, {
+		watchdogConfig: { idleDelaySeconds: 0.1 },
+	});
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "stop", text: "ordinary work complete" },
+		{ kind: "unlock", reason: "resume context is clean" },
+		{ kind: "stop", text: "resumed ordinary response" },
+	]);
+	const sessionDir = join(fixture.root, "sessions");
+	await mkdir(sessionDir, { recursive: true });
+	const firstManager = SessionManager.create(fixture.cwd, sessionDir);
+	const first = await createSession(fixture, baseUrl, {
+		sessionManager: firstManager,
+	});
+
+	await first.session.prompt(
+		"Persist one ordinary task before watchdog unlock.",
+	);
+	await waitFor(
+		() => requests.length === 2,
+		6_000,
+		"persisted unlock decision",
+	);
+	await waitForSessionIdle(first.session, 3_000, "persisted unlock decision");
+	const sessionFile = first.session.sessionManager.getSessionFile();
+	assert.ok(sessionFile);
+	await shutdownSession(first.session);
+
+	const rawSession = await readFile(sessionFile, "utf8");
+	const persistedBeforeResume = SessionManager.open(sessionFile);
+	const persistedAssistants = persistedBeforeResume
+		.getBranch()
+		.flatMap((entry) =>
+			entry.type === "message" && entry.message.role === "assistant"
+				? [entry.message]
+				: [],
+		);
+	assert.deepEqual(persistedAssistants.at(-1)?.content, []);
+	assert.equal(rawSession.includes("resume context is clean"), true);
+	assert.equal(
+		rawSession.includes("pi-continue-watchdog:decision-audit"),
+		true,
+	);
+
+	const resumedManager = SessionManager.open(sessionFile);
+	const resumed = await createSession(fixture, baseUrl, {
+		sessionManager: resumedManager,
+	});
+	t.after(() => shutdownSession(resumed.session));
+	await resumed.session.prompt("Continue after restoring this session.");
+	await waitForSessionIdle(resumed.session, 3_000, "resumed ordinary request");
+	assert.equal(requests.length, 3);
+
+	const resumedPayload = JSON.stringify(requests[2]);
+	assert.equal(resumedPayload.includes(decisionPromptStart), false);
+	assert.equal(resumedPayload.includes("<watchdog>"), false);
+	assert.equal(resumedPayload.includes("resume context is clean"), false);
+	assert.equal(
+		resumedPayload.includes("pi-continue-watchdog:decision-audit"),
+		false,
+	);
 });
 
 test("packed custom reasonTypes replace defaults and match mixed-case input", {
@@ -1026,7 +1167,7 @@ test("packed custom reasonTypes replace defaults and match mixed-case input", {
 
 	await session.prompt("Unlock with a custom mixed-case reason type.");
 	await waitFor(() => requests.length === 2, 8_000, "unlock decision request");
-	await session.waitForIdle();
+	await waitForSessionIdle(session, 3_000, "custom reason unlock path");
 
 	// The hidden prompt advertises only the effective custom list while ordinary
 	// tools remain unchanged for prompt-prefix stability.
@@ -1049,17 +1190,46 @@ test("packed custom reasonTypes replace defaults and match mixed-case input", {
 		true,
 	);
 
-	// The raw XML persists both fields as supplied by the model.
-	const branchAssistants = session.sessionManager
-		.getBranch()
-		.flatMap((entry) =>
-			entry.type === "message" && entry.message.role === "assistant"
-				? [entry.message]
-				: [],
-		);
-	const rawUnlockXml = JSON.stringify(branchAssistants);
-	assert.equal(rawUnlockXml.includes(" need review "), true);
-	assert.equal(rawUnlockXml.includes(" awaiting review "), true);
+	// The provider XML is replaced with an empty assistant before persistence.
+	// Only a structured CustomEntry audit survives, and CustomEntry is excluded
+	// from Pi's model-bound session context by construction.
+	const branch = session.sessionManager.getBranch();
+	const branchAssistants = branch.flatMap((entry) =>
+		entry.type === "message" && entry.message.role === "assistant"
+			? [entry.message]
+			: [],
+	);
+	assert.deepEqual(branchAssistants.at(-1)?.content, []);
+	assert.equal(JSON.stringify(branch).includes(" need review "), false);
+	assert.equal(JSON.stringify(branch).includes(" awaiting review "), false);
+	const auditEntries = branch.flatMap((entry) =>
+		entry.type === "custom" &&
+		entry.customType === "pi-continue-watchdog:decision-audit"
+			? [entry]
+			: [],
+	);
+	assert.equal(auditEntries.length, 1);
+	const auditData = auditEntries[0]?.data as
+		| {
+				exchangeId?: unknown;
+		  }
+		| undefined;
+	assert.ok(auditData);
+	assert.deepEqual(auditData, {
+		version: 1,
+		exchangeId: auditData.exchangeId,
+		cycleId: 1,
+		outcome: "unlock",
+		reasonType: "NEED REVIEW",
+		reason: "awaiting review",
+	});
+	assert.equal(typeof auditData.exchangeId, "string");
+	assert.equal(
+		JSON.stringify(session.sessionManager.buildSessionContext()).includes(
+			"pi-continue-watchdog:decision-audit",
+		),
+		false,
+	);
 
 	// The trimmed, case-insensitively matched, uppercased pair publishes once.
 	const hookDeadline = Date.now() + 3_000;

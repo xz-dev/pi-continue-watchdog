@@ -75,7 +75,7 @@ Configured type lists may use ordinary nonblank UTF-8 text. Trust sane user conf
 ### Exact default `decisionPrompt`
 
 ```text
-This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one.
+This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. It does not represent any decision by the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one.
 ```
 
 At runtime the extension always appends a fixed protocol suffix. It says to use existing conversation context, not call tools, output exactly one watchdog XML block at the end, never output multiple watchdog blocks, and use one of the effective configured unlock reason types. It includes canonical continue and unlock XML examples. Parser compatibility with surplus XML keys is intentionally not advertised to the model.
@@ -247,8 +247,9 @@ On invalid decision:
 - Append exactly one muted **persisted TUI-only** AI unlock entry, `Continue watchdog unlocked · <TYPE> · <reason>`, where `<TYPE>` is the matched configured type uppercased and `<reason>` is the validated reason (user-visible history, not model-bound as ordinary assistant prose)
 - Do **not** also emit a transient reasoned unlock notification
 - **No further work turn** is started for that unlock decision
-- **Future model-bound context** removes the **entire** decision exchange (prompt, narration/XML reply, blocked calls/results, and re-asks) and **inserts nothing** in its place
-- Raw session may still preserve the XML protocol records; folding is model-bound context only
+- Pi `message_end` captures the validated decision and replaces the provider answer with an empty assistant before final TUI rendering and session persistence; the raw XML is neither shown nor stored as assistant content
+- **Future model-bound context** removes the **entire** decision exchange (prompt, empty assistant replacement, blocked calls/results, re-asks, and fold marker) and **inserts nothing** in its place
+- A context-excluded `pi-continue-watchdog:decision-audit` CustomEntry preserves only the structured validated outcome; Pi does not project CustomEntry into Agent/provider context
 
 ### Valid continue
 
@@ -256,7 +257,7 @@ On invalid decision:
 
 - Reasonless (`reason_type` and `reason_content` are not required or used)
 - The decision turn ends, and ordinary work continues automatically without further user input
-- Context folding removes the complete prompt / narration/XML reply / blocked calls and results and replaces them with **one** compact custom message containing the configured `continuePrompt` (exact default: `Continue until user assistance is required.`)
+- `message_end` replaces the provider XML with an empty assistant; context folding then removes the complete prompt / empty assistant / blocked calls and results and replaces them with **one** compact custom message containing the configured `continuePrompt` (exact default: `Continue until user assistance is required.`)
 - The continued ordinary turn receives exactly one compact model-bound message containing `continuePrompt`; the XML decision exchange is otherwise hidden from later context
 - Consumes **one** exponential retry (attempt advances)
 - Next settle + all-observable-idle uses the next exponential delay
@@ -401,7 +402,7 @@ With defaults, delays for successive continue attempts begin **3s, 6s, 12s, 24s,
 - exactly one muted TUI-only entry is appended: `Continue watchdog unlocked · JOB_DONE · All requested package bumps are merged.`
 - **no further work turn** starts from that unlock decision
 - future model-bound context removes the entire decision exchange and inserts **nothing**
-- raw session may still contain the XML protocol record with `reason_type` and `reason_content`
+- raw session contains a context-excluded structured audit CustomEntry with the validated `reason_type` and `reason_content`, but no assistant XML content
 
 **And when** config sets `reasonTypes: ["NeedReview", "shipped"]` (replacing, not extending, the default list)
 **And** the agent unlocks with mixed-case type `needreview` and reason `PR is open for human review.`
@@ -561,10 +562,10 @@ These are product constraints, not optional polish. Implementation details are r
 
 | Limitation | Observable implication |
 |---|---|
-| Context folding is model-bound | Future model requests drop/replace the decision exchange; raw session may still store protocol records |
+| Context folding is model-bound | Future model requests drop/replace the decision exchange; persisted structured audits are CustomEntry records excluded from Agent/provider context |
 | Ordinary tools remain advertised during decisions | Prompt/tool prefixes stay stable; the extension blocks execution until the final XML decision arrives |
 | Unlock ends the decision path without starting more work | Valid unlock must not start a further ordinary work turn |
-| Raw session retains XML replies and any blocked call/result records | Even after context folding, protocol history may exist on disk / in session file |
+| Raw session is append-only | Hidden prompt, empty assistant, blocked call/result, and fold-marker records may remain on disk, but complete terminal exchanges are folded before provider requests; raw assistant XML and invalid answer text are not retained |
 | XML extraction is suffix-based | Narration may precede the sole watchdog block; multiple watchdog blocks or trailing non-whitespace are invalid |
 
 ---
@@ -605,7 +606,7 @@ These are product constraints, not optional polish. Implementation details are r
 For each example above, implementation slices must leave evidence that can be re-run:
 
 - **Unit / component:** pure state machine (including decision-failed and attempt advancement rules), config precedence including `reasonTypes` replace semantics, XML suffix extraction and exactly-one-block validation, AI type case-insensitive match + uppercased matched configured value, reason trim/truncate/length (AI no-truncation vs human truncate), timer cancel/restart, generation guards, and decision validity matrix
-- **Integration / E2E (stock Pi, packed install):** auto-lock on real main user message start; command lock/unlock notifies and optional untyped reason; ordinary-tool stability with XML decision prompts; at least one real timed path into a decision window; continue fold vs typed XML unlock fold/raw-record retention; delayed `AI_UNLOCK` user-ready while a child is busy; third-invalid decision-failed warning and folding; exhaustion or multi-attempt math (real or injected clock, documented)
+- **Integration / E2E (stock Pi, packed install):** auto-lock on real main user message start; command lock/unlock notifies and optional untyped reason; ordinary-tool stability with XML decision prompts; at least one real timed path into a decision window; final XML hidden before persistence; structured CustomEntry audit excluded from context; continue/unlock/three-invalid/error/abort paths return to idle within bounded time; persisted session resume sends no watchdog question, answer, audit, or fold marker to the provider; delayed `AI_UNLOCK` user-ready while a child is busy; exhaustion or multi-attempt math (real or injected clock, documented)
 - **Human accept:** product authority reviews evidence against this file; AI does not self-accept
 
 **Contract status:** this file remains the accepted **behavior** contract. Implementation history is preserved in Git.

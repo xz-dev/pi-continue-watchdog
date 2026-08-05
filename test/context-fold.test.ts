@@ -280,6 +280,16 @@ test("valid unlock and decision-failed erase the exchange with no replacement", 
 	];
 	assert.deepEqual(foldDecisionContext(unlockMessages), [user("task", 1)]);
 
+	const hiddenUnlockMessages = [
+		user("task", 1),
+		decision(EXCHANGE_ID, 1, 2),
+		assistant([], 3),
+		foldMarker({ outcome: "unlock", timestamp: 4 }),
+	];
+	assert.deepEqual(foldDecisionContext(hiddenUnlockMessages), [
+		user("task", 1),
+	]);
+
 	const failedMessages = [
 		user("task", 1),
 		decision(EXCHANGE_ID, 1, 2),

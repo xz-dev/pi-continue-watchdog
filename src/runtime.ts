@@ -6,6 +6,7 @@ import {
 	type ExtensionCommandContext,
 	type ExtensionContext,
 	getAgentDir,
+	type MessageEndEvent,
 } from "@earendil-works/pi-coding-agent";
 
 import { HUMAN_UNLOCK_ENTRY_TYPE, type HumanUnlockEntry } from "./commands.js";
@@ -27,8 +28,10 @@ import {
 	DECISION_TOOL_BLOCK_REASON,
 	type DecisionProtocolFinalization,
 	type DecisionProtocolSession,
+	type DecisionResponse,
 	formatDecisionFailedNotification,
 	normalizeAssistantDecisionResponse,
+	validateDecisionResponse,
 } from "./decision-protocol.js";
 import type {
 	HubAttachment,
@@ -60,6 +63,32 @@ const nodeClock: RuntimeClock = {
 };
 
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+
+/** Context-excluded persisted metadata for one model decision response. */
+export const DECISION_AUDIT_ENTRY_TYPE = "pi-continue-watchdog:decision-audit";
+
+export type DecisionAuditEntry =
+	| {
+			readonly version: 1;
+			readonly exchangeId: string;
+			readonly cycleId: number;
+			readonly outcome: "continue";
+	  }
+	| {
+			readonly version: 1;
+			readonly exchangeId: string;
+			readonly cycleId: number;
+			readonly outcome: "unlock";
+			readonly reasonType: string;
+			readonly reason: string;
+	  }
+	| {
+			readonly version: 1;
+			readonly exchangeId: string;
+			readonly cycleId: number;
+			readonly outcome: "invalid";
+			readonly error: string;
+	  };
 
 interface ActiveDecision {
 	readonly decisionId: number;
@@ -183,6 +212,11 @@ export function createDecisionRuntime(
 	let stopped = false;
 	let armedTimer: ArmedTimer | null = null;
 	let activeDecision: ActiveDecision | null = null;
+	let capturedDecisionResponse: {
+		readonly active: ActiveDecision;
+		readonly cycleId: number;
+		readonly response: DecisionResponse;
+	} | null = null;
 	let pendingFinalization: PendingFinalization | null = null;
 	/** Retained only for AI decision unlock until the next all-idle settle. */
 	let pendingAiUnlock: {
@@ -228,6 +262,7 @@ export function createDecisionRuntime(
 	const clearOperationalPendingWork = (): void => {
 		clearArmedTimer();
 		activeDecision = null;
+		capturedDecisionResponse = null;
 		pendingFinalization = null;
 		// Human/abort unlock must not inherit a prior AI unlock publication intent.
 		pendingAiUnlock = null;
@@ -373,6 +408,7 @@ export function createDecisionRuntime(
 				// Historical effect name: closes the decision window; no tool swap.
 				if (activeDecision?.decisionId === effect.decisionId) {
 					activeDecision = null;
+					capturedDecisionResponse = null;
 					pendingFinalization = null;
 				}
 				break;
@@ -669,6 +705,7 @@ export function createDecisionRuntime(
 
 		if (stopIfStale(claim)) return false;
 		activeDecision = null;
+		capturedDecisionResponse = null;
 
 		if (finalization.outcome === "decision-failed") {
 			if (finalization.cycleId === undefined) return false;
@@ -802,10 +839,76 @@ export function createDecisionRuntime(
 		};
 	};
 
+	const handleDecisionMessageEnd = (event: MessageEndEvent) => {
+		const active = activeDecision;
+		if (
+			active === null ||
+			pendingFinalization !== null ||
+			event.message.role !== "assistant" ||
+			isAbortedAssistant(event.message) ||
+			!options.hub.isCurrentMain(active.claim)
+		) {
+			return undefined;
+		}
+		const cycleId = active.protocol.currentCycleId;
+		const response = normalizeAssistantDecisionResponse(event.message);
+		capturedDecisionResponse = { active, cycleId, response };
+
+		const validation = validateDecisionResponse(response, config.reasonTypes);
+		const audit: DecisionAuditEntry = validation.valid
+			? validation.decision.kind === "continue"
+				? {
+						version: 1,
+						exchangeId: active.exchangeId,
+						cycleId,
+						outcome: "continue",
+					}
+				: {
+						version: 1,
+						exchangeId: active.exchangeId,
+						cycleId,
+						outcome: "unlock",
+						reasonType: validation.decision.reasonType,
+						reason: validation.decision.reason,
+					}
+			: {
+					version: 1,
+					exchangeId: active.exchangeId,
+					cycleId,
+					outcome: "invalid",
+					error: validation.error,
+				};
+		try {
+			options.pi.appendEntry<DecisionAuditEntry>(
+				DECISION_AUDIT_ENTRY_TYPE,
+				audit,
+			);
+		} catch {
+			// Audit persistence is optional; context hiding must still succeed.
+		}
+
+		return {
+			message: {
+				...event.message,
+				content: [],
+			},
+		};
+	};
+
 	const handleAgentEnd = (event: AgentEndEvent): void => {
 		const assistant = terminalAssistant(event.messages);
 		// Aborted terminal assistants are owned by the abort-outcome path.
 		if (assistant !== undefined && isAbortedAssistant(assistant)) return;
+		const captured = capturedDecisionResponse;
+		if (
+			captured !== null &&
+			captured.active === activeDecision &&
+			captured.cycleId === activeDecision.protocol.currentCycleId
+		) {
+			capturedDecisionResponse = null;
+			finalizeActiveDecision(captured.response);
+			return;
+		}
 		finalizeActiveDecision(
 			assistant === undefined
 				? "missing"
@@ -848,6 +951,7 @@ export function createDecisionRuntime(
 			if (attachment !== null) options.hub.markBusy(attachment);
 		});
 
+		options.pi.on("message_end", handleDecisionMessageEnd);
 		options.pi.on("agent_end", handleAgentEnd);
 
 		// While a decision is open, block ordinary tools before execution. The

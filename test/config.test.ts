@@ -28,7 +28,7 @@ const REJECTED_UNTYPED_DECISION_PROMPT =
 	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Call unlock_continue_watchdog with a concise reason if you are intentionally waiting for the user or all tasks are complete. Otherwise call continue_watchdog. Call exactly one tool and do not answer with prose.";
 
 const ACCEPTED_DECISION_PROMPT =
-	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one.";
+	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. It does not represent any decision by the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one.";
 
 async function fixture(
 	t: TestContext,
