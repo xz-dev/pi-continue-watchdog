@@ -42,7 +42,9 @@
     "format": "biome format --write src test",
     "test": "tsx --test test/*.test.ts",
     "check": "npm run lint && npm run typecheck && npm run test && npm run build",
-    "test:e2e": "tsx --test test/e2e/*.test.ts"
+    "test:e2e:packed": "tsx --test test/e2e/packed.test.ts",
+    "test:e2e:cross-process": "tsx --test test/e2e/cross-process.test.ts",
+    "test:e2e": "npm run test:e2e:packed && npm run test:e2e:cross-process"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
