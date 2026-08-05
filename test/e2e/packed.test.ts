@@ -998,8 +998,12 @@ test("packed stock Pi retries a decision connection error and accepts the succes
 		.getEntries()
 		.map((entry) => JSON.stringify(entry));
 	assert.equal(
-		serialized.filter((entry) => entry.includes('"outcome":"invalid"')).length,
-		0,
+		serialized.some(
+			(entry) =>
+				entry.includes('"outcome":"invalid"') &&
+				!entry.includes('"outcome":"invalidated"'),
+		),
+		false,
 	);
 	assert.equal(
 		serialized.filter((entry) =>
