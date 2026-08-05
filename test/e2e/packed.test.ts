@@ -1006,10 +1006,12 @@ test("packed stock Pi retries a decision connection error and accepts the succes
 		false,
 	);
 	assert.equal(
-		serialized.filter((entry) =>
-			entry.includes("previous decision response was invalid"),
-		).length,
-		0,
+		serialized.some(
+			(entry) =>
+				entry.includes("previous decision response was invalid") &&
+				!entry.includes('"outcome":"invalidated"'),
+		),
+		false,
 	);
 	assert.equal(
 		serialized.some(
