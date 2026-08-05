@@ -148,8 +148,28 @@ async function makePackedFixture(
 	const packageDir = join(installRoot, "node_modules", manifest.name);
 	const installedManifest = JSON.parse(
 		await readFile(join(packageDir, "package.json"), "utf8"),
-	) as { pi?: { extensions?: string[] } };
+	) as {
+		pi?: { extensions?: string[] };
+		dependencies?: Record<string, string>;
+	};
 	assert.deepEqual(installedManifest.pi?.extensions, ["./src/extension.ts"]);
+	assert.equal(
+		installedManifest.dependencies?.["pi-process-domain"],
+		"git+https://github.com/xz-dev/pi-process-domain.git#b907a999d1e2112b30b7b3c5340eabc977c70744",
+	);
+	const domainPackage = join(installRoot, "node_modules", "pi-process-domain");
+	const domainManifest = JSON.parse(
+		await readFile(join(domainPackage, "package.json"), "utf8"),
+	) as { bin?: Record<string, string> };
+	assert.equal(
+		domainManifest.bin?.["pi-process-domain-broker"],
+		"bin/pi-process-domain-broker.mjs",
+	);
+	await readFile(join(domainPackage, "dist", "index.js"), "utf8");
+	await readFile(
+		join(domainPackage, "bin", "pi-process-domain-broker.mjs"),
+		"utf8",
+	);
 	assert.equal((await readdir(packageDir)).includes("test"), false);
 
 	const extensions: string[] =
@@ -362,6 +382,17 @@ async function createSession(
 	const previousHome = process.env.HOME;
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const previousProbeOut = process.env.PI_SEMANTIC_PROBE_OUT;
+	const domainNames = [
+		"PI_PROCESS_DOMAIN_ID",
+		"PI_PROCESS_DOMAIN_KEY",
+		"PI_PROCESS_DOMAIN_PROTOCOL",
+		"PI_PROCESS_DOMAIN_RESERVATION",
+		"PI_CONTINUE_WATCHDOG_ROOT_PID",
+	] as const;
+	const previousDomain = Object.fromEntries(
+		domainNames.map((name) => [name, process.env[name]]),
+	) as Record<(typeof domainNames)[number], string | undefined>;
+	for (const name of domainNames) delete process.env[name];
 	process.env.HOME = fixture.home;
 	process.env.PI_CODING_AGENT_DIR = fixture.agentDir;
 	if (fixture.probeOut !== undefined) {
@@ -434,6 +465,11 @@ async function createSession(
 		if (previousProbeOut === undefined)
 			delete process.env.PI_SEMANTIC_PROBE_OUT;
 		else process.env.PI_SEMANTIC_PROBE_OUT = previousProbeOut;
+		for (const name of domainNames) {
+			const value = previousDomain[name];
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		}
 	}
 }
 

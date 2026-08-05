@@ -25,7 +25,7 @@ export type DecisionFoldDetails =
 			readonly version: typeof DECISION_PROTOCOL_VERSION;
 			readonly exchangeId: string;
 			readonly cycleId: number;
-			readonly outcome: "unlock" | "decision-failed";
+			readonly outcome: "unlock" | "decision-failed" | "invalidated";
 	  }
 	| {
 			readonly version: typeof DECISION_PROTOCOL_VERSION;
@@ -45,7 +45,7 @@ export type DecisionFoldMessageInput =
 	| {
 			readonly exchangeId: string;
 			readonly cycleId: number;
-			readonly outcome: "unlock" | "decision-failed";
+			readonly outcome: "unlock" | "decision-failed" | "invalidated";
 	  }
 	| {
 			readonly exchangeId: string;
@@ -73,7 +73,7 @@ type ParsedFoldMarker =
 			readonly type: "fold";
 			readonly exchangeId: string;
 			readonly cycleId: number;
-			readonly outcome: "unlock" | "decision-failed";
+			readonly outcome: "unlock" | "decision-failed" | "invalidated";
 			readonly timestamp: number;
 	  }
 	| {
@@ -173,7 +173,11 @@ function foldDetails(input: unknown): DecisionFoldDetails | undefined {
 	) {
 		return undefined;
 	}
-	if (outcome === "unlock" || outcome === "decision-failed") {
+	if (
+		outcome === "unlock" ||
+		outcome === "decision-failed" ||
+		outcome === "invalidated"
+	) {
 		return {
 			version: DECISION_PROTOCOL_VERSION,
 			exchangeId,

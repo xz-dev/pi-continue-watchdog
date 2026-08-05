@@ -55,5 +55,8 @@
     "@types/node": "^26.1.2",
     "tsx": "^4.20.6",
     "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "pi-process-domain": "git+https://github.com/xz-dev/pi-process-domain.git#b907a999d1e2112b30b7b3c5340eabc977c70744"
   }
 }

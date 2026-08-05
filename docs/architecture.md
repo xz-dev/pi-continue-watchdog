@@ -463,3 +463,21 @@ The folder fails closed in those cases to avoid deleting genuine user conversati
 - semantic-hook publication;
 - persistent session reopen with clean provider context;
 - bounded return from `working` to idle across covered paths.
+
+## Authenticated process-domain layer
+
+```text
+same-process watchdog attachments
+  -> local hub (main election) + exact attachment activity
+  -> one watchdog coordinator / one pi-process-domain participant
+  -> authenticated per-user broker
+  <- inherited child/nested Pi observer participants
+```
+
+`pi-process-domain` supplies immutable certain/all-idle snapshots and `{brokerEpoch, activityGeneration}` fences. The root captures a fence for each delay/decision and confirms it before automatic effects. Root's artificial watchdog decision run is suppressed only for that exact local attachment; any other local or remote work invalidates the decision. Stale automated exchanges are folded from later model context.
+
+The domain creator is decision root. `PI_CONTINUE_WATCHDOG_ROOT_PID` permits reload in that OS process and keeps inherited processes observer-only; authentication remains the domain's 256-bit capability. Attachments await domain open before hub/controller participation and detach the shared participant after the final local shutdown.
+
+Declared-domain failures are terminal and sanitized (exit 78). TUI/RPC request Pi's public graceful shutdown with a bounded nonzero fallback; print/json use the bounded fallback because public shutdown is a no-op there. The extension never prints keys, HMAC values, reservation tokens, raw declarations, or endpoint details.
+
+Coverage begins when inherited watchdog `session_start` completes. Strict spawn-before-registration coverage requires launcher `reserveSpawn()` cooperation. Stripped environments and children without watchdog are not observable.

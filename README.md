@@ -1,6 +1,6 @@
 # pi-continue-watchdog
 
-Pi extension that notices when all same-process extension-loaded observable agents are idle and asks the main AI to continue or intentionally unlock, so work does not stop without explanation.
+Pi extension that notices when every watchdog-loaded Pi process in an inherited authenticated process domain is idle and asks the root AI to continue or intentionally unlock, so work does not stop without explanation.
 
 **Status:** live source package. This project has no versioned releases; users track the latest `master` commit.
 
@@ -10,7 +10,7 @@ Pi extension that notices when all same-process extension-loaded observable agen
 
 - Node.js `>= 22.19`
 - Pi coding agent (tested with `@earendil-works/pi-coding-agent` `0.83.0`)
-- No other plugin dependencies
+- Uses the exact reviewed Git-pinned `pi-process-domain` library; no dependency on a subagent plugin
 
 ## Install
 
@@ -29,7 +29,7 @@ Reload Pi extensions or start a new session after install.
 Observable behavior only (implementation details may change):
 
 1. Whenever the **main agent starts running**, the continue watchdog ensures it is locked. If already locked, the current cycle is preserved. A real main user message starts a fresh cycle by silently performing a full unlock cleanup first—canceling timers and pending decision work—then locking again to reset old cycle accounting, without either notification.
-2. While locked, after **all observable** same-process agents stay idle for the current delay, the extension re-checks true idle and opens a short **decision check** on main—regardless of whether Pi stopped normally, after compaction, or because of a Provider/extension error.
+2. While locked, after every participant in the inherited authenticated process domain stays idle for the current delay, the extension confirms an immutable broker fence and opens a short **decision check** on the root main—regardless of whether Pi stopped normally, after compaction, or because of a Provider/extension error.
 3. The decision is a **hidden automated** custom message, not a user message. Ordinary active tools and the system-prompt tool list remain unchanged for prompt-cache stability. The model decides quickly from existing conversation knowledge without tools and finishes with exactly one XML block:
 
    ```xml
@@ -163,7 +163,9 @@ Publication is at most once per such terminal idle epoch. It does **not** publis
 
 ## Scope and limitations
 
-- **“All agents”** means same-process sessions that loaded this extension and report lifecycle into **one process-wide domain**. That domain is shared across independent extension evaluations in the same Node process—including distinct project `cwd` values and separate Pi `ResourceLoader` loads. Isolated, out-of-process, or non-extension children remain outside coverage.
+- **“All agents”** means watchdog-loaded Pi sessions in the authenticated `pi-process-domain` declaration inherited from the root. Same-realm attachments aggregate into one OS-process participant; inherited child and nested Pi processes join as observer-only participants. A deliberately stripped/replaced environment, a child that disables watchdog, and the unreserved gap before child `session_start` are outside coverage. Launchers needing zero-gap coverage must use `reserveSpawn()` before `spawn()`.
+- The process which creates the domain is the sole decision authority. `PI_CONTINUE_WATCHDOG_ROOT_PID` preserves that topology across same-process reloads; inherited PIDs remain observers. It is topology metadata, not authentication.
+- Declared-domain authentication, protocol, runtime-path, lease, or broker failures fail closed with sanitized output and exit status 78. Unix uses private sockets on Linux/macOS/FreeBSD; Windows uses a named pipe.
 - **Main election:** UI-bound session wins; pure headless uses first-bound attachment as best-effort main; later non-UI attachments do not steal main.
 - **Root ownership:** every extension-enabled attachment observes and reports busy/idle. Only the exact current main owns config, timers, XML decision messages, tool-call blocking, UI notifies, and `user-ready` publication. Non-main attachments are **observer-only** and do not load watchdog config or open decision windows.
 - **Framework boundary:** coordination uses only Pi public lifecycle/session APIs. There is no dependence on other plugins or path heuristics. Pi's `pi.events` bus is for semantic-hook delivery only, not for process coordination.

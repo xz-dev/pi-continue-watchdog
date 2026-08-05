@@ -616,3 +616,16 @@ For each example above, implementation slices must leave evidence that can be re
 - **Human accept:** product authority reviews evidence against this file; AI does not self-accept
 
 **Contract status:** this file remains the accepted **behavior** contract. Implementation history is preserved in Git.
+
+## Authenticated cross-process acceptance (authoritative)
+
+1. A Pi with no `PI_PROCESS_DOMAIN_*` declaration creates a private domain during awaited `session_start`, records its own PID in `PI_CONTINUE_WATCHDOG_ROOT_PID`, and is the sole decision owner for that domain.
+2. A child Pi inheriting the declaration and root PID joins as an observer. It reports `agent_start` busy, `agent_settled` idle, and shutdown detach, but never loads watchdog config, locks, inquires, continues, unlocks, or publishes `user-ready`.
+3. Same-realm watchdog attachments aggregate into exactly one broker participant. Local hub election still chooses the one root-process main attachment.
+4. A remote busy participant blocks the root idle timer. Busy then idle begins a fresh complete delay and fence.
+5. Activity-generation or broker-epoch change during a decision invalidates the response without consuming a retry. It cannot continue, unlock, exhaust, decision-fail, persist a continue status, or publish `user-ready`; the hidden exchange folds as `invalidated`.
+6. Every automatic outcome is committed only while the root claim remains current and a certain/all-idle broker fence confirms. Manual commands and immediate main-abort unlock retain their explicit semantics.
+7. Root main abort unlocks immediately regardless of child activity. Child abort is only child activity settling; it never unlocks root.
+8. Partial/malformed declarations, wrong keys, absent/unavailable brokers, rejected leases, incompatible protocol, and unsafe endpoints fail closed with sanitized output and status 78. No domain key, HMAC, token, declaration, or private endpoint is rendered.
+9. Once an inherited Pi loads watchdog and completes `session_start`, broker observation is strict. Zero-gap coverage from `spawn()` until registration requires a cooperating launcher to call `reserveSpawn()` before launch.
+10. Deliberately stripped/replaced declarations and Pi children that do not load watchdog are outside the observable guarantee. No decision-root takeover occurs after root-process exit.

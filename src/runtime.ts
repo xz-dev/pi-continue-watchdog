@@ -40,12 +40,14 @@ import {
 	normalizeAssistantDecisionResponse,
 	validateDecisionResponse,
 } from "./decision-protocol.js";
+import type { FatalExitAdapter } from "./fatal-exit.js";
 import type {
 	HubAttachment,
 	HubAttachmentInstance,
 	HubMainClaim,
 	ObservableAgentHub,
 } from "./hub.js";
+import type { ProcessDomainCoordinator } from "./process-domain.js";
 import { createUserReadyEnvelope, emitSemanticHook } from "./semantic-hook.js";
 
 export interface RuntimeControllerHolder {
@@ -103,6 +105,8 @@ interface ActiveDecision {
 	readonly exchangeId: string;
 	readonly claim: HubMainClaim;
 	readonly protocol: DecisionProtocolSession;
+	readonly domainFence: import("pi-process-domain").DomainFence;
+	invalidated: boolean;
 }
 
 interface PendingFinalization {
@@ -115,6 +119,7 @@ interface ArmedTimer {
 	readonly handle: RuntimeTimerHandle;
 	readonly timerId: number;
 	readonly claim: HubMainClaim;
+	readonly domainFence: import("pi-process-domain").DomainFence;
 }
 
 type RuntimeContext = ExtensionCommandContext | ExtensionContext;
@@ -122,6 +127,8 @@ type RuntimeContext = ExtensionCommandContext | ExtensionContext;
 export interface DecisionRuntimeOptions {
 	readonly pi: ExtensionAPI;
 	readonly hub: ObservableAgentHub;
+	readonly processDomain?: ProcessDomainCoordinator;
+	readonly fatalExit?: FatalExitAdapter;
 	readonly attachmentInstance: HubAttachmentInstance;
 	readonly controllerHolder: RuntimeControllerHolder;
 	readonly injectedController?: boolean;
@@ -165,7 +172,7 @@ export interface DecisionRuntime {
 	): void;
 	reconcileIdle(): void;
 	registerLifecycle(): void;
-	shutdown(): void;
+	shutdown(): Promise<void>;
 }
 
 function terminalAssistant(messages: readonly unknown[]): unknown | undefined {
@@ -232,6 +239,9 @@ export function createDecisionRuntime(
 		...(options.initialConfig ?? BUILT_IN_CONFIG),
 	};
 	let attachment: HubAttachment | null = null;
+	let domainAttached = false;
+	let domainReady = options.processDomain === undefined;
+	let domainFatal = false;
 	let ownedClaim: HubMainClaim | null = null;
 	let sessionContext: ExtensionContext | null = null;
 	let configLoad: Promise<void> | null = null;
@@ -261,11 +271,26 @@ export function createDecisionRuntime(
 	let statusTui: { requestRender(): void } | null = null;
 	let statusWidgetRegistered = false;
 
+	const isRootProcess = (): boolean =>
+		domainReady &&
+		!domainFatal &&
+		(options.processDomain?.isRootProcess ?? true);
+
 	const getMainClaim = (): HubMainClaim | null =>
-		attachment === null ? null : options.hub.mainClaimFor(attachment);
+		!isRootProcess() || attachment === null
+			? null
+			: options.hub.mainClaimFor(attachment);
 
 	const owns = (claim: HubMainClaim): boolean =>
-		!stopped && options.hub.isCurrentMain(claim);
+		!stopped && isRootProcess() && options.hub.isCurrentMain(claim);
+
+	const domainIdle = (): boolean => {
+		if (options.processDomain === undefined) {
+			return options.hub.snapshot.allObservableIdle;
+		}
+		const snapshot = options.processDomain.snapshot;
+		return snapshot.certain && snapshot.allIdle;
+	};
 
 	const isCurrentMain = (): boolean => {
 		const claim = getMainClaim();
@@ -446,10 +471,16 @@ export function createDecisionRuntime(
 			config.decisionPrompt,
 			config.reasonTypes,
 		);
+		const domainFence = options.processDomain?.snapshot.fence ?? {
+			brokerEpoch: "local",
+			activityGeneration: BigInt(options.hub.snapshot.revision),
+		};
 		const active: ActiveDecision = {
 			decisionId,
 			exchangeId: createExchangeId(),
 			claim,
+			domainFence,
+			invalidated: false,
 			protocol: createDecisionProtocolSession({
 				controller,
 				decisionId,
@@ -459,7 +490,7 @@ export function createDecisionRuntime(
 		};
 		activeDecision = active;
 		try {
-			if (!stillOwns()) {
+			if (!stillOwns() || !domainIdle()) {
 				silentlyAbandonDecision();
 				return;
 			}
@@ -477,6 +508,33 @@ export function createDecisionRuntime(
 			}
 			if (!stillOwns()) {
 				silentlyAbandonDecision();
+				return;
+			}
+			if (!domainIdle()) {
+				controller.invalidateDecision(decisionId);
+				activeDecision = null;
+				clearLiveStatus();
+				return;
+			}
+			if (options.processDomain !== undefined) {
+				void Promise.resolve(
+					options.processDomain.confirm(active.domainFence),
+				).then((confirmed) => {
+					if (
+						!confirmed ||
+						!domainIdle() ||
+						active.invalidated ||
+						activeDecision !== active
+					) {
+						invalidateActiveDecision();
+						return;
+					}
+					sendDecisionPrompt(
+						active,
+						active.protocol.currentCycleId,
+						decisionPrompt,
+					);
+				});
 				return;
 			}
 			sendDecisionPrompt(
@@ -503,7 +561,12 @@ export function createDecisionRuntime(
 
 	const armIdleTimer = (timerId: number, delaySeconds: number): void => {
 		const claim = getMainClaim();
-		if (claim === null || currentController(claim) === null) return;
+		if (claim === null || currentController(claim) === null || !domainIdle())
+			return;
+		const domainFence = options.processDomain?.snapshot.fence ?? {
+			brokerEpoch: "local",
+			activityGeneration: BigInt(options.hub.snapshot.revision),
+		};
 		clearArmedTimer();
 
 		const deadline = Math.min(now() + delaySeconds * 1000, Number.MAX_VALUE);
@@ -515,13 +578,15 @@ export function createDecisionRuntime(
 			const timer: ArmedTimer = {
 				timerId,
 				claim,
-				handle: clock.setTimeout(() => {
+				domainFence,
+				handle: clock.setTimeout(async () => {
 					if (armedTimer !== timer) return;
 					const controller = currentController(timer.claim);
 					if (
 						stopped ||
 						controller === null ||
 						!options.hub.snapshot.allObservableIdle ||
+						!domainIdle() ||
 						controller.snapshot.idleTimer?.id !== timer.timerId
 					) {
 						armedTimer = null;
@@ -529,6 +594,17 @@ export function createDecisionRuntime(
 					}
 					if (now() < deadline) {
 						schedule();
+						return;
+					}
+					if (
+						options.processDomain !== undefined &&
+						!(await options.processDomain.confirm(timer.domainFence))
+					) {
+						armedTimer = null;
+						applyTransition(controller.onObservableBusy(), undefined, {
+							claim: timer.claim,
+						});
+						reconcileIdle();
 						return;
 					}
 					armedTimer = null;
@@ -609,6 +685,7 @@ export function createDecisionRuntime(
 			claim === null ||
 			controller === null ||
 			!options.hub.snapshot.allObservableIdle ||
+			!domainIdle() ||
 			pendingFinalization !== null
 		) {
 			return;
@@ -656,12 +733,13 @@ export function createDecisionRuntime(
 	 * Only AI decision unlock, exhausted, and decision-failed terminal states
 	 * produce a signal. Ordinary unlocked idle never publishes by inference.
 	 */
-	const maybePublishUserReady = (): void => {
+	const maybePublishUserReady = async (): Promise<void> => {
 		if (
 			stopped ||
 			!configReady ||
 			!isCurrentMain() ||
 			!options.hub.snapshot.allObservableIdle ||
+			!domainIdle() ||
 			pendingFinalization !== null ||
 			publishedForIdleEpoch
 		) {
@@ -692,6 +770,15 @@ export function createDecisionRuntime(
 		}
 
 		if (envelope === null || !options.hub.isCurrentMain(claim)) return;
+		if (options.processDomain !== undefined) {
+			const snapshot = options.processDomain.snapshot;
+			if (
+				!snapshot.certain ||
+				!snapshot.allIdle ||
+				!(await options.processDomain.confirm(snapshot.fence))
+			)
+				return;
+		}
 		publishedForIdleEpoch = true;
 		try {
 			emitSemanticHook(options.pi.events, envelope);
@@ -798,9 +885,9 @@ export function createDecisionRuntime(
 		}
 		const controller = currentController(claim);
 		if (!configReady || controller === null) return;
-		if (options.hub.snapshot.allObservableIdle) {
+		if (options.hub.snapshot.allObservableIdle && domainIdle()) {
 			reconcileIdle();
-			maybePublishUserReady();
+			void maybePublishUserReady();
 		} else {
 			publishedForIdleEpoch = false;
 			applyTransition(controller.onObservableBusy(), undefined, { claim });
@@ -811,6 +898,67 @@ export function createDecisionRuntime(
 		if (!stopped) syncHubState();
 	});
 
+	const invalidateActiveDecision = (): void => {
+		const active = activeDecision;
+		const controller = options.controllerHolder.controller;
+		if (active === null || active.invalidated || controller === null) return;
+		const snapshot = options.processDomain?.snapshot;
+		if (
+			snapshot?.certain &&
+			snapshot.fence.brokerEpoch === active.domainFence.brokerEpoch &&
+			snapshot.fence.activityGeneration ===
+				active.domainFence.activityGeneration
+		) {
+			return;
+		}
+		active.invalidated = true;
+		capturedDecisionResponse = null;
+		pendingFinalization = null;
+		clearLiveStatus();
+		applyTransition(
+			controller.invalidateDecision(active.decisionId),
+			undefined,
+			{
+				claim: active.claim,
+			},
+		);
+		try {
+			options.pi.sendMessage(
+				createDecisionFoldMessage({
+					exchangeId: active.exchangeId,
+					cycleId: active.protocol.currentCycleId,
+					outcome: "invalidated",
+				}),
+				{ triggerTurn: false, deliverAs: "steer" },
+			);
+		} catch {
+			// Context folding is best effort; no external watchdog outcome is emitted.
+		}
+	};
+
+	const unsubscribeDomain = options.processDomain?.subscribe(() => {
+		if (stopped || !domainReady) return;
+		invalidateActiveDecision();
+		syncHubState();
+	});
+
+	const withDecisionFence = async (
+		active: ActiveDecision,
+		effect: () => void,
+	): Promise<boolean> => {
+		if (!owns(active.claim) || !domainIdle()) return false;
+		if (
+			options.processDomain !== undefined &&
+			!(await options.processDomain.confirm(active.domainFence))
+		) {
+			invalidateActiveDecision();
+			return false;
+		}
+		if (!owns(active.claim) || !domainIdle()) return false;
+		effect();
+		return owns(active.claim) && domainIdle();
+	};
+
 	/**
 	 * Deliver a cached decision finalization. Returns true when a valid continue
 	 * was dispatched so this settle stays intermediate and must not publish
@@ -820,7 +968,7 @@ export function createDecisionRuntime(
 	 * and after every ownership-dependent external/re-entrant call so a
 	 * synchronous demotion cannot continue into later messages, UI, or entries.
 	 */
-	const deliverPending = (ctx: ExtensionContext): boolean => {
+	const deliverPending = async (ctx: ExtensionContext): Promise<boolean> => {
 		const pending = pendingFinalization;
 		if (
 			pending === null ||
@@ -831,11 +979,22 @@ export function createDecisionRuntime(
 		}
 		pendingFinalization = null;
 		const { finalization, active, cycleId } = pending;
+		if (
+			active.invalidated ||
+			(options.processDomain !== undefined && !domainIdle())
+		) {
+			invalidateActiveDecision();
+			return false;
+		}
 		// Exact claim carried by this decision exchange — not a live re-lookup.
 		const claim = active.claim;
 
 		if (finalization.outcome === "reask") {
-			if (stopIfStale(claim)) return false;
+			if (
+				stopIfStale(claim) ||
+				(options.processDomain !== undefined && !domainIdle())
+			)
+				return false;
 			const validationStatus: WatchdogStatusEntry = {
 				kind: "validation-error",
 				exchangeId: active.exchangeId,
@@ -854,7 +1013,11 @@ export function createDecisionRuntime(
 				silentlyAbandonDecision();
 				return false;
 			}
-			if (stopIfStale(claim)) return false;
+			if (
+				stopIfStale(claim) ||
+				(options.processDomain !== undefined && !domainIdle())
+			)
+				return false;
 			try {
 				const status = checkingStatus(active);
 				const widgetError = showLiveStatus(status);
@@ -868,7 +1031,11 @@ export function createDecisionRuntime(
 					silentlyAbandonDecision();
 					return false;
 				}
-				if (stopIfStale(claim)) return false;
+				if (
+					stopIfStale(claim) ||
+					(options.processDomain !== undefined && !domainIdle())
+				)
+					return false;
 				sendDecisionPrompt(
 					active,
 					active.protocol.currentCycleId,
@@ -899,6 +1066,11 @@ export function createDecisionRuntime(
 
 		if (finalization.outcome === "decision-failed") {
 			if (finalization.cycleId === undefined) return false;
+			if (
+				options.processDomain !== undefined &&
+				!(await withDecisionFence(active, () => {}))
+			)
+				return false;
 			if (
 				!appendStatus({
 					kind: "decision-failed",
@@ -948,9 +1120,15 @@ export function createDecisionRuntime(
 		}
 
 		if (finalization.outcome === "continue") {
+			const finalCycleId = finalization.cycleId;
 			if (stopIfStale(claim)) return false;
 			try {
-				options.pi.appendEntry(CONTINUE_ENTRY_TYPE, {});
+				if (
+					!(await withDecisionFence(active, () => {
+						options.pi.appendEntry(CONTINUE_ENTRY_TYPE, {});
+					}))
+				)
+					return false;
 			} catch {
 				// Never start an invisible continuation: if its durable TUI marker
 				// cannot be recorded, fail closed and abandon this lock cycle.
@@ -959,21 +1137,30 @@ export function createDecisionRuntime(
 			}
 			if (stopIfStale(claim)) return false;
 			try {
-				options.pi.sendMessage(
-					createDecisionFoldMessage({
-						exchangeId: active.exchangeId,
-						cycleId: finalization.cycleId,
-						outcome: "continue",
-						continuePrompt: config.continuePrompt,
-					}),
-					{ triggerTurn: true, deliverAs: "steer" },
-				);
+				if (
+					!(await withDecisionFence(active, () => {
+						options.pi.sendMessage(
+							createDecisionFoldMessage({
+								exchangeId: active.exchangeId,
+								cycleId: finalCycleId,
+								outcome: "continue",
+								continuePrompt: config.continuePrompt,
+							}),
+							{ triggerTurn: true, deliverAs: "steer" },
+						);
+					}))
+				)
+					return false;
 			} catch {
 				silentlyAbandonDecision();
 				return false;
 			}
 			// Demotion after a successful send still must not claim intermediate continue.
 			if (stopIfStale(claim)) return false;
+			// The continuation turn is now the only local busy source; reconcile the
+			// next retry from the controller state for hosts/tests that have not yet
+			// delivered its agent_start event.
+			reconcileIdle();
 			return true;
 		}
 
@@ -992,6 +1179,11 @@ export function createDecisionRuntime(
 			return false;
 		}
 		if (stopIfStale(claim)) return false;
+		if (
+			options.processDomain !== undefined &&
+			!(await withDecisionFence(active, () => {}))
+		)
+			return false;
 		// Retain AI unlock publication intent until the authoritative all-idle settle.
 		pendingAiUnlock = { reasonType, reason };
 		try {
@@ -1150,6 +1342,28 @@ export function createDecisionRuntime(
 	const registerLifecycle = (): void => {
 		options.pi.on("session_start", async (_event, ctx: ExtensionContext) => {
 			++lifecycleGeneration;
+			sessionContext = ctx;
+			if (options.processDomain !== undefined) {
+				try {
+					await options.processDomain.attach(options.attachmentInstance, {
+						initialBusy: !ctx.isIdle(),
+						onFatal: (error) => {
+							domainFatal = true;
+							options.fatalExit?.fail(error, ctx);
+						},
+					});
+					domainAttached = true;
+					domainReady = true;
+				} catch (error) {
+					domainFatal = true;
+					options.fatalExit?.fail(
+						error instanceof Error ? error : new Error("process domain failed"),
+						ctx,
+					);
+					return;
+				}
+			}
+			if (stopped || domainFatal) return;
 			const bound = options.hub.bind({
 				instance: options.attachmentInstance,
 				sessionId: ctx.sessionManager.getSessionId(),
@@ -1157,12 +1371,11 @@ export function createDecisionRuntime(
 				initialBusy: !ctx.isIdle(),
 			});
 			attachment = bound.attachment;
-			sessionContext = ctx;
 			syncHubState();
 			await configLoad;
 		});
 
-		options.pi.on("agent_start", () => {
+		options.pi.on("agent_start", async () => {
 			// Invalidate any deferred settled wake from a previous run on this attachment.
 			agentActivityGeneration += 1;
 			const claim = getMainClaim();
@@ -1180,6 +1393,14 @@ export function createDecisionRuntime(
 				// Already locked: preserve cycle/decision; do not clear active work.
 			}
 			if (attachment !== null) options.hub.markBusy(attachment);
+			if (domainReady && !domainFatal && options.processDomain !== undefined) {
+				await options.processDomain.markBusy(options.attachmentInstance, {
+					internalDecision:
+						activeDecision !== null &&
+						!activeDecision.invalidated &&
+						owns(activeDecision.claim),
+				});
+			}
 		});
 
 		options.pi.on("message_end", handleDecisionMessageEnd);
@@ -1202,12 +1423,15 @@ export function createDecisionRuntime(
 			};
 		});
 
-		options.pi.on("agent_settled", (_event, ctx: ExtensionContext) => {
+		options.pi.on("agent_settled", async (_event, ctx: ExtensionContext) => {
 			// Only Pi's live idle truth may mark this attachment idle. Another
 			// extension can start a nested run from an earlier settled handler.
 			if (stopped || !ctx.isIdle()) return;
 
 			if (attachment !== null) options.hub.markIdle(attachment);
+			if (domainReady && !domainFatal && options.processDomain !== undefined) {
+				await options.processDomain.markIdle(options.attachmentInstance);
+			}
 			if (!isCurrentMain() || options.controllerHolder.controller === null)
 				return;
 
@@ -1220,7 +1444,7 @@ export function createDecisionRuntime(
 			const settledLifecycleGeneration = lifecycleGeneration;
 			const settledActivityGeneration = agentActivityGeneration;
 			const settledToken = ++settledCallbackGeneration;
-			const handle = clock.setTimeout(() => {
+			const handle = clock.setTimeout(async () => {
 				// Later agent_start, a newer settle, session rebind, demotion, or nested
 				// busy cancels this wake so no-result is not double-counted. Child busy
 				// alone must not block delivery; publish still waits for aggregate idle.
@@ -1238,17 +1462,17 @@ export function createDecisionRuntime(
 
 				// No agent_end / no pending finalization => one malformed no-result.
 				finalizeActiveDecision("missing");
-				const continued = deliverPending(ctx);
+				const continued = await deliverPending(ctx);
 				// Explicit reconcile even when hub markIdle was a no-op edge.
 				reconcileIdle();
 				// Valid continue remains intermediate; wait for the next real idle epoch.
-				if (!continued) maybePublishUserReady();
+				if (!continued) await maybePublishUserReady();
 			}, 0);
 			handle.unref?.();
 		});
 	};
 
-	const shutdown = (): void => {
+	const shutdown = async (): Promise<void> => {
 		if (stopped) return;
 		stopped = true;
 		lifecycleGeneration += 1;
@@ -1259,6 +1483,11 @@ export function createDecisionRuntime(
 		attachment = null;
 		sessionContext = null;
 		unsubscribe();
+		unsubscribeDomain?.();
+		if (domainAttached && options.processDomain !== undefined) {
+			domainAttached = false;
+			await options.processDomain.detach(options.attachmentInstance);
+		}
 	};
 
 	return {

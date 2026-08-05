@@ -13,11 +13,16 @@ import type {
 } from "./config-loader.js";
 import { registerDecisionContextFolding } from "./context-fold.js";
 import type { LockDecisionController } from "./controller.js";
+import { createFatalExitAdapter, type FatalExitAdapter } from "./fatal-exit.js";
 import {
 	createHubAttachmentInstance,
 	getProcessObservableAgentHub,
 	type ObservableAgentHub,
 } from "./hub.js";
+import {
+	getProcessDomainCoordinator,
+	type ProcessDomainCoordinator,
+} from "./process-domain.js";
 import {
 	createDecisionRuntime,
 	type RuntimeClock,
@@ -27,6 +32,8 @@ import {
 /** Dependencies supplied only by focused lifecycle tests. */
 export interface ContinueWatchdogExtensionOptions {
 	readonly hub?: ObservableAgentHub;
+	readonly processDomain?: ProcessDomainCoordinator;
+	readonly fatalExit?: FatalExitAdapter;
 	/** Optional lifecycle-test controller; normal installs load effective config. */
 	readonly controller?: LockDecisionController;
 	readonly config?: ContinueWatchdogConfig;
@@ -43,6 +50,15 @@ export function createContinueWatchdogExtension(
 	options: ContinueWatchdogExtensionOptions = {},
 ): (pi: ExtensionAPI) => void {
 	const hub = options.hub ?? getProcessObservableAgentHub();
+	const useProductionDomain =
+		options.processDomain !== undefined ||
+		(options.hub === undefined && options.controller === undefined);
+	const processDomain = useProductionDomain
+		? (options.processDomain ?? getProcessDomainCoordinator())
+		: undefined;
+	const fatalExit = useProductionDomain
+		? (options.fatalExit ?? createFatalExitAdapter())
+		: options.fatalExit;
 	const attachmentInstance = createHubAttachmentInstance();
 	const holder: RuntimeControllerHolder = {
 		controller: options.controller ?? null,
@@ -52,6 +68,8 @@ export function createContinueWatchdogExtension(
 		const runtime = createDecisionRuntime({
 			pi,
 			hub,
+			processDomain,
+			fatalExit,
 			attachmentInstance,
 			controllerHolder: holder,
 			injectedController: options.controller !== undefined,
@@ -98,9 +116,10 @@ export function createContinueWatchdogExtension(
 		// Abort handlers register first; Pi awaits event handlers in registration order.
 		runtime.registerLifecycle();
 
-		pi.on("session_shutdown", (_event, _ctx: ExtensionContext) => {
+		pi.on("session_shutdown", async (_event, _ctx: ExtensionContext) => {
 			abortUnlock.clear();
-			runtime.shutdown();
+			await runtime.shutdown();
+			fatalExit?.completeShutdown();
 		});
 	};
 }

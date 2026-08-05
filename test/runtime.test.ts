@@ -301,6 +301,8 @@ async function settleOnly(harness: Harness): Promise<void> {
 	const deferred = after - 1;
 	assert.equal(harness.clock.records[deferred]?.delayMs, 0);
 	harness.clock.fire(deferred);
+	await Promise.resolve();
+	await Promise.resolve();
 }
 
 async function settleResponse(

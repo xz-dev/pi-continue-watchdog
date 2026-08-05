@@ -76,6 +76,8 @@ export interface LockDecisionController {
 	): ControllerTransition;
 	recordValidContinue(decisionId: number): ControllerTransition;
 	recordValidUnlock(decisionId: number): ControllerTransition;
+	/** Close a stale decision without consuming attempts or unlocking. */
+	invalidateDecision(decisionId: number): ControllerTransition;
 }
 
 const INVALID_DECISION_LIMIT = 3;
@@ -291,6 +293,18 @@ class PureLockDecisionController implements LockDecisionController {
 			lastInvalidDecisionError: null,
 			decisionOpen: false,
 			decisionId: null,
+		};
+		return this.applied([{ kind: "restoreDecisionTools", decisionId }]);
+	}
+
+	public invalidateDecision(decisionId: number): ControllerTransition {
+		if (!this.isCurrentDecision(decisionId)) return this.noop();
+		this.state = {
+			...this.state,
+			decisionOpen: false,
+			decisionId: null,
+			invalidDecisionAttempts: 0,
+			lastInvalidDecisionError: null,
 		};
 		return this.applied([{ kind: "restoreDecisionTools", decisionId }]);
 	}
