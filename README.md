@@ -178,7 +178,7 @@ Each decision stores only a structured `pi-continue-watchdog:decision-audit` cus
 
 ## Development
 
-The detailed accepted behavior contract is maintained in [`docs/behavior-contract.md`](docs/behavior-contract.md).
+The detailed accepted behavior contract is maintained in [`docs/behavior-contract.md`](docs/behavior-contract.md). For the current module design, lifecycle, XML finalization, session persistence, and provider-context isolation, see [`docs/architecture.md`](docs/architecture.md).
 
 ```bash
 npm ci
