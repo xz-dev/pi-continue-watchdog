@@ -705,6 +705,92 @@ function spawnPackedChild(
 	};
 }
 
+async function assertWrongDomainKeyChildFailsClosed(
+	fixture: PackedFixture,
+	baseUrl: string,
+	domainEnv: NodeJS.ProcessEnv,
+): Promise<void> {
+	const actualKey = domainEnv.PI_PROCESS_DOMAIN_KEY;
+	assert.ok(actualKey);
+	const wrongKey = randomBytes(32).toString("base64url");
+	assert.notEqual(wrongKey, actualKey);
+	const child = spawn(
+		process.execPath,
+		[
+			"--import",
+			"tsx",
+			join(repoRoot, "test", "fixtures", "packed-pi-child.ts"),
+		],
+		{
+			cwd: repoRoot,
+			env: {
+				...process.env,
+				...domainEnv,
+				PI_PROCESS_DOMAIN_KEY: wrongKey,
+				HOME: fixture.home,
+				PI_CODING_AGENT_DIR: fixture.agentDir,
+				XDG_RUNTIME_DIR: fixture.runtimeDir,
+				WATCHDOG_CHILD_AGENT_DIR: fixture.agentDir,
+				WATCHDOG_CHILD_CWD: fixture.cwd,
+				WATCHDOG_CHILD_BASE_URL: baseUrl,
+				WATCHDOG_CHILD_MODEL_ID: "wrong-key-child-model",
+			},
+			stdio: ["ignore", "pipe", "pipe", "ipc"],
+		},
+	);
+	let stdout = "";
+	let stderr = "";
+	child.stdout?.on("data", (chunk) => {
+		stdout += String(chunk);
+	});
+	child.stderr?.on("data", (chunk) => {
+		stderr += String(chunk);
+	});
+	const exit = once(child, "exit") as Promise<
+		[number | null, NodeJS.Signals | null]
+	>;
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+	let code: number | null;
+	let signal: NodeJS.Signals | null;
+	try {
+		child.send({ id: 1, command: "start" });
+		[code, signal] = await Promise.race([
+			exit,
+			new Promise<never>((_resolve, reject) => {
+				timeout = setTimeout(
+					() => reject(new Error("Timed out waiting for wrong-key child exit")),
+					5_000,
+				);
+			}),
+		]);
+	} finally {
+		if (timeout !== undefined) clearTimeout(timeout);
+		if (child.exitCode === null && child.signalCode === null) {
+			child.kill("SIGKILL");
+			await Promise.race([
+				exit,
+				new Promise<void>((resolveTimeout) =>
+					setTimeout(resolveTimeout, 2_000),
+				),
+			]);
+		}
+		child.stdout?.destroy();
+		child.stderr?.destroy();
+	}
+	assert.equal(signal, null);
+	assert.equal(code, 78);
+	const output = `${stdout}\n${stderr}`;
+	assert.equal(
+		output.includes("AUTHENTICATION_FAILED"),
+		true,
+		`sanitized child output: ${output}`,
+	);
+	assert.equal(output.includes(actualKey), false);
+	assert.equal(output.includes(wrongKey), false);
+	assert.equal(output.includes(fixture.runtimeDir), false);
+	assert.equal(output.includes("broker.sock"), false);
+}
+
 function createRpcUiContext(): ExtensionUIContext {
 	// bindExtensions only treats a supplied public UI context as UI-capable; the
 	// watchdog uses notify in this E2E and does not require a real terminal/TUI.
@@ -959,82 +1045,8 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 	const finalChild = await child.command<ChildHarnessSnapshot>("snapshot");
 	assert.deepEqual(finalChild.decisionTools, []);
 	assert.deepEqual(finalChild.customEntries, []);
+	await assertWrongDomainKeyChildFailsClosed(fixture, baseUrl, root.domainEnv);
 	await child.stop();
-});
-
-test("packed stock Pi child fails closed on an inherited wrong domain key", {
-	timeout: 25_000,
-}, async (t) => {
-	const fixture = await makePackedFixture(t, {
-		watchdogConfig: { idleDelaySeconds: 0.2 },
-	});
-	const { baseUrl } = await startMockServer(t, []);
-	const root = await createSession(fixture, baseUrl, {
-		modelId: "wrong-key-root-model",
-		uiContext: createRpcUiContext(),
-	});
-	t.after(() => shutdownSession(root.session));
-	const actualKey = root.domainEnv.PI_PROCESS_DOMAIN_KEY;
-	assert.ok(actualKey);
-	const wrongKey = randomBytes(32).toString("base64url");
-	assert.notEqual(wrongKey, actualKey);
-	const child = spawn(
-		process.execPath,
-		[
-			"--import",
-			"tsx",
-			join(repoRoot, "test", "fixtures", "packed-pi-child.ts"),
-		],
-		{
-			cwd: repoRoot,
-			env: {
-				...process.env,
-				...root.domainEnv,
-				PI_PROCESS_DOMAIN_KEY: wrongKey,
-				HOME: fixture.home,
-				PI_CODING_AGENT_DIR: fixture.agentDir,
-				XDG_RUNTIME_DIR: fixture.runtimeDir,
-				WATCHDOG_CHILD_AGENT_DIR: fixture.agentDir,
-				WATCHDOG_CHILD_CWD: fixture.cwd,
-				WATCHDOG_CHILD_BASE_URL: baseUrl,
-				WATCHDOG_CHILD_MODEL_ID: "wrong-key-child-model",
-			},
-			stdio: ["ignore", "pipe", "pipe", "ipc"],
-		},
-	);
-	t.after(() => {
-		if (child.exitCode === null && child.signalCode === null)
-			child.kill("SIGKILL");
-		child.stdout?.destroy();
-		child.stderr?.destroy();
-	});
-	let stdout = "";
-	let stderr = "";
-	child.stdout?.on("data", (chunk) => {
-		stdout += String(chunk);
-	});
-	child.stderr?.on("data", (chunk) => {
-		stderr += String(chunk);
-	});
-	child.send({ id: 1, command: "start" });
-	const [code, signal] = (await once(child, "exit")) as [
-		number | null,
-		NodeJS.Signals | null,
-	];
-	assert.equal(signal, null);
-	assert.equal(code, 78);
-	const output = `${stdout}\n${stderr}`;
-	assert.equal(
-		output.includes("AUTHENTICATION_FAILED"),
-		true,
-		`sanitized child output: ${output}`,
-	);
-	assert.equal(output.includes(actualKey), false);
-	assert.equal(output.includes(wrongKey), false);
-	assert.equal(output.includes(fixture.runtimeDir), false);
-	assert.equal(output.includes("broker.sock"), false);
-	child.stdout?.destroy();
-	child.stderr?.destroy();
 });
 
 test("packed stock Pi shares aggregate idle and root control across independent ResourceLoaders", {
