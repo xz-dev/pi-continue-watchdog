@@ -11,18 +11,16 @@ import type {
 import type { HubMainClaim } from "./hub.js";
 
 /**
- * Narrow main-run abort / terminal-error detector.
+ * Narrow main-run abort detector.
  *
  * Captures the current leaf boundary at main `agent_start`, then at
  * `agent_settled` inspects only the newly appended branch suffix through public
- * `ctx.sessionManager` APIs. Unlocks when the terminal new assistant has
- * `stopReason === "aborted"` or `stopReason === "error"` (retry-exhausted or
- * unretried run error). Never infers abort/error from settle alone.
+ * `ctx.sessionManager` APIs. Unlocks only when the terminal new assistant has
+ * `stopReason === "aborted"`. Never infers abort from settle alone.
  */
 
 export type TerminalAssistantOutcome =
 	| "aborted"
-	| "error"
 	| "non-aborted"
 	| "none"
 	| "boundary-missing";
@@ -112,7 +110,6 @@ export function inspectTerminalAssistantOutcome(
 
 	if (terminalStopReason === undefined) return "none";
 	if (terminalStopReason === "aborted") return "aborted";
-	if (terminalStopReason === "error") return "error";
 	return "non-aborted";
 }
 
@@ -192,7 +189,7 @@ export function registerMainAbortUnlock(
 			ctx.sessionManager,
 			active.boundaryLeafId,
 		);
-		if (outcome !== "aborted" && outcome !== "error") return;
+		if (outcome !== "aborted") return;
 
 		const controller = runtime.controller;
 		if (controller === null || !runtime.isCurrentMainClaim(active.claim))

@@ -304,14 +304,14 @@ test("pure: boundary capture and suffix terminal outcomes", () => {
 			{ getBranch: () => [assistant("a", "error")] },
 			null,
 		),
-		"error",
+		"non-aborted",
 	);
 	assert.equal(
 		inspectTerminalAssistantOutcome(
 			{ getBranch: () => [user("u0"), assistant("a", "error")] },
 			"u0",
 		),
-		"error",
+		"non-aborted",
 	);
 	assert.equal(
 		inspectTerminalAssistantOutcome({ getBranch: () => [] }, null),
@@ -363,7 +363,7 @@ test("already-unlocked abort still notifies bare text", async () => {
 	assert.deepEqual(harness.notifications, ["Continue watchdog unlocked"]);
 });
 
-test("terminal error settle unlocks like abort (retry-exhausted)", async () => {
+test("terminal error settle stays locked without bare unlock", async () => {
 	const harness = createAbortHarness({ locked: true });
 	harness.append(user("u0"));
 	await harness.start();
@@ -376,19 +376,15 @@ test("terminal error settle unlocks like abort (retry-exhausted)", async () => {
 	harness.append(assistant("a1", "error"));
 	await harness.settle();
 
-	assert.equal(harness.controller.snapshot.locked, false);
-	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.decisionOpen, true);
 	assert.equal(harness.controller.snapshot.attempt, 1);
-	assert.deepEqual(harness.notifications, ["Continue watchdog unlocked"]);
+	assert.deepEqual(harness.notifications, []);
 	assert.deepEqual(
 		harness.effects.map((effect) => effect.kind),
-		["restoreDecisionTools"],
+		[],
 	);
-	assert.deepEqual(harness.timeline, [
-		"cleanup:locked=false",
-		"restoreDecisionTools",
-		"notify:Continue watchdog unlocked",
-	]);
+	assert.deepEqual(harness.timeline, []);
 });
 
 test("non-aborted matrix and no-assistant / missing-boundary stay locked", async () => {
