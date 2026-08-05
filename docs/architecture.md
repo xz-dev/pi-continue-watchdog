@@ -237,7 +237,7 @@ Pi applies this replacement before final listeners and `SessionManager.appendMes
 - the persisted assistant entry has empty content;
 - the raw XML is not stored as assistant content.
 
-The original response is held only until runtime finalization. `agent_end` uses the captured response rather than trying to parse the empty replacement. Captured data is cleared on terminal delivery, cleanup, ownership loss, restart, abort, and shutdown so it cannot leak into a later cycle.
+The original response is held only until runtime finalization. `agent_end` uses the captured response rather than trying to parse the empty replacement. Provider `stopReason: "error"` messages remain provisional because Pi may automatically retry within the same run; the first later successful response is captured and finalized normally, while a true final settle with no verifiable response consumes one invalid attempt. Captured data is cleared on terminal delivery, cleanup, ownership loss, restart, abort, and shutdown so it cannot leak into a later cycle.
 
 ### Streaming boundary
 
@@ -298,7 +298,7 @@ The session remains append-only and still contains Pi-recognizable protocol entr
 - hidden re-asks;
 - a terminal fold marker.
 
-Before every provider request, `src/context-fold.ts` correlates a complete exchange by protocol version, exchange ID, and cycle IDs. It fails closed on unrelated user/system/custom messages or malformed correlation so it never risks deleting real user conversation.
+Before every provider request, `src/context-fold.ts` correlates a complete exchange by protocol version, exchange ID, and cycle IDs. Complete exchanges fold normally, and a canonical decision prompt followed by an aborted assistant is removed as a bounded plugin-owned pair. An unrelated, incomplete, or malformed exchange fails closed locally for its own correlation ID; it cannot disable folding for later independent exchanges.
 
 Terminal outcomes transform context as follows.
 
@@ -353,6 +353,7 @@ Packed E2E creates a persistent session, triggers a decision, shuts it down, reo
 
 - record the accepted continue;
 - increment the continue attempt;
+- append one muted TUI-only `Continue watchdog continued` entry so automatic continuation and possible token-consuming loops remain visible;
 - append the terminal fold marker;
 - fold the exchange into `continuePrompt`;
 - trigger the next ordinary turn;
@@ -377,7 +378,7 @@ Packed E2E creates a persistent session, triggers a decision, shuts it down, reo
 
 ### Main abort
 
-Abort detection uses Pi's persisted canonical assistant outcome `stopReason: "aborted"`, not raw keyboard guesses. A main abort unlocks reasonlessly and cancels watchdog work. Child abort causes are not inspected and do not unlock main.
+Abort detection uses Pi's persisted canonical assistant outcome `stopReason: "aborted"`, not raw keyboard guesses. A main abort unlocks reasonlessly and cancels watchdog work. Its bounded decision prompt/aborted-assistant pair is removed from later provider context without requiring a persisted fold marker. Child abort causes are not inspected and do not unlock main.
 
 ## Avoiding a persistent `working` state
 

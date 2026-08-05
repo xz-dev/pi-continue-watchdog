@@ -222,7 +222,7 @@ Thinking blocks are ignored. Concatenate final assistant text and trim it. It mu
 - Empty/blank or overlong reasons are **invalid** (no truncation on the AI path)
 - Existing reason rules remain; they are independent of type matching
 
-**Invalid includes:** missing/malformed XML; no or multiple watchdog blocks; non-whitespace after the closing block; unknown function; duplicate required keys; missing/blank/unknown `reason_type`; invalid `reason_content`.
+**Invalid includes:** a completed decision response with missing/malformed XML; no or multiple watchdog blocks; non-whitespace after the closing block; unknown function; duplicate required keys; missing/blank/unknown `reason_type`; invalid `reason_content`. A provisional Provider error that Pi retries within the same run is not a completed response and does not consume an invalid attempt.
 
 ### Invalid → re-ask (fixed 3)
 
@@ -258,6 +258,7 @@ On invalid decision:
 - Reasonless (`reason_type` and `reason_content` are not required or used)
 - The decision turn ends, and ordinary work continues automatically without further user input
 - `message_end` replaces the provider XML with an empty assistant; context folding then removes the complete prompt / empty assistant / blocked calls and results and replaces them with **one** compact custom message containing the configured `continuePrompt` (exact default: `Continue until user assistance is required.`)
+- append exactly one muted persistent TUI-only entry with exact text `Continue watchdog continued`, so repeated automatic continuation remains observable without entering model context or adding a duplicate transient notification
 - The continued ordinary turn receives exactly one compact model-bound message containing `continuePrompt`; the XML decision exchange is otherwise hidden from later context
 - Consumes **one** exponential retry (attempt advances)
 - Next settle + all-observable-idle uses the next exponential delay
@@ -422,6 +423,9 @@ With defaults, delays for successive continue attempts begin **3s, 6s, 12s, 24s,
 - ordinary tools remain unchanged and execution stays blocked during the re-ask
 - invalid type and invalid reason both count under the same fixed three invalid attempts total
 - invalid re-asks do **not** advance exponential continue attempt / do not count toward `maxRetries`
+
+**When instead** a Provider error occurs and Pi successfully retries the same decision run
+**Then** accept the successful retry response without recording an invalid decision or opening a duplicate re-ask
 
 **When** the third consecutive invalid decision occurs
 **Then**

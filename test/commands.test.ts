@@ -9,7 +9,10 @@ import type {
 import { visibleWidth } from "@earendil-works/pi-tui";
 
 import {
+	CONTINUE_ENTRY_TEXT,
+	CONTINUE_ENTRY_TYPE,
 	type CommandRuntimeEffect,
+	createContinueEntryRenderer,
 	createHumanUnlockEntryRenderer,
 	createMainCommands,
 	formatUnlockEntryText,
@@ -214,6 +217,36 @@ test("Slice 4 RED: registers the exact human command names, descriptions, and TU
 		"Unlock the continue watchdog (optional reason).",
 	);
 	assert.equal(harness.entryRenderers.has(HUMAN_UNLOCK_ENTRY_TYPE), true);
+});
+
+test("accepted continue entry renders one persistent muted status line", () => {
+	assert.equal(CONTINUE_ENTRY_TEXT, "Continue watchdog continued");
+	const renderer = createContinueEntryRenderer();
+	const mutedCalls: Array<{ color: string; text: string }> = [];
+	const component = renderer(
+		{
+			type: "custom",
+			customType: CONTINUE_ENTRY_TYPE,
+			id: "continue-entry",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			data: {},
+		},
+		{} as never,
+		{
+			fg(color: string, text: string) {
+				mutedCalls.push({ color, text });
+				return text;
+			},
+		} as never,
+	);
+
+	assert.ok(component);
+	assert.deepEqual(component.render(10_000), [CONTINUE_ENTRY_TEXT]);
+	assert.deepEqual(mutedCalls, [
+		{ color: "toolOutput", text: CONTINUE_ENTRY_TEXT },
+	]);
+	assert.equal(CONTINUE_ENTRY_TYPE, "pi-continue-watchdog:continue");
 });
 
 test("Examples 2-3 RED: same-state human lock/unlock are unconditional and notify exactly", async () => {

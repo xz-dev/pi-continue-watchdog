@@ -9,7 +9,11 @@ import {
 	type MessageEndEvent,
 } from "@earendil-works/pi-coding-agent";
 
-import { HUMAN_UNLOCK_ENTRY_TYPE, type HumanUnlockEntry } from "./commands.js";
+import {
+	CONTINUE_ENTRY_TYPE,
+	HUMAN_UNLOCK_ENTRY_TYPE,
+	type HumanUnlockEntry,
+} from "./commands.js";
 import { BUILT_IN_CONFIG, type ContinueWatchdogConfig } from "./config.js";
 import { type LoadedConfig, loadRuntimeConfig } from "./config-loader.js";
 import {
@@ -174,12 +178,20 @@ function terminalAssistant(messages: readonly unknown[]): unknown | undefined {
 	return undefined;
 }
 
-function isAbortedAssistant(message: unknown): boolean {
+function hasAssistantStopReason(message: unknown, stopReason: string): boolean {
 	return (
 		typeof message === "object" &&
 		message !== null &&
-		(message as { readonly stopReason?: unknown }).stopReason === "aborted"
+		(message as { readonly stopReason?: unknown }).stopReason === stopReason
 	);
+}
+
+function isAbortedAssistant(message: unknown): boolean {
+	return hasAssistantStopReason(message, "aborted");
+}
+
+function isErroredAssistant(message: unknown): boolean {
+	return hasAssistantStopReason(message, "error");
 }
 
 /**
@@ -749,6 +761,15 @@ export function createDecisionRuntime(
 		if (finalization.outcome === "continue") {
 			if (stopIfStale(claim)) return false;
 			try {
+				options.pi.appendEntry(CONTINUE_ENTRY_TYPE, {});
+			} catch {
+				// Never start an invisible continuation: if its durable TUI marker
+				// cannot be recorded, fail closed and abandon this lock cycle.
+				silentlyAbandonDecision();
+				return false;
+			}
+			if (stopIfStale(claim)) return false;
+			try {
 				options.pi.sendMessage(
 					createDecisionFoldMessage({
 						exchangeId: active.exchangeId,
@@ -846,6 +867,7 @@ export function createDecisionRuntime(
 			pendingFinalization !== null ||
 			event.message.role !== "assistant" ||
 			isAbortedAssistant(event.message) ||
+			isErroredAssistant(event.message) ||
 			!options.hub.isCurrentMain(active.claim)
 		) {
 			return undefined;
@@ -897,8 +919,16 @@ export function createDecisionRuntime(
 
 	const handleAgentEnd = (event: AgentEndEvent): void => {
 		const assistant = terminalAssistant(event.messages);
-		// Aborted terminal assistants are owned by the abort-outcome path.
-		if (assistant !== undefined && isAbortedAssistant(assistant)) return;
+		// Aborts are owned by the abort-outcome path. Provider errors remain
+		// provisional because Pi may automatically retry within the same run;
+		// only a successful response or the final settled no-result may consume a
+		// decision attempt.
+		if (
+			assistant !== undefined &&
+			(isAbortedAssistant(assistant) || isErroredAssistant(assistant))
+		) {
+			return;
+		}
 		const captured = capturedDecisionResponse;
 		if (
 			captured !== null &&

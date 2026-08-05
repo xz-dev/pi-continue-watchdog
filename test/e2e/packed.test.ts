@@ -42,7 +42,13 @@ interface RequestRecord {
 }
 
 interface MockReply {
-	readonly kind: "stop" | "continue" | "unlock" | "invalid" | "delayed";
+	readonly kind:
+		| "stop"
+		| "continue"
+		| "unlock"
+		| "invalid"
+		| "delayed"
+		| "connection-error";
 	readonly reasonType?: string;
 	readonly reason?: string;
 	readonly started?: () => void;
@@ -207,6 +213,12 @@ function textOf(message: RequestRecord["messages"][number]): string {
 	return JSON.stringify(message.content);
 }
 
+function isDecisionRequest(request: RequestRecord): boolean {
+	return request.messages.some((message) =>
+		textOf(message).includes(decisionPromptStart),
+	);
+}
+
 function sendSse(
 	response: import("node:http").ServerResponse,
 	chunks: unknown[],
@@ -241,6 +253,10 @@ async function startMockServer(
 				return;
 			}
 			const id = `mock-${requests.length}`;
+			if (reply.kind === "connection-error") {
+				request.socket.destroy();
+				return;
+			}
 			if (reply.kind === "delayed") {
 				response.writeHead(200, {
 					"content-type": "text/event-stream",
@@ -761,10 +777,6 @@ test("packed artifact asks after threshold compaction settles", {
 	)?.at;
 	assert.ok(postCompactionSettledAt);
 	await waitWithinDeadline(() => session.isIdle, "post-compaction idle");
-	const isDecisionRequest = (request: RequestRecord): boolean =>
-		request.messages.some((message) =>
-			textOf(message).includes(decisionPromptStart),
-		);
 	await waitWithinDeadline(
 		() =>
 			requests.some(
@@ -898,6 +910,66 @@ test("packed source artifact waits a real 3 seconds, decides continue, and folds
 	assert.equal(thirdBody.includes(decisionPromptStart), false);
 	assert.equal(thirdBody.includes("continue_watchdog"), false);
 	assert.equal(thirdBody.includes("unlock_continue_watchdog"), false);
+	const persisted = session.sessionManager
+		.getEntries()
+		.map((entry) => JSON.stringify(entry));
+	assert.equal(
+		persisted.filter((entry) =>
+			entry.includes('"customType":"pi-continue-watchdog:continue"'),
+		).length,
+		1,
+	);
+	assert.equal(thirdBody.includes("Continue watchdog continued"), false);
+});
+
+test("packed stock Pi retries a decision connection error and accepts the successful unlock", {
+	timeout: 30_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t, {
+		watchdogConfig: { idleDelaySeconds: 0 },
+	});
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "stop" },
+		{ kind: "connection-error" },
+		{
+			kind: "unlock",
+			reasonType: "JOB_DONE",
+			reason: "retry recovered",
+		},
+	]);
+	const { session } = await createSession(fixture, baseUrl);
+	t.after(() => shutdownSession(session));
+
+	await session.prompt("Complete the task, then let the watchdog decide.");
+	await waitFor(
+		() => requests.length === 3,
+		10_000,
+		"retried watchdog decision provider request",
+	);
+	await waitForSessionIdle(session, 10_000, "retried watchdog unlock");
+
+	assert.equal(requests.filter(isDecisionRequest).length, 2);
+	const serialized = session.sessionManager
+		.getEntries()
+		.map((entry) => JSON.stringify(entry));
+	assert.equal(
+		serialized.filter((entry) => entry.includes('"outcome":"invalid"')).length,
+		0,
+	);
+	assert.equal(
+		serialized.filter((entry) =>
+			entry.includes("previous decision response was invalid"),
+		).length,
+		0,
+	);
+	assert.equal(
+		serialized.some((entry) => entry.includes('"outcome":"unlock"')),
+		true,
+	);
+	assert.equal(
+		serialized.some((entry) => entry.includes("retry recovered")),
+		true,
+	);
 });
 
 test("packed command unlock and canonical programmatic abort prevent a decision turn", {

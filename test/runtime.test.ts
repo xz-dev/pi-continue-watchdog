@@ -137,6 +137,7 @@ function unlockXml(
 function createHarness(options?: {
 	readonly config?: Partial<ContinueWatchdogConfig>;
 	readonly sendThrows?: boolean;
+	readonly appendThrows?: boolean;
 	readonly hasUI?: boolean;
 	readonly onNotify?: (message: string) => void;
 }): Harness {
@@ -195,6 +196,7 @@ function createHarness(options?: {
 			}
 		},
 		appendEntry(type: string, data: HumanUnlockEntry): void {
+			if (options?.appendThrows) throw new Error("append failed");
 			entries.push({ type, data });
 		},
 	} as unknown as ExtensionAPI;
@@ -487,6 +489,26 @@ test("agent_end finalizes while streaming but settled alone dispatches continue"
 	});
 	assert.equal(harness.triggeredTurns, turnsBefore + 1);
 	assert.equal(harness.controller.snapshot.attempt, 1);
+	assert.deepEqual(harness.entries, [
+		{
+			type: "pi-continue-watchdog:continue",
+			data: {},
+		},
+	]);
+});
+
+test("continue entry persistence failure prevents an invisible continuation", async () => {
+	const harness = createHarness({ appendThrows: true });
+	await startIdle(harness);
+	harness.openDecision();
+	const sentBefore = harness.sent.length;
+
+	await settleResponse(harness, harness.answerContinue());
+
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.sent.length, sentBefore);
+	assert.equal(harness.triggeredTurns, 1);
+	assert.deepEqual(harness.entries, []);
 });
 
 test("decision message_end hides XML, persists a context-excluded audit, and finalizes from the captured response", async () => {
@@ -528,6 +550,88 @@ test("decision message_end hides XML, persists a context-excluded audit, and fin
 		type: "pi-continue-watchdog:unlock",
 		data: { reasonType: "WAIT_USER", reason: "Waiting for approval." },
 	});
+});
+
+test("decision provider error stays provisional so the same Pi run can retry and unlock", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.openDecision();
+
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	const providerError = assistant([], "error");
+	assert.equal(await harness.endDecisionMessage(providerError), undefined);
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [providerError],
+	});
+
+	const unlock = harness.answerUnlock(
+		"All requested work is complete.",
+		"JOB_DONE",
+	);
+	const replacement = (await harness.endDecisionMessage(
+		unlock,
+	)) as DecisionMessageReplacement;
+	assert.deepEqual(replacement.message.content, []);
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [unlock],
+	});
+
+	harness.streaming = false;
+	await settleOnly(harness);
+
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
+	assert.equal(
+		harness.sent.filter((entry) =>
+			entry.message.content.includes("previous decision response was invalid"),
+		).length,
+		0,
+	);
+	assert.equal(
+		harness.sent.filter(
+			(entry) => entry.message.customType === DECISION_FOLD_MESSAGE_TYPE,
+		).length,
+		1,
+	);
+	assert.deepEqual(harness.sent.at(-1), {
+		message: {
+			customType: DECISION_FOLD_MESSAGE_TYPE,
+			content: "",
+			display: false,
+			details: {
+				version: 1,
+				exchangeId: "exchange-1",
+				cycleId: 1,
+				outcome: "unlock",
+			},
+		},
+		options: { triggerTurn: false, deliverAs: "steer" },
+		streaming: false,
+	});
+	assert.deepEqual(harness.entries, [
+		{
+			type: "pi-continue-watchdog:decision-audit",
+			data: {
+				version: 1,
+				exchangeId: "exchange-1",
+				cycleId: 1,
+				outcome: "unlock",
+				reasonType: "JOB_DONE",
+				reason: "All requested work is complete.",
+			},
+		},
+		{
+			type: "pi-continue-watchdog:unlock",
+			data: {
+				reasonType: "JOB_DONE",
+				reason: "All requested work is complete.",
+			},
+		},
+	]);
+	assert.deepEqual(harness.notifications, []);
 });
 
 test("decision message_end audit records invalid output without retaining raw text", async () => {

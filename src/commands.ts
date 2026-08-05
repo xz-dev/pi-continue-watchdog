@@ -17,6 +17,10 @@ export const LOCK_COMMAND_DESCRIPTION = "Lock the continue watchdog.";
 export const UNLOCK_COMMAND_DESCRIPTION =
 	"Unlock the continue watchdog (optional reason).";
 
+/** Persisted TUI-only entry for every accepted automatic continue. */
+export const CONTINUE_ENTRY_TYPE = "pi-continue-watchdog:continue";
+export const CONTINUE_ENTRY_TEXT = "Continue watchdog continued";
+
 /** Persisted custom-entry type for human-visible unlock reasons. */
 export const HUMAN_UNLOCK_ENTRY_TYPE = "pi-continue-watchdog:unlock";
 
@@ -178,6 +182,13 @@ export function formatUnlockEntryText(
  * Render a persisted custom entry. Pi custom entries are TUI-only and are not
  * added to LLM context; this renderer intentionally has no model-facing path.
  */
+export function createContinueEntryRenderer(): EntryRenderer<
+	Record<string, never>
+> {
+	return (_entry, _options, theme) =>
+		createStaticTextComponent(CONTINUE_ENTRY_TEXT, theme);
+}
+
 export function createHumanUnlockEntryRenderer(): EntryRenderer<HumanUnlockEntry> {
 	return (entry, _options, theme) => {
 		const { reason, reasonType } = getHumanUnlockFields(entry);
@@ -306,6 +317,10 @@ export function createMainCommands(
 	pi: ExtensionAPI,
 	runtime: MainCommandRuntime,
 ): void {
+	pi.registerEntryRenderer<Record<string, never>>(
+		CONTINUE_ENTRY_TYPE,
+		createContinueEntryRenderer(),
+	);
 	pi.registerEntryRenderer<HumanUnlockEntry>(
 		HUMAN_UNLOCK_ENTRY_TYPE,
 		createHumanUnlockEntryRenderer(),

@@ -96,6 +96,11 @@ type FoldedSegment<T extends object> = {
 	readonly replacement: T | undefined;
 };
 
+type DecisionSegment<T extends object> =
+	| { readonly kind: "folded"; readonly segment: FoldedSegment<T> }
+	| { readonly kind: "aborted"; readonly endIndex: number }
+	| { readonly kind: "incomplete" };
+
 function isObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
@@ -188,6 +193,20 @@ function foldDetails(input: unknown): DecisionFoldDetails | undefined {
 	};
 }
 
+function pluginExchangeId(input: unknown): string | undefined {
+	if (!isObject(input)) return undefined;
+	if (
+		input.role !== "custom" ||
+		(input.customType !== DECISION_MESSAGE_TYPE &&
+			input.customType !== DECISION_FOLD_MESSAGE_TYPE) ||
+		!isObject(input.details) ||
+		!validExchangeId(input.details.exchangeId)
+	) {
+		return undefined;
+	}
+	return input.details.exchangeId;
+}
+
 function parsePluginMessage(input: unknown): ParsedPluginMessage {
 	if (!isObject(input) || input.role !== "custom") return { type: "unrelated" };
 	const customType = asString(input.customType);
@@ -222,6 +241,14 @@ function parsePluginMessage(input: unknown): ParsedPluginMessage {
 		: { type: "invalid" };
 }
 
+function isAbortedAssistant(input: unknown): boolean {
+	return (
+		isObject(input) &&
+		input.role === "assistant" &&
+		input.stopReason === "aborted"
+	);
+}
+
 function createContinuationMessage<T extends object>(
 	marker: Extract<ParsedFoldMarker, { outcome: "continue" }>,
 ): T {
@@ -244,25 +271,25 @@ function createContinuationMessage<T extends object>(
  * (including blocked ordinary tool calls), and tool results. User/system or
  * unrelated custom messages fail closed so raw context is retained.
  */
-function findFoldedSegment<T extends object>(
+function findDecisionSegment<T extends object>(
 	messages: readonly T[],
 	startIndex: number,
 	start: ParsedDecisionMessage,
-): FoldedSegment<T> | undefined {
+): DecisionSegment<T> {
 	let cycleId = start.cycleId;
 	let sawTerminalAssistant = false;
 
 	for (let index = startIndex + 1; index < messages.length; index += 1) {
 		const message = messages[index];
 		const pluginMessage = parsePluginMessage(message);
-		if (pluginMessage.type === "invalid") return undefined;
+		if (pluginMessage.type === "invalid") return { kind: "incomplete" };
 
 		if (pluginMessage.type === "decision") {
 			if (
 				pluginMessage.exchangeId !== start.exchangeId ||
 				pluginMessage.cycleId !== cycleId + 1
 			) {
-				return undefined;
+				return { kind: "incomplete" };
 			}
 			cycleId = pluginMessage.cycleId;
 			sawTerminalAssistant = false;
@@ -275,19 +302,25 @@ function findFoldedSegment<T extends object>(
 				pluginMessage.cycleId !== cycleId ||
 				(pluginMessage.outcome !== "decision-failed" && !sawTerminalAssistant)
 			) {
-				return undefined;
+				return { kind: "incomplete" };
 			}
 			return {
-				endIndex: index,
-				replacement:
-					pluginMessage.outcome === "continue"
-						? createContinuationMessage<T>(pluginMessage)
-						: undefined,
+				kind: "folded",
+				segment: {
+					endIndex: index,
+					replacement:
+						pluginMessage.outcome === "continue"
+							? createContinuationMessage<T>(pluginMessage)
+							: undefined,
+				},
 			};
 		}
 
-		if (!isObject(message)) return undefined;
+		if (!isObject(message)) return { kind: "incomplete" };
 		if (message.role === "assistant") {
+			if (isAbortedAssistant(message)) {
+				return { kind: "aborted", endIndex: index };
+			}
 			sawTerminalAssistant = true;
 			continue;
 		}
@@ -296,11 +329,13 @@ function findFoldedSegment<T extends object>(
 			continue;
 		}
 
-		// User, system, or unrelated custom messages are never safe to erase.
-		return undefined;
+		// User, system, or unrelated custom messages terminate this incomplete
+		// segment, but do not prevent later independently correlated exchanges
+		// from being folded.
+		return { kind: "incomplete" };
 	}
 
-	return undefined;
+	return { kind: "incomplete" };
 }
 
 /**
@@ -371,28 +406,54 @@ export function createDecisionFoldMessage(
 }
 
 /**
- * Non-destructively remove only complete, fully correlated plugin exchanges from
- * the array Pi is about to send to a model. Session records are never changed.
- * Any malformed or interleaved sequence fails closed by preserving raw messages.
+ * Non-destructively remove complete, fully correlated plugin exchanges and
+ * canonical aborted decision pairs from the array Pi is about to send to a
+ * model. Session records are never changed. Ambiguous exchanges fail closed
+ * locally without disabling later independent folds.
  */
 export function foldDecisionContext<T extends object>(messages: T[]): T[] {
 	if (!Array.isArray(messages)) return messages;
 
 	const folded: T[] = [];
+	const incompleteExchangeIds = new Set<string>();
 	let changed = false;
 	for (let index = 0; index < messages.length; index += 1) {
 		const message = messages[index];
 		const pluginMessage = parsePluginMessage(message);
-		if (pluginMessage.type === "invalid") return messages;
+		if (pluginMessage.type === "invalid") {
+			const exchangeId = pluginExchangeId(message);
+			if (exchangeId !== undefined) incompleteExchangeIds.add(exchangeId);
+			folded.push(message);
+			continue;
+		}
 		if (pluginMessage.type !== "decision") {
 			folded.push(message);
 			continue;
 		}
-		const segment = findFoldedSegment(messages, index, pluginMessage);
-		if (segment === undefined) return messages;
-		if (segment.replacement !== undefined) folded.push(segment.replacement);
-		index = segment.endIndex;
-		changed = true;
+		if (incompleteExchangeIds.has(pluginMessage.exchangeId)) {
+			folded.push(message);
+			continue;
+		}
+		const result = findDecisionSegment(messages, index, pluginMessage);
+		if (result.kind === "folded") {
+			if (result.segment.replacement !== undefined) {
+				folded.push(result.segment.replacement);
+			}
+			index = result.segment.endIndex;
+			changed = true;
+			continue;
+		}
+		if (result.kind === "aborted") {
+			index = result.endIndex;
+			changed = true;
+			continue;
+		}
+
+		// Preserve an ambiguous/incomplete exchange locally. A later cycle with
+		// the same correlation id remains raw, while independent exchanges can
+		// still fold normally.
+		incompleteExchangeIds.add(pluginMessage.exchangeId);
+		folded.push(message);
 	}
 	return changed ? folded : messages;
 }

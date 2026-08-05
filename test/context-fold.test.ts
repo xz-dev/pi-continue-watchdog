@@ -371,6 +371,89 @@ test("incomplete, interleaved, or malformed exchanges fail closed", () => {
 	assert.equal(foldDecisionContext(badCycle), badCycle);
 });
 
+test("a malformed plugin record keeps later cycles with the same exchange id raw", () => {
+	const malformedDecision = {
+		...decision(EXCHANGE_ID, 1, 1),
+		content: "",
+	};
+	const laterCycle = decision(EXCHANGE_ID, 2, 2);
+	const laterAssistant = assistant(
+		[text("<watchdog><function>continue_watchdog</function></watchdog>")],
+		3,
+	);
+	const laterFold = foldMarker({
+		outcome: "continue",
+		cycleId: 2,
+		timestamp: 4,
+	});
+	const messages = [malformedDecision, laterCycle, laterAssistant, laterFold];
+
+	assert.deepEqual(foldDecisionContext(messages), messages);
+});
+
+test("an earlier aborted decision does not prevent a later complete exchange from folding", () => {
+	const abortedExchangeId = "aborted-exchange";
+	const completeExchangeId = "complete-exchange";
+	const abortedAssistant = {
+		...assistant([], 3),
+		stopReason: "aborted",
+		errorMessage: "Operation aborted",
+	};
+	const messages = [
+		user("before", 1),
+		decision(abortedExchangeId, 1, 2),
+		abortedAssistant,
+		user("after aborted run", 4),
+		decision(completeExchangeId, 1, 5),
+		assistant(
+			[text("<watchdog><function>continue_watchdog</function></watchdog>")],
+			6,
+		),
+		foldMarker({
+			exchangeId: completeExchangeId,
+			outcome: "continue",
+			timestamp: 7,
+		}),
+	];
+
+	assert.deepEqual(foldDecisionContext(messages), [
+		user("before", 1),
+		user("after aborted run", 4),
+		continuationMessage(7, completeExchangeId),
+	]);
+});
+
+test("an incomplete exchange stays raw without poisoning a later complete exchange", () => {
+	const incompleteExchangeId = "incomplete-exchange";
+	const completeExchangeId = "complete-exchange";
+	const incompleteDecision = decision(incompleteExchangeId, 1, 2);
+	const incompleteAssistant = assistant([text("no terminal marker")], 3);
+	const messages = [
+		user("before", 1),
+		incompleteDecision,
+		incompleteAssistant,
+		user("interleaving user message", 4),
+		decision(completeExchangeId, 1, 5),
+		assistant(
+			[text("<watchdog><function>continue_watchdog</function></watchdog>")],
+			6,
+		),
+		foldMarker({
+			exchangeId: completeExchangeId,
+			outcome: "continue",
+			timestamp: 7,
+		}),
+	];
+
+	assert.deepEqual(foldDecisionContext(messages), [
+		user("before", 1),
+		incompleteDecision,
+		incompleteAssistant,
+		user("interleaving user message", 4),
+		continuationMessage(7, completeExchangeId),
+	]);
+});
+
 test("builders reject invalid inputs and the context hook uses foldDecisionContext", () => {
 	assert.throws(() =>
 		createDecisionPromptMessage({

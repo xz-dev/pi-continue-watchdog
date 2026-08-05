@@ -47,9 +47,9 @@ Observable behavior only (implementation details may change):
    ```
 
    It may explain first or output only XML, but after trimming the sole `</watchdog>` must be the end of the response. Multiple watchdog blocks are invalid. If it tries an ordinary tool during the decision, the extension blocks execution and reminds it to answer from existing context with XML. Pi's public `message_end` replacement then captures the final decision and replaces the provider XML with an empty assistant before final TUI rendering and session persistence, so the raw XML is not shown or stored as assistant content.
-4. **Continue** folds the complete hidden exchange into the compact prompt `Continue until user assistance is required.` (configurable), then ordinary work resumes without further user input.
+4. **Continue** appends one muted persistent TUI-only line, `Continue watchdog continued`, so repeated automatic continuation is visible and cannot silently consume tokens. It then folds the complete hidden exchange into the compact prompt `Continue until user assistance is required.` (configurable), and ordinary work resumes without further user input.
 5. **AI unlock** requires an allowed `reason_type` and concise nonblank `reason_content` of at most 500 Unicode code points. It shows one muted persistent TUI line, `Continue watchdog unlocked · <TYPE> · <reason>`, with no duplicate transient notification, and does **not** start another work turn. Future model context drops the complete decision exchange. Human command unlock remains untyped.
-6. A decision gets up to **3 total attempts**. An invalid final XML response counts as one attempt; blocked ordinary tool calls within that run do not. Invalid raw text is not retained. After the third invalid response, the extension stays locked/failed until a new main user message or manual lock, and the failed exchange is folded out of future model context.
+6. A decision gets up to **3 total attempts**. An invalid final XML response counts as one attempt; blocked ordinary tool calls and provisional Provider errors that Pi retries within the same run do not. Invalid raw text is not retained. After the third invalid response, the extension stays locked/failed until a new main user message or manual lock, and the failed exchange is folded out of future model context.
 7. After each valid continue, the next idle delay doubles: default **3s, 6s, 12s, …** up to **10** valid continues per lock cycle.
 8. An **aborted** main run unlocks immediately (reasonless). Child stop reasons are never inspected.
 
@@ -172,7 +172,7 @@ Publication is at most once per such terminal idle epoch. It does **not** publis
 
 ## Context cleanliness
 
-After valid continue, valid unlock, or terminal decision failure, future **model-bound** context drops the complete decision exchange, including the hidden question, empty replacement assistant, blocked calls/results, re-asks, and fold marker. Continue replaces it with the compact continue prompt; unlock and failure replace it with nothing.
+After valid continue, valid unlock, or terminal decision failure, future **model-bound** context drops the complete decision exchange, including the hidden question, empty replacement assistant, blocked calls/results, re-asks, and fold marker. Continue replaces it with the compact continue prompt; unlock and failure replace it with nothing. Canonical aborted decision pairs are also removed. A malformed or incomplete historical exchange fails closed only for its own correlation ID; it cannot disable folding for later independent exchanges.
 
 Each decision stores only a structured `pi-continue-watchdog:decision-audit` custom entry. Pi explicitly excludes plain custom entries from Agent/provider context, so the audit survives `pi -c` without becoming conversation. Valid unlock audits keep the validated type and reason; invalid audits keep only the fixed validation error, never raw model text. The original XML is not retained as assistant content.
 

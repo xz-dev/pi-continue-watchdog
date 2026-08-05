@@ -190,7 +190,10 @@ test("actual main user message_start locks without a command notification", () =
 		"lock-continue-watchdog",
 		"unlock-continue-watchdog",
 	]);
-	assert.deepEqual(harness.entryRendererTypes, ["pi-continue-watchdog:unlock"]);
+	assert.deepEqual(harness.entryRendererTypes, [
+		"pi-continue-watchdog:continue",
+		"pi-continue-watchdog:unlock",
+	]);
 	assert.equal(harness.calls.filter((name) => name === "context").length, 1);
 	assert.equal(harness.controller.snapshot.locked, false);
 
