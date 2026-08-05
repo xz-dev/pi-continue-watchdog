@@ -6,7 +6,6 @@ const FALLBACK_DELAY_MS = 1_000;
 export interface FatalExitProcess {
 	exitCode: number | undefined;
 	once(event: "exit", listener: (code: number) => void): unknown;
-	off(event: "exit", listener: (code: number) => void): unknown;
 	exit(code: number): never | undefined;
 }
 
@@ -80,10 +79,9 @@ export function createFatalExitAdapter(options?: {
 				clock.clearTimeout(fallback);
 				fallback = null;
 			}
-			if (exitListener !== null) {
-				processAdapter.off("exit", exitListener);
-				exitListener = null;
-			}
+			// Keep the one-shot exit guard installed through the host's actual exit.
+			// Pi may explicitly call process.exit(0) after graceful session shutdown;
+			// the exit listener restores the fatal status in that exact ordering.
 		},
 	};
 }

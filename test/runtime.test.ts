@@ -5,8 +5,12 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import type { DomainFence, DomainSnapshot } from "pi-process-domain";
 
-import type { HumanUnlockEntry } from "../src/commands.js";
+import {
+	HUMAN_UNLOCK_ENTRY_TYPE,
+	type HumanUnlockEntry,
+} from "../src/commands.js";
 import {
 	type ContinueWatchdogConfig,
 	MAX_PROMPT_CHARACTERS,
@@ -21,6 +25,7 @@ import {
 	createHubAttachmentInstance,
 	createObservableAgentHub,
 } from "../src/hub.js";
+import type { ProcessDomainCoordinator } from "../src/process-domain.js";
 import {
 	createDecisionRuntime,
 	type RuntimeClock,
@@ -135,12 +140,64 @@ function unlockXml(
 	return `<watchdog><function>unlock_continue_watchdog</function><reason_type>${reasonType}</reason_type><reason_content>${reason}</reason_content></watchdog>`;
 }
 
+function idleDomainSnapshot(generation = 1n): DomainSnapshot {
+	return {
+		domainId: "domain",
+		brokerEpoch: "epoch",
+		revision: generation,
+		activityGeneration: generation,
+		participants: 1,
+		busyParticipants: 0,
+		pendingSpawns: 0,
+		allIdle: true,
+		certain: true,
+		fence: { brokerEpoch: "epoch", activityGeneration: generation },
+	};
+}
+
+function createFenceHarness() {
+	let snapshot = idleDomainSnapshot();
+	let confirmResult = true;
+	const listeners = new Set<(value: DomainSnapshot) => void>();
+	const domain: ProcessDomainCoordinator = {
+		get snapshot() {
+			return snapshot;
+		},
+		isRootProcess: true,
+		async attach() {},
+		async markBusy() {},
+		async markIdle() {},
+		async setInternalDecision() {},
+		confirm(_fence: DomainFence) {
+			return confirmResult;
+		},
+		subscribe(listener) {
+			listeners.add(listener);
+			return () => listeners.delete(listener);
+		},
+		async detach() {},
+	};
+	return {
+		domain,
+		failConfirm(): void {
+			confirmResult = false;
+		},
+		advanceFence(notify = true): void {
+			snapshot = idleDomainSnapshot(snapshot.activityGeneration + 1n);
+			if (notify) {
+				for (const listener of listeners) listener(snapshot);
+			}
+		},
+	};
+}
+
 function createHarness(options?: {
 	readonly config?: Partial<ContinueWatchdogConfig>;
 	readonly sendThrows?: boolean;
 	readonly appendThrows?: boolean | string;
 	readonly hasUI?: boolean;
 	readonly onNotify?: (message: string) => void;
+	readonly processDomain?: ProcessDomainCoordinator;
 }): Harness {
 	const config: ContinueWatchdogConfig = {
 		idleDelaySeconds: options?.config?.idleDelaySeconds ?? 3,
@@ -226,6 +283,7 @@ function createHarness(options?: {
 	runtime = createDecisionRuntime({
 		pi,
 		hub,
+		processDomain: options?.processDomain,
 		attachmentInstance: createHubAttachmentInstance(),
 		controllerHolder: holder,
 		injectedController: true,
@@ -1191,6 +1249,79 @@ test("decision settle without agent_end reasks twice then decision-fails without
 			"Continue watchdog decision failed after 3 attempts: The decision response was malformed. End with the watchdog XML decision block.",
 		level: "warning",
 	});
+});
+
+test("stale fenced valid continue does not consume retry or exhaust", async () => {
+	const fence = createFenceHarness();
+	const harness = createHarness({
+		config: { maxRetries: 1 },
+		processDomain: fence.domain,
+	});
+	await startIdle(harness);
+	harness.openDecision();
+	await Promise.resolve();
+	await Promise.resolve();
+	await harness.endDecisionMessage(harness.answerContinue());
+	fence.failConfirm();
+	fence.advanceFence(false);
+	await settleOnly(harness);
+
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.controller.snapshot.exhausted, false);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(
+		harness.sent.filter(
+			(entry) => entry.message.customType === DECISION_FOLD_MESSAGE_TYPE,
+		).length,
+		1,
+	);
+});
+
+test("stale fenced valid unlock does not unlock", async () => {
+	const fence = createFenceHarness();
+	const harness = createHarness({ processDomain: fence.domain });
+	await startIdle(harness);
+	harness.openDecision();
+	await Promise.resolve();
+	await Promise.resolve();
+	await harness.endDecisionMessage(harness.answerUnlock());
+	fence.failConfirm();
+	fence.advanceFence(false);
+	await settleOnly(harness);
+
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(
+		harness.entries.some((entry) => entry.type === HUMAN_UNLOCK_ENTRY_TYPE),
+		false,
+	);
+});
+
+test("stale fenced third invalid response preserves counts and permits retry", async () => {
+	const fence = createFenceHarness();
+	const harness = createHarness({ processDomain: fence.domain });
+	await startIdle(harness);
+	harness.openDecision();
+	await Promise.resolve();
+	await Promise.resolve();
+
+	await settleResponse(harness, harness.answerInvalid());
+	await settleResponse(harness, harness.answerInvalid());
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 2);
+
+	await harness.endDecisionMessage(harness.answerInvalid());
+	fence.failConfirm();
+	fence.advanceFence(false);
+	await settleOnly(harness);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 2);
+	assert.equal(harness.controller.snapshot.decisionFailed, false);
+	assert.equal(harness.controller.snapshot.locked, true);
+
+	// A later idle epoch remains eligible for a fresh decision attempt.
+	harness.runtime.reconcileIdle();
+	assert.equal(harness.controller.snapshot.idleTimer !== null, true);
 });
 
 test("pending valid continue keeps reconcile inert until fold delivery", async () => {

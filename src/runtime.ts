@@ -33,7 +33,7 @@ import {
 	buildDecisionPrompt,
 	createDecisionProtocolSession,
 	DECISION_TOOL_BLOCK_REASON,
-	type DecisionProtocolFinalization,
+	type DecisionProtocolPlan,
 	type DecisionProtocolSession,
 	type DecisionResponse,
 	formatDecisionFailedNotification,
@@ -112,7 +112,7 @@ interface ActiveDecision {
 interface PendingFinalization {
 	readonly active: ActiveDecision;
 	readonly cycleId: number;
-	readonly finalization: DecisionProtocolFinalization;
+	readonly plan: DecisionProtocolPlan;
 }
 
 interface ArmedTimer {
@@ -898,12 +898,13 @@ export function createDecisionRuntime(
 		if (!stopped) syncHubState();
 	});
 
-	const invalidateActiveDecision = (): void => {
+	const invalidateActiveDecision = (force = false): void => {
 		const active = activeDecision;
 		const controller = options.controllerHolder.controller;
 		if (active === null || active.invalidated || controller === null) return;
 		const snapshot = options.processDomain?.snapshot;
 		if (
+			!force &&
 			snapshot?.certain &&
 			snapshot.fence.brokerEpoch === active.domainFence.brokerEpoch &&
 			snapshot.fence.activityGeneration ===
@@ -951,7 +952,7 @@ export function createDecisionRuntime(
 			options.processDomain !== undefined &&
 			!(await options.processDomain.confirm(active.domainFence))
 		) {
-			invalidateActiveDecision();
+			invalidateActiveDecision(true);
 			return false;
 		}
 		if (!owns(active.claim) || !domainIdle()) return false;
@@ -978,7 +979,7 @@ export function createDecisionRuntime(
 			return false;
 		}
 		pendingFinalization = null;
-		const { finalization, active, cycleId } = pending;
+		const { active, cycleId, plan } = pending;
 		if (
 			active.invalidated ||
 			(options.processDomain !== undefined && !domainIdle())
@@ -988,6 +989,15 @@ export function createDecisionRuntime(
 		}
 		// Exact claim carried by this decision exchange — not a live re-lookup.
 		const claim = active.claim;
+		if (options.processDomain !== undefined) {
+			if (!owns(claim) || !domainIdle()) return false;
+			if (!(await options.processDomain.confirm(active.domainFence))) {
+				invalidateActiveDecision(true);
+				return false;
+			}
+			if (!owns(claim) || !domainIdle()) return false;
+		}
+		const finalization = active.protocol.commitResponse(cycleId, plan);
 
 		if (finalization.outcome === "reask") {
 			if (
@@ -1061,10 +1071,10 @@ export function createDecisionRuntime(
 		if (stopIfStale(claim)) return false;
 		clearLiveStatus();
 		if (stopIfStale(claim)) return false;
-		activeDecision = null;
-		capturedDecisionResponse = null;
 
 		if (finalization.outcome === "decision-failed") {
+			activeDecision = null;
+			capturedDecisionResponse = null;
 			if (finalization.cycleId === undefined) return false;
 			if (
 				options.processDomain !== undefined &&
@@ -1120,6 +1130,8 @@ export function createDecisionRuntime(
 		}
 
 		if (finalization.outcome === "continue") {
+			activeDecision = null;
+			capturedDecisionResponse = null;
 			const finalCycleId = finalization.cycleId;
 			if (stopIfStale(claim)) return false;
 			try {
@@ -1164,6 +1176,8 @@ export function createDecisionRuntime(
 			return true;
 		}
 
+		activeDecision = null;
+		capturedDecisionResponse = null;
 		// Valid AI unlock must carry both fields; never invent empty fallbacks.
 		const reasonType =
 			typeof finalization.reasonType === "string" &&
@@ -1232,7 +1246,7 @@ export function createDecisionRuntime(
 		pendingFinalization = {
 			active,
 			cycleId,
-			finalization: active.protocol.finalizeResponse(
+			plan: active.protocol.planResponse(
 				cycleId,
 				response === "missing"
 					? { content: [{ type: "malformed" }] }

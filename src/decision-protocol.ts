@@ -89,6 +89,22 @@ export interface DecisionProtocolFinalization {
 	readonly cycleId?: number;
 }
 
+/** A parsed response whose controller transition has not yet been committed. */
+export type DecisionProtocolPlan =
+	| { readonly outcome: "continue"; readonly cycleId: number }
+	| {
+			readonly outcome: "unlock";
+			readonly cycleId: number;
+			readonly reasonType: string;
+			readonly reason: string;
+	  }
+	| {
+			readonly outcome: "invalid";
+			readonly cycleId: number;
+			readonly error: string;
+	  }
+	| { readonly outcome: "ignored" };
+
 export interface DecisionProtocolSessionOptions {
 	readonly controller: LockDecisionController;
 	readonly decisionId: number;
@@ -106,11 +122,17 @@ export interface DecisionProtocolSessionOptions {
 export interface DecisionProtocolSession {
 	/** Monotonically increasing response-cycle token captured by runtime callbacks. */
 	readonly currentCycleId: number;
-	/**
-	 * Finalize exactly one completed response for `cycleId`. A duplicate callback
-	 * for the current cycle receives the same cached result; another cycle's
-	 * callback is ignored without changing controller state.
-	 */
+	/** Parse and validate a response without changing controller state. */
+	readonly planResponse: (
+		cycleId: number,
+		response: DecisionResponse,
+	) => DecisionProtocolPlan;
+	/** Commit a previously planned response exactly once. */
+	readonly commitResponse: (
+		cycleId: number,
+		plan: DecisionProtocolPlan,
+	) => DecisionProtocolFinalization;
+	/** Convenience seam for callers that do not need pre-commit fencing. */
 	readonly finalizeResponse: (
 		cycleId: number,
 		response: DecisionResponse,
@@ -574,44 +596,68 @@ export function createDecisionProtocolSession(
 		};
 	};
 
-	const finalizeResponse = (
+	const planResponse = (
 		expectedCycleId: number,
 		response: DecisionResponse,
+	): DecisionProtocolPlan => {
+		if (expectedCycleId !== cycleId || finalized !== null) {
+			return { outcome: "ignored" };
+		}
+		const validation = validateDecisionResponse(response, options.reasonTypes);
+		if (!validation.valid) {
+			return { outcome: "invalid", cycleId, error: validation.error };
+		}
+		return validation.decision.kind === "continue"
+			? { outcome: "continue", cycleId }
+			: {
+					outcome: "unlock",
+					cycleId,
+					reasonType: validation.decision.reasonType,
+					reason: validation.decision.reason,
+				};
+	};
+
+	const commitResponse = (
+		expectedCycleId: number,
+		plan: DecisionProtocolPlan,
 	): DecisionProtocolFinalization => {
 		if (expectedCycleId !== cycleId) return ignoredFinalization();
 		if (finalized !== null) return finalized;
-
-		const validation = validateDecisionResponse(response, options.reasonTypes);
-		if (!validation.valid) {
-			finalized = finalizeInvalid(validation.error);
+		if (plan.outcome === "ignored" || plan.cycleId !== cycleId) {
+			return ignoredFinalization();
+		}
+		if (plan.outcome === "invalid") {
+			finalized = finalizeInvalid(plan.error);
 			return finalized;
 		}
 
 		const transition =
-			validation.decision.kind === "continue"
+			plan.outcome === "continue"
 				? options.controller.recordValidContinue(options.decisionId)
 				: options.controller.recordValidUnlock(options.decisionId);
 		if (!transition.applied) {
 			finalized = { outcome: "ignored", transition };
 			return finalized;
 		}
-		if (validation.decision.kind === "continue") {
-			finalized = {
-				outcome: "continue",
-				transition,
-				cycleId,
-			};
+		if (plan.outcome === "continue") {
+			finalized = { outcome: "continue", transition, cycleId };
 			return finalized;
 		}
 		finalized = {
 			outcome: "unlock",
 			transition,
-			reasonType: validation.decision.reasonType,
-			reason: validation.decision.reason,
+			reasonType: plan.reasonType,
+			reason: plan.reason,
 			cycleId,
 		};
 		return finalized;
 	};
+
+	const finalizeResponse = (
+		expectedCycleId: number,
+		response: DecisionResponse,
+	): DecisionProtocolFinalization =>
+		commitResponse(expectedCycleId, planResponse(expectedCycleId, response));
 
 	const advanceAfterReask = (expectedCycleId: number): boolean => {
 		if (
@@ -630,6 +676,8 @@ export function createDecisionProtocolSession(
 		get currentCycleId(): number {
 			return cycleId;
 		},
+		planResponse,
+		commitResponse,
 		finalizeResponse,
 		advanceAfterReask,
 	};

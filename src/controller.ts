@@ -303,8 +303,6 @@ class PureLockDecisionController implements LockDecisionController {
 			...this.state,
 			decisionOpen: false,
 			decisionId: null,
-			invalidDecisionAttempts: 0,
-			lastInvalidDecisionError: null,
 		};
 		return this.applied([{ kind: "restoreDecisionTools", decisionId }]);
 	}

@@ -25,9 +25,6 @@ function harness(mode: "tui" | "rpc" | "print" | "json") {
 			once(_event, listener) {
 				exitListener = listener;
 			},
-			off() {
-				exitListener = undefined;
-			},
 			exit(code) {
 				calls.push(`exit:${code}`);
 			},
@@ -55,7 +52,10 @@ function harness(mode: "tui" | "rpc" | "print" | "json") {
 		get exitCode() {
 			return exitCode;
 		},
-		fireExit: () => exitListener?.(0),
+		fireExit: (code = 0) => {
+			exitCode = code;
+			exitListener?.(code);
+		},
 		fireFallback: () => fallback?.(),
 	};
 }
@@ -81,6 +81,23 @@ for (const mode of ["tui", "rpc", "print", "json"] as const) {
 		assert.ok(testHarness.calls.includes("exit:78"));
 	});
 }
+
+test("graceful shutdown cancels fallback but preserves fatal exit guard", () => {
+	const testHarness = harness("tui");
+	const error = new ProcessDomainFatalError(
+		"AUTHENTICATION_FAILED",
+		"private details",
+	);
+
+	testHarness.adapter.fail(error, testHarness.ctx);
+	testHarness.adapter.completeShutdown();
+	testHarness.fireFallback();
+	assert.equal(testHarness.calls.includes("exit:78"), false);
+
+	// Production order: Pi completes session_shutdown, then explicitly exits 0.
+	testHarness.fireExit();
+	assert.equal(testHarness.exitCode, 78);
+});
 
 test("sanitized fatal output exposes only a stable code", () => {
 	const message = sanitizedProcessDomainError(
