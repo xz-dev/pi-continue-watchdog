@@ -15,6 +15,7 @@ import {
 	createContinueEntryRenderer,
 	createHumanUnlockEntryRenderer,
 	createMainCommands,
+	createWatchdogStatusEntryRenderer,
 	formatUnlockEntryText,
 	HUMAN_UNLOCK_ENTRY_TYPE,
 	LOCK_COMMAND_DESCRIPTION,
@@ -217,6 +218,53 @@ test("Slice 4 RED: registers the exact human command names, descriptions, and TU
 		"Unlock the continue watchdog (optional reason).",
 	);
 	assert.equal(harness.entryRenderers.has(HUMAN_UNLOCK_ENTRY_TYPE), true);
+});
+
+test("watchdog status entries render standard colored Pi-TUI boxes", () => {
+	const renderer = createWatchdogStatusEntryRenderer();
+	const backgrounds: string[] = [];
+	const foregrounds: string[] = [];
+	const component = renderer(
+		{
+			type: "custom",
+			customType: "pi-continue-watchdog:status",
+			id: "status-entry",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			data: {
+				kind: "validation-error",
+				exchangeId: "exchange-1",
+				cycleId: 2,
+				message: "Invalid watchdog XML.",
+			},
+		},
+		{} as never,
+		{
+			bg(color: string, text: string) {
+				backgrounds.push(color);
+				return text;
+			},
+			fg(color: string, text: string) {
+				foregrounds.push(color);
+				return text;
+			},
+		} as never,
+	);
+
+	assert.ok(component);
+	const rendered = component.render(80);
+	assert.equal(rendered.length, 4);
+	assert.equal(rendered[1]?.trim(), "Continue watchdog · Decision re-ask 2");
+	assert.equal(rendered[2]?.trim(), "Invalid watchdog XML.");
+	assert.equal(
+		rendered.every((line) => visibleWidth(line) === 80),
+		true,
+	);
+	assert.equal(
+		backgrounds.every((color) => color === "toolErrorBg"),
+		true,
+	);
+	assert.equal(foregrounds.includes("warning"), true);
 });
 
 test("accepted continue entry renders one persistent muted status line", () => {

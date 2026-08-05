@@ -351,9 +351,12 @@ Packed E2E creates a persistent session, triggers a decision, shuts it down, reo
 
 ### Continue
 
+- show a live colored `Continue watchdog checking` widget for the active decision cycle;
+- persist a colored TUI-only card for every validation re-ask or other error, preserving the safe parser error or original provider error content;
 - record the accepted continue;
 - increment the continue attempt;
-- append one muted TUI-only `Continue watchdog continued` entry so automatic continuation and possible token-consuming loops remain visible;
+- clear the live checking widget;
+- append one TUI-only `Continue watchdog continued` entry so automatic continuation and possible token-consuming loops remain visible;
 - append the terminal fold marker;
 - fold the exchange into `continuePrompt`;
 - trigger the next ordinary turn;

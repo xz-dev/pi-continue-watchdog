@@ -4,7 +4,7 @@ import type {
 	ExtensionCommandContext,
 	Theme,
 } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { Box, Text, visibleWidth } from "@earendil-works/pi-tui";
 
 import type { ControllerEffect, LockDecisionController } from "./controller.js";
 import type { HubMainClaim } from "./hub.js";
@@ -20,6 +20,22 @@ export const UNLOCK_COMMAND_DESCRIPTION =
 /** Persisted TUI-only entry for every accepted automatic continue. */
 export const CONTINUE_ENTRY_TYPE = "pi-continue-watchdog:continue";
 export const CONTINUE_ENTRY_TEXT = "Continue watchdog continued";
+
+/** Persistent lifecycle event rendered as a standard colored Pi-TUI box. */
+export const WATCHDOG_STATUS_ENTRY_TYPE = "pi-continue-watchdog:status";
+
+export type WatchdogStatusKind =
+	| "checking"
+	| "validation-error"
+	| "other-error"
+	| "decision-failed";
+
+export interface WatchdogStatusEntry {
+	readonly kind: WatchdogStatusKind;
+	readonly exchangeId: string;
+	readonly cycleId: number;
+	readonly message: string;
+}
 
 /** Persisted custom-entry type for human-visible unlock reasons. */
 export const HUMAN_UNLOCK_ENTRY_TYPE = "pi-continue-watchdog:unlock";
@@ -182,6 +198,56 @@ export function formatUnlockEntryText(
  * Render a persisted custom entry. Pi custom entries are TUI-only and are not
  * added to LLM context; this renderer intentionally has no model-facing path.
  */
+function getWatchdogStatusEntry(entry: unknown): WatchdogStatusEntry | null {
+	if (typeof entry !== "object" || entry === null) return null;
+	const data = (entry as { readonly data?: unknown }).data;
+	if (typeof data !== "object" || data === null) return null;
+	const value = data as Partial<WatchdogStatusEntry>;
+	if (
+		(value.kind !== "checking" &&
+			value.kind !== "validation-error" &&
+			value.kind !== "other-error" &&
+			value.kind !== "decision-failed") ||
+		typeof value.exchangeId !== "string" ||
+		value.exchangeId.length === 0 ||
+		typeof value.cycleId !== "number" ||
+		!Number.isSafeInteger(value.cycleId) ||
+		value.cycleId < 1 ||
+		typeof value.message !== "string" ||
+		value.message.length === 0
+	) {
+		return null;
+	}
+	return value as WatchdogStatusEntry;
+}
+
+export function createWatchdogStatusEntryRenderer(): EntryRenderer<WatchdogStatusEntry> {
+	return (entry, _options, theme) => {
+		const status = getWatchdogStatusEntry(entry);
+		if (status === null) return undefined;
+		const error = status.kind !== "checking";
+		const title =
+			status.kind === "checking"
+				? `Continue watchdog · Checking ${status.cycleId}`
+				: status.kind === "validation-error"
+					? `Continue watchdog · Decision re-ask ${status.cycleId}`
+					: status.kind === "decision-failed"
+						? "Continue watchdog · Decision failed"
+						: "Continue watchdog · Other error";
+		const box = new Box(1, 1, (text) =>
+			theme.bg(error ? "toolErrorBg" : "toolPendingBg", text),
+		);
+		box.addChild(
+			new Text(
+				`${theme.fg(error ? "warning" : "accent", title)}\n${theme.fg("toolOutput", status.message)}`,
+				0,
+				0,
+			),
+		);
+		return box;
+	};
+}
+
 export function createContinueEntryRenderer(): EntryRenderer<
 	Record<string, never>
 > {
@@ -317,6 +383,10 @@ export function createMainCommands(
 	pi: ExtensionAPI,
 	runtime: MainCommandRuntime,
 ): void {
+	pi.registerEntryRenderer<WatchdogStatusEntry>(
+		WATCHDOG_STATUS_ENTRY_TYPE,
+		createWatchdogStatusEntryRenderer(),
+	);
 	pi.registerEntryRenderer<Record<string, never>>(
 		CONTINUE_ENTRY_TYPE,
 		createContinueEntryRenderer(),

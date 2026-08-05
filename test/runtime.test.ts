@@ -96,6 +96,7 @@ interface DecisionMessageReplacement {
 interface Harness {
 	readonly handlers: Map<string, Handler[]>;
 	readonly clock: FakeClock;
+	readonly widgets: Array<{ key: string; value: unknown }>;
 	readonly config: ContinueWatchdogConfig;
 	readonly controller: ReturnType<typeof createLockDecisionController>;
 	readonly hub: ReturnType<typeof createObservableAgentHub>;
@@ -137,7 +138,7 @@ function unlockXml(
 function createHarness(options?: {
 	readonly config?: Partial<ContinueWatchdogConfig>;
 	readonly sendThrows?: boolean;
-	readonly appendThrows?: boolean;
+	readonly appendThrows?: boolean | string;
 	readonly hasUI?: boolean;
 	readonly onNotify?: (message: string) => void;
 }): Harness {
@@ -160,6 +161,7 @@ function createHarness(options?: {
 	const sent: SentMessage[] = [];
 	const notifications: Array<{ message: string; level?: string }> = [];
 	const entries: Array<{ type: string; data: unknown }> = [];
+	const widgets: Array<{ key: string; value: unknown }> = [];
 	let runtime: ReturnType<typeof createDecisionRuntime>;
 
 	const harness = {
@@ -171,6 +173,7 @@ function createHarness(options?: {
 		sent,
 		notifications,
 		entries,
+		widgets,
 		streaming: false,
 		triggeredTurns: 0,
 	} as Harness;
@@ -196,7 +199,9 @@ function createHarness(options?: {
 			}
 		},
 		appendEntry(type: string, data: HumanUnlockEntry): void {
-			if (options?.appendThrows) throw new Error("append failed");
+			if (options?.appendThrows === true || options?.appendThrows === type) {
+				throw new Error("append failed");
+			}
 			entries.push({ type, data });
 		},
 	} as unknown as ExtensionAPI;
@@ -211,6 +216,9 @@ function createHarness(options?: {
 			notify(message: string, level?: string): void {
 				notifications.push({ message, level });
 				options?.onNotify?.(message);
+			},
+			setWidget(key: string, value: unknown): void {
+				widgets.push({ key, value });
 			},
 		},
 	} as unknown as ExtensionContext;
@@ -465,6 +473,9 @@ test("agent_end finalizes while streaming but settled alone dispatches continue"
 	const harness = createHarness();
 	await startIdle(harness);
 	harness.openDecision();
+	assert.deepEqual(harness.entries, []);
+	assert.equal(harness.widgets.at(-1)?.key, "pi-continue-watchdog:status");
+	assert.notEqual(harness.widgets.at(-1)?.value, undefined);
 	const before = harness.sent.length;
 	const turnsBefore = harness.triggeredTurns;
 
@@ -495,10 +506,16 @@ test("agent_end finalizes while streaming but settled alone dispatches continue"
 			data: {},
 		},
 	]);
+	assert.deepEqual(harness.widgets.at(-1), {
+		key: "pi-continue-watchdog:status",
+		value: undefined,
+	});
 });
 
 test("continue entry persistence failure prevents an invisible continuation", async () => {
-	const harness = createHarness({ appendThrows: true });
+	const harness = createHarness({
+		appendThrows: "pi-continue-watchdog:continue",
+	});
 	await startIdle(harness);
 	harness.openDecision();
 	const sentBefore = harness.sent.length;
@@ -611,27 +628,79 @@ test("decision provider error stays provisional so the same Pi run can retry and
 		options: { triggerTurn: false, deliverAs: "steer" },
 		streaming: false,
 	});
-	assert.deepEqual(harness.entries, [
-		{
-			type: "pi-continue-watchdog:decision-audit",
-			data: {
-				version: 1,
-				exchangeId: "exchange-1",
-				cycleId: 1,
-				outcome: "unlock",
-				reasonType: "JOB_DONE",
-				reason: "All requested work is complete.",
+	assert.deepEqual(
+		harness.entries.filter(
+			(entry) => entry.type !== "pi-continue-watchdog:status",
+		),
+		[
+			{
+				type: "pi-continue-watchdog:decision-audit",
+				data: {
+					version: 1,
+					exchangeId: "exchange-1",
+					cycleId: 1,
+					outcome: "unlock",
+					reasonType: "JOB_DONE",
+					reason: "All requested work is complete.",
+				},
 			},
-		},
-		{
-			type: "pi-continue-watchdog:unlock",
-			data: {
-				reasonType: "JOB_DONE",
-				reason: "All requested work is complete.",
+			{
+				type: "pi-continue-watchdog:unlock",
+				data: {
+					reasonType: "JOB_DONE",
+					reason: "All requested work is complete.",
+				},
 			},
-		},
-	]);
+		],
+	);
 	assert.deepEqual(harness.notifications, []);
+});
+
+test("each invalid XML response persists a parser re-ask event and updates checking", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.openDecision();
+
+	await settleResponse(harness, harness.answerInvalid("not XML"));
+
+	assert.deepEqual(harness.entries.at(-1), {
+		type: "pi-continue-watchdog:status",
+		data: {
+			kind: "validation-error",
+			exchangeId: "exchange-1",
+			cycleId: 1,
+			message: "End the response with one valid watchdog XML decision block.",
+		},
+	});
+	assert.notEqual(harness.widgets.at(-1)?.value, undefined);
+});
+
+test("decision provider errors persist Other error with original content", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.openDecision();
+	const providerError = {
+		role: "assistant",
+		content: [],
+		stopReason: "error",
+		errorMessage: "Connection error.",
+	};
+
+	assert.equal(await harness.endDecisionMessage(providerError), undefined);
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [providerError],
+	});
+
+	assert.deepEqual(harness.entries.at(-1), {
+		type: "pi-continue-watchdog:status",
+		data: {
+			kind: "other-error",
+			exchangeId: "exchange-1",
+			cycleId: 1,
+			message: "Connection error.",
+		},
+	});
 });
 
 test("decision message_end audit records invalid output without retaining raw text", async () => {
@@ -712,15 +781,20 @@ test("valid unlock folds without a turn and leaves one compact persisted result"
 		deliverAs: "steer",
 	});
 	assert.equal(harness.triggeredTurns, turnsBefore);
-	assert.deepEqual(harness.entries, [
-		{
-			type: "pi-continue-watchdog:unlock",
-			data: {
-				reasonType: "JOB_DONE",
-				reason: "waiting for user",
+	assert.deepEqual(
+		harness.entries.filter(
+			(entry) => entry.type !== "pi-continue-watchdog:status",
+		),
+		[
+			{
+				type: "pi-continue-watchdog:unlock",
+				data: {
+					reasonType: "JOB_DONE",
+					reason: "waiting for user",
+				},
 			},
-		},
-	]);
+		],
+	);
 	assert.equal(harness.controller.snapshot.locked, false);
 	assert.deepEqual(harness.notifications, []);
 });
@@ -736,15 +810,20 @@ test("Example 7: AI unlock retains typed entry data only; no transient notificat
 		harness.answerUnlock("PR is open for human review.", "needreview"),
 	);
 
-	assert.deepEqual(harness.entries, [
-		{
-			type: "pi-continue-watchdog:unlock",
-			data: {
-				reasonType: "NEEDREVIEW",
-				reason: "PR is open for human review.",
+	assert.deepEqual(
+		harness.entries.filter(
+			(entry) => entry.type !== "pi-continue-watchdog:status",
+		),
+		[
+			{
+				type: "pi-continue-watchdog:unlock",
+				data: {
+					reasonType: "NEEDREVIEW",
+					reason: "PR is open for human review.",
+				},
 			},
-		},
-	]);
+		],
+	);
 	assert.deepEqual(harness.notifications, []);
 });
 

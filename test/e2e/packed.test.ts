@@ -919,7 +919,16 @@ test("packed source artifact waits a real 3 seconds, decides continue, and folds
 		).length,
 		1,
 	);
+	assert.equal(
+		persisted.some(
+			(entry) =>
+				entry.includes('"customType":"pi-continue-watchdog:status"') &&
+				entry.includes('"kind":"checking"'),
+		),
+		false,
+	);
 	assert.equal(thirdBody.includes("Continue watchdog continued"), false);
+	assert.equal(thirdBody.includes("Continue watchdog checking"), false);
 });
 
 test("packed stock Pi retries a decision connection error and accepts the successful unlock", {
@@ -961,6 +970,14 @@ test("packed stock Pi retries a decision connection error and accepts the succes
 			entry.includes("previous decision response was invalid"),
 		).length,
 		0,
+	);
+	assert.equal(
+		serialized.some(
+			(entry) =>
+				entry.includes('"kind":"other-error"') &&
+				entry.includes("Connection error."),
+		),
+		true,
 	);
 	assert.equal(
 		serialized.some((entry) => entry.includes('"outcome":"unlock"')),

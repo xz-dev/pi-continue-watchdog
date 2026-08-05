@@ -8,11 +8,14 @@ import {
 	getAgentDir,
 	type MessageEndEvent,
 } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 import {
 	CONTINUE_ENTRY_TYPE,
 	HUMAN_UNLOCK_ENTRY_TYPE,
 	type HumanUnlockEntry,
+	WATCHDOG_STATUS_ENTRY_TYPE,
+	type WatchdogStatusEntry,
 } from "./commands.js";
 import { BUILT_IN_CONFIG, type ContinueWatchdogConfig } from "./config.js";
 import { type LoadedConfig, loadRuntimeConfig } from "./config-loader.js";
@@ -67,6 +70,7 @@ const nodeClock: RuntimeClock = {
 };
 
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+const WATCHDOG_STATUS_WIDGET_KEY = "pi-continue-watchdog:status";
 
 /** Context-excluded persisted metadata for one model decision response. */
 export const DECISION_AUDIT_ENTRY_TYPE = "pi-continue-watchdog:decision-audit";
@@ -194,6 +198,22 @@ function isErroredAssistant(message: unknown): boolean {
 	return hasAssistantStopReason(message, "error");
 }
 
+function originalErrorMessage(error: unknown): string {
+	if (error instanceof Error && error.message.trim().length > 0) {
+		return error.message;
+	}
+	return typeof error === "string" && error.trim().length > 0
+		? error
+		: "Unknown error";
+}
+
+function assistantErrorMessage(message: unknown): string {
+	if (typeof message !== "object" || message === null) return "Unknown error";
+	return originalErrorMessage(
+		(message as { readonly errorMessage?: unknown }).errorMessage,
+	);
+}
+
 /**
  * Compose one attachment's idle timer, decision protocol, and Pi lifecycle.
  * The process hub remains the only cross-attachment coordination seam.
@@ -237,6 +257,9 @@ export function createDecisionRuntime(
 	} | null = null;
 	/** At-most-once publication guard for the current aggregate-idle epoch. */
 	let publishedForIdleEpoch = false;
+	let activeStatus: WatchdogStatusEntry | null = null;
+	let statusTui: { requestRender(): void } | null = null;
+	let statusWidgetRegistered = false;
 
 	const getMainClaim = (): HubMainClaim | null =>
 		attachment === null ? null : options.hub.mainClaimFor(attachment);
@@ -267,6 +290,101 @@ export function createDecisionRuntime(
 		armedTimer = null;
 	};
 
+	const renderLiveStatus = (
+		width: number,
+		theme: ExtensionContext["ui"]["theme"],
+	): string[] => {
+		const status = activeStatus;
+		if (status === null) return [];
+		const safeWidth = Math.max(1, Math.floor(width));
+		const styleLine = (content: string): string => {
+			const clipped = visibleWidth(content) <= safeWidth ? content : "…";
+			const padding = " ".repeat(
+				Math.max(0, safeWidth - visibleWidth(clipped)),
+			);
+			return theme.bg("toolPendingBg", clipped + padding);
+		};
+		const detail = `Attempt ${status.cycleId} · waiting for model`;
+		return [
+			styleLine(""),
+			styleLine(` ${theme.fg("accent", "Continue watchdog checking")} `),
+			styleLine(` ${theme.fg("toolOutput", detail)} `),
+			styleLine(""),
+		];
+	};
+
+	const showLiveStatus = (status: WatchdogStatusEntry): string | null => {
+		activeStatus = status;
+		const ctx = sessionContext;
+		if (ctx === null || !ctx.hasUI || typeof ctx.ui.setWidget !== "function") {
+			return null;
+		}
+		if (!statusWidgetRegistered) {
+			try {
+				ctx.ui.setWidget(
+					WATCHDOG_STATUS_WIDGET_KEY,
+					(tui, theme) => {
+						statusTui = tui;
+						return {
+							render: (width: number) => renderLiveStatus(width, theme),
+							invalidate() {},
+							dispose() {
+								statusTui = null;
+								statusWidgetRegistered = false;
+							},
+						};
+					},
+					{ placement: "belowEditor" },
+				);
+				statusWidgetRegistered = true;
+			} catch (error) {
+				statusWidgetRegistered = false;
+				statusTui = null;
+				return originalErrorMessage(error);
+			}
+			return null;
+		}
+		statusTui?.requestRender();
+		return null;
+	};
+
+	const clearLiveStatus = (): void => {
+		activeStatus = null;
+		const ctx = sessionContext;
+		if (
+			ctx !== null &&
+			statusWidgetRegistered &&
+			typeof ctx.ui.setWidget === "function"
+		) {
+			try {
+				ctx.ui.setWidget(WATCHDOG_STATUS_WIDGET_KEY, undefined);
+			} catch {
+				// A stale host may reject cleanup during shutdown or demotion.
+			}
+		}
+		statusWidgetRegistered = false;
+		statusTui = null;
+	};
+
+	const appendStatus = (status: WatchdogStatusEntry): boolean => {
+		try {
+			options.pi.appendEntry<WatchdogStatusEntry>(
+				WATCHDOG_STATUS_ENTRY_TYPE,
+				status,
+			);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+
+	const checkingStatus = (active: ActiveDecision): WatchdogStatusEntry => ({
+		kind: "checking",
+		exchangeId: active.exchangeId,
+		cycleId: active.protocol.currentCycleId,
+		message: "Continue watchdog checking",
+	});
+
 	/**
 	 * Invalidate runtime-local decision state after a controller transition.
 	 * Does not change controller lock/cycle accounting.
@@ -276,6 +394,7 @@ export function createDecisionRuntime(
 		activeDecision = null;
 		capturedDecisionResponse = null;
 		pendingFinalization = null;
+		clearLiveStatus();
 		// Human/abort unlock must not inherit a prior AI unlock publication intent.
 		pendingAiUnlock = null;
 	};
@@ -344,6 +463,22 @@ export function createDecisionRuntime(
 				silentlyAbandonDecision();
 				return;
 			}
+			const status = checkingStatus(active);
+			const widgetError = showLiveStatus(status);
+			if (widgetError !== null) {
+				appendStatus({
+					kind: "other-error",
+					exchangeId: active.exchangeId,
+					cycleId: active.protocol.currentCycleId,
+					message: widgetError,
+				});
+				silentlyAbandonDecision();
+				return;
+			}
+			if (!stillOwns()) {
+				silentlyAbandonDecision();
+				return;
+			}
 			sendDecisionPrompt(
 				active,
 				active.protocol.currentCycleId,
@@ -353,7 +488,15 @@ export function createDecisionRuntime(
 			if (!stillOwns()) {
 				silentlyAbandonDecision();
 			}
-		} catch {
+		} catch (error) {
+			if (stillOwns()) {
+				appendStatus({
+					kind: "other-error",
+					exchangeId: active.exchangeId,
+					cycleId: active.protocol.currentCycleId,
+					message: originalErrorMessage(error),
+				});
+			}
 			silentlyAbandonDecision();
 		}
 	};
@@ -692,7 +835,19 @@ export function createDecisionRuntime(
 		const claim = active.claim;
 
 		if (finalization.outcome === "reask") {
+			if (stopIfStale(claim)) return false;
+			const validationStatus: WatchdogStatusEntry = {
+				kind: "validation-error",
+				exchangeId: active.exchangeId,
+				cycleId,
+				message: finalization.error ?? "Invalid watchdog decision response.",
+			};
+			if (!appendStatus(validationStatus)) {
+				silentlyAbandonDecision();
+				return false;
+			}
 			if (
+				stopIfStale(claim) ||
 				finalization.reaskPrompt === undefined ||
 				!active.protocol.advanceAfterReask(cycleId)
 			) {
@@ -701,12 +856,33 @@ export function createDecisionRuntime(
 			}
 			if (stopIfStale(claim)) return false;
 			try {
+				const status = checkingStatus(active);
+				const widgetError = showLiveStatus(status);
+				if (widgetError !== null) {
+					appendStatus({
+						kind: "other-error",
+						exchangeId: active.exchangeId,
+						cycleId: active.protocol.currentCycleId,
+						message: widgetError,
+					});
+					silentlyAbandonDecision();
+					return false;
+				}
+				if (stopIfStale(claim)) return false;
 				sendDecisionPrompt(
 					active,
 					active.protocol.currentCycleId,
 					finalization.reaskPrompt,
 				);
-			} catch {
+			} catch (error) {
+				if (owns(claim)) {
+					appendStatus({
+						kind: "other-error",
+						exchangeId: active.exchangeId,
+						cycleId: active.protocol.currentCycleId,
+						message: originalErrorMessage(error),
+					});
+				}
 				silentlyAbandonDecision();
 				return false;
 			}
@@ -716,11 +892,24 @@ export function createDecisionRuntime(
 		}
 
 		if (stopIfStale(claim)) return false;
+		clearLiveStatus();
+		if (stopIfStale(claim)) return false;
 		activeDecision = null;
 		capturedDecisionResponse = null;
 
 		if (finalization.outcome === "decision-failed") {
 			if (finalization.cycleId === undefined) return false;
+			if (
+				!appendStatus({
+					kind: "decision-failed",
+					exchangeId: active.exchangeId,
+					cycleId: finalization.cycleId,
+					message: finalization.error ?? "Continue watchdog decision failed.",
+				})
+			) {
+				silentlyAbandonDecision();
+				return false;
+			}
 			if (stopIfStale(claim)) return false;
 			try {
 				options.pi.sendMessage(
@@ -923,10 +1112,22 @@ export function createDecisionRuntime(
 		// provisional because Pi may automatically retry within the same run;
 		// only a successful response or the final settled no-result may consume a
 		// decision attempt.
-		if (
-			assistant !== undefined &&
-			(isAbortedAssistant(assistant) || isErroredAssistant(assistant))
-		) {
+		if (assistant !== undefined && isAbortedAssistant(assistant)) return;
+		if (assistant !== undefined && isErroredAssistant(assistant)) {
+			const active = activeDecision;
+			if (active !== null && owns(active.claim)) {
+				if (
+					!appendStatus({
+						kind: "other-error",
+						exchangeId: active.exchangeId,
+						cycleId: active.protocol.currentCycleId,
+						message: assistantErrorMessage(assistant),
+					}) ||
+					!owns(active.claim)
+				) {
+					silentlyAbandonDecision();
+				}
+			}
 			return;
 		}
 		const captured = capturedDecisionResponse;
