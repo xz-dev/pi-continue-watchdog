@@ -143,6 +143,8 @@ export interface DecisionProtocolSession {
 	 * is collected in the new cycle rather than rejected as stale.
 	 */
 	readonly advanceAfterReask: (cycleId: number) => boolean;
+	/** Undo a just-advanced re-ask when final prompt submission deferred busy. */
+	readonly rollbackAfterReask: (previousCycleId: number) => boolean;
 }
 
 function isOrdinaryObject(input: unknown): input is Record<string, unknown> {
@@ -672,6 +674,12 @@ export function createDecisionProtocolSession(
 		return true;
 	};
 
+	const rollbackAfterReask = (previousCycleId: number): boolean => {
+		if (cycleId !== previousCycleId + 1 || finalized !== null) return false;
+		cycleId = previousCycleId;
+		return true;
+	};
+
 	return {
 		get currentCycleId(): number {
 			return cycleId;
@@ -680,5 +688,6 @@ export function createDecisionProtocolSession(
 		commitResponse,
 		finalizeResponse,
 		advanceAfterReask,
+		rollbackAfterReask,
 	};
 }

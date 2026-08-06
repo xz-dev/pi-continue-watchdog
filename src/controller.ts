@@ -74,7 +74,15 @@ export interface LockDecisionController {
 		decisionId: number,
 		error: unknown,
 	): ControllerTransition;
+	/** Undo a just-recorded non-terminal invalid decision after busy send defer. */
+	rollbackInvalidDecision(
+		decisionId: number,
+		previousAttempts: number,
+		previousError: string | null,
+	): ControllerTransition;
 	recordValidContinue(decisionId: number): ControllerTransition;
+	/** Undo a just-recorded continue when its send raced a newly busy Pi. */
+	rollbackValidContinue(): ControllerTransition;
 	recordValidUnlock(decisionId: number): ControllerTransition;
 	/** Close a stale decision without consuming attempts or unlocking. */
 	invalidateDecision(decisionId: number): ControllerTransition;
@@ -279,6 +287,22 @@ class PureLockDecisionController implements LockDecisionController {
 		]);
 	}
 
+	public rollbackInvalidDecision(
+		decisionId: number,
+		previousAttempts: number,
+		previousError: string | null,
+	): ControllerTransition {
+		if (!this.isCurrentDecision(decisionId) || this.state.decisionFailed) {
+			return this.noop();
+		}
+		this.state = {
+			...this.state,
+			invalidDecisionAttempts: previousAttempts,
+			lastInvalidDecisionError: previousError,
+		};
+		return this.applied([]);
+	}
+
 	public recordValidContinue(decisionId: number): ControllerTransition {
 		if (!this.isCurrentDecision(decisionId)) {
 			return this.noop();
@@ -295,6 +319,16 @@ class PureLockDecisionController implements LockDecisionController {
 			decisionId: null,
 		};
 		return this.applied([{ kind: "restoreDecisionTools", decisionId }]);
+	}
+
+	public rollbackValidContinue(): ControllerTransition {
+		if (this.state.decisionOpen || this.state.attempt === 0) return this.noop();
+		this.state = {
+			...this.state,
+			attempt: this.state.attempt - 1,
+			exhausted: false,
+		};
+		return this.applied([]);
 	}
 
 	public invalidateDecision(decisionId: number): ControllerTransition {

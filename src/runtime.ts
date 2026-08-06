@@ -107,6 +107,8 @@ interface ActiveDecision {
 	readonly protocol: DecisionProtocolSession;
 	readonly domainFence: import("pi-process-domain").DomainFence;
 	invalidated: boolean;
+	/** True only after the decision prompt was actually submitted to the model. */
+	submitted: boolean;
 }
 
 interface PendingFinalization {
@@ -150,6 +152,12 @@ export interface DecisionRuntime {
 	 * lock/unlock transition so a later settle cannot continue stale work.
 	 */
 	clearOperationalPendingWork(): void;
+	/**
+	 * Atomically consume the marker suppressing a watchdog decision aborted by
+	 * user input. Returns true once; afterwards a later unrelated abort is never
+	 * suppressed. Used by the abort-outcome path to avoid emitting an unlock.
+	 */
+	consumeDecisionAbortSuppression(): boolean;
 	/**
 	 * Start a fresh cycle through the full silent unlock-cleanup-lock sequence.
 	 * The exact current-main claim is fenced across every re-entrant effect.
@@ -254,6 +262,8 @@ export function createDecisionRuntime(
 	let stopped = false;
 	let armedTimer: ArmedTimer | null = null;
 	let activeDecision: ActiveDecision | null = null;
+	/** Suppress the aborted assistant of a watchdog decision preempted by user input. */
+	let suppressDecisionAbort = false;
 	let capturedDecisionResponse: {
 		readonly active: ActiveDecision;
 		readonly cycleId: number;
@@ -417,11 +427,58 @@ export function createDecisionRuntime(
 	const clearOperationalPendingWork = (): void => {
 		clearArmedTimer();
 		activeDecision = null;
+		suppressDecisionAbort = false;
 		capturedDecisionResponse = null;
 		pendingFinalization = null;
 		clearLiveStatus();
 		// Human/abort unlock must not inherit a prior AI unlock publication intent.
 		pendingAiUnlock = null;
+	};
+	/** Pi's same-runtime authoritative idle truth. */
+	const localIdle = (): boolean => sessionContext?.isIdle() === true;
+
+	const allIdleForClaim = (claim: HubMainClaim): boolean =>
+		owns(claim) &&
+		options.hub.snapshot.allObservableIdle &&
+		domainIdle() &&
+		localIdle();
+
+	/**
+	 * Defer an open decision because local Pi became busy (user input took over or
+	 * an unrelated run started). Stay locked, close the decision window, consume
+	 * no continue/invalid retry, append no error card, and recover after the next
+	 * genuine agent_settled.
+	 */
+	const deferDecisionOnBusy = (active: ActiveDecision): void => {
+		if (active.invalidated) return;
+		active.invalidated = true;
+		const controller = options.controllerHolder.controller;
+		capturedDecisionResponse = null;
+		pendingFinalization = null;
+		clearLiveStatus();
+		if (controller !== null) {
+			applyTransition(
+				controller.invalidateDecision(active.decisionId),
+				undefined,
+				{
+					claim: active.claim,
+				},
+			);
+		}
+		activeDecision = null;
+		// suppressDecisionAbort is owned by the user-takeover input hook and is
+		// intentionally not cleared here.
+	};
+
+	/**
+	 * Atomically consume the suppression marker for the watchdog decision that user
+	 * input preempted. True only once; afterwards the marker is clear so a later
+	 * unrelated user abort is never suppressed.
+	 */
+	const consumeDecisionAbortSuppression = (): boolean => {
+		if (!suppressDecisionAbort) return false;
+		suppressDecisionAbort = false;
+		return true;
 	};
 
 	const silentlyAbandonDecision = (): void => {
@@ -444,15 +501,34 @@ export function createDecisionRuntime(
 		active: ActiveDecision,
 		cycleId: number,
 		decisionPrompt: string,
-	): void => {
-		options.pi.sendMessage(
-			createDecisionPromptMessage({
-				exchangeId: active.exchangeId,
-				cycleId,
-				decisionPrompt,
-			}),
-			{ triggerTurn: true, deliverAs: "steer" },
-		);
+		sendOptions?: { readonly deferOnBusy?: boolean },
+	): boolean => {
+		if (active.invalidated) return false;
+		if (!allIdleForClaim(active.claim)) {
+			// A transactional re-ask caller rolls accounting back before deferring.
+			if (sendOptions?.deferOnBusy !== false) deferDecisionOnBusy(active);
+			return false;
+		}
+		active.submitted = true;
+		try {
+			options.pi.sendMessage(
+				createDecisionPromptMessage({
+					exchangeId: active.exchangeId,
+					cycleId,
+					decisionPrompt,
+				}),
+				{ triggerTurn: true, deliverAs: "steer" },
+			);
+			return true;
+		} catch (error) {
+			if (!allIdleForClaim(active.claim)) {
+				// Final TOCTOU: Pi or an observable child became busy. Silent defer.
+				if (sendOptions?.deferOnBusy !== false) deferDecisionOnBusy(active);
+				return false;
+			}
+			// Genuine dispatch failure while still idle: fail closed with evidence.
+			throw error;
+		}
 	};
 
 	const openDecision = (decisionId: number): void => {
@@ -481,6 +557,7 @@ export function createDecisionRuntime(
 			claim,
 			domainFence,
 			invalidated: false,
+			submitted: false,
 			protocol: createDecisionProtocolSession({
 				controller,
 				decisionId,
@@ -490,8 +567,12 @@ export function createDecisionRuntime(
 		};
 		activeDecision = active;
 		try {
-			if (!stillOwns() || !domainIdle()) {
+			if (!stillOwns()) {
 				silentlyAbandonDecision();
+				return;
+			}
+			if (!allIdleForClaim(claim)) {
+				deferDecisionOnBusy(active);
 				return;
 			}
 			const status = checkingStatus(active);
@@ -506,35 +587,41 @@ export function createDecisionRuntime(
 				silentlyAbandonDecision();
 				return;
 			}
-			if (!stillOwns()) {
-				silentlyAbandonDecision();
-				return;
-			}
-			if (!domainIdle()) {
-				controller.invalidateDecision(decisionId);
-				activeDecision = null;
-				clearLiveStatus();
+			if (!allIdleForClaim(claim)) {
+				deferDecisionOnBusy(active);
 				return;
 			}
 			if (options.processDomain !== undefined) {
-				void Promise.resolve(
-					options.processDomain.confirm(active.domainFence),
-				).then((confirmed) => {
-					if (
-						!confirmed ||
-						!domainIdle() ||
-						active.invalidated ||
-						activeDecision !== active
-					) {
-						invalidateActiveDecision();
-						return;
+				const processDomain = options.processDomain;
+				void (async () => {
+					try {
+						const confirmed = await processDomain.confirm(active.domainFence);
+						if (
+							!confirmed ||
+							active.invalidated ||
+							activeDecision !== active ||
+							!allIdleForClaim(active.claim)
+						) {
+							invalidateActiveDecision();
+							return;
+						}
+						sendDecisionPrompt(
+							active,
+							active.protocol.currentCycleId,
+							decisionPrompt,
+						);
+					} catch (error) {
+						if (stillOwns() && localIdle()) {
+							appendStatus({
+								kind: "other-error",
+								exchangeId: active.exchangeId,
+								cycleId: active.protocol.currentCycleId,
+								message: originalErrorMessage(error),
+							});
+						}
+						silentlyAbandonDecision();
 					}
-					sendDecisionPrompt(
-						active,
-						active.protocol.currentCycleId,
-						decisionPrompt,
-					);
-				});
+				})();
 				return;
 			}
 			sendDecisionPrompt(
@@ -547,7 +634,7 @@ export function createDecisionRuntime(
 				silentlyAbandonDecision();
 			}
 		} catch (error) {
-			if (stillOwns()) {
+			if (stillOwns() && localIdle()) {
 				appendStatus({
 					kind: "other-error",
 					exchangeId: active.exchangeId,
@@ -561,7 +648,12 @@ export function createDecisionRuntime(
 
 	const armIdleTimer = (timerId: number, delaySeconds: number): void => {
 		const claim = getMainClaim();
-		if (claim === null || currentController(claim) === null || !domainIdle())
+		if (
+			claim === null ||
+			currentController(claim) === null ||
+			!domainIdle() ||
+			!localIdle()
+		)
 			return;
 		const domainFence = options.processDomain?.snapshot.fence ?? {
 			brokerEpoch: "local",
@@ -592,6 +684,16 @@ export function createDecisionRuntime(
 						armedTimer = null;
 						return;
 					}
+					if (!localIdle()) {
+						// The local lifecycle edge has not reached the aggregate hub yet.
+						// Clear the controller timer intent now so the next authoritative
+						// agent_settled can arm a fresh full delay.
+						armedTimer = null;
+						applyTransition(controller.onObservableBusy(), undefined, {
+							claim: timer.claim,
+						});
+						return;
+					}
 					if (now() < deadline) {
 						schedule();
 						return;
@@ -604,13 +706,34 @@ export function createDecisionRuntime(
 						applyTransition(controller.onObservableBusy(), undefined, {
 							claim: timer.claim,
 						});
-						reconcileIdle();
+						return;
+					}
+					const confirmedController = currentController(timer.claim);
+					if (
+						armedTimer !== timer ||
+						confirmedController === null ||
+						confirmedController.snapshot.idleTimer?.id !== timer.timerId ||
+						!allIdleForClaim(timer.claim)
+					) {
+						if (armedTimer === timer) armedTimer = null;
+						if (
+							confirmedController !== null &&
+							confirmedController.snapshot.idleTimer?.id === timer.timerId
+						) {
+							applyTransition(
+								confirmedController.onObservableBusy(),
+								undefined,
+								{ claim: timer.claim },
+							);
+						}
 						return;
 					}
 					armedTimer = null;
-					applyTransition(controller.beginDecision(timer.timerId), undefined, {
-						claim: timer.claim,
-					});
+					applyTransition(
+						confirmedController.beginDecision(timer.timerId),
+						undefined,
+						{ claim: timer.claim },
+					);
 				}, delayMs),
 			};
 			armedTimer = timer;
@@ -686,6 +809,7 @@ export function createDecisionRuntime(
 			controller === null ||
 			!options.hub.snapshot.allObservableIdle ||
 			!domainIdle() ||
+			!localIdle() ||
 			pendingFinalization !== null
 		) {
 			return;
@@ -740,6 +864,7 @@ export function createDecisionRuntime(
 			!isCurrentMain() ||
 			!options.hub.snapshot.allObservableIdle ||
 			!domainIdle() ||
+			!localIdle() ||
 			pendingFinalization !== null ||
 			publishedForIdleEpoch
 		) {
@@ -751,13 +876,13 @@ export function createDecisionRuntime(
 		if (claim === null || controller === null) return;
 
 		let envelope = null as ReturnType<typeof createUserReadyEnvelope> | null;
-		if (pendingAiUnlock !== null) {
+		const aiUnlockIntent = pendingAiUnlock;
+		if (aiUnlockIntent !== null) {
 			envelope = createUserReadyEnvelope({
 				STOP_KIND: "AI_UNLOCK",
-				REASON_TYPE: pendingAiUnlock.reasonType,
-				REASON: pendingAiUnlock.reason,
+				REASON_TYPE: aiUnlockIntent.reasonType,
+				REASON: aiUnlockIntent.reason,
 			});
-			pendingAiUnlock = null;
 		} else {
 			const snapshot = controller.snapshot;
 			if (snapshot.locked && snapshot.exhausted) {
@@ -769,15 +894,16 @@ export function createDecisionRuntime(
 			}
 		}
 
-		if (envelope === null || !options.hub.isCurrentMain(claim)) return;
+		if (envelope === null || !allIdleForClaim(claim)) return;
 		if (options.processDomain !== undefined) {
 			const snapshot = options.processDomain.snapshot;
-			if (
-				!snapshot.certain ||
-				!snapshot.allIdle ||
-				!(await options.processDomain.confirm(snapshot.fence))
-			)
-				return;
+			if (!snapshot.certain || !snapshot.allIdle) return;
+			if (!(await options.processDomain.confirm(snapshot.fence))) return;
+			if (!allIdleForClaim(claim)) return;
+		}
+		if (aiUnlockIntent !== null) {
+			if (pendingAiUnlock !== aiUnlockIntent) return;
+			pendingAiUnlock = null;
 		}
 		publishedForIdleEpoch = true;
 		try {
@@ -947,7 +1073,7 @@ export function createDecisionRuntime(
 		active: ActiveDecision,
 		effect: () => void,
 	): Promise<boolean> => {
-		if (!owns(active.claim) || !domainIdle()) return false;
+		if (!allIdleForClaim(active.claim)) return false;
 		if (
 			options.processDomain !== undefined &&
 			!(await options.processDomain.confirm(active.domainFence))
@@ -955,9 +1081,9 @@ export function createDecisionRuntime(
 			invalidateActiveDecision(true);
 			return false;
 		}
-		if (!owns(active.claim) || !domainIdle()) return false;
+		if (!allIdleForClaim(active.claim)) return false;
 		effect();
-		return owns(active.claim) && domainIdle();
+		return allIdleForClaim(active.claim);
 	};
 
 	/**
@@ -978,79 +1104,109 @@ export function createDecisionRuntime(
 		) {
 			return false;
 		}
-		pendingFinalization = null;
 		const { active, cycleId, plan } = pending;
-		if (
-			active.invalidated ||
-			(options.processDomain !== undefined && !domainIdle())
-		) {
+		if (active.invalidated) {
+			pendingFinalization = null;
 			invalidateActiveDecision();
+			return false;
+		}
+		const readyToFinalize = (): boolean =>
+			plan.outcome === "unlock"
+				? owns(active.claim) && localIdle()
+				: allIdleForClaim(active.claim);
+		if (!readyToFinalize()) {
+			if (plan.outcome !== "unlock") deferDecisionOnBusy(active);
 			return false;
 		}
 		// Exact claim carried by this decision exchange — not a live re-lookup.
 		const claim = active.claim;
-		if (options.processDomain !== undefined) {
-			if (!owns(claim) || !domainIdle()) return false;
+		if (options.processDomain !== undefined && plan.outcome !== "unlock") {
+			if (!readyToFinalize()) return false;
 			if (!(await options.processDomain.confirm(active.domainFence))) {
 				invalidateActiveDecision(true);
 				return false;
 			}
-			if (!owns(claim) || !domainIdle()) return false;
+			if (!readyToFinalize()) {
+				deferDecisionOnBusy(active);
+				return false;
+			}
 		}
+		// Local Pi and every observable attachment must still be idle to finalize;
+		// a busy race must not commit an invalid response or dispatch a re-ask.
+		if (!readyToFinalize()) {
+			if (plan.outcome !== "unlock") deferDecisionOnBusy(active);
+			return false;
+		}
+		// Invalid re-asks have re-entrant status/UI work before dispatch. Keep the
+		// plan uncommitted through that work so an aggregate-busy edge consumes no
+		// invalid-attempt budget and can be retried at the next genuine idle settle.
+		if (plan.outcome === "invalid") {
+			const status = checkingStatus(active);
+			const widgetError = showLiveStatus(status);
+			if (widgetError !== null) {
+				appendStatus({
+					kind: "other-error",
+					exchangeId: active.exchangeId,
+					cycleId,
+					message: widgetError,
+				});
+				silentlyAbandonDecision();
+				return false;
+			}
+			if (!allIdleForClaim(claim)) return false;
+		}
+
+		const controllerBeforeCommit =
+			options.controllerHolder.controller?.snapshot;
+		pendingFinalization = null;
 		const finalization = active.protocol.commitResponse(cycleId, plan);
 
 		if (finalization.outcome === "reask") {
-			if (
-				stopIfStale(claim) ||
-				(options.processDomain !== undefined && !domainIdle())
-			)
-				return false;
-			const validationStatus: WatchdogStatusEntry = {
-				kind: "validation-error",
-				exchangeId: active.exchangeId,
-				cycleId,
-				message: finalization.error ?? "Invalid watchdog decision response.",
-			};
-			if (!appendStatus(validationStatus)) {
-				silentlyAbandonDecision();
+			if (stopIfStale(claim)) return false;
+			if (!allIdleForClaim(claim)) {
+				// Local Pi became busy after this invalid response was committed but
+				// before the re-ask could dispatch. Defer the whole exchange so the
+				// next settle cannot re-commit or consume another attempt.
+				deferDecisionOnBusy(active);
 				return false;
 			}
 			if (
 				stopIfStale(claim) ||
+				!allIdleForClaim(claim) ||
 				finalization.reaskPrompt === undefined ||
 				!active.protocol.advanceAfterReask(cycleId)
 			) {
 				silentlyAbandonDecision();
 				return false;
 			}
-			if (
-				stopIfStale(claim) ||
-				(options.processDomain !== undefined && !domainIdle())
-			)
+			if (stopIfStale(claim) || !allIdleForClaim(claim)) {
+				deferDecisionOnBusy(active);
 				return false;
+			}
 			try {
-				const status = checkingStatus(active);
-				const widgetError = showLiveStatus(status);
-				if (widgetError !== null) {
-					appendStatus({
-						kind: "other-error",
-						exchangeId: active.exchangeId,
-						cycleId: active.protocol.currentCycleId,
-						message: widgetError,
-					});
-					silentlyAbandonDecision();
+				if (
+					!sendDecisionPrompt(
+						active,
+						active.protocol.currentCycleId,
+						finalization.reaskPrompt,
+						{ deferOnBusy: false },
+					)
+				) {
+					const cycleRolledBack = active.protocol.rollbackAfterReask(cycleId);
+					const controllerRolledBack =
+						controllerBeforeCommit !== undefined &&
+						options.controllerHolder.controller?.rollbackInvalidDecision(
+							active.decisionId,
+							controllerBeforeCommit.invalidDecisionAttempts,
+							controllerBeforeCommit.lastInvalidDecisionError,
+						).applied === true;
+					if (!cycleRolledBack || !controllerRolledBack) {
+						silentlyAbandonDecision();
+						return false;
+					}
+					deferDecisionOnBusy(active);
 					return false;
 				}
-				if (
-					stopIfStale(claim) ||
-					(options.processDomain !== undefined && !domainIdle())
-				)
-					return false;
-				sendDecisionPrompt(
-					active,
-					active.protocol.currentCycleId,
-					finalization.reaskPrompt,
-				);
 			} catch (error) {
 				if (owns(claim)) {
 					appendStatus({
@@ -1064,6 +1220,12 @@ export function createDecisionRuntime(
 				return false;
 			}
 			if (stopIfStale(claim)) return false;
+			appendStatus({
+				kind: "validation-error",
+				exchangeId: active.exchangeId,
+				cycleId,
+				message: finalization.error ?? "Invalid watchdog decision response.",
+			});
 			// Re-ask is still an open decision cycle, not a terminal epoch.
 			return false;
 		}
@@ -1133,39 +1295,42 @@ export function createDecisionRuntime(
 			activeDecision = null;
 			capturedDecisionResponse = null;
 			const finalCycleId = finalization.cycleId;
+			const deferAcceptedContinue = (): false => {
+				options.controllerHolder.controller?.rollbackValidContinue();
+				active.invalidated = true;
+				clearLiveStatus();
+				return false;
+			};
 			if (stopIfStale(claim)) return false;
+			if (!allIdleForClaim(claim)) return deferAcceptedContinue();
+			if (options.processDomain !== undefined) {
+				if (!(await options.processDomain.confirm(active.domainFence))) {
+					return deferAcceptedContinue();
+				}
+				if (!allIdleForClaim(claim)) return deferAcceptedContinue();
+			}
+			if (!allIdleForClaim(claim)) return deferAcceptedContinue();
 			try {
-				if (
-					!(await withDecisionFence(active, () => {
-						options.pi.appendEntry(CONTINUE_ENTRY_TYPE, {});
-					}))
-				)
-					return false;
+				options.pi.sendMessage(
+					createDecisionFoldMessage({
+						exchangeId: active.exchangeId,
+						cycleId: finalCycleId,
+						outcome: "continue",
+						continuePrompt: config.continuePrompt,
+					}),
+					{ triggerTurn: true, deliverAs: "steer" },
+				);
 			} catch {
-				// Never start an invisible continuation: if its durable TUI marker
-				// cannot be recorded, fail closed and abandon this lock cycle.
+				if (!allIdleForClaim(claim)) return deferAcceptedContinue();
 				silentlyAbandonDecision();
 				return false;
 			}
-			if (stopIfStale(claim)) return false;
+			// Persist accepted-continuation evidence only after dispatch succeeds, so a
+			// busy send rollback cannot leave a false `continued` card.
 			try {
-				if (
-					!(await withDecisionFence(active, () => {
-						options.pi.sendMessage(
-							createDecisionFoldMessage({
-								exchangeId: active.exchangeId,
-								cycleId: finalCycleId,
-								outcome: "continue",
-								continuePrompt: config.continuePrompt,
-							}),
-							{ triggerTurn: true, deliverAs: "steer" },
-						);
-					}))
-				)
-					return false;
+				options.pi.appendEntry(CONTINUE_ENTRY_TYPE, {});
 			} catch {
-				silentlyAbandonDecision();
-				return false;
+				// Dispatch has already succeeded; history persistence is best effort.
 			}
 			// Demotion after a successful send still must not claim intermediate continue.
 			if (stopIfStale(claim)) return false;
@@ -1193,12 +1358,9 @@ export function createDecisionRuntime(
 			return false;
 		}
 		if (stopIfStale(claim)) return false;
-		if (
-			options.processDomain !== undefined &&
-			!(await withDecisionFence(active, () => {}))
-		)
-			return false;
-		// Retain AI unlock publication intent until the authoritative all-idle settle.
+		// Retain AI unlock publication intent before asynchronous publication
+		// fencing. The controller is already terminally unlocked; if Pi becomes busy,
+		// the next genuine idle epoch publishes the typed intent exactly once.
 		pendingAiUnlock = { reasonType, reason };
 		try {
 			options.pi.sendMessage(
@@ -1256,6 +1418,23 @@ export function createDecisionRuntime(
 	};
 
 	const handleDecisionMessageEnd = (event: MessageEndEvent) => {
+		// Suppress the aborted assistant of a watchdog decision preempted by user
+		// input so the TUI does not show `Operation aborted` for the internal run.
+		// The TUI renders abort text from `stopReason`, so neutralize both fields;
+		// this only ever applies to the watchdog's own preempted internal turn.
+		if (
+			suppressDecisionAbort &&
+			event.message.role === "assistant" &&
+			isAbortedAssistant(event.message)
+		) {
+			return {
+				message: {
+					...event.message,
+					content: [],
+					stopReason: "stop" as const,
+				},
+			};
+		}
 		const active = activeDecision;
 		if (
 			active === null ||
@@ -1270,6 +1449,10 @@ export function createDecisionRuntime(
 		const cycleId = active.protocol.currentCycleId;
 		const response = normalizeAssistantDecisionResponse(event.message);
 		capturedDecisionResponse = { active, cycleId, response };
+		// The current prompt's run is over; until the next prompt (re-ask,
+		// continue, or fold) is actually sent, an unrelated run must not be
+		// misattributed as this decision's answer.
+		active.submitted = false;
 
 		const validation = validateDecisionResponse(response, config.reasonTypes);
 		const audit: DecisionAuditEntry = validation.valid
@@ -1394,6 +1577,14 @@ export function createDecisionRuntime(
 			agentActivityGeneration += 1;
 			const claim = getMainClaim();
 			const controller = currentController(claim);
+			// A run that starts before the watchdog decision was actually submitted is
+			// unrelated work (for example a compaction resume during fence confirm).
+			// Defer the provisional decision so this run is never captured as the
+			// decision answer and never marked internal in the process domain.
+			const active = activeDecision;
+			if (active !== null && !active.submitted && !active.invalidated) {
+				deferDecisionOnBusy(active);
+			}
 			if (claim !== null && controller !== null) {
 				const transition = controller.ensureLocked();
 				if (transition.applied) {
@@ -1412,9 +1603,40 @@ export function createDecisionRuntime(
 					internalDecision:
 						activeDecision !== null &&
 						!activeDecision.invalidated &&
+						activeDecision.submitted &&
 						owns(activeDecision.claim),
 				});
 			}
+		});
+
+		// A real user input (interactive or RPC) that arrives while a submitted
+		// internal watchdog decision is running must preempt it: Pi keeps the user
+		// message queued (we return `continue`), and we abort the internal decision
+		// so the queued user turn takes over promptly. Extension-injected messages
+		// never preempt the watchdog. The suppressed aborted assistant is the
+		// watchdog's own response only; normal user aborts are unaffected.
+		options.pi.on("input", (event) => {
+			const active = activeDecision;
+			if (event.source !== "interactive" && event.source !== "rpc") {
+				return;
+			}
+			if (
+				active === null ||
+				active.invalidated ||
+				!active.submitted ||
+				!owns(active.claim)
+			) {
+				return;
+			}
+			suppressDecisionAbort = true;
+			deferDecisionOnBusy(active);
+			try {
+				sessionContext?.abort();
+			} catch {
+				// Abort is best effort; the decision was already deferred so the next
+				// settle will not misattribute this run.
+			}
+			return { action: "continue" };
 		});
 
 		options.pi.on("message_end", handleDecisionMessageEnd);
@@ -1515,6 +1737,7 @@ export function createDecisionRuntime(
 		getMainClaim,
 		isCurrentMainClaim: (claim) => options.hub.isCurrentMain(claim),
 		clearOperationalPendingWork,
+		consumeDecisionAbortSuppression,
 		restartLockCycle,
 		applyEffect,
 		applyTransition,

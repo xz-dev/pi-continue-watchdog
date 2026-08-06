@@ -8,6 +8,7 @@ import type {
 import type { DomainFence, DomainSnapshot } from "pi-process-domain";
 
 import {
+	CONTINUE_ENTRY_TYPE,
 	HUMAN_UNLOCK_ENTRY_TYPE,
 	type HumanUnlockEntry,
 } from "../src/commands.js";
@@ -108,11 +109,13 @@ interface Harness {
 	readonly sent: SentMessage[];
 	readonly notifications: Array<{ message: string; level?: string }>;
 	readonly entries: Array<{ type: string; data: unknown }>;
+	aborts: number;
 	ctx: ExtensionContext;
 	runtime: ReturnType<typeof createDecisionRuntime>;
 	streaming: boolean;
 	triggeredTurns: number;
 	fire(name: string, event: unknown): Promise<void>;
+	fireInput(source: string, text?: string): Promise<unknown>;
 	openDecision(): void;
 	answerContinue(): unknown;
 	answerUnlock(reason?: string, reasonType?: string): unknown;
@@ -155,9 +158,17 @@ function idleDomainSnapshot(generation = 1n): DomainSnapshot {
 	};
 }
 
+interface PendingConfirm {
+	readonly fence: DomainFence;
+	resolve(value: boolean): void;
+}
+
 function createFenceHarness() {
 	let snapshot = idleDomainSnapshot();
 	let confirmResult = true;
+	let deferred = false;
+	const pendingConfirms: PendingConfirm[] = [];
+	const internalDecisionMarks: boolean[] = [];
 	const listeners = new Set<(value: DomainSnapshot) => void>();
 	const domain: ProcessDomainCoordinator = {
 		get snapshot() {
@@ -165,10 +176,17 @@ function createFenceHarness() {
 		},
 		isRootProcess: true,
 		async attach() {},
-		async markBusy() {},
+		async markBusy(_instance, options) {
+			internalDecisionMarks.push(options?.internalDecision ?? false);
+		},
 		async markIdle() {},
 		async setInternalDecision() {},
-		confirm(_fence: DomainFence) {
+		confirm(fence: DomainFence) {
+			if (deferred) {
+				return new Promise<boolean>((resolve) => {
+					pendingConfirms.push({ fence, resolve });
+				});
+			}
 			return confirmResult;
 		},
 		subscribe(listener) {
@@ -179,8 +197,23 @@ function createFenceHarness() {
 	};
 	return {
 		domain,
+		internalDecisionMarks,
 		failConfirm(): void {
 			confirmResult = false;
+		},
+		deferConfirm(): void {
+			deferred = true;
+		},
+		setDeferred(value: boolean): void {
+			deferred = value;
+		},
+		pendingConfirmCount(): number {
+			return pendingConfirms.length;
+		},
+		resolvePendingConfirm(value: boolean): void {
+			const pending = pendingConfirms.shift();
+			assert.ok(pending, "expected a pending fence confirm");
+			pending.resolve(value);
 		},
 		advanceFence(notify = true): void {
 			snapshot = idleDomainSnapshot(snapshot.activityGeneration + 1n);
@@ -194,10 +227,13 @@ function createFenceHarness() {
 function createHarness(options?: {
 	readonly config?: Partial<ContinueWatchdogConfig>;
 	readonly sendThrows?: boolean;
+	readonly onSend?: (message: SentMessage["message"]) => Error | undefined;
 	readonly appendThrows?: boolean | string;
+	readonly onAppend?: (type: string) => void;
 	readonly hasUI?: boolean;
 	readonly onNotify?: (message: string) => void;
 	readonly processDomain?: ProcessDomainCoordinator;
+	readonly isIdle?: () => boolean;
 }): Harness {
 	const config: ContinueWatchdogConfig = {
 		idleDelaySeconds: options?.config?.idleDelaySeconds ?? 3,
@@ -219,6 +255,7 @@ function createHarness(options?: {
 	const notifications: Array<{ message: string; level?: string }> = [];
 	const entries: Array<{ type: string; data: unknown }> = [];
 	const widgets: Array<{ key: string; value: unknown }> = [];
+	const aborts = 0;
 	let runtime: ReturnType<typeof createDecisionRuntime>;
 
 	const harness = {
@@ -231,6 +268,7 @@ function createHarness(options?: {
 		notifications,
 		entries,
 		widgets,
+		aborts,
 		streaming: false,
 		triggeredTurns: 0,
 	} as Harness;
@@ -245,6 +283,10 @@ function createHarness(options?: {
 			message: SentMessage["message"],
 			sendOptions?: SentMessage["options"],
 		): void {
+			if (options?.onSend) {
+				const result = options.onSend(message);
+				if (result instanceof Error) throw result;
+			}
 			if (options?.sendThrows) throw new Error("send failed");
 			sent.push({
 				message,
@@ -256,6 +298,7 @@ function createHarness(options?: {
 			}
 		},
 		appendEntry(type: string, data: HumanUnlockEntry): void {
+			options?.onAppend?.(type);
 			if (options?.appendThrows === true || options?.appendThrows === type) {
 				throw new Error("append failed");
 			}
@@ -266,7 +309,7 @@ function createHarness(options?: {
 	const ctx = {
 		hasUI: options?.hasUI ?? true,
 		cwd: "/project",
-		isIdle: () => !harness.streaming,
+		isIdle: () => options?.isIdle?.() ?? !harness.streaming,
 		isProjectTrusted: () => true,
 		sessionManager: { getSessionId: () => "main" },
 		ui: {
@@ -277,6 +320,9 @@ function createHarness(options?: {
 			setWidget(key: string, value: unknown): void {
 				widgets.push({ key, value });
 			},
+		},
+		abort(): void {
+			harness.aborts += 1;
 		},
 	} as unknown as ExtensionContext;
 
@@ -299,6 +345,16 @@ function createHarness(options?: {
 		for (const handler of handlers.get(name) ?? []) {
 			await handler(event as never, ctx);
 		}
+	};
+	harness.fireInput = async (source, text = "user message") => {
+		let result: unknown;
+		for (const handler of handlers.get("input") ?? []) {
+			result = await handler(
+				{ type: "input", text, source, images: undefined } as never,
+				ctx,
+			);
+		}
+		return result;
 	};
 	harness.openDecision = () => {
 		runtime.applyTransition(controller.lock(), undefined, {
@@ -572,7 +628,7 @@ test("agent_end finalizes while streaming but settled alone dispatches continue"
 	});
 });
 
-test("continue entry persistence failure prevents an invisible continuation", async () => {
+test("continue entry persistence failure does not cancel an already dispatched continuation", async () => {
 	const harness = createHarness({
 		appendThrows: "pi-continue-watchdog:continue",
 	});
@@ -582,9 +638,9 @@ test("continue entry persistence failure prevents an invisible continuation", as
 
 	await settleResponse(harness, harness.answerContinue());
 
-	assert.equal(harness.controller.snapshot.locked, false);
-	assert.equal(harness.sent.length, sentBefore);
-	assert.equal(harness.triggeredTurns, 1);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.sent.length, sentBefore + 1);
+	assert.equal(harness.triggeredTurns, 2);
 	assert.deepEqual(harness.entries, []);
 });
 
@@ -614,8 +670,10 @@ test("decision message_end hides XML, persists a context-excluded audit, and fin
 		},
 	});
 
+	// The decision prompt itself already caused agent_start. At this point the
+	// finalized replacement belongs to that submitted run; do not synthesize a
+	// second start after message_end reset the submission phase.
 	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
 	await harness.fire("agent_end", {
 		type: "agent_end",
 		messages: [replacement.message],
@@ -1579,4 +1637,381 @@ test("effective config loads before binding is reconciled and shutdown blocks la
 
 	runtime.shutdown();
 	assert.equal(holder.controller, null);
+});
+
+test("local Pi busy before idle timer callback defers; next true settle rearms", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	harness.runtime.reconcileIdle();
+	const timer = harness.clock.records.at(-1);
+	assert.ok(timer);
+	assert.equal(timer.delayMs, 3000);
+
+	// Local Pi becomes busy without any hub/domain edge (smallest scheduling window).
+	harness.streaming = true;
+	harness.clock.fire(harness.clock.records.length - 1);
+
+	assert.equal(harness.sent.length, 0);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
+	assert.equal(harness.controller.snapshot.locked, true);
+
+	// Next genuine true-idle settle re-arms and a fresh decision is sent.
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.sent.length, 0);
+	const rearmed = [...harness.clock.records]
+		.reverse()
+		.find((record) => record.delayMs === 3000 && !record.cleared);
+	assert.ok(rearmed);
+	assert.equal(rearmed.delayMs, 3000);
+	assert.equal(rearmed.cleared, false);
+
+	// Let the freshly re-armed watchdog dispatch before supplying its response.
+	harness.clock.fire(harness.clock.records.indexOf(rearmed));
+	assert.equal(harness.sent.length, 1);
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [harness.answerContinue()],
+	});
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.equal(harness.controller.snapshot.attempt, 1);
+});
+
+test("local Pi busy during deferred initial fence confirm defers without consuming attempts", async () => {
+	const fence = createFenceHarness();
+	const harness = createHarness({ processDomain: fence.domain });
+	await startIdle(harness);
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	fence.deferConfirm();
+	harness.runtime.reconcileIdle();
+	harness.clock.fire(harness.clock.records.length - 1);
+	assert.equal(fence.pendingConfirmCount(), 1);
+	assert.equal(harness.sent.length, 0);
+
+	// Local Pi becomes busy while the fence confirm is in flight.
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	fence.resolvePendingConfirm(true);
+	await Promise.resolve();
+	await Promise.resolve();
+
+	assert.equal(harness.sent.length, 0);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
+	assert.equal(harness.controller.snapshot.decisionFailed, false);
+	assert.equal(harness.controller.snapshot.exhausted, false);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(
+		harness.entries.some(
+			(entry) =>
+				entry.type === "pi-continue-watchdog:status" &&
+				(entry.data as { kind?: string }).kind !== undefined,
+		),
+		false,
+	);
+
+	// The unrelated run's response must not be captured as the decision answer.
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [harness.answerContinue()],
+	});
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.sent.length, 0);
+	const rearmed = [...harness.clock.records]
+		.reverse()
+		.find((record) => record.delayMs === 3000 && !record.cleared);
+	assert.ok(rearmed);
+	assert.equal(rearmed.delayMs, 3000);
+});
+
+test("timer confirm busy race clears intent and waits for the next full idle delay", async () => {
+	const fence = createFenceHarness();
+	const harness = createHarness({ processDomain: fence.domain });
+	await startIdle(harness);
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	harness.runtime.reconcileIdle();
+	const timer = harness.clock.records.at(-1);
+	assert.ok(timer);
+	fence.deferConfirm();
+	harness.clock.fire(harness.clock.records.length - 1);
+	assert.equal(fence.pendingConfirmCount(), 1);
+
+	harness.streaming = true;
+	fence.resolvePendingConfirm(true);
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(harness.sent.length, 0);
+	assert.equal(harness.controller.snapshot.idleTimer, null);
+	assert.equal(harness.controller.snapshot.locked, true);
+
+	harness.streaming = false;
+	await settleOnly(harness);
+	const rearmed = [...harness.clock.records]
+		.reverse()
+		.find((record) => record.delayMs === 3000 && !record.cleared);
+	assert.ok(rearmed);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+});
+
+test("provisional decision during confirm is not marked internal when an unrelated run starts", async () => {
+	const fence = createFenceHarness();
+	const harness = createHarness({ processDomain: fence.domain });
+	await startIdle(harness);
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	fence.deferConfirm();
+	harness.runtime.reconcileIdle();
+	harness.clock.fire(harness.clock.records.length - 1);
+	assert.equal(fence.pendingConfirmCount(), 1);
+
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	// The unrelated run must not be branded an internal watchdog decision.
+	assert.deepEqual(fence.internalDecisionMarks, [false]);
+
+	fence.resolvePendingConfirm(true);
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(harness.sent.length, 0);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.controller.snapshot.locked, true);
+});
+
+test("re-ask delivery that races local busy does not consume another attempt", async () => {
+	const fence = createFenceHarness();
+	const harness = createHarness({ processDomain: fence.domain });
+	await startIdle(harness);
+	harness.openDecision();
+	await Promise.resolve();
+	await Promise.resolve();
+	// Commit attempt 1 and enter re-ask delivery while still idle.
+	await settleResponse(harness, harness.answerInvalid());
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
+	assert.match(
+		harness.sent.at(-1)?.message.content ?? "",
+		/previous decision response was invalid/,
+	);
+
+	// Second invalid response: hold the re-ask delivery confirm in flight.
+	fence.deferConfirm();
+	const sentBefore = harness.sent.length;
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [harness.answerInvalid()],
+	});
+	harness.streaming = false;
+	await harness.fire("agent_settled", { type: "agent_settled" });
+	const deferredSettle = harness.clock.records.length - 1;
+	assert.equal(harness.clock.records[deferredSettle]?.delayMs, 0);
+	harness.clock.fire(deferredSettle);
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(fence.pendingConfirmCount(), 1);
+
+	// Local Pi becomes busy while the re-ask confirm is pending; resolve stale true.
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	fence.resolvePendingConfirm(true);
+	await Promise.resolve();
+	await Promise.resolve();
+
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
+	assert.equal(harness.controller.snapshot.decisionFailed, false);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.sent.length, sentBefore);
+	assert.equal(
+		harness.sent.filter((entry) =>
+			entry.message.content.includes("previous decision response was invalid"),
+		).length,
+		1,
+	);
+
+	// A later true-idle settle can start a fresh decision.
+	harness.streaming = false;
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [harness.answerContinue()],
+	});
+	await settleOnly(harness);
+	const rearmed = [...harness.clock.records]
+		.reverse()
+		.find((record) => record.delayMs === 3000 && !record.cleared);
+	assert.ok(rearmed);
+	assert.equal(rearmed.delayMs, 3000);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.controller.snapshot.locked, true);
+});
+
+test("accepted continue busy races roll back retry and defer without unlocking", async () => {
+	const fence = createFenceHarness();
+	const duringConfirm = createHarness({ processDomain: fence.domain });
+	await startIdle(duringConfirm);
+	duringConfirm.openDecision();
+	await Promise.resolve();
+	await Promise.resolve();
+	fence.deferConfirm();
+	duringConfirm.streaming = true;
+	await duringConfirm.fire("agent_start", { type: "agent_start" });
+	await duringConfirm.fire("agent_end", {
+		type: "agent_end",
+		messages: [duringConfirm.answerContinue()],
+	});
+	duringConfirm.streaming = false;
+	await duringConfirm.fire("agent_settled", { type: "agent_settled" });
+	const deferred = duringConfirm.clock.records.length - 1;
+	duringConfirm.clock.fire(deferred);
+	await Promise.resolve();
+	await Promise.resolve();
+	// deliverPending first performs the common finalization fence, then the
+	// accepted-continuation fence under test.
+	assert.equal(fence.pendingConfirmCount(), 1);
+	fence.resolvePendingConfirm(true);
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(fence.pendingConfirmCount(), 1);
+	duringConfirm.streaming = true;
+	fence.resolvePendingConfirm(true);
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(duringConfirm.controller.snapshot.attempt, 0);
+	assert.equal(duringConfirm.controller.snapshot.locked, true);
+	assert.equal(duringConfirm.triggeredTurns, 1);
+
+	let sendBusy = false;
+	const atSend = createHarness({
+		isIdle: () => !sendBusy,
+		onSend(message) {
+			if (message.customType === DECISION_FOLD_MESSAGE_TYPE) {
+				sendBusy = true;
+				return new Error("busy");
+			}
+			return undefined;
+		},
+	});
+	await startIdle(atSend);
+	atSend.openDecision();
+	await settleResponse(atSend, atSend.answerContinue());
+	assert.equal(atSend.controller.snapshot.attempt, 0);
+	assert.equal(atSend.controller.snapshot.locked, true);
+	assert.equal(
+		atSend.entries.filter(
+			(entry) =>
+				entry.type === "pi-continue-watchdog:status" ||
+				entry.type === CONTINUE_ENTRY_TYPE,
+		).length,
+		0,
+	);
+});
+
+test("real user input silently preempts a submitted decision and extension input stays inert", async () => {
+	for (const source of ["interactive", "rpc"] as const) {
+		const harness = createHarness();
+		await startIdle(harness);
+		harness.openDecision();
+		assert.equal(harness.controller.snapshot.decisionOpen, true);
+		assert.equal(harness.aborts, 0);
+
+		assert.deepEqual(await harness.fireInput(source), { action: "continue" });
+		assert.equal(harness.aborts, 1);
+		assert.equal(harness.controller.snapshot.locked, true);
+		assert.equal(harness.controller.snapshot.decisionOpen, false);
+		assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
+
+		const replacement = (await harness.endDecisionMessage(
+			assistant([], "aborted"),
+		)) as DecisionMessageReplacement;
+		assert.deepEqual(replacement.message.content, []);
+		assert.equal(
+			(replacement.message as { stopReason?: string }).stopReason,
+			"stop",
+		);
+		assert.equal(harness.runtime.consumeDecisionAbortSuppression(), true);
+		assert.equal(harness.runtime.consumeDecisionAbortSuppression(), false);
+		assert.deepEqual(harness.notifications, []);
+	}
+
+	const extension = createHarness();
+	await startIdle(extension);
+	extension.openDecision();
+	assert.equal(await extension.fireInput("extension"), undefined);
+	assert.equal(extension.aborts, 0);
+	assert.equal(extension.controller.snapshot.decisionOpen, true);
+});
+
+test("send-time busy TOCTOU defers silently; idle send failure still fail-closed", async () => {
+	// Busy at the final send boundary: the hook flips local idle and throws the
+	// stock busy error; the watchdog must defer without unlock or error cards.
+	let busyHookStreaming = false;
+	const busy = createHarness({
+		isIdle: () => !busyHookStreaming,
+		onSend(message) {
+			if (message.customType === DECISION_MESSAGE_TYPE) {
+				busyHookStreaming = true;
+				return new Error(
+					"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
+				);
+			}
+			return undefined;
+		},
+	});
+	await startIdle(busy);
+	busy.runtime.applyTransition(busy.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	busy.runtime.reconcileIdle();
+	const timer = busy.clock.records.at(-1);
+	assert.ok(timer);
+	busy.clock.fire(busy.clock.records.length - 1);
+
+	assert.equal(busy.sent.length, 0);
+	assert.equal(busy.controller.snapshot.decisionOpen, false);
+	assert.equal(busy.controller.snapshot.invalidDecisionAttempts, 0);
+	assert.equal(busy.controller.snapshot.locked, true);
+	assert.equal(
+		busy.entries.filter(
+			(entry) =>
+				entry.type === "pi-continue-watchdog:status" &&
+				(entry.data as { kind?: string }).kind === "other-error",
+		).length,
+		0,
+	);
+
+	// Genuine idle send failure keeps the existing fail-closed unlock behavior.
+	const idle = createHarness({ sendThrows: true });
+	await startIdle(idle);
+	idle.runtime.applyTransition(idle.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	idle.runtime.reconcileIdle();
+	const idleTimer = idle.clock.records.at(-1);
+	assert.ok(idleTimer);
+	idle.clock.fire(idle.clock.records.length - 1);
+	assert.equal(idle.controller.snapshot.locked, false);
+	assert.equal(
+		idle.entries.some(
+			(entry) =>
+				entry.type === "pi-continue-watchdog:status" &&
+				(entry.data as { kind?: string }).kind === "other-error",
+		),
+		true,
+	);
 });

@@ -5,6 +5,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { createEventBus } from "@earendil-works/pi-coding-agent";
+import type { DomainFence, DomainSnapshot } from "pi-process-domain";
 
 import type { ContinueWatchdogConfig } from "../src/config.js";
 import { createLockDecisionController } from "../src/controller.js";
@@ -12,6 +13,7 @@ import {
 	createHubAttachmentInstance,
 	createObservableAgentHub,
 } from "../src/hub.js";
+import type { ProcessDomainCoordinator } from "../src/process-domain.js";
 import {
 	createDecisionRuntime,
 	type RuntimeClock,
@@ -82,6 +84,7 @@ interface SemanticHarness {
 	readonly received: SemanticHookEnvelope[];
 	readonly bus: ReturnType<typeof createEventBus>;
 	readonly notifications: Array<{ message: string; level?: string }>;
+	readonly sentTypes: string[];
 	ctx: ExtensionContext;
 	runtime: ReturnType<typeof createDecisionRuntime>;
 	streaming: boolean;
@@ -116,9 +119,76 @@ function unlockXml(
 	return `<watchdog><function>unlock_continue_watchdog</function><reason_type>${reasonType}</reason_type><reason_content>${reason}</reason_content></watchdog>`;
 }
 
+function idleDomainSnapshot(): DomainSnapshot {
+	return {
+		domainId: "semantic-domain",
+		brokerEpoch: "epoch",
+		revision: 1n,
+		activityGeneration: 1n,
+		participants: 1,
+		busyParticipants: 0,
+		pendingSpawns: 0,
+		allIdle: true,
+		certain: true,
+		fence: { brokerEpoch: "epoch", activityGeneration: 1n },
+	};
+}
+
+function deferredDomain() {
+	const pending: Array<{ readonly id: number; resolve(value: boolean): void }> =
+		[];
+	let confirmCalls = 0;
+	let defer = true;
+	const snapshot = idleDomainSnapshot();
+	const domain: ProcessDomainCoordinator = {
+		get snapshot() {
+			return snapshot;
+		},
+		isRootProcess: true,
+		async attach() {},
+		async markBusy() {},
+		async markIdle() {},
+		async setInternalDecision() {},
+		confirm(_fence: DomainFence) {
+			confirmCalls += 1;
+			if (!defer) return Promise.resolve(true);
+			const id = confirmCalls;
+			return new Promise<boolean>((resolve) => {
+				pending.push({ id, resolve });
+			});
+		},
+		subscribe() {
+			return () => {};
+		},
+		async detach() {},
+	};
+	return {
+		domain,
+		hasPending(): boolean {
+			return pending.length > 0;
+		},
+		confirmCallCount(): number {
+			return confirmCalls;
+		},
+		pendingIds(): number[] {
+			return pending.map((item) => item.id);
+		},
+		resolve(value: boolean): void {
+			const item = pending.shift();
+			assert.ok(item, "expected pending domain confirmation");
+			item.resolve(value);
+		},
+		setDeferred(value: boolean): void {
+			defer = value;
+		},
+	};
+}
+
 function createSemanticHarness(options?: {
 	readonly config?: Partial<ContinueWatchdogConfig>;
 	readonly hasUI?: boolean;
+	readonly processDomain?: ProcessDomainCoordinator;
+	readonly isIdle?: () => boolean;
 }): SemanticHarness {
 	const config: ContinueWatchdogConfig = {
 		idleDelaySeconds: options?.config?.idleDelaySeconds ?? 3,
@@ -139,6 +209,7 @@ function createSemanticHarness(options?: {
 	const received: SemanticHookEnvelope[] = [];
 	const bus = createEventBus();
 	const notifications: Array<{ message: string; level?: string }> = [];
+	const sentTypes: string[] = [];
 	let runtime: ReturnType<typeof createDecisionRuntime>;
 
 	bus.on(SEMANTIC_HOOK_CHANNEL, (data) => {
@@ -153,6 +224,7 @@ function createSemanticHarness(options?: {
 		received,
 		bus,
 		notifications,
+		sentTypes,
 		streaming: false,
 	} as SemanticHarness;
 
@@ -163,14 +235,16 @@ function createSemanticHarness(options?: {
 			handlers.set(name, list);
 		},
 		events: bus,
-		sendMessage(): void {},
+		sendMessage(message: { customType?: string }): void {
+			sentTypes.push(message.customType ?? "unknown");
+		},
 		appendEntry(): void {},
 	} as unknown as ExtensionAPI;
 
 	const ctx = {
 		hasUI: options?.hasUI ?? true,
 		cwd: "/project",
-		isIdle: () => !harness.streaming,
+		isIdle: () => options?.isIdle?.() ?? !harness.streaming,
 		isProjectTrusted: () => true,
 		sessionManager: { getSessionId: () => "main" },
 		ui: {
@@ -183,6 +257,7 @@ function createSemanticHarness(options?: {
 	runtime = createDecisionRuntime({
 		pi,
 		hub,
+		processDomain: options?.processDomain,
 		attachmentInstance: createHubAttachmentInstance(),
 		controllerHolder: holder,
 		injectedController: true,
@@ -219,6 +294,19 @@ function createSemanticHarness(options?: {
 	});
 
 	return harness;
+}
+
+async function waitForPendingConfirm(
+	fence: ReturnType<typeof deferredDomain>,
+): Promise<void> {
+	for (let attempt = 0; attempt < 50 && !fence.hasPending(); attempt += 1) {
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+	assert.equal(
+		fence.hasPending(),
+		true,
+		"expected pending domain confirmation",
+	);
 }
 
 async function startIdle(harness: SemanticHarness): Promise<void> {
@@ -468,6 +556,87 @@ test("AI unlock intent waits for aggregate idle and publishes typed pair only on
 	});
 
 	// Same terminal epoch: no second publication.
+	harness.runtime.reconcileIdle();
+	assert.equal(harness.received.length, 1);
+});
+
+test("AI unlock intent is retained until publication confirmation succeeds", async () => {
+	const fence = deferredDomain();
+	let locallyIdle = true;
+	const harness = createSemanticHarness({
+		processDomain: fence.domain,
+		isIdle: () => locallyIdle,
+	});
+	await startIdle(harness);
+	fence.setDeferred(false);
+	harness.openDecision();
+	for (
+		let attempt = 0;
+		attempt < 100 && harness.sentTypes.length === 0;
+		attempt += 1
+	) {
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+	assert.equal(harness.sentTypes.length, 1);
+	fence.setDeferred(true);
+
+	// Finalization's first fence succeeds; publication's fence remains pending.
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [harness.answerUnlock("Need approval.", "WAIT_USER")],
+	});
+	harness.streaming = false;
+	await harness.fire("agent_settled", { type: "agent_settled" });
+	const deferred = harness.clock.records.length - 1;
+	assert.equal(harness.clock.records[deferred]?.delayMs, 0);
+	harness.clock.fire(deferred);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	// Resolve deferred finalization confirmations while local Pi remains idle,
+	// stopping as soon as the unlock has committed. The next pending confirmation
+	// is therefore publication C2 and must remain unresolved here.
+	for (let attempt = 0; attempt < 5; attempt += 1) {
+		await waitForPendingConfirm(fence);
+		if (!harness.controller.snapshot.locked) break;
+		fence.resolve(true);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.ok(fence.confirmCallCount() >= 2);
+	assert.equal(fence.hasPending(), true);
+
+	// C2: only publication is now pending. Become locally busy before resolving
+	// it, so the retained intent cannot be consumed or emitted.
+	locallyIdle = false;
+	fence.resolve(true);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(harness.received.length, 0);
+
+	// A later genuine aggregate busy→idle edge with immediate confirmation emits
+	// the retained typed intent exactly once.
+	locallyIdle = true;
+	fence.setDeferred(false);
+	const child = harness.hub.bind({
+		instance: createHubAttachmentInstance(),
+		sessionId: "publication-retry-child",
+		hasUI: false,
+		initialBusy: false,
+	}).attachment;
+	harness.hub.markBusy(child);
+	harness.hub.markIdle(child);
+	for (
+		let attempt = 0;
+		attempt < 200 && harness.received.length === 0;
+		attempt += 1
+	) {
+		await Promise.resolve();
+	}
+	assert.deepEqual(harness.received[0]?.values, {
+		STOP_KIND: "AI_UNLOCK",
+		REASON_TYPE: "WAIT_USER",
+		REASON: "Need approval.",
+	});
 	harness.runtime.reconcileIdle();
 	assert.equal(harness.received.length, 1);
 });

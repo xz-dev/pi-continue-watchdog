@@ -46,6 +46,13 @@ export interface MainAbortUnlockRuntime {
 	 * later settle path cannot continue after abort unlock.
 	 */
 	clearOperationalPendingWork(): void;
+	/**
+	 * Atomically consume the marker suppressing a watchdog decision aborted by
+	 * user input. When true, the abort unlock must be suppressed entirely (no
+	 * unlock transition, no bare notification) because the user already took
+	 * over the turn.
+	 */
+	consumeDecisionAbortSuppression?(): boolean;
 	applyEffect(
 		effect: AbortUnlockRuntimeEffect,
 		ctx: ExtensionContext,
@@ -184,6 +191,12 @@ export function registerMainAbortUnlock(
 		if (!runtime.isCurrentMainClaim(active.claim)) {
 			return;
 		}
+
+		// A watchdog decision preempted by user input is not a user abort. Its
+		// message_end replacement neutralizes the internal aborted assistant before
+		// this settle inspection, so consume the one-shot marker before checking the
+		// terminal outcome. A later unrelated abort must retain normal semantics.
+		if (runtime.consumeDecisionAbortSuppression?.() === true) return;
 
 		const outcome = inspectTerminalAssistantOutcome(
 			ctx.sessionManager,
