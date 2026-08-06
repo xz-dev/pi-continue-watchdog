@@ -22,7 +22,7 @@ pi install git:github.com/xz-dev/pi-continue-watchdog
 
 This unpinned Git source intentionally tracks the latest repository state. Use `pi update --extensions` to update installed Pi packages. The project does not publish npm versions, tags, or GitHub Releases.
 
-The tracked root `.npmrc` sets `allow-git=root`. npm 12 otherwise rejects the exact Git-pinned `pi-process-domain` dependency when Pi installs this cloned Git package. The `root` policy admits only the dependency declared directly by this reviewed package; it does not broadly allow transitive Git dependencies.
+The tracked root `.npmrc` sets `allow-git=root`. npm 12 otherwise rejects the exact Git-pinned `pi-process-domain` dependency when Pi installs this cloned Git package. The `root` policy admits only the dependency declared directly by this reviewed package; it does not broadly allow transitive Git dependencies. The package-owned `allowScripts` entry names only `pi-process-domain`; users do not need to relax their npm configuration.
 
 Reload Pi extensions or start a new session after install.
 

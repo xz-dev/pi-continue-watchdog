@@ -23,5 +23,9 @@ jobs:
           install_root="$(mktemp -d)"
           git clone --local . "$install_root/pi-continue-watchdog"
           cd "$install_root/pi-continue-watchdog"
-          npx --yes npm@12 install --omit=dev --no-audit --no-fund
+          # Exercise npm 12's nested-preparation failure mode with the
+          # package-owned allowScripts policy and a clean cache. A
+          # preparation-free Git dependency must not turn that project policy
+          # into a forbidden child-install CLI policy.
+          NPM_CONFIG_CACHE="$install_root/npm-cache" npx --yes npm@12.0.2 install --omit=dev --no-audit --no-fund
           node --input-type=module -e 'import("pi-process-domain").then((module) => { if (typeof module.openDomain !== "function") process.exit(1); })'
