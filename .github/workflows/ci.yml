@@ -18,3 +18,10 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run test:e2e
+      - name: Verify npm 12 Git-clone install policy
+        run: |
+          install_root="$(mktemp -d)"
+          git clone --local . "$install_root/pi-continue-watchdog"
+          cd "$install_root/pi-continue-watchdog"
+          npx --yes npm@12 install --omit=dev --no-audit --no-fund
+          node --input-type=module -e 'import("pi-process-domain").then((module) => { if (typeof module.openDomain !== "function") process.exit(1); })'

@@ -137,6 +137,11 @@ async function makePackedFixture(
 			"--ignore-scripts",
 			"--no-audit",
 			"--no-fund",
+			// This fixture intentionally installs the watchdog as a tarball dependency,
+			// so its reviewed Git dependency is transitive to the temporary root.
+			// Production distribution uses a Pi Git clone, where `.npmrc` applies the
+			// narrower `allow-git=root` policy verified separately in CI.
+			"--allow-git=all",
 			tarball,
 		],
 		{ cwd: installRoot, timeout: 120_000, maxBuffer: 8 * 1024 * 1024 },
