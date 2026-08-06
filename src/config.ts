@@ -62,7 +62,7 @@ export interface MergeConfigResult {
 }
 
 export const BUILT_IN_CONFIG: Readonly<ContinueWatchdogConfig> = Object.freeze({
-	idleDelaySeconds: 3,
+	idleDelaySeconds: 10,
 	maxRetries: 10,
 	decisionPrompt: DEFAULT_DECISION_PROMPT,
 	continuePrompt: DEFAULT_CONTINUE_PROMPT,

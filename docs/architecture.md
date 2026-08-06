@@ -123,7 +123,7 @@ After each accepted continue decision, the next aggregate-idle delay is:
 delaySeconds = idleDelaySeconds × 2^attempt
 ```
 
-With the defaults, the sequence starts at `3s, 6s, 12s, 24s, …`. Only valid continue decisions consume `maxRetries`.
+With the defaults, the sequence starts at `10s, 20s, 40s, 80s, …`. Only valid continue decisions consume `maxRetries`.
 
 ## Ownership and stale-work fencing
 

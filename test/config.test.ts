@@ -45,7 +45,7 @@ async function fixture(
 }
 
 test("built-in defaults match acceptance and reject the stale direct reminder", () => {
-	assert.equal(BUILT_IN_CONFIG.idleDelaySeconds, 3);
+	assert.equal(BUILT_IN_CONFIG.idleDelaySeconds, 10);
 	assert.equal(BUILT_IN_CONFIG.maxRetries, 10);
 	assert.equal(BUILT_IN_CONFIG.decisionPrompt, ACCEPTED_DECISION_PROMPT);
 	assert.equal(

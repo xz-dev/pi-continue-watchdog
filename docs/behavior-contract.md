@@ -107,7 +107,7 @@ Continue until user assistance is required.
 
 | Key | Default | Notes |
 |---|---|---|
-| `idleDelaySeconds` | `3` | Base delay in seconds; any finite number `>= 0`. Zero schedules an asynchronous 0 ms decision and fractions are allowed. |
+| `idleDelaySeconds` | `10` | Base delay in seconds; any finite number `>= 0`. Zero schedules an asynchronous 0 ms decision and fractions are allowed. |
 | `maxRetries` | `10` | Maximum **valid continue** decisions per lock cycle (not invalid re-asks); safe integer in `[1, 10]` |
 | `decisionPrompt` | exact default above | Hidden custom-role body; explicitly identifies extension automation and says it is not a user message/request; nonblank and at most 16,384 Unicode code points |
 | `continuePrompt` | exact default above | Compact fold-in after valid continue; nonblank and at most 16,384 Unicode code points |
@@ -127,7 +127,7 @@ Trusted-project fields override global field-by-field (`builtins < global < trus
 delaySeconds(N) = idleDelaySeconds × 2^(N - 1)
 ```
 
-With defaults: 3s, 6s, 12s, 24s, … for attempts 1…`maxRetries`. With a zero base, every attempt schedules through a 0 ms timer.
+With defaults: 10s, 20s, 40s, 80s, … for attempts 1…`maxRetries`. With a zero base, every attempt schedules through a 0 ms timer.
 
 **Non-configurable:** invalid decision re-ask budget is fixed at **3** attempts (not a config key).
 
@@ -380,7 +380,7 @@ Ordinary natural idle settle never counts as abort.
   is **not** used as the idle wake message
 - the rejected untyped decision default that asked only for a concise reason without an allowed `reasonType` is **not** used
 
-With defaults, delays for successive continue attempts begin **3s, 6s, 12s, 24s, …**
+With defaults, delays for successive continue attempts begin **10s, 20s, 40s, 80s, …**
 
 ### Example 6 — Valid continue: fold, compact prompt, retry consumption
 

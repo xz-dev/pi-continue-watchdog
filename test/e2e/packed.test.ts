@@ -888,8 +888,8 @@ test("packed artifact asks after threshold compaction settles", {
 	);
 });
 
-test("packed source artifact waits a real 3 seconds, decides continue, and folds context", {
-	timeout: 30_000,
+test("packed source artifact waits a real 10 seconds, decides continue, and folds context", {
+	timeout: 40_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t);
 	const { baseUrl, requests } = await startMockServer(t, [
@@ -911,7 +911,7 @@ test("packed source artifact waits a real 3 seconds, decides continue, and folds
 	assert.equal(commands.includes("unlock-continue-watchdog"), true);
 
 	await session.prompt("Start a task that must not mysteriously stop.");
-	await waitFor(() => requests.length === 3, 10_000, "continued provider turn");
+	await waitFor(() => requests.length === 3, 20_000, "continued provider turn");
 	await waitForSessionIdle(session, 5_000, "continued ordinary work");
 
 	const firstRequest = requests[0];
@@ -934,8 +934,8 @@ test("packed source artifact waits a real 3 seconds, decides continue, and folds
 		"write",
 	]);
 	const elapsed = decisionRequest.receivedAt - firstRequest.receivedAt;
-	assert.ok(elapsed >= 2_800, `decision arrived too early after ${elapsed}ms`);
-	assert.ok(elapsed <= 6_000, `decision arrived too late after ${elapsed}ms`);
+	assert.ok(elapsed >= 9_800, `decision arrived too early after ${elapsed}ms`);
+	assert.ok(elapsed <= 13_000, `decision arrived too late after ${elapsed}ms`);
 	assert.equal(
 		decisionRequest.messages.some((message) =>
 			textOf(message).includes(decisionPromptStart),
