@@ -234,6 +234,11 @@ function createHarness(options?: {
 	readonly onNotify?: (message: string) => void;
 	readonly processDomain?: ProcessDomainCoordinator;
 	readonly isIdle?: () => boolean;
+	readonly wouldTriggerAutoCompaction?: (content: string) => boolean;
+	readonly onCompact?: (options: {
+		readonly onComplete?: () => void;
+		readonly onError?: (error: Error) => void;
+	}) => void;
 }): Harness {
 	const config: ContinueWatchdogConfig = {
 		idleDelaySeconds: options?.config?.idleDelaySeconds ?? 3,
@@ -310,6 +315,12 @@ function createHarness(options?: {
 		hasUI: options?.hasUI ?? true,
 		cwd: "/project",
 		isIdle: () => options?.isIdle?.() ?? !harness.streaming,
+		wouldTriggerAutoCompaction: (content: string) =>
+			options?.wouldTriggerAutoCompaction?.(content) ?? false,
+		compact: (compactOptions: {
+			onComplete?: () => void;
+			onError?: (error: Error) => void;
+		}) => options?.onCompact?.(compactOptions),
 		isProjectTrusted: () => true,
 		sessionManager: { getSessionId: () => "main" },
 		ui: {
@@ -452,6 +463,79 @@ test("idle arms one unref timer and opens one hidden decision-only window", asyn
 		triggerTurn: true,
 		deliverAs: "steer",
 	});
+});
+
+test("compacts before sending a watchdog question near the context limit", async () => {
+	let complete: (() => void) | undefined;
+	const predictedPrompts: string[] = [];
+	const harness = createHarness({
+		wouldTriggerAutoCompaction: (content) => {
+			predictedPrompts.push(content);
+			return true;
+		},
+		onCompact: (options) => {
+			complete = options.onComplete;
+		},
+	});
+	await startIdle(harness);
+	harness.openDecision();
+
+	assert.equal(predictedPrompts.length, 1);
+	assert.match(predictedPrompts[0] ?? "", /exactly one <watchdog>/);
+	assert.equal(harness.sent.length, 0);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.widgets.length, 0);
+	assert.equal(typeof complete, "function");
+	complete?.();
+	await Promise.resolve();
+	await Promise.resolve();
+
+	assert.equal(harness.controller.snapshot.decisionOpen, true);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.sent[0]?.message.customType, DECISION_MESSAGE_TYPE);
+});
+
+test("failed pre-question compaction clears the timer intent and waits for a fresh idle epoch", async () => {
+	let fail: ((error: Error) => void) | undefined;
+	const harness = createHarness({
+		wouldTriggerAutoCompaction: () => true,
+		onCompact: (options) => {
+			fail = options.onError;
+		},
+	});
+	await startIdle(harness);
+	harness.openDecision();
+
+	assert.equal(typeof fail, "function");
+	fail?.(new Error("compaction failed"));
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.controller.snapshot.idleTimer?.delaySeconds, 3);
+	assert.equal(harness.clock.records.at(-1)?.delayMs, 3000);
+});
+
+test("a stale pre-question compaction gate cannot open a newer timer's decision", async () => {
+	let complete: (() => void) | undefined;
+	const harness = createHarness({
+		wouldTriggerAutoCompaction: () => true,
+		onCompact: (options) => {
+			complete = options.onComplete;
+		},
+	});
+	await startIdle(harness);
+	harness.openDecision();
+
+	await harness.runtime.restartLockCycle(harness.ctx, { notifyLocked: false });
+	complete?.();
+	await Promise.resolve();
+	await Promise.resolve();
+
+	assert.equal(harness.sent.length, 0);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.clock.records.at(-1)?.delayMs, 3000);
 });
 
 test("maximum configured decision prompt still opens and re-asks with generated XML suffix", async () => {

@@ -509,6 +509,7 @@ export function createDecisionRuntime(
 			if (sendOptions?.deferOnBusy !== false) deferDecisionOnBusy(active);
 			return false;
 		}
+
 		active.submitted = true;
 		try {
 			options.pi.sendMessage(
@@ -646,6 +647,58 @@ export function createDecisionRuntime(
 		}
 	};
 
+	const compactBeforeDecision = (
+		claim: HubMainClaim,
+		timerId: number,
+		domainFence: import("pi-process-domain").DomainFence,
+	): boolean | Promise<boolean> => {
+		const ctx = sessionContext;
+		const controller = currentController(claim);
+		if (
+			ctx === null ||
+			controller === null ||
+			controller.snapshot.idleTimer?.id !== timerId ||
+			!allIdleForClaim(claim)
+		) {
+			return false;
+		}
+		const decisionPrompt = buildDecisionPrompt(
+			config.decisionPrompt,
+			config.reasonTypes,
+		);
+		const predict = (
+			ctx as ExtensionContext & {
+				wouldTriggerAutoCompaction?: (content: string) => boolean;
+			}
+		).wouldTriggerAutoCompaction;
+		try {
+			if (predict === undefined || !predict(decisionPrompt)) return true;
+		} catch {
+			return false;
+		}
+
+		return (async () => {
+			const compacted = await new Promise<boolean>((resolve) => {
+				try {
+					ctx.compact({
+						onComplete: () => resolve(true),
+						onError: () => resolve(false),
+					});
+				} catch {
+					resolve(false);
+				}
+			});
+			if (!compacted || !allIdleForClaim(claim)) return false;
+			if (
+				options.processDomain !== undefined &&
+				!(await options.processDomain.confirm(domainFence))
+			) {
+				return false;
+			}
+			return allIdleForClaim(claim);
+		})();
+	};
+
 	const armIdleTimer = (timerId: number, delaySeconds: number): void => {
 		const claim = getMainClaim();
 		if (
@@ -728,12 +781,48 @@ export function createDecisionRuntime(
 						}
 						return;
 					}
-					armedTimer = null;
-					applyTransition(
-						confirmedController.beginDecision(timer.timerId),
-						undefined,
-						{ claim: timer.claim },
-					);
+					const beginAfterGate = (compacted: boolean): void => {
+						const readyController = currentController(timer.claim);
+						if (armedTimer !== timer) return;
+						if (
+							!compacted ||
+							readyController === null ||
+							!allIdleForClaim(timer.claim) ||
+							readyController.snapshot.idleTimer?.id !== timer.timerId
+						) {
+							armedTimer = null;
+							if (
+								readyController !== null &&
+								readyController.snapshot.idleTimer?.id === timer.timerId
+							) {
+								applyTransition(readyController.onObservableBusy(), undefined, {
+									claim: timer.claim,
+								});
+								if (allIdleForClaim(timer.claim)) reconcileIdle();
+							}
+							return;
+						}
+						armedTimer = null;
+						applyTransition(
+							readyController.beginDecision(timer.timerId),
+							undefined,
+							{ claim: timer.claim },
+						);
+					};
+					try {
+						const gate = compactBeforeDecision(
+							timer.claim,
+							timer.timerId,
+							timer.domainFence,
+						);
+						if (typeof gate === "boolean") {
+							beginAfterGate(gate);
+							return;
+						}
+						beginAfterGate(await gate);
+					} catch {
+						beginAfterGate(false);
+					}
 				}, delayMs),
 			};
 			armedTimer = timer;
