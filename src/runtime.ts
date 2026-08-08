@@ -1772,9 +1772,9 @@ export function createDecisionRuntime(
 			const provisionalInternal =
 				active !== null &&
 				!active.invalidated &&
-				active.dispatchPending &&
-				!active.submitted &&
-				owns(active.claim);
+				owns(active.claim) &&
+				((active.dispatchPending && !active.submitted) ||
+					(active.submitted && domainInternalDecision));
 			domainInternalDecision = provisionalInternal;
 			if (claim !== null && controller !== null) {
 				const transition = controller.ensureLocked();

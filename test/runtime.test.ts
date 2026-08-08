@@ -2146,6 +2146,24 @@ test("real user input silently preempts a submitted decision and extension input
 	assert.equal(extension.controller.snapshot.decisionOpen, true);
 });
 
+test("provider retry agent_start preserves a confirmed internal decision classification", async () => {
+	const fence = createFenceHarness();
+	const harness = createHarness({ processDomain: fence.domain });
+	await startIdle(harness);
+	await harness.openDecision();
+	await Promise.resolve();
+	await Promise.resolve();
+	await harness.startDecision();
+	const confirmedMarks = [...fence.internalDecisionMarks];
+	assert.equal(confirmedMarks.at(-1), true);
+	assert.equal(harness.controller.snapshot.decisionOpen, true);
+
+	await harness.fire("agent_start", { type: "agent_start" });
+
+	assert.deepEqual(fence.internalDecisionMarks, [...confirmedMarks, true]);
+	assert.equal(harness.controller.snapshot.decisionOpen, true);
+});
+
 test("agent_end before correlated message_start defers a ghost decision without re-ask", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
