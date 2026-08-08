@@ -94,6 +94,9 @@ export function createContinueWatchdogExtension(
 			reconcileIdle: runtime.reconcileIdle,
 		});
 		registerDecisionContextFolding(pi);
+		// Correlate a pending watchdog dispatch before real-user auto-lock can
+		// restart the cycle and discard the identity needed to downgrade a foreign run.
+		pi.on("message_start", runtime.handleMessageStart);
 
 		registerMainUserAutoLock(pi, {
 			isCurrentMain: runtime.isCurrentMain,
@@ -101,7 +104,6 @@ export function createContinueWatchdogExtension(
 				runtime.restartLockCycle(undefined, { notifyLocked: false });
 			},
 		});
-		pi.on("message_start", runtime.handleMessageStart);
 
 		const abortUnlock = registerMainAbortUnlock(pi, {
 			isCurrentMain: runtime.isCurrentMain,

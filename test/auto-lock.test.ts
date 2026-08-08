@@ -187,6 +187,12 @@ test("actual main user message_start locks without a command notification", () =
 	);
 	assert.equal(harness.handlers.has("input"), true);
 	assert.equal(harness.handlers.has("message_start"), true);
+	const firstMessageStart = harness.calls.indexOf("message_start");
+	const secondMessageStart = harness.calls.indexOf(
+		"message_start",
+		firstMessageStart + 1,
+	);
+	assert.ok(firstMessageStart >= 0 && secondMessageStart > firstMessageStart);
 	assert.deepEqual(harness.commandNames, [
 		"lock-continue-watchdog",
 		"unlock-continue-watchdog",

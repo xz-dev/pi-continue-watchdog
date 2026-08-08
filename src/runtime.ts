@@ -1618,12 +1618,7 @@ export function createDecisionRuntime(
 
 	const handleAgentEnd = (event: AgentEndEvent): void => {
 		const active = activeDecision;
-		if (
-			active !== null &&
-			active.dispatchPending &&
-			!active.submitted &&
-			!active.invalidated
-		) {
+		if (active?.dispatchPending && !active.submitted && !active.invalidated) {
 			// A foreign run may end before the correlated decision message_start is
 			// observed. It cannot supply or consume the watchdog decision response.
 			deferDecisionOnBusy(active);
