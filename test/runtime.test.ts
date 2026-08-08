@@ -183,7 +183,9 @@ function createFenceHarness() {
 			internalDecisionMarks.push(options?.internalDecision ?? false);
 		},
 		async markIdle() {},
-		async setInternalDecision() {},
+		async setInternalDecision(_instance, internal) {
+			internalDecisionMarks.push(internal);
+		},
 		confirm(fence: DomainFence) {
 			if (deferred) {
 				return new Promise<boolean>((resolve) => {
@@ -1955,6 +1957,31 @@ test("provisional decision during confirm is not marked internal when an unrelat
 	assert.equal(harness.controller.snapshot.locked, true);
 });
 
+test("pending decision agent_start is provisionally internal until message correlation", async () => {
+	const fence = createFenceHarness();
+	const harness = createHarness({ processDomain: fence.domain });
+	await startIdle(harness);
+	await harness.openDecision({ start: false });
+	await Promise.resolve();
+	await Promise.resolve();
+
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	assert.deepEqual(fence.internalDecisionMarks, [true]);
+	assert.equal(harness.controller.snapshot.decisionOpen, true);
+
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: {
+			role: "user",
+			content: [text("foreign run")],
+			timestamp: Date.now(),
+		},
+	});
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.controller.snapshot.locked, true);
+});
+
 test("re-ask delivery that races local busy does not consume another attempt", async () => {
 	const fence = createFenceHarness();
 	const harness = createHarness({ processDomain: fence.domain });
@@ -2117,6 +2144,28 @@ test("real user input silently preempts a submitted decision and extension input
 	assert.equal(await extension.fireInput("extension"), undefined);
 	assert.equal(extension.aborts, 0);
 	assert.equal(extension.controller.snapshot.decisionOpen, true);
+});
+
+test("agent_end before correlated message_start defers a ghost decision without re-ask", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	await harness.openDecision({ start: false });
+	assert.equal(harness.sent.length, 1);
+
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [harness.answerInvalid()],
+	});
+
+	assert.equal(
+		harness.sent.filter((entry) =>
+			entry.message.content.includes("previous decision response was invalid"),
+		).length,
+		0,
+	);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
+	assert.equal(harness.controller.snapshot.locked, true);
 });
 
 test("fire-and-forget ghost decision send is deferred instead of becoming a malformed re-ask", async () => {

@@ -480,6 +480,7 @@ export function createDecisionRuntime(
 			);
 		}
 		activeDecision = null;
+		domainInternalDecision = false;
 		// suppressDecisionAbort is owned by the user-takeover input hook and is
 		// intentionally not cleared here.
 	};
@@ -1616,6 +1617,18 @@ export function createDecisionRuntime(
 	};
 
 	const handleAgentEnd = (event: AgentEndEvent): void => {
+		const active = activeDecision;
+		if (
+			active !== null &&
+			active.dispatchPending &&
+			!active.submitted &&
+			!active.invalidated
+		) {
+			// A foreign run may end before the correlated decision message_start is
+			// observed. It cannot supply or consume the watchdog decision response.
+			deferDecisionOnBusy(active);
+			return;
+		}
 		const assistant = terminalAssistant(event.messages);
 		// Aborts are owned by the abort-outcome path. Provider errors remain
 		// provisional because Pi may automatically retry within the same run;
@@ -1693,6 +1706,17 @@ export function createDecisionRuntime(
 				options.attachmentInstance,
 				true,
 			);
+			if (
+				activeDecision !== active ||
+				active.invalidated ||
+				!owns(active.claim)
+			) {
+				domainInternalDecision = false;
+				await options.processDomain.setInternalDecision(
+					options.attachmentInstance,
+					false,
+				);
+			}
 		}
 	};
 
@@ -1750,6 +1774,13 @@ export function createDecisionRuntime(
 			) {
 				deferDecisionOnBusy(active);
 			}
+			const provisionalInternal =
+				active !== null &&
+				!active.invalidated &&
+				active.dispatchPending &&
+				!active.submitted &&
+				owns(active.claim);
+			domainInternalDecision = provisionalInternal;
 			if (claim !== null && controller !== null) {
 				const transition = controller.ensureLocked();
 				if (transition.applied) {
@@ -1764,9 +1795,8 @@ export function createDecisionRuntime(
 			}
 			if (attachment !== null) options.hub.markBusy(attachment);
 			if (domainReady && !domainFatal && options.processDomain !== undefined) {
-				domainInternalDecision = false;
 				await options.processDomain.markBusy(options.attachmentInstance, {
-					internalDecision: false,
+					internalDecision: provisionalInternal,
 				});
 			}
 		});
