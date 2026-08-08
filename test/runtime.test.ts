@@ -5,7 +5,11 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import type { DomainFence, DomainSnapshot } from "pi-process-domain";
+import {
+	type DomainFence,
+	type DomainSnapshot,
+	ProcessDomainFatalError,
+} from "pi-process-domain";
 
 import {
 	CONTINUE_ENTRY_TYPE,
@@ -234,6 +238,7 @@ function createFenceHarness() {
 function createHarness(options?: {
 	readonly config?: Partial<ContinueWatchdogConfig>;
 	readonly sendThrows?: boolean;
+	readonly fatalExit?: import("../src/fatal-exit.js").FatalExitAdapter;
 	readonly onSend?: (message: SentMessage["message"]) => Error | undefined;
 	readonly appendThrows?: boolean | string;
 	readonly onAppend?: (type: string) => void;
@@ -357,6 +362,7 @@ function createHarness(options?: {
 		pi,
 		hub,
 		processDomain: options?.processDomain,
+		fatalExit: options?.fatalExit,
 		attachmentInstance: createHubAttachmentInstance(),
 		controllerHolder: holder,
 		injectedController: true,
@@ -468,6 +474,47 @@ function createHarness(options?: {
 
 async function startIdle(harness: Harness): Promise<void> {
 	await harness.fire("session_start", { type: "session_start" });
+}
+
+function fatalSpy() {
+	const errors: Error[] = [];
+	return {
+		errors,
+		adapter: {
+			fail(error: Error): void {
+				errors.push(error);
+			},
+			completeShutdown(): void {},
+		} satisfies import("../src/fatal-exit.js").FatalExitAdapter,
+	};
+}
+
+function lifecycleDomain(options?: {
+	readonly attachError?: Error;
+	readonly emitAttachErrorBeforeReject?: boolean;
+}) {
+	let onFatal: ((error: Error) => void) | null = null;
+	const base = createFenceHarness();
+	const domain: ProcessDomainCoordinator = {
+		...base.domain,
+		async attach(_instance, attachOptions) {
+			onFatal = attachOptions.onFatal;
+			if (options?.attachError !== undefined) {
+				if (options.emitAttachErrorBeforeReject) onFatal(options.attachError);
+				throw options.attachError;
+			}
+		},
+	};
+	return {
+		domain,
+		emitFatal(error: Error): void {
+			assert.ok(
+				onFatal,
+				"process domain must be attached before runtime failure",
+			);
+			onFatal(error);
+		},
+	};
 }
 
 /**
@@ -2283,4 +2330,84 @@ test("send-time busy TOCTOU defers silently; idle send failure still fail-closed
 		),
 		true,
 	);
+});
+
+test("initial process-domain authentication failure exits this watchdog instance", async () => {
+	const fatal = fatalSpy();
+	const domain = lifecycleDomain({
+		attachError: new ProcessDomainFatalError(
+			"AUTHENTICATION_FAILED",
+			"wrong key",
+		),
+		emitAttachErrorBeforeReject: true,
+	});
+	const harness = createHarness({
+		processDomain: domain.domain,
+		fatalExit: fatal.adapter,
+	});
+
+	await startIdle(harness);
+	assert.equal(fatal.errors.length, 1);
+	assert.equal(
+		(fatal.errors[0] as ProcessDomainFatalError).code,
+		"AUTHENTICATION_FAILED",
+	);
+	harness.runtime.reconcileIdle();
+	assert.equal(harness.clock.records.length, 0);
+});
+
+test("initial non-auth process-domain failure disables watchdog without exiting Pi", async () => {
+	const fatal = fatalSpy();
+	const domain = lifecycleDomain({
+		attachError: new ProcessDomainFatalError("LEASE_REJECTED", "join rejected"),
+	});
+	const harness = createHarness({
+		processDomain: domain.domain,
+		fatalExit: fatal.adapter,
+	});
+
+	await startIdle(harness);
+	assert.equal(fatal.errors.length, 0);
+	harness.runtime.reconcileIdle();
+	assert.equal(harness.clock.records.length, 0);
+});
+
+test("runtime lease rejection disables watchdog without exiting Pi", async () => {
+	const fatal = fatalSpy();
+	const domain = lifecycleDomain();
+	const harness = createHarness({
+		processDomain: domain.domain,
+		fatalExit: fatal.adapter,
+	});
+	await startIdle(harness);
+
+	domain.emitFatal(
+		new ProcessDomainFatalError(
+			"LEASE_REJECTED",
+			"participant lease is not current",
+		),
+	);
+	assert.equal(fatal.errors.length, 0);
+	harness.runtime.reconcileIdle();
+	assert.equal(harness.clock.records.length, 0);
+});
+
+test("runtime authentication failure after attach never exits Pi", async () => {
+	const fatal = fatalSpy();
+	const domain = lifecycleDomain();
+	const harness = createHarness({
+		processDomain: domain.domain,
+		fatalExit: fatal.adapter,
+	});
+	await startIdle(harness);
+
+	domain.emitFatal(
+		new ProcessDomainFatalError(
+			"AUTHENTICATION_FAILED",
+			"runtime reconnect rejected",
+		),
+	);
+	assert.equal(fatal.errors.length, 0);
+	harness.runtime.reconcileIdle();
+	assert.equal(harness.clock.records.length, 0);
 });

@@ -152,6 +152,30 @@ test("partial or marker-inconsistent declarations fail closed", async () => {
 	}
 });
 
+test("a rejected runtime write does not poison later coordinator writes", async () => {
+	const domain = new FakeDomain();
+	let failNext = true;
+	const originalSetActivity = domain.setActivity.bind(domain);
+	domain.setActivity = async (state) => {
+		if (failNext) {
+			failNext = false;
+			throw new Error("stale participant lease");
+		}
+		return originalSetActivity(state);
+	};
+	const coordinator = createProcessDomainCoordinator({
+		env: declaredEnv(),
+		pid: 100,
+		open: async () => ({ domain, created: false }),
+	});
+	const attachment = {};
+	await coordinator.attach(attachment, { initialBusy: false, onFatal() {} });
+
+	await assert.rejects(coordinator.markBusy(attachment), /stale participant/);
+	await coordinator.markIdle(attachment);
+	assert.deepEqual(domain.writes, ["idle"]);
+});
+
 test("subscriptions and fence confirmation use the broker view", async () => {
 	const domain = new FakeDomain();
 	const coordinator = createProcessDomainCoordinator({

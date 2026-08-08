@@ -9,6 +9,7 @@ import {
 	type MessageEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import { isProcessDomainFatalError } from "pi-process-domain";
 
 import {
 	CONTINUE_ENTRY_TYPE,
@@ -1722,22 +1723,43 @@ export function createDecisionRuntime(
 			++lifecycleGeneration;
 			sessionContext = ctx;
 			if (options.processDomain !== undefined) {
+				let initialAttachComplete = false;
+				let initialAuthenticationExitRequested = false;
+				const disableDomain = (): void => {
+					domainFatal = true;
+					domainReady = false;
+					domainInternalDecision = false;
+					clearOperationalPendingWork();
+				};
+				const exitForInitialAuthenticationFailure = (error: Error): boolean => {
+					if (
+						initialAttachComplete ||
+						initialAuthenticationExitRequested ||
+						!isProcessDomainFatalError(error) ||
+						error.code !== "AUTHENTICATION_FAILED"
+					) {
+						return false;
+					}
+					initialAuthenticationExitRequested = true;
+					options.fatalExit?.fail(error, ctx);
+					return true;
+				};
 				try {
 					await options.processDomain.attach(options.attachmentInstance, {
 						initialBusy: !ctx.isIdle(),
 						onFatal: (error) => {
-							domainFatal = true;
-							options.fatalExit?.fail(error, ctx);
+							disableDomain();
+							exitForInitialAuthenticationFailure(error);
 						},
 					});
+					initialAttachComplete = true;
 					domainAttached = true;
 					domainReady = true;
 				} catch (error) {
-					domainFatal = true;
-					options.fatalExit?.fail(
-						error instanceof Error ? error : new Error("process domain failed"),
-						ctx,
-					);
+					const attachError =
+						error instanceof Error ? error : new Error("process domain failed");
+					disableDomain();
+					exitForInitialAuthenticationFailure(attachError);
 					return;
 				}
 			}

@@ -132,19 +132,28 @@ export function createProcessDomainCoordinator(
 	};
 
 	const queueWrite = (): Promise<void> => {
-		writeTail = writeTail.then(async () => {
-			if (handle === null) return;
-			const desired = desiredActivity();
-			if (desired === lastWritten) return;
-			lastWritten = desired;
-			localWriteInFlight = true;
-			try {
-				notify(await handle.setActivity(desired), "local");
-			} finally {
-				localWriteInFlight = false;
-			}
-		});
-		return writeTail;
+		// A rejected runtime write must not poison the serialization tail forever.
+		// The caller still observes this operation's failure, while later writes can
+		// proceed after the domain client has recovered its participant lease.
+		const write = writeTail
+			.catch(() => {})
+			.then(async () => {
+				if (handle === null) return;
+				const desired = desiredActivity();
+				if (desired === lastWritten) return;
+				localWriteInFlight = true;
+				try {
+					notify(await handle.setActivity(desired), "local");
+					lastWritten = desired;
+				} catch (error) {
+					lastWritten = null;
+					throw error;
+				} finally {
+					localWriteInFlight = false;
+				}
+			});
+		writeTail = write;
+		return write;
 	};
 
 	const ensureOpen = (): Promise<void> => {
