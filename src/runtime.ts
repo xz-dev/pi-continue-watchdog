@@ -253,6 +253,8 @@ export function createDecisionRuntime(
 	let domainAttached = false;
 	let domainReady = options.processDomain === undefined;
 	let domainFatal = false;
+	/** The current busy run was confirmed as an internal watchdog decision. */
+	let domainInternalDecision = false;
 	let ownedClaim: HubMainClaim | null = null;
 	let sessionContext: ExtensionContext | null = null;
 	let configLoad: Promise<void> | null = null;
@@ -432,6 +434,7 @@ export function createDecisionRuntime(
 	const clearOperationalPendingWork = (): void => {
 		clearArmedTimer();
 		activeDecision = null;
+		domainInternalDecision = false;
 		suppressDecisionAbort = false;
 		capturedDecisionResponse = null;
 		pendingFinalization = null;
@@ -1174,8 +1177,7 @@ export function createDecisionRuntime(
 
 	const unsubscribeDomain = options.processDomain?.subscribe(() => {
 		if (stopped || !domainReady) return;
-		const active = activeDecision;
-		if (active?.submitted) {
+		if (domainInternalDecision) {
 			// A confirmed internal decision run may mark this participant busy while
 			// preserving its original decision fence through finalization.
 			syncHubState();
@@ -1685,6 +1687,7 @@ export function createDecisionRuntime(
 		}
 		active.dispatchPending = false;
 		active.submitted = true;
+		domainInternalDecision = true;
 		if (domainReady && !domainFatal && options.processDomain !== undefined) {
 			await options.processDomain.setInternalDecision(
 				options.attachmentInstance,
@@ -1761,6 +1764,7 @@ export function createDecisionRuntime(
 			}
 			if (attachment !== null) options.hub.markBusy(attachment);
 			if (domainReady && !domainFatal && options.processDomain !== undefined) {
+				domainInternalDecision = false;
 				await options.processDomain.markBusy(options.attachmentInstance, {
 					internalDecision: false,
 				});
@@ -1827,6 +1831,7 @@ export function createDecisionRuntime(
 			if (stopped || !ctx.isIdle()) return;
 
 			if (attachment !== null) options.hub.markIdle(attachment);
+			domainInternalDecision = false;
 			if (domainReady && !domainFatal && options.processDomain !== undefined) {
 				await options.processDomain.markIdle(options.attachmentInstance);
 			}
