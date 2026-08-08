@@ -183,7 +183,7 @@ test("actual main user message_start locks without a command notification", () =
 
 	assert.equal(
 		harness.calls.filter((name) => name === "message_start").length,
-		1,
+		2,
 	);
 	assert.equal(harness.handlers.has("input"), true);
 	assert.equal(harness.handlers.has("message_start"), true);

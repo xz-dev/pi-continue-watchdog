@@ -110,13 +110,16 @@ interface Harness {
 	readonly notifications: Array<{ message: string; level?: string }>;
 	readonly entries: Array<{ type: string; data: unknown }>;
 	aborts: number;
+	pendingMessages: boolean;
 	ctx: ExtensionContext;
 	runtime: ReturnType<typeof createDecisionRuntime>;
 	streaming: boolean;
 	triggeredTurns: number;
 	fire(name: string, event: unknown): Promise<void>;
 	fireInput(source: string, text?: string): Promise<unknown>;
-	openDecision(): void;
+	openDecision(options?: { readonly start?: boolean }): Promise<void>;
+	startDecision(): Promise<void>;
+	startUnrelatedRun(message?: unknown): Promise<void>;
 	answerContinue(): unknown;
 	answerUnlock(reason?: string, reasonType?: string): unknown;
 	answerInvalid(text?: string): unknown;
@@ -262,6 +265,8 @@ function createHarness(options?: {
 	const widgets: Array<{ key: string; value: unknown }> = [];
 	const aborts = 0;
 	let runtime: ReturnType<typeof createDecisionRuntime>;
+	let decisionStarted = false;
+	let startedDecisionDetails: unknown = null;
 
 	const harness = {
 		handlers,
@@ -274,6 +279,7 @@ function createHarness(options?: {
 		entries,
 		widgets,
 		aborts,
+		pendingMessages: false,
 		streaming: false,
 		triggeredTurns: 0,
 	} as Harness;
@@ -298,6 +304,11 @@ function createHarness(options?: {
 				options: sendOptions,
 				streaming: harness.streaming,
 			});
+			if (
+				message.customType === DECISION_MESSAGE_TYPE &&
+				startedDecisionDetails !== message.details
+			)
+				decisionStarted = false;
 			if (sendOptions?.triggerTurn && !harness.streaming) {
 				harness.triggeredTurns += 1;
 			}
@@ -315,6 +326,7 @@ function createHarness(options?: {
 		hasUI: options?.hasUI ?? true,
 		cwd: "/project",
 		isIdle: () => options?.isIdle?.() ?? !harness.streaming,
+		hasPendingMessages: () => harness.pendingMessages,
 		wouldTriggerAutoCompaction: (content: string) =>
 			options?.wouldTriggerAutoCompaction?.(content) ?? false,
 		compact: (compactOptions: {
@@ -353,6 +365,9 @@ function createHarness(options?: {
 	harness.ctx = ctx;
 	harness.runtime = runtime;
 	harness.fire = async (name, event) => {
+		if (name === "message_start") {
+			await runtime.handleMessageStart(event as { readonly message: unknown });
+		}
 		for (const handler of handlers.get(name) ?? []) {
 			await handler(event as never, ctx);
 		}
@@ -367,12 +382,53 @@ function createHarness(options?: {
 		}
 		return result;
 	};
-	harness.openDecision = () => {
+	harness.openDecision = async (openOptions) => {
+		const sentBefore = harness.sent.length;
 		runtime.applyTransition(controller.lock(), undefined, {
 			suppressNotify: true,
 		});
 		runtime.reconcileIdle();
 		clock.fire(clock.records.length - 1);
+		if (
+			openOptions?.start !== false &&
+			harness.sent.length > sentBefore &&
+			harness.sent.at(-1)?.message.customType === DECISION_MESSAGE_TYPE
+		) {
+			await harness.startDecision();
+		}
+	};
+	harness.startDecision = async () => {
+		if (decisionStarted) return;
+		harness.streaming = true;
+		await harness.fire("agent_start", { type: "agent_start" });
+		const decision = [...harness.sent]
+			.reverse()
+			.find((entry) => entry.message.customType === DECISION_MESSAGE_TYPE);
+		assert.ok(decision, "expected a dispatched watchdog decision");
+		await harness.fire("message_start", {
+			type: "message_start",
+			message: {
+				role: "custom",
+				customType: decision.message.customType,
+				content: [{ type: "text", text: decision.message.content }],
+				display: decision.message.display,
+				details: decision.message.details,
+				timestamp: Date.now(),
+			},
+		});
+		startedDecisionDetails = decision.message.details;
+		decisionStarted = true;
+	};
+	harness.startUnrelatedRun = async (
+		message = {
+			role: "user",
+			content: [text("unrelated user work")],
+			timestamp: Date.now(),
+		},
+	) => {
+		harness.streaming = true;
+		await harness.fire("agent_start", { type: "agent_start" });
+		await harness.fire("message_start", { type: "message_start", message });
 	};
 	harness.answerContinue = () => assistant([text(continueXml())]);
 	harness.answerUnlock = (
@@ -434,8 +490,7 @@ async function settleResponse(
 	harness: Harness,
 	message: unknown,
 ): Promise<void> {
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.startDecision();
 	await harness.fire("agent_end", {
 		type: "agent_end",
 		messages: [message],
@@ -478,7 +533,7 @@ test("compacts before sending a watchdog question near the context limit", async
 		},
 	});
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 
 	assert.equal(predictedPrompts.length, 1);
 	assert.match(predictedPrompts[0] ?? "", /exactly one <watchdog>/);
@@ -496,6 +551,30 @@ test("compacts before sending a watchdog question near the context limit", async
 	assert.equal(harness.sent[0]?.message.customType, DECISION_MESSAGE_TYPE);
 });
 
+test("queued user input after pre-question compaction prevents the watchdog decision send", async () => {
+	let complete: (() => void) | undefined;
+	const harness = createHarness({
+		wouldTriggerAutoCompaction: () => true,
+		onCompact: (options) => {
+			complete = options.onComplete;
+		},
+	});
+	await startIdle(harness);
+	await harness.openDecision();
+
+	await harness.fireInput("interactive", "queued during compaction");
+	// The TUI compaction queue is private and not included by the upstream
+	// hasPendingMessages() signal, so the input lifecycle generation must fence it.
+	complete?.();
+	await Promise.resolve();
+	await Promise.resolve();
+
+	assert.equal(harness.sent.length, 0);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
+	assert.equal(harness.controller.snapshot.locked, true);
+});
+
 test("failed pre-question compaction clears the timer intent and waits for a fresh idle epoch", async () => {
 	let fail: ((error: Error) => void) | undefined;
 	const harness = createHarness({
@@ -505,7 +584,7 @@ test("failed pre-question compaction clears the timer intent and waits for a fre
 		},
 	});
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 
 	assert.equal(typeof fail, "function");
 	fail?.(new Error("compaction failed"));
@@ -526,7 +605,7 @@ test("a stale pre-question compaction gate cannot open a newer timer's decision"
 		},
 	});
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 
 	await harness.runtime.restartLockCycle(harness.ctx, { notifyLocked: false });
 	complete?.();
@@ -544,7 +623,7 @@ test("maximum configured decision prompt still opens and re-asks with generated 
 		config: { decisionPrompt: configuredPrompt },
 	});
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 
 	const firstPrompt = harness.sent.at(-1)?.message.content ?? "";
 	assert.equal(firstPrompt.startsWith(configuredPrompt), true);
@@ -672,15 +751,14 @@ test("observable child busy cancels and full idle restarts the same delay", asyn
 test("agent_end finalizes while streaming but settled alone dispatches continue", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 	assert.deepEqual(harness.entries, []);
 	assert.equal(harness.widgets.at(-1)?.key, "pi-continue-watchdog:status");
 	assert.notEqual(harness.widgets.at(-1)?.value, undefined);
 	const before = harness.sent.length;
 	const turnsBefore = harness.triggeredTurns;
 
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.startDecision();
 	await harness.fire("agent_end", {
 		type: "agent_end",
 		messages: [harness.answerContinue()],
@@ -717,7 +795,7 @@ test("continue entry persistence failure does not cancel an already dispatched c
 		appendThrows: "pi-continue-watchdog:continue",
 	});
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 	const sentBefore = harness.sent.length;
 
 	await settleResponse(harness, harness.answerContinue());
@@ -736,7 +814,7 @@ test("decision message_end hides XML, persists a context-excluded audit, and fin
 	assert.equal(await harness.endDecisionMessage(answer), undefined);
 	assert.deepEqual(harness.entries, []);
 
-	harness.openDecision();
+	await harness.openDecision();
 	const replacement = (await harness.endDecisionMessage(
 		answer,
 	)) as DecisionMessageReplacement;
@@ -774,10 +852,9 @@ test("decision message_end hides XML, persists a context-excluded audit, and fin
 test("decision provider error stays provisional so the same Pi run can retry and unlock", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.startDecision();
 	const providerError = assistant([], "error");
 	assert.equal(await harness.endDecisionMessage(providerError), undefined);
 	await harness.fire("agent_end", {
@@ -861,7 +938,7 @@ test("decision provider error stays provisional so the same Pi run can retry and
 test("each invalid XML response persists a parser re-ask event and updates checking", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 
 	await settleResponse(harness, harness.answerInvalid("not XML"));
 
@@ -880,7 +957,7 @@ test("each invalid XML response persists a parser re-ask event and updates check
 test("decision provider errors persist Other error with original content", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 	const providerError = {
 		role: "assistant",
 		content: [],
@@ -908,7 +985,7 @@ test("decision provider errors persist Other error with original content", async
 test("decision message_end audit records invalid output without retaining raw text", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 	const replacement = (await harness.endDecisionMessage(
 		harness.answerInvalid("private malformed watchdog answer"),
 	)) as DecisionMessageReplacement;
@@ -935,7 +1012,7 @@ test("decision window blocks ordinary tool_call before execution", async () => {
 	await startIdle(harness);
 	assert.equal(await harness.blockToolCall(), undefined);
 
-	harness.openDecision();
+	await harness.openDecision();
 	assert.deepEqual(await harness.blockToolCall(), {
 		block: true,
 		reason: DECISION_TOOL_BLOCK_REASON,
@@ -948,7 +1025,7 @@ test("decision window blocks ordinary tool_call before execution", async () => {
 test("continued settle rearms exponential delay once and exhausts at max", async () => {
 	const harness = createHarness({ config: { maxRetries: 2 } });
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 	await settleResponse(harness, harness.answerContinue());
 
 	assert.equal(harness.clock.records.at(-1)?.delayMs, 6000);
@@ -971,7 +1048,7 @@ test("continued settle rearms exponential delay once and exhausts at max", async
 test("valid unlock folds without a turn and leaves one compact persisted result", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 	const turnsBefore = harness.triggeredTurns;
 	await settleResponse(
 		harness,
@@ -1006,7 +1083,7 @@ test("Example 7: AI unlock retains typed entry data only; no transient notificat
 		config: { reasonTypes: ["NeedReview", "shipped"] },
 	});
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 	await settleResponse(
 		harness,
 		harness.answerUnlock("PR is open for human review.", "needreview"),
@@ -1032,12 +1109,11 @@ test("Example 7: AI unlock retains typed entry data only; no transient notificat
 test("invalid decisions reask only after settle and third failure stays stopped", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 
 	for (let attempt = 1; attempt <= 3; attempt += 1) {
 		const sentBefore = harness.sent.length;
-		harness.streaming = true;
-		await harness.fire("agent_start", { type: "agent_start" });
+		await harness.startDecision();
 		await harness.fire("agent_end", {
 			type: "agent_end",
 			messages: [harness.answerInvalid("done")],
@@ -1075,11 +1151,10 @@ test("invalid decisions reask only after settle and third failure stays stopped"
 test("aborted decision response is not finalized by agent_end (abort path owns unlock)", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 	const sentBefore = harness.sent.length;
 
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.startDecision();
 	await harness.fire("agent_end", {
 		type: "agent_end",
 		messages: [assistant([text(continueXml())], "aborted")],
@@ -1136,7 +1211,7 @@ test("demotion, shutdown, stale timer, and send failures cleanly unlock", async 
 test("external unlock after agent_end cancels pending continue before settle", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 
 	harness.streaming = true;
 	await harness.fire("agent_start", { type: "agent_start" });
@@ -1171,7 +1246,7 @@ test("Examples 1-2: restart lock cycle clears an open decision, then locks and n
 		},
 	});
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 	harness.controller.recordInvalidDecision(1, "bad decision");
 	assert.equal(harness.controller.snapshot.decisionOpen, true);
 	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
@@ -1188,6 +1263,8 @@ test("Examples 1-2: restart lock cycle clears an open decision, then locks and n
 	assert.equal(harness.controller.snapshot.decisionFailed, false);
 	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
 	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	harness.streaming = false;
+	await settleOnly(harness);
 	assert.equal(harness.controller.snapshot.idleTimer?.delaySeconds, 3);
 });
 
@@ -1211,7 +1288,7 @@ test("Example 2: restart from unlocked still performs silent unlock cleanup befo
 test("manual lock after pending continue clears fold and rearms base idle delay", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 	await settleResponse(harness, harness.answerContinue());
 	assert.equal(
 		harness.sent.at(-1)?.message.customType,
@@ -1280,7 +1357,8 @@ test("false-idle settle schedules no deferred callback; later true settle reconc
 test("deferred settled wake is inert after later agent_start; next true settle works", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
+	harness.streaming = false;
 	const before = harness.clock.records.length;
 	await harness.fire("agent_settled", { type: "agent_settled" });
 	const deferred = harness.clock.records.length - 1;
@@ -1307,7 +1385,7 @@ test("deferred settled wake is inert after later agent_start; next true settle w
 test("stale deferred settle is inert after later start+settle even when ctx is idle again", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 	await harness.fire("agent_settled", { type: "agent_settled" });
 	const firstDeferred = harness.clock.records.length - 1;
 
@@ -1332,7 +1410,9 @@ test("stale deferred settle is inert after later start+settle even when ctx is i
 test("duplicate true-idle settles schedule two wakes but only the latest acts", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
+	await harness.startDecision();
+	harness.streaming = false;
 	await harness.fire("agent_settled", { type: "agent_settled" });
 	const firstDeferred = harness.clock.records.length - 1;
 	await harness.fire("agent_settled", { type: "agent_settled" });
@@ -1358,12 +1438,11 @@ test("duplicate true-idle settles schedule two wakes but only the latest acts", 
 test("decision settle without agent_end reasks twice then decision-fails without double count", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 
 	for (let attempt = 1; attempt <= 3; attempt += 1) {
 		const sentBefore = harness.sent.length;
-		harness.streaming = true;
-		await harness.fire("agent_start", { type: "agent_start" });
+		await harness.startDecision();
 		harness.streaming = false;
 		await settleOnly(harness);
 		if (attempt < 3) {
@@ -1400,7 +1479,7 @@ test("stale fenced valid continue does not consume retry or exhaust", async () =
 		processDomain: fence.domain,
 	});
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 	await Promise.resolve();
 	await Promise.resolve();
 	await harness.endDecisionMessage(harness.answerContinue());
@@ -1416,7 +1495,7 @@ test("stale fenced valid continue does not consume retry or exhaust", async () =
 		harness.sent.filter(
 			(entry) => entry.message.customType === DECISION_FOLD_MESSAGE_TYPE,
 		).length,
-		1,
+		0,
 	);
 });
 
@@ -1424,7 +1503,7 @@ test("stale fenced valid unlock does not unlock", async () => {
 	const fence = createFenceHarness();
 	const harness = createHarness({ processDomain: fence.domain });
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 	await Promise.resolve();
 	await Promise.resolve();
 	await harness.endDecisionMessage(harness.answerUnlock());
@@ -1445,7 +1524,7 @@ test("stale fenced third invalid response preserves counts and permits retry", a
 	const fence = createFenceHarness();
 	const harness = createHarness({ processDomain: fence.domain });
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 	await Promise.resolve();
 	await Promise.resolve();
 
@@ -1469,7 +1548,7 @@ test("stale fenced third invalid response preserves counts and permits retry", a
 test("pending valid continue keeps reconcile inert until fold delivery", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 
 	harness.streaming = true;
 	await harness.fire("agent_start", { type: "agent_start" });
@@ -1758,8 +1837,7 @@ test("local Pi busy before idle timer callback defers; next true settle rearms",
 	// Let the freshly re-armed watchdog dispatch before supplying its response.
 	harness.clock.fire(harness.clock.records.indexOf(rearmed));
 	assert.equal(harness.sent.length, 1);
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.startDecision();
 	await harness.fire("agent_end", {
 		type: "agent_end",
 		messages: [harness.answerContinue()],
@@ -1881,7 +1959,7 @@ test("re-ask delivery that races local busy does not consume another attempt", a
 	const fence = createFenceHarness();
 	const harness = createHarness({ processDomain: fence.domain });
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 	await Promise.resolve();
 	await Promise.resolve();
 	// Commit attempt 1 and enter re-ask delivery while still idle.
@@ -1895,8 +1973,7 @@ test("re-ask delivery that races local busy does not consume another attempt", a
 	// Second invalid response: hold the re-ask delivery confirm in flight.
 	fence.deferConfirm();
 	const sentBefore = harness.sent.length;
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.startDecision();
 	await harness.fire("agent_end", {
 		type: "agent_end",
 		messages: [harness.answerInvalid()],
@@ -1949,12 +2026,11 @@ test("accepted continue busy races roll back retry and defer without unlocking",
 	const fence = createFenceHarness();
 	const duringConfirm = createHarness({ processDomain: fence.domain });
 	await startIdle(duringConfirm);
-	duringConfirm.openDecision();
+	await duringConfirm.openDecision();
 	await Promise.resolve();
 	await Promise.resolve();
 	fence.deferConfirm();
-	duringConfirm.streaming = true;
-	await duringConfirm.fire("agent_start", { type: "agent_start" });
+	await duringConfirm.startDecision();
 	await duringConfirm.fire("agent_end", {
 		type: "agent_end",
 		messages: [duringConfirm.answerContinue()],
@@ -2010,7 +2086,8 @@ test("real user input silently preempts a submitted decision and extension input
 	for (const source of ["interactive", "rpc"] as const) {
 		const harness = createHarness();
 		await startIdle(harness);
-		harness.openDecision();
+		await harness.openDecision();
+		await harness.startDecision();
 		assert.equal(harness.controller.snapshot.decisionOpen, true);
 		assert.equal(harness.aborts, 0);
 
@@ -2036,9 +2113,48 @@ test("real user input silently preempts a submitted decision and extension input
 	const extension = createHarness();
 	await startIdle(extension);
 	extension.openDecision();
+	await extension.startDecision();
 	assert.equal(await extension.fireInput("extension"), undefined);
 	assert.equal(extension.aborts, 0);
 	assert.equal(extension.controller.snapshot.decisionOpen, true);
+});
+
+test("fire-and-forget ghost decision send is deferred instead of becoming a malformed re-ask", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	await harness.openDecision({ start: false });
+	assert.equal(harness.sent.length, 1);
+
+	// Production Pi's public sendMessage returns before its triggerTurn can reject
+	// as busy. The racing user run emits agent_start, but its public message_start
+	// does not match the watchdog exchange and therefore defers the ghost send.
+	await harness.startUnrelatedRun();
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [harness.answerContinue()],
+	});
+	harness.streaming = false;
+	await settleOnly(harness);
+
+	assert.equal(
+		harness.sent.filter((entry) =>
+			entry.message.content.includes("previous decision response was invalid"),
+		).length,
+		0,
+	);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
+	assert.equal(harness.controller.snapshot.decisionFailed, false);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(
+		harness.entries.some(
+			(entry) =>
+				entry.type === "pi-continue-watchdog:status" &&
+				((entry.data as { kind?: string }).kind === "validation-error" ||
+					(entry.data as { kind?: string }).kind === "decision-failed"),
+		),
+		false,
+	);
 });
 
 test("send-time busy TOCTOU defers silently; idle send failure still fail-closed", async () => {

@@ -89,7 +89,8 @@ interface SemanticHarness {
 	runtime: ReturnType<typeof createDecisionRuntime>;
 	streaming: boolean;
 	fire(name: string, event: unknown): Promise<void>;
-	openDecision(): void;
+	openDecision(): Promise<void>;
+	startDecision(): Promise<void>;
 	answerContinue(): unknown;
 	answerUnlock(reason?: string, reasonType?: string): unknown;
 	snapshotController(): {
@@ -211,6 +212,9 @@ function createSemanticHarness(options?: {
 	const notifications: Array<{ message: string; level?: string }> = [];
 	const sentTypes: string[] = [];
 	let runtime: ReturnType<typeof createDecisionRuntime>;
+	let lastDecisionMessage: { customType?: string; details?: unknown } | null =
+		null;
+	let startedDecisionDetails: unknown = null;
 
 	bus.on(SEMANTIC_HOOK_CHANNEL, (data) => {
 		received.push(data as SemanticHookEnvelope);
@@ -235,8 +239,11 @@ function createSemanticHarness(options?: {
 			handlers.set(name, list);
 		},
 		events: bus,
-		sendMessage(message: { customType?: string }): void {
+		sendMessage(message: { customType?: string; details?: unknown }): void {
 			sentTypes.push(message.customType ?? "unknown");
+			if (message.customType === "pi-continue-watchdog:decision") {
+				lastDecisionMessage = message;
+			}
 		},
 		appendEntry(): void {},
 	} as unknown as ExtensionAPI;
@@ -270,16 +277,42 @@ function createSemanticHarness(options?: {
 	harness.ctx = ctx;
 	harness.runtime = runtime;
 	harness.fire = async (name, event) => {
+		if (name === "message_start") {
+			await runtime.handleMessageStart(event as { readonly message: unknown });
+		}
 		for (const handler of handlers.get(name) ?? []) {
 			await handler(event as never, ctx);
 		}
 	};
-	harness.openDecision = () => {
+	harness.openDecision = async () => {
 		runtime.applyTransition(controller.lock(), undefined, {
 			suppressNotify: true,
 		});
 		runtime.reconcileIdle();
 		clock.fire(clock.records.length - 1);
+		for (
+			let attempt = 0;
+			attempt < 50 && lastDecisionMessage === null;
+			attempt += 1
+		) {
+			await Promise.resolve();
+		}
+		await harness.startDecision();
+	};
+	harness.startDecision = async () => {
+		assert.ok(lastDecisionMessage, "expected dispatched decision message");
+		if (startedDecisionDetails === lastDecisionMessage.details) return;
+		harness.streaming = true;
+		await harness.fire("agent_start", { type: "agent_start" });
+		await harness.fire("message_start", {
+			type: "message_start",
+			message: {
+				role: "custom",
+				customType: lastDecisionMessage.customType,
+				details: lastDecisionMessage.details,
+			},
+		});
+		startedDecisionDetails = lastDecisionMessage.details;
 	};
 	harness.answerContinue = () => assistant([text(continueXml())]);
 	harness.answerUnlock = (
@@ -337,8 +370,7 @@ async function settleResponse(
 	harness: SemanticHarness,
 	message: unknown,
 ): Promise<void> {
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.startDecision();
 	await harness.fire("agent_end", {
 		type: "agent_end",
 		messages: [message],
@@ -405,7 +437,7 @@ test("protocol builders emit exact three envelopes as fresh frozen plain data", 
 test("AI decision unlock publishes exact validated reasonType and reason once at terminal idle", async () => {
 	const harness = createSemanticHarness();
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 	await settleResponse(
 		harness,
 		harness.answerUnlock("waiting for user", "wait_user"),
@@ -435,14 +467,18 @@ test("AI decision unlock publishes exact validated reasonType and reason once at
 test("exhausted and decisionFailed publish exact STOP_KIND envelopes once", async () => {
 	const exhausted = createSemanticHarness({ config: { maxRetries: 1 } });
 	await startIdle(exhausted);
-	exhausted.openDecision();
+	await exhausted.openDecision();
 	await settleResponse(exhausted, exhausted.answerContinue());
 	assert.equal(exhausted.snapshotController().exhausted, true);
 	// Continue turn settles into terminal exhausted idle.
-	await settleResponse(
-		exhausted,
-		assistant([{ type: "text", text: "done working" }], "stop"),
-	);
+	exhausted.streaming = true;
+	await exhausted.fire("agent_start", { type: "agent_start" });
+	await exhausted.fire("agent_end", {
+		type: "agent_end",
+		messages: [assistant([{ type: "text", text: "done working" }], "stop")],
+	});
+	exhausted.streaming = false;
+	await settleOnly(exhausted);
 	assert.equal(exhausted.received.length, 1);
 	const exhaustedEnvelope = exhausted.received[0];
 	assert.ok(exhaustedEnvelope);
@@ -459,7 +495,7 @@ test("exhausted and decisionFailed publish exact STOP_KIND envelopes once", asyn
 
 	const failed = createSemanticHarness();
 	await startIdle(failed);
-	failed.openDecision();
+	await failed.openDecision();
 	for (let attempt = 0; attempt < 3; attempt += 1) {
 		await settleResponse(
 			failed,
@@ -520,7 +556,7 @@ test("human unlock, abort unlock, continue, and initial unlocked idle publish no
 
 	const continued = createSemanticHarness({ config: { maxRetries: 3 } });
 	await startIdle(continued);
-	continued.openDecision();
+	await continued.openDecision();
 	await settleResponse(continued, continued.answerContinue());
 	// Intermediate post-continue rearm must not publish.
 	assert.equal(continued.received.length, 0);
@@ -533,7 +569,7 @@ test("human unlock, abort unlock, continue, and initial unlocked idle publish no
 test("AI unlock intent waits for aggregate idle and publishes typed pair only once", async () => {
 	const harness = createSemanticHarness();
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 	const child = harness.hub.bind({
 		instance: createHubAttachmentInstance(),
 		sessionId: "child",
@@ -569,7 +605,7 @@ test("AI unlock intent is retained until publication confirmation succeeds", asy
 	});
 	await startIdle(harness);
 	fence.setDeferred(false);
-	harness.openDecision();
+	await harness.openDecision();
 	for (
 		let attempt = 0;
 		attempt < 100 && harness.sentTypes.length === 0;
@@ -581,8 +617,6 @@ test("AI unlock intent is retained until publication confirmation succeeds", asy
 	fence.setDeferred(true);
 
 	// Finalization's first fence succeeds; publication's fence remains pending.
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
 	await harness.fire("agent_end", {
 		type: "agent_end",
 		messages: [harness.answerUnlock("Need approval.", "WAIT_USER")],
@@ -667,7 +701,7 @@ test("main-only ownership, stale demotion, and reload/shutdown publish nothing",
 
 	const reloaded = createSemanticHarness();
 	await startIdle(reloaded);
-	reloaded.openDecision();
+	await reloaded.openDecision();
 	// Shutdown before settle clears ownership generation bookkeeping.
 	reloaded.runtime.shutdown();
 	await reloaded.fire("agent_end", {
@@ -686,7 +720,7 @@ test("absent and throwing consumers leave controller and results unchanged", asy
 	// Drop the only listener so emission has no consumer.
 	noConsumer.bus.clear();
 	await startIdle(noConsumer);
-	noConsumer.openDecision();
+	await noConsumer.openDecision();
 	await settleResponse(
 		noConsumer,
 		noConsumer.answerUnlock("silent consumer absence", "JOB_DONE"),
@@ -710,7 +744,7 @@ test("absent and throwing consumers leave controller and results unchanged", asy
 	};
 	try {
 		await startIdle(throwing);
-		throwing.openDecision();
+		await throwing.openDecision();
 		await settleResponse(
 			throwing,
 			throwing.answerUnlock("consumer throws", "JOB_DONE"),
@@ -752,7 +786,7 @@ async function establishPendingAiUnlock(
 		hasUI: options?.hasUI ?? true,
 	});
 	await startIdle(harness);
-	harness.openDecision();
+	await harness.openDecision();
 	const child = harness.hub.bind({
 		instance: createHubAttachmentInstance(),
 		sessionId: `child-${reason}`,
@@ -859,7 +893,7 @@ test("async-rejecting bus consumer leaves producer and controller unchanged", as
 	console.error = () => {};
 	try {
 		await startIdle(harness);
-		harness.openDecision();
+		await harness.openDecision();
 		await settleResponse(
 			harness,
 			harness.answerUnlock("async reject path", "JOB_DONE"),

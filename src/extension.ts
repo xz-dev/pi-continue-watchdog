@@ -101,6 +101,7 @@ export function createContinueWatchdogExtension(
 				runtime.restartLockCycle(undefined, { notifyLocked: false });
 			},
 		});
+		pi.on("message_start", runtime.handleMessageStart);
 
 		const abortUnlock = registerMainAbortUnlock(pi, {
 			isCurrentMain: runtime.isCurrentMain,

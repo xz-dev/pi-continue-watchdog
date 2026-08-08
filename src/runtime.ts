@@ -107,7 +107,9 @@ interface ActiveDecision {
 	readonly protocol: DecisionProtocolSession;
 	readonly domainFence: import("pi-process-domain").DomainFence;
 	invalidated: boolean;
-	/** True only after the decision prompt was actually submitted to the model. */
+	/** True while a public fire-and-forget dispatch awaits matching lifecycle. */
+	dispatchPending: boolean;
+	/** True only after Pi emits this decision's correlated custom message_start. */
 	submitted: boolean;
 }
 
@@ -179,6 +181,7 @@ export interface DecisionRuntime {
 		},
 	): void;
 	reconcileIdle(): void;
+	handleMessageStart(event: { readonly message: unknown }): Promise<void>;
 	registerLifecycle(): void;
 	shutdown(): Promise<void>;
 }
@@ -257,6 +260,8 @@ export function createDecisionRuntime(
 	let lifecycleGeneration = 0;
 	/** Bumps on every agent_start so deferred settled wakes cannot outlive that run. */
 	let agentActivityGeneration = 0;
+	/** Bumps on real user input so an in-flight compaction gate cannot overtake it. */
+	let userInputGeneration = 0;
 	/** Bumps when a deferred settled-phase callback is scheduled; only the latest acts. */
 	let settledCallbackGeneration = 0;
 	let stopped = false;
@@ -436,12 +441,18 @@ export function createDecisionRuntime(
 	};
 	/** Pi's same-runtime authoritative idle truth. */
 	const localIdle = (): boolean => sessionContext?.isIdle() === true;
+	/** Public queued-message signal present in every supported upstream Pi. */
+	const hasPendingMessages = (): boolean => {
+		const pending = sessionContext?.hasPendingMessages;
+		return typeof pending === "function" && pending.call(sessionContext);
+	};
 
 	const allIdleForClaim = (claim: HubMainClaim): boolean =>
 		owns(claim) &&
 		options.hub.snapshot.allObservableIdle &&
 		domainIdle() &&
-		localIdle();
+		localIdle() &&
+		!hasPendingMessages();
 
 	/**
 	 * Defer an open decision because local Pi became busy (user input took over or
@@ -510,7 +521,8 @@ export function createDecisionRuntime(
 			return false;
 		}
 
-		active.submitted = true;
+		active.dispatchPending = true;
+		active.submitted = false;
 		try {
 			options.pi.sendMessage(
 				createDecisionPromptMessage({
@@ -522,6 +534,7 @@ export function createDecisionRuntime(
 			);
 			return true;
 		} catch (error) {
+			active.dispatchPending = false;
 			if (!allIdleForClaim(active.claim)) {
 				// Final TOCTOU: Pi or an observable child became busy. Silent defer.
 				if (sendOptions?.deferOnBusy !== false) deferDecisionOnBusy(active);
@@ -558,6 +571,7 @@ export function createDecisionRuntime(
 			claim,
 			domainFence,
 			invalidated: false,
+			dispatchPending: false,
 			submitted: false,
 			protocol: createDecisionProtocolSession({
 				controller,
@@ -676,6 +690,7 @@ export function createDecisionRuntime(
 		} catch {
 			return false;
 		}
+		const inputGeneration = userInputGeneration;
 
 		return (async () => {
 			const compacted = await new Promise<boolean>((resolve) => {
@@ -688,14 +703,19 @@ export function createDecisionRuntime(
 					resolve(false);
 				}
 			});
-			if (!compacted || !allIdleForClaim(claim)) return false;
+			if (
+				!compacted ||
+				userInputGeneration !== inputGeneration ||
+				!allIdleForClaim(claim)
+			)
+				return false;
 			if (
 				options.processDomain !== undefined &&
 				!(await options.processDomain.confirm(domainFence))
 			) {
 				return false;
 			}
-			return allIdleForClaim(claim);
+			return userInputGeneration === inputGeneration && allIdleForClaim(claim);
 		})();
 	};
 
@@ -1154,6 +1174,13 @@ export function createDecisionRuntime(
 
 	const unsubscribeDomain = options.processDomain?.subscribe(() => {
 		if (stopped || !domainReady) return;
+		const active = activeDecision;
+		if (active?.submitted) {
+			// A confirmed internal decision run may mark this participant busy while
+			// preserving its original decision fence through finalization.
+			syncHubState();
+			return;
+		}
 		invalidateActiveDecision();
 		syncHubState();
 	});
@@ -1527,6 +1554,7 @@ export function createDecisionRuntime(
 		const active = activeDecision;
 		if (
 			active === null ||
+			!active.submitted ||
 			pendingFinalization !== null ||
 			event.message.role !== "assistant" ||
 			isAbortedAssistant(event.message) ||
@@ -1541,6 +1569,7 @@ export function createDecisionRuntime(
 		// The current prompt's run is over; until the next prompt (re-ask,
 		// continue, or fold) is actually sent, an unrelated run must not be
 		// misattributed as this decision's answer.
+		active.dispatchPending = false;
 		active.submitted = false;
 
 		const validation = validateDecisionResponse(response, config.reasonTypes);
@@ -1625,6 +1654,45 @@ export function createDecisionRuntime(
 		);
 	};
 
+	const handleMessageStart = async (event: {
+		readonly message: unknown;
+	}): Promise<void> => {
+		const active = activeDecision;
+		if (
+			active === null ||
+			active.invalidated ||
+			!active.dispatchPending ||
+			!owns(active.claim)
+		) {
+			return;
+		}
+		const message = event.message as {
+			readonly role?: unknown;
+			readonly customType?: unknown;
+			readonly details?: {
+				readonly exchangeId?: unknown;
+				readonly cycleId?: unknown;
+			};
+		};
+		const isCurrentDecision =
+			message.role === "custom" &&
+			message.customType === "pi-continue-watchdog:decision" &&
+			message.details?.exchangeId === active.exchangeId &&
+			message.details?.cycleId === active.protocol.currentCycleId;
+		if (!isCurrentDecision) {
+			deferDecisionOnBusy(active);
+			return;
+		}
+		active.dispatchPending = false;
+		active.submitted = true;
+		if (domainReady && !domainFatal && options.processDomain !== undefined) {
+			await options.processDomain.setInternalDecision(
+				options.attachmentInstance,
+				true,
+			);
+		}
+	};
+
 	const registerLifecycle = (): void => {
 		options.pi.on("session_start", async (_event, ctx: ExtensionContext) => {
 			++lifecycleGeneration;
@@ -1671,7 +1739,12 @@ export function createDecisionRuntime(
 			// Defer the provisional decision so this run is never captured as the
 			// decision answer and never marked internal in the process domain.
 			const active = activeDecision;
-			if (active !== null && !active.submitted && !active.invalidated) {
+			if (
+				active !== null &&
+				!active.invalidated &&
+				!active.dispatchPending &&
+				!active.submitted
+			) {
 				deferDecisionOnBusy(active);
 			}
 			if (claim !== null && controller !== null) {
@@ -1689,11 +1762,7 @@ export function createDecisionRuntime(
 			if (attachment !== null) options.hub.markBusy(attachment);
 			if (domainReady && !domainFatal && options.processDomain !== undefined) {
 				await options.processDomain.markBusy(options.attachmentInstance, {
-					internalDecision:
-						activeDecision !== null &&
-						!activeDecision.invalidated &&
-						activeDecision.submitted &&
-						owns(activeDecision.claim),
+					internalDecision: false,
 				});
 			}
 		});
@@ -1709,6 +1778,7 @@ export function createDecisionRuntime(
 			if (event.source !== "interactive" && event.source !== "rpc") {
 				return;
 			}
+			userInputGeneration += 1;
 			if (
 				active === null ||
 				active.invalidated ||
@@ -1717,13 +1787,16 @@ export function createDecisionRuntime(
 			) {
 				return;
 			}
-			suppressDecisionAbort = true;
+			const shouldAbort = active.submitted;
+			if (shouldAbort) suppressDecisionAbort = true;
 			deferDecisionOnBusy(active);
-			try {
-				sessionContext?.abort();
-			} catch {
-				// Abort is best effort; the decision was already deferred so the next
-				// settle will not misattribute this run.
+			if (shouldAbort) {
+				try {
+					sessionContext?.abort();
+				} catch {
+					// Abort is best effort; the decision was already deferred so the next
+					// settle will not misattribute this run.
+				}
 			}
 			return { action: "continue" };
 		});
@@ -1785,8 +1858,20 @@ export function createDecisionRuntime(
 					return;
 				}
 
-				// No agent_end / no pending finalization => one malformed no-result.
-				finalizeActiveDecision("missing");
+				const active = activeDecision;
+				if (
+					active?.dispatchPending &&
+					!active.submitted &&
+					!active.invalidated
+				) {
+					// Public sendMessage is fire-and-forget. If no matching agent_start ever
+					// confirmed dispatch, a later settle belongs to other Pi work and must
+					// not be converted into a malformed decision response.
+					deferDecisionOnBusy(active);
+				} else {
+					// A confirmed decision run that settled without agent_end is malformed.
+					finalizeActiveDecision("missing");
+				}
 				const continued = await deliverPending(ctx);
 				// Explicit reconcile even when hub markIdle was a no-op edge.
 				reconcileIdle();
@@ -1831,6 +1916,7 @@ export function createDecisionRuntime(
 		applyEffect,
 		applyTransition,
 		reconcileIdle,
+		handleMessageStart,
 		registerLifecycle,
 		shutdown,
 	};
