@@ -172,7 +172,9 @@ function createFenceHarness() {
 	let deferred = false;
 	const pendingConfirms: PendingConfirm[] = [];
 	const internalDecisionMarks: boolean[] = [];
-	const listeners = new Set<(value: DomainSnapshot) => void>();
+	const listeners = new Set<
+		(value: DomainSnapshot, source: "local" | "domain") => void
+	>();
 	const domain: ProcessDomainCoordinator = {
 		get snapshot() {
 			return snapshot;
@@ -223,7 +225,7 @@ function createFenceHarness() {
 		advanceFence(notify = true): void {
 			snapshot = idleDomainSnapshot(snapshot.activityGeneration + 1n);
 			if (notify) {
-				for (const listener of listeners) listener(snapshot);
+				for (const listener of listeners) listener(snapshot, "domain");
 			}
 		},
 	};

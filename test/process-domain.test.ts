@@ -160,12 +160,17 @@ test("subscriptions and fence confirmation use the broker view", async () => {
 		open: async () => ({ domain, created: false }),
 	});
 	const seen: bigint[] = [];
-	coordinator.subscribe((value) => seen.push(value.activityGeneration));
+	const sources: Array<"local" | "domain"> = [];
+	coordinator.subscribe((value, source) => {
+		seen.push(value.activityGeneration);
+		sources.push(source);
+	});
 	const attachment = {};
 	await coordinator.attach(attachment, { initialBusy: false, onFatal() {} });
 	const fence = coordinator.snapshot.fence;
 	assert.equal(await coordinator.confirm(fence), true);
 	await coordinator.markBusy(attachment);
 	assert.equal(await coordinator.confirm(fence), false);
-	assert.ok(seen.length >= 2);
+	assert.deepEqual(sources, ["domain", "local"]);
+	assert.deepEqual(seen, [1n, 2n]);
 });

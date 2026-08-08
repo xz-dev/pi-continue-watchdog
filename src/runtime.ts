@@ -1176,17 +1176,19 @@ export function createDecisionRuntime(
 		}
 	};
 
-	const unsubscribeDomain = options.processDomain?.subscribe(() => {
-		if (stopped || !domainReady) return;
-		if (domainInternalDecision) {
-			// A confirmed internal decision run may mark this participant busy while
-			// preserving its original decision fence through finalization.
+	const unsubscribeDomain = options.processDomain?.subscribe(
+		(_snapshot, source) => {
+			if (stopped || !domainReady) return;
+			if (domainInternalDecision && source === "local") {
+				// The current participant intentionally reports its own watchdog decision
+				// as broker-idle. Foreign domain updates still invalidate the decision.
+				syncHubState();
+				return;
+			}
+			invalidateActiveDecision();
 			syncHubState();
-			return;
-		}
-		invalidateActiveDecision();
-		syncHubState();
-	});
+		},
+	);
 
 	const withDecisionFence = async (
 		active: ActiveDecision,

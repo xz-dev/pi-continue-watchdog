@@ -31,7 +31,9 @@ export interface ProcessDomainCoordinator {
 		internal: boolean,
 	): Promise<void>;
 	confirm(fence: DomainFence): Promise<boolean> | boolean;
-	subscribe(listener: (snapshot: DomainSnapshot) => void): () => void;
+	subscribe(
+		listener: (snapshot: DomainSnapshot, source: "local" | "domain") => void,
+	): () => void;
 	detach(instance: DomainAttachmentInstance): Promise<void>;
 }
 
@@ -86,7 +88,9 @@ export function createProcessDomainCoordinator(
 	const env = options.env ?? process.env;
 	const pid = options.pid ?? process.pid;
 	const attachments = new Map<DomainAttachmentInstance, AttachmentRecord>();
-	const listeners = new Set<(snapshot: DomainSnapshot) => void>();
+	const listeners = new Set<
+		(snapshot: DomainSnapshot, source: "local" | "domain") => void
+	>();
 	let handle: ProcessDomain | null = null;
 	let latest = EMPTY_SNAPSHOT;
 	let opening: Promise<void> | null = null;
@@ -94,10 +98,20 @@ export function createProcessDomainCoordinator(
 	let root = false;
 	let writeTail = Promise.resolve();
 	let lastWritten: "busy" | "idle" | null = null;
+	let localWriteInFlight = false;
 
-	const notify = (snapshot: DomainSnapshot): void => {
+	const notify = (
+		snapshot: DomainSnapshot,
+		source: "local" | "domain",
+	): void => {
+		if (
+			latest.brokerEpoch === snapshot.brokerEpoch &&
+			latest.revision === snapshot.revision
+		) {
+			return;
+		}
 		latest = snapshot;
-		for (const listener of listeners) listener(snapshot);
+		for (const listener of listeners) listener(snapshot, source);
 	};
 
 	const reportFatal = (error: Error): void => {
@@ -123,7 +137,12 @@ export function createProcessDomainCoordinator(
 			const desired = desiredActivity();
 			if (desired === lastWritten) return;
 			lastWritten = desired;
-			notify(await handle.setActivity(desired));
+			localWriteInFlight = true;
+			try {
+				notify(await handle.setActivity(desired), "local");
+			} finally {
+				localWriteInFlight = false;
+			}
 		});
 		return writeTail;
 	};
@@ -165,8 +184,10 @@ export function createProcessDomainCoordinator(
 				// The marker is created only together with a brand-new declaration.
 				root = exactPid(marker) === pid;
 			}
-			notify(handle.snapshot());
-			unsubscribeDomain = handle.subscribe(notify);
+			notify(handle.snapshot(), "domain");
+			unsubscribeDomain = handle.subscribe((snapshot) =>
+				notify(snapshot, localWriteInFlight ? "local" : "domain"),
+			);
 		})().catch((error: unknown) => {
 			const fatal =
 				error instanceof Error
