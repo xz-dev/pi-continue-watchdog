@@ -55,7 +55,7 @@
     "@earendil-works/pi-coding-agent": "0.83.0",
     "@earendil-works/pi-tui": "0.83.0",
     "@types/node": "^26.1.2",
-    "tsx": "^4.20.6",
+    "tsx": "^4.23.8",
     "typescript": "^7.0.2"
   },
   "dependencies": {
