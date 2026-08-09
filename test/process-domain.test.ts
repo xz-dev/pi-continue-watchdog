@@ -108,6 +108,134 @@ test("one coordinator opens one participant and aggregates attachments", async (
 	assert.equal(domain.closeCount, 1);
 });
 
+test("final root detach resets topology and clears its marker", async () => {
+	const domain = new FakeDomain();
+	const env: NodeJS.ProcessEnv = {};
+	const coordinator = createProcessDomainCoordinator({
+		env,
+		pid: 100,
+		open: async () => ({ domain, created: true }),
+	});
+	const attachment = {};
+	await coordinator.attach(attachment, { initialBusy: false, onFatal() {} });
+	await coordinator.detach(attachment);
+
+	assert.equal(coordinator.isRootProcess, false);
+	assert.equal(env[WATCHDOG_ROOT_PID_ENV], undefined);
+	assert.equal(domain.closeCount, 1);
+});
+
+test("reattach after final root detach creates a fresh root", async () => {
+	const domains = [new FakeDomain(), new FakeDomain()];
+	const env: NodeJS.ProcessEnv = {};
+	let opens = 0;
+	const coordinator = createProcessDomainCoordinator({
+		env,
+		pid: 100,
+		open: async () => ({
+			domain: domains[opens++] as FakeDomain,
+			created: true,
+		}),
+	});
+	const first = {};
+	await coordinator.attach(first, { initialBusy: false, onFatal() {} });
+	await coordinator.detach(first);
+	const second = {};
+	await coordinator.attach(second, { initialBusy: false, onFatal() {} });
+
+	assert.equal(opens, 2);
+	assert.equal(coordinator.isRootProcess, true);
+	assert.equal(env[WATCHDOG_ROOT_PID_ENV], "100");
+	assert.equal(domains[0]?.closeCount, 1);
+	await coordinator.detach(second);
+});
+
+test("concurrent final detach and attach wait for teardown then open a fresh root", async () => {
+	let releaseClose = () => {};
+	const closeStarted = new Promise<void>((resolve) => {
+		releaseClose = resolve;
+	});
+	let allowClose = () => {};
+	const closeAllowed = new Promise<void>((resolve) => {
+		allowClose = resolve;
+	});
+	const firstDomain = new FakeDomain();
+	const domains = [firstDomain, new FakeDomain()];
+	firstDomain.close = async () => {
+		firstDomain.closeCount += 1;
+		releaseClose();
+		await closeAllowed;
+	};
+	const env: NodeJS.ProcessEnv = {};
+	let opens = 0;
+	const coordinator = createProcessDomainCoordinator({
+		env,
+		pid: 100,
+		open: async () => ({
+			domain: domains[opens++] as FakeDomain,
+			created: true,
+		}),
+	});
+	const first = {};
+	const second = {};
+	await coordinator.attach(first, { initialBusy: false, onFatal() {} });
+	const detach = coordinator.detach(first);
+	await closeStarted;
+	const attach = coordinator.attach(second, {
+		initialBusy: false,
+		onFatal() {},
+	});
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(opens, 1, "reattach must wait while the old root is closing");
+	allowClose();
+	await Promise.all([detach, attach]);
+
+	assert.equal(opens, 2);
+	assert.equal(coordinator.isRootProcess, true);
+	assert.equal(env[WATCHDOG_ROOT_PID_ENV], "100");
+	assert.equal(coordinator.snapshot.brokerEpoch, "epoch");
+	assert.equal(domains[0]?.closeCount, 1);
+	assert.equal(domains[1]?.closeCount, 0);
+	await coordinator.detach(second);
+	assert.equal(domains[1]?.closeCount, 1);
+	assert.equal(env[WATCHDOG_ROOT_PID_ENV], undefined);
+});
+
+test("final observer detach preserves the inherited foreign marker", async () => {
+	const domain = new FakeDomain();
+	const env = declaredEnv("100");
+	const coordinator = createProcessDomainCoordinator({
+		env,
+		pid: 200,
+		open: async () => ({ domain, created: false }),
+	});
+	const attachment = {};
+	await coordinator.attach(attachment, { initialBusy: false, onFatal() {} });
+	await coordinator.detach(attachment);
+
+	assert.equal(coordinator.isRootProcess, false);
+	assert.equal(env[WATCHDOG_ROOT_PID_ENV], "100");
+	assert.equal(domain.closeCount, 1);
+});
+
+test("final root detach preserves a replaced foreign marker", async () => {
+	const domain = new FakeDomain();
+	const env: NodeJS.ProcessEnv = {};
+	const coordinator = createProcessDomainCoordinator({
+		env,
+		pid: 100,
+		open: async () => ({ domain, created: true }),
+	});
+	const attachment = {};
+	await coordinator.attach(attachment, { initialBusy: false, onFatal() {} });
+	env[WATCHDOG_ROOT_PID_ENV] = "200";
+	await coordinator.detach(attachment);
+
+	assert.equal(coordinator.isRootProcess, false);
+	assert.equal(env[WATCHDOG_ROOT_PID_ENV], "200");
+	assert.equal(domain.closeCount, 1);
+});
+
 test("a predeclared domain without a marker is observer-only", async () => {
 	const domain = new FakeDomain();
 	const env = declaredEnv();
@@ -150,6 +278,68 @@ test("partial or marker-inconsistent declarations fail closed", async () => {
 			coordinator.attach({}, { initialBusy: false, onFatal() {} }),
 		);
 	}
+});
+
+test("final root detach recovers from a rejected write and reopens fresh", async () => {
+	const domains = [new FakeDomain(), new FakeDomain()];
+	const env: NodeJS.ProcessEnv = {};
+	let opens = 0;
+	let failNext = true;
+	const firstDomain = domains[0];
+	assert.ok(firstDomain);
+	const firstSetActivity = firstDomain.setActivity.bind(firstDomain);
+	firstDomain.setActivity = async (state) => {
+		if (failNext) {
+			failNext = false;
+			throw new Error("stale participant lease");
+		}
+		return firstSetActivity(state);
+	};
+	const coordinator = createProcessDomainCoordinator({
+		env,
+		pid: 100,
+		open: async () => ({
+			domain: domains[opens++] as FakeDomain,
+			created: true,
+		}),
+	});
+	const first = {};
+	await coordinator.attach(first, { initialBusy: false, onFatal() {} });
+	await assert.rejects(coordinator.markBusy(first), /stale participant/);
+	await coordinator.detach(first);
+
+	assert.equal(domains[0]?.closeCount, 1);
+	assert.equal(coordinator.isRootProcess, false);
+	assert.equal(env[WATCHDOG_ROOT_PID_ENV], undefined);
+
+	const second = {};
+	await coordinator.attach(second, { initialBusy: false, onFatal() {} });
+	assert.equal(opens, 2);
+	assert.equal(coordinator.isRootProcess, true);
+	assert.equal(env[WATCHDOG_ROOT_PID_ENV], "100");
+	assert.equal(coordinator.snapshot.brokerEpoch, "epoch");
+	await coordinator.detach(second);
+	assert.equal(domains[1]?.closeCount, 1);
+	assert.equal(env[WATCHDOG_ROOT_PID_ENV], undefined);
+});
+
+test("final detach does not hide a close failure", async () => {
+	const domain = new FakeDomain();
+	domain.close = async () => {
+		domain.closeCount += 1;
+		throw new Error("close failed");
+	};
+	const coordinator = createProcessDomainCoordinator({
+		env: {},
+		pid: 100,
+		open: async () => ({ domain, created: true }),
+	});
+	const attachment = {};
+	await coordinator.attach(attachment, { initialBusy: false, onFatal() {} });
+
+	await assert.rejects(coordinator.detach(attachment), /close failed/);
+	assert.equal(domain.closeCount, 1);
+	assert.equal(coordinator.isRootProcess, false);
 });
 
 test("a rejected runtime write does not poison later coordinator writes", async () => {

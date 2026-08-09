@@ -97,6 +97,7 @@ export function createProcessDomainCoordinator(
 	let unsubscribeDomain: (() => void) | null = null;
 	let root = false;
 	let writeTail = Promise.resolve();
+	let lifecycleTail = Promise.resolve();
 	let lastWritten: "busy" | "idle" | null = null;
 	let localWriteInFlight = false;
 
@@ -154,6 +155,15 @@ export function createProcessDomainCoordinator(
 			});
 		writeTail = write;
 		return write;
+	};
+
+	const queueLifecycle = <T>(operation: () => Promise<T>): Promise<T> => {
+		const result = lifecycleTail.catch(() => {}).then(operation);
+		lifecycleTail = result.then(
+			() => {},
+			() => {},
+		);
+		return result;
 	};
 
 	const ensureOpen = (): Promise<void> => {
@@ -218,16 +228,24 @@ export function createProcessDomainCoordinator(
 		get isRootProcess(): boolean {
 			return root;
 		},
-		async attach(instance, attachOptions): Promise<void> {
-			if (!attachments.has(instance)) {
-				attachments.set(instance, {
-					busy: attachOptions.initialBusy,
-					internalDecision: false,
-					onFatal: attachOptions.onFatal,
-				});
-			}
-			await ensureOpen();
-			await queueWrite();
+		attach(instance, attachOptions): Promise<void> {
+			return queueLifecycle(async () => {
+				if (!attachments.has(instance)) {
+					attachments.set(instance, {
+						busy: attachOptions.initialBusy,
+						internalDecision: false,
+						onFatal: attachOptions.onFatal,
+					});
+				}
+				await ensureOpen();
+				await queueWrite();
+				if (handle === null) {
+					throw new ProcessDomainFatalError(
+						"BROKER_UNAVAILABLE",
+						"watchdog process domain closed during attachment",
+					);
+				}
+			});
 		},
 		async markBusy(instance, markOptions): Promise<void> {
 			const record = attachments.get(instance);
@@ -254,21 +272,31 @@ export function createProcessDomainCoordinator(
 			listeners.add(listener);
 			return () => listeners.delete(listener);
 		},
-		async detach(instance): Promise<void> {
-			if (!attachments.delete(instance)) return;
-			if (attachments.size > 0) {
-				await queueWrite();
-				return;
-			}
-			await writeTail;
-			unsubscribeDomain?.();
-			unsubscribeDomain = null;
-			const closing = handle;
-			handle = null;
-			opening = null;
-			lastWritten = null;
-			latest = { ...EMPTY_SNAPSHOT, fence: { ...EMPTY_SNAPSHOT.fence } };
-			if (closing !== null) await closing.close();
+		detach(instance): Promise<void> {
+			return queueLifecycle(async () => {
+				if (!attachments.delete(instance)) return;
+				if (attachments.size > 0) {
+					await queueWrite();
+					return;
+				}
+				// The caller that queued a failed activity write already observed its
+				// error. Final teardown must still settle that write before releasing
+				// the participant; close failures below remain observable.
+				await writeTail.catch(() => {});
+				unsubscribeDomain?.();
+				unsubscribeDomain = null;
+				const closing = handle;
+				const wasRoot = root;
+				handle = null;
+				opening = null;
+				root = false;
+				if (wasRoot && exactPid(env[WATCHDOG_ROOT_PID_ENV]) === pid) {
+					delete env[WATCHDOG_ROOT_PID_ENV];
+				}
+				lastWritten = null;
+				latest = { ...EMPTY_SNAPSHOT, fence: { ...EMPTY_SNAPSHOT.fence } };
+				if (closing !== null) await closing.close();
+			});
 		},
 	};
 }

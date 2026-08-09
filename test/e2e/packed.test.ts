@@ -160,7 +160,7 @@ async function makePackedFixture(
 	assert.deepEqual(installedManifest.pi?.extensions, ["./src/extension.ts"]);
 	assert.equal(
 		installedManifest.dependencies?.["pi-process-domain"],
-		"git+https://github.com/xz-dev/pi-process-domain.git#85bb08a",
+		"git+https://github.com/xz-dev/pi-process-domain.git#54633a01cc734576ecc1c9086d1b8080c82ff334",
 	);
 	const domainPackage = join(installRoot, "node_modules", "pi-process-domain");
 	const domainManifest = JSON.parse(
