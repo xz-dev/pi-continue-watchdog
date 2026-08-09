@@ -824,8 +824,8 @@ Pi packages 本身是受信任、拥有完整本机权限的代码，因此 regi
 
 ## 16. Supersession: implemented authenticated broker architecture
 
-The earlier same-process-only conclusion in this report is superseded for watchdog-loaded inherited Pi processes by the reviewed `xz-dev/pi-process-domain` architecture pinned at commit `b907a999d1e2112b30b7b3c5340eabc977c70744`.
+The earlier same-process-only conclusion in this report is superseded for watchdog-loaded inherited Pi processes by the reviewed `xz-dev/pi-process-domain` architecture.
 
-The shipped design uses one process-wide watchdog coordinator participant, exact local attachment aggregation, an authenticated per-user socket/pipe broker, immutable certain/all-idle snapshots, and confirmation fences. Only the domain-creating root PID owns watchdog decisions; inherited processes report activity and remain observers. The root decision run suppresses only its own artificial busy state, while any other activity invalidates its fence and folds the stale exchange.
+The shipped design uses one process-wide watchdog coordinator participant, exact local attachment aggregation, and one authenticated embedded protocol-v2 broker per root Pi domain on a private Unix socket/named pipe, with immutable certain/all-idle snapshots and confirmation fences. Only the domain-creating root PID owns watchdog decisions while that broker is open; inherited processes connect as observers and cannot create or revive it. Final root detach clears the creator marker and closes the endpoint, so a later root attachment creates a fresh isolated domain. The root decision run suppresses only its own artificial busy state, while any other activity invalidates its fence and folds the stale exchange.
 
 Guarantee boundaries remain explicit: observation is strict after inherited watchdog `session_start`; zero-gap launch coverage requires `reserveSpawn()` cooperation; stripped/replaced environment declarations and children that do not load watchdog cannot be observed.
