@@ -143,11 +143,9 @@ For AI unlock, the extension trims XML `reason_type`, matches it against the eff
 
 Invalid re-ask budget is fixed at **3** (not configurable).
 
-Delay for continue attempt `N` (1-based, advances only on **valid continue**):
-
-```text
-delaySeconds(N) = idleDelaySeconds × 2^(N - 1)
-```
+Every new authoritative all-idle activity generation waits one fixed
+`idleDelaySeconds` grace. Valid continues advance only the `maxRetries`
+accounting; they do not lengthen later grace periods.
 
 
 ## Neutral `user-ready` semantic hook

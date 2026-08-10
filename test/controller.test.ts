@@ -2,29 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-	type ControllerEffect,
 	type ControllerTransition,
 	createLockDecisionController,
 } from "../src/controller.js";
 
-function controller(
-	config: { idleDelaySeconds: number; maxRetries: number } = {
-		idleDelaySeconds: 3,
-		maxRetries: 3,
-	},
-) {
-	return createLockDecisionController(config);
-}
-
-function armEffect(
-	transition: ControllerTransition,
-): Extract<ControllerEffect, { kind: "armIdleTimer" }> {
-	const effect = transition.effects.find(
-		(candidate) => candidate.kind === "armIdleTimer",
-	);
-	assert.ok(effect, "expected an armIdleTimer effect");
-	assert.equal(effect.kind, "armIdleTimer");
-	return effect;
+function controller(maxRetries = 3) {
+	return createLockDecisionController({ maxRetries });
 }
 
 function decisionId(transition: ControllerTransition): number {
@@ -32,423 +15,204 @@ function decisionId(transition: ControllerTransition): number {
 		(candidate) => candidate.kind === "openDecisionWindow",
 	);
 	assert.ok(effect, "expected an openDecisionWindow effect");
-	assert.equal(effect.kind, "openDecisionWindow");
 	return effect.decisionId;
+}
+
+function openDecision(state: ReturnType<typeof controller>): number {
+	return decisionId(state.beginDecision());
 }
 
 function effectKinds(transition: ControllerTransition): string[] {
 	return transition.effects.map((effect) => effect.kind);
 }
 
-function openDecision(state: ReturnType<typeof controller>): {
-	decisionId: number;
-	timerId: number;
-} {
-	const arm = armEffect(state.onAllObservableIdle());
-	return {
-		decisionId: decisionId(state.beginDecision(arm.timerId)),
-		timerId: arm.timerId,
-	};
-}
-
-test("initial snapshot is unlocked with no timer or decision window", () => {
-	const state = controller();
-
-	assert.deepEqual(state.snapshot, {
+test("initial snapshot is unlocked with no decision window", () => {
+	assert.deepEqual(controller().snapshot, {
 		locked: false,
 		attempt: 0,
 		exhausted: false,
 		decisionFailed: false,
 		invalidDecisionAttempts: 0,
 		lastInvalidDecisionError: null,
-		idleTimer: null,
 		decisionOpen: false,
 	});
 });
 
-test("manual lock and main user start always reset, cancel pending work, and notify", () => {
-	const state = controller({ idleDelaySeconds: 3, maxRetries: 2 });
-
-	const first = state.lock();
-	assert.equal(first.applied, true);
-	assert.deepEqual(first.effects, [{ kind: "notify", notification: "locked" }]);
-
-	const pending = armEffect(state.onAllObservableIdle());
-	assert.equal(pending.attempt, 0);
-	assert.equal(pending.delaySeconds, 3);
-
-	const sameState = state.lock();
-	assert.equal(sameState.applied, true);
-	assert.deepEqual(sameState.effects, [
-		{ kind: "cancelIdleTimer", timerId: pending.timerId },
+test("lock and main user start reset accounting and close pending decisions", () => {
+	const state = controller(2);
+	assert.deepEqual(state.lock().effects, [
 		{ kind: "notify", notification: "locked" },
 	]);
-	assert.equal(state.snapshot.locked, true);
-	assert.equal(state.snapshot.attempt, 0);
-	assert.equal(state.snapshot.idleTimer, null);
+	const oldDecisionId = openDecision(state);
+	state.recordInvalidDecision(oldDecisionId, "first");
 
-	const { decisionId: oldDecisionId } = openDecision(state);
-	const started = state.onMainUserMessageStart();
-	assert.equal(started.applied, true);
-	assert.deepEqual(started.effects, [
+	const restarted = state.onMainUserMessageStart();
+	assert.deepEqual(restarted.effects, [
 		{ kind: "restoreDecisionTools", decisionId: oldDecisionId },
 		{ kind: "notify", notification: "locked" },
 	]);
-	assert.equal(state.snapshot.locked, true);
-	assert.equal(state.snapshot.attempt, 0);
-	assert.equal(state.snapshot.decisionOpen, false);
-});
-
-test("ensureLocked is a no-op when locked and a silent fresh lock when unlocked", () => {
-	const state = controller({ idleDelaySeconds: 3, maxRetries: 2 });
-
-	const fromUnlocked = state.ensureLocked();
-	assert.equal(fromUnlocked.applied, true);
-	assert.equal(state.snapshot.locked, true);
-	assert.deepEqual(fromUnlocked.effects, [
-		{ kind: "notify", notification: "locked" },
-	]);
-
-	const { decisionId: openId, timerId } = openDecision(state);
-	state.recordInvalidDecision(openId, "first");
-	assert.equal(state.snapshot.invalidDecisionAttempts, 1);
-	assert.equal(state.snapshot.decisionOpen, true);
-
-	const alreadyLocked = state.ensureLocked();
-	assert.equal(alreadyLocked.applied, false);
-	assert.deepEqual(alreadyLocked.effects, []);
-	assert.equal(state.snapshot.locked, true);
-	assert.equal(state.snapshot.decisionOpen, true);
-	assert.equal(state.snapshot.invalidDecisionAttempts, 1);
-	assert.equal(state.snapshot.idleTimer, null);
-	// Already-consumed timer id must stay inert while decision remains open.
-	assert.equal(state.beginDecision(timerId).applied, false);
-});
-
-test("unlock clears pending controller work but preserves attempt and exhaustion", () => {
-	const state = controller({ idleDelaySeconds: 3, maxRetries: 2 });
-
-	const alreadyUnlocked = state.unlock();
-	assert.equal(alreadyUnlocked.applied, true);
-	assert.deepEqual(alreadyUnlocked.effects, [
-		{ kind: "notify", notification: "unlocked" },
-	]);
-
-	state.lock();
-	const firstDecision = openDecision(state).decisionId;
-	state.recordValidContinue(firstDecision);
-	assert.equal(state.snapshot.attempt, 1);
-	const pending = armEffect(state.onAllObservableIdle());
-	const duringDelay = state.unlock();
-	assert.deepEqual(duringDelay.effects, [
-		{ kind: "cancelIdleTimer", timerId: pending.timerId },
-		{ kind: "notify", notification: "unlocked" },
-	]);
-	assert.equal(state.snapshot.locked, false);
-	assert.equal(state.snapshot.attempt, 1);
-	assert.equal(state.snapshot.exhausted, false);
-	assert.equal(state.snapshot.idleTimer, null);
-
-	state.lock();
-	state.recordValidContinue(openDecision(state).decisionId);
-	state.recordValidContinue(openDecision(state).decisionId);
-	assert.equal(state.snapshot.exhausted, true);
-	assert.equal(state.snapshot.attempt, 2);
-	assert.equal(state.onAllObservableIdle().applied, false);
-	state.unlock();
-	assert.equal(state.snapshot.locked, false);
-	assert.equal(state.snapshot.exhausted, true);
-	assert.equal(state.snapshot.attempt, 2);
-});
-
-test("unlock during decision and valid unlock preserve counters and failures", () => {
-	const state = controller({ idleDelaySeconds: 3, maxRetries: 2 });
-	state.lock();
-	const first = openDecision(state).decisionId;
-	state.recordValidContinue(first);
-	assert.equal(state.snapshot.attempt, 1);
-	const { decisionId: openDecisionId } = openDecision(state);
-	state.recordInvalidDecision(openDecisionId, "blank reason");
-	assert.equal(state.snapshot.invalidDecisionAttempts, 1);
-	assert.equal(state.snapshot.lastInvalidDecisionError, "blank reason");
-
-	const duringDecision = state.unlock();
-	assert.deepEqual(duringDecision.effects, [
-		{ kind: "restoreDecisionTools", decisionId: openDecisionId },
-		{ kind: "notify", notification: "unlocked" },
-	]);
-	assert.equal(state.snapshot.locked, false);
-	assert.equal(state.snapshot.attempt, 1);
-	assert.equal(state.snapshot.decisionOpen, false);
-	assert.equal(state.snapshot.invalidDecisionAttempts, 1);
-	assert.equal(state.snapshot.lastInvalidDecisionError, "blank reason");
-	assert.equal(state.snapshot.decisionFailed, false);
-
-	// decision-failed then unlock preserves failure flags
-	state.lock();
-	const failedId = openDecision(state).decisionId;
-	state.recordInvalidDecision(failedId, "one");
-	state.recordInvalidDecision(failedId, "two");
-	state.recordInvalidDecision(failedId, "three");
-	assert.equal(state.snapshot.decisionFailed, true);
-	assert.equal(state.snapshot.invalidDecisionAttempts, 3);
-	state.unlock();
-	assert.equal(state.snapshot.locked, false);
-	assert.equal(state.snapshot.decisionFailed, true);
-	assert.equal(state.snapshot.invalidDecisionAttempts, 3);
-	assert.equal(state.snapshot.lastInvalidDecisionError, "three");
-
-	// valid AI unlock preserves attempt accounting
-	state.lock();
-	const continued = openDecision(state).decisionId;
-	state.recordValidContinue(continued);
-	const { decisionId: validUnlockDecisionId } = openDecision(state);
-	const validUnlock = state.recordValidUnlock(validUnlockDecisionId);
-	assert.deepEqual(validUnlock.effects, [
-		{ kind: "restoreDecisionTools", decisionId: validUnlockDecisionId },
-		{ kind: "notify", notification: "unlocked" },
-	]);
-	assert.equal(state.snapshot.locked, false);
-	assert.equal(state.snapshot.attempt, 1);
-	assert.equal(state.snapshot.exhausted, false);
-	assert.equal(state.snapshot.decisionOpen, false);
-	assert.equal(state.snapshot.idleTimer, null);
-});
-
-test("valid continues advance zero-based exponential delays then exhaust", () => {
-	const state = controller({ idleDelaySeconds: 3, maxRetries: 3 });
-	state.lock();
-
-	const first = armEffect(state.onAllObservableIdle());
-	assert.deepEqual(
-		{ attempt: first.attempt, delaySeconds: first.delaySeconds },
-		{ attempt: 0, delaySeconds: 3 },
-	);
-	state.recordValidContinue(decisionId(state.beginDecision(first.timerId)));
-	assert.equal(state.snapshot.attempt, 1);
-	assert.equal(state.snapshot.exhausted, false);
-
-	const second = armEffect(state.onAllObservableIdle());
-	assert.deepEqual(
-		{ attempt: second.attempt, delaySeconds: second.delaySeconds },
-		{ attempt: 1, delaySeconds: 6 },
-	);
-	state.recordValidContinue(decisionId(state.beginDecision(second.timerId)));
-
-	const third = armEffect(state.onAllObservableIdle());
-	assert.deepEqual(
-		{ attempt: third.attempt, delaySeconds: third.delaySeconds },
-		{ attempt: 2, delaySeconds: 12 },
-	);
-	const finalContinue = state.recordValidContinue(
-		decisionId(state.beginDecision(third.timerId)),
-	);
-	assert.deepEqual(effectKinds(finalContinue), ["restoreDecisionTools"]);
-	assert.equal(state.snapshot.attempt, 3);
-	assert.equal(state.snapshot.locked, true);
-	assert.equal(state.snapshot.exhausted, true);
-	assert.equal(state.onAllObservableIdle().applied, false);
-	assert.equal(state.snapshot.idleTimer, null);
-});
-
-test("stale continue cannot double-consume the retry budget", () => {
-	const state = controller({ idleDelaySeconds: 3, maxRetries: 1 });
-	state.lock();
-	const { decisionId: activeDecisionId } = openDecision(state);
-
-	assert.equal(state.recordValidContinue(activeDecisionId).applied, true);
-	assert.equal(state.snapshot.attempt, 1);
-	assert.equal(state.snapshot.exhausted, true);
-
-	const duplicate = state.recordValidContinue(activeDecisionId);
-	assert.equal(duplicate.applied, false);
-	assert.deepEqual(duplicate.effects, []);
-	assert.equal(state.snapshot.attempt, 1);
-});
-
-test("manual lock or main user start resets exhausted and decision-failed state", () => {
-	const state = controller({ idleDelaySeconds: 3, maxRetries: 1 });
-	state.lock();
-	const { decisionId: firstDecisionId } = openDecision(state);
-	state.recordValidContinue(firstDecisionId);
-	assert.equal(state.snapshot.exhausted, true);
-
-	const userStart = state.onMainUserMessageStart();
-	assert.deepEqual(userStart.effects, [
-		{ kind: "notify", notification: "locked" },
-	]);
-	assert.equal(state.snapshot.locked, true);
-	assert.equal(state.snapshot.attempt, 0);
-	assert.equal(state.snapshot.exhausted, false);
-
-	const { decisionId: secondDecisionId } = openDecision(state);
-	state.recordValidContinue(secondDecisionId);
-	assert.equal(state.snapshot.exhausted, true);
-	const manualLock = state.lock();
-	assert.deepEqual(manualLock.effects, [
-		{ kind: "notify", notification: "locked" },
-	]);
-	assert.equal(state.snapshot.attempt, 0);
-	assert.equal(state.snapshot.exhausted, false);
-});
-
-test("invalid decisions re-ask twice without retry consumption, then decision-fail", () => {
-	const state = controller({ idleDelaySeconds: 3, maxRetries: 2 });
-	state.lock();
-	const { decisionId: activeDecisionId } = openDecision(state);
-
-	const firstInvalid = state.recordInvalidDecision(
-		activeDecisionId,
-		"Call exactly one decision tool.",
-	);
-	assert.deepEqual(firstInvalid.effects, [
-		{
-			kind: "reaskDecision",
-			decisionId: activeDecisionId,
-			invalidDecisionAttempt: 1,
-			error: "Call exactly one decision tool.",
-		},
-	]);
-	assert.equal(state.snapshot.attempt, 0);
-	assert.equal(state.snapshot.invalidDecisionAttempts, 1);
-	assert.equal(state.snapshot.decisionOpen, true);
-
-	const secondInvalid = state.recordInvalidDecision(
-		activeDecisionId,
-		"The unlock reason is blank.",
-	);
-	assert.deepEqual(secondInvalid.effects, [
-		{
-			kind: "reaskDecision",
-			decisionId: activeDecisionId,
-			invalidDecisionAttempt: 2,
-			error: "The unlock reason is blank.",
-		},
-	]);
-	assert.equal(state.snapshot.attempt, 0);
-	assert.equal(state.snapshot.invalidDecisionAttempts, 2);
-
-	const thirdInvalid = state.recordInvalidDecision(
-		activeDecisionId,
-		"Unknown tool.",
-	);
-	assert.deepEqual(thirdInvalid.effects, [
-		{ kind: "restoreDecisionTools", decisionId: activeDecisionId },
-		{ kind: "decisionFailed", error: "Unknown tool." },
-	]);
-	assert.equal(state.snapshot.locked, true);
-	assert.equal(state.snapshot.decisionFailed, true);
-	assert.equal(state.snapshot.decisionOpen, false);
-	assert.equal(state.snapshot.idleTimer, null);
-	assert.equal(state.onAllObservableIdle().applied, false);
-
-	const reset = state.onMainUserMessageStart();
-	assert.equal(reset.applied, true);
-	assert.deepEqual(reset.effects, [{ kind: "notify", notification: "locked" }]);
-	assert.equal(state.snapshot.decisionFailed, false);
-	assert.equal(state.snapshot.invalidDecisionAttempts, 0);
-	assert.equal(state.snapshot.attempt, 0);
-	assert.equal(state.onAllObservableIdle().applied, true);
-});
-
-test("zero idle delay stays zero across continued attempts", () => {
-	const state = controller({ idleDelaySeconds: 0, maxRetries: 2 });
-	state.lock();
-	const first = armEffect(state.onAllObservableIdle());
-	assert.equal(first.delaySeconds, 0);
-	const firstDecision = decisionId(state.beginDecision(first.timerId));
-	state.recordValidContinue(firstDecision);
-	const second = armEffect(state.onAllObservableIdle());
-	assert.equal(second.delaySeconds, 0);
-	assert.equal(second.attempt, 1);
-});
-
-test("fractional idle delay doubles after a valid continue", () => {
-	const state = controller({ idleDelaySeconds: 0.25, maxRetries: 2 });
-	state.lock();
-	const first = armEffect(state.onAllObservableIdle());
-	assert.equal(first.delaySeconds, 0.25);
-	const firstDecision = decisionId(state.beginDecision(first.timerId));
-	state.recordValidContinue(firstDecision);
-	const second = armEffect(state.onAllObservableIdle());
-	assert.equal(second.delaySeconds, 0.5);
-});
-
-test("finite idle base keeps finite controller delays through the final retry", () => {
-	const state = controller({
-		idleDelaySeconds: Number.MAX_VALUE,
-		maxRetries: 10,
+	assert.deepEqual(state.snapshot, {
+		locked: true,
+		attempt: 0,
+		exhausted: false,
+		decisionFailed: false,
+		invalidDecisionAttempts: 0,
+		lastInvalidDecisionError: null,
+		decisionOpen: false,
 	});
-	state.lock();
-
-	for (let attempt = 0; attempt < 10; attempt += 1) {
-		const timer = armEffect(state.onAllObservableIdle());
-		assert.equal(Number.isFinite(timer.delaySeconds), true);
-		assert.equal(timer.delaySeconds, Number.MAX_VALUE);
-		state.recordValidContinue(decisionId(state.beginDecision(timer.timerId)));
-	}
 });
 
-test("busy cancels the delay and the next all-idle arms the same attempt again", () => {
-	const state = controller({ idleDelaySeconds: 7, maxRetries: 2 });
-	state.lock();
-	const first = armEffect(state.onAllObservableIdle());
-	assert.equal(first.delaySeconds, 7);
-	assert.equal(first.attempt, 0);
-
-	const busy = state.onObservableBusy();
-	assert.deepEqual(busy.effects, [
-		{ kind: "cancelIdleTimer", timerId: first.timerId },
-	]);
-	assert.equal(state.snapshot.idleTimer, null);
-	assert.equal(state.snapshot.attempt, 0);
-	assert.equal(state.beginDecision(first.timerId).applied, false);
-
-	const second = armEffect(state.onAllObservableIdle());
-	assert.equal(second.delaySeconds, 7);
-	assert.equal(second.attempt, 0);
-	assert.notEqual(second.timerId, first.timerId);
-});
-
-test("stale idle, timer, and decision ids are inert", () => {
+test("ensureLocked starts once and leaves an active lock untouched", () => {
 	const state = controller();
-	state.lock();
-	const timer = armEffect(state.onAllObservableIdle());
-	assert.equal(state.onAllObservableIdle().applied, false);
-	assert.equal(state.beginDecision(timer.timerId + 1).applied, false);
+	assert.equal(state.ensureLocked().applied, true);
+	const activeDecisionId = openDecision(state);
+	state.recordInvalidDecision(activeDecisionId, "first");
 
-	const activeDecisionId = decisionId(state.beginDecision(timer.timerId));
-	assert.equal(state.beginDecision(timer.timerId).applied, false);
-	assert.equal(state.onAllObservableIdle().applied, false);
+	const repeated = state.ensureLocked();
+	assert.equal(repeated.applied, false);
+	assert.deepEqual(repeated.effects, []);
+	assert.equal(state.snapshot.decisionOpen, true);
+	assert.equal(state.snapshot.invalidDecisionAttempts, 1);
+	assert.equal(state.beginDecision().applied, false);
+});
+
+test("unlock closes pending work while preserving visible accounting", () => {
+	const state = controller(2);
+	state.lock();
+	state.recordValidContinue(openDecision(state));
+	const activeDecisionId = openDecision(state);
+	state.recordInvalidDecision(activeDecisionId, "blank reason");
+
+	const unlocked = state.unlock();
+	assert.deepEqual(unlocked.effects, [
+		{ kind: "restoreDecisionTools", decisionId: activeDecisionId },
+		{ kind: "notify", notification: "unlocked" },
+	]);
+	assert.equal(state.snapshot.locked, false);
+	assert.equal(state.snapshot.attempt, 1);
+	assert.equal(state.snapshot.invalidDecisionAttempts, 1);
+	assert.equal(state.snapshot.lastInvalidDecisionError, "blank reason");
+	assert.equal(state.snapshot.decisionOpen, false);
+});
+
+test("valid continues consume only the retry budget and exhaust at max", () => {
+	const state = controller(3);
+	state.lock();
+
+	for (let attempt = 1; attempt <= 3; attempt += 1) {
+		const continued = state.recordValidContinue(openDecision(state));
+		assert.deepEqual(effectKinds(continued), ["restoreDecisionTools"]);
+		assert.equal(state.snapshot.attempt, attempt);
+		assert.equal(state.snapshot.exhausted, attempt === 3);
+	}
+
+	assert.equal(state.beginDecision().applied, false);
+});
+
+test("stale decisions cannot consume retry budget twice", () => {
+	const state = controller(1);
+	state.lock();
+	const activeDecisionId = openDecision(state);
+
 	assert.equal(state.recordValidContinue(activeDecisionId).applied, true);
 	assert.equal(state.recordValidContinue(activeDecisionId).applied, false);
 	assert.equal(
 		state.recordInvalidDecision(activeDecisionId, "stale").applied,
 		false,
 	);
+	assert.equal(state.snapshot.attempt, 1);
 });
 
-test("snapshots are fresh objects and config values are copied at construction", () => {
-	const suppliedConfig = { idleDelaySeconds: 3, maxRetries: 2 };
-	const state = controller(suppliedConfig);
-	const locked = state.lock();
-	const arm = armEffect(state.onAllObservableIdle());
-	const snapA = state.snapshot;
-	const snapB = state.snapshot;
+test("invalid decisions re-ask twice without retry consumption, then fail closed", () => {
+	const state = controller(2);
+	state.lock();
+	const activeDecisionId = openDecision(state);
 
-	assert.notEqual(snapA, snapB);
-	assert.deepEqual(snapA, snapB);
-	assert.notEqual(locked.effects, state.lock().effects);
+	const first = state.recordInvalidDecision(activeDecisionId, "first");
+	assert.deepEqual(first.effects, [
+		{
+			kind: "reaskDecision",
+			decisionId: activeDecisionId,
+			invalidDecisionAttempt: 1,
+			error: "first",
+		},
+	]);
+	const second = state.recordInvalidDecision(activeDecisionId, "second");
+	assert.deepEqual(second.effects, [
+		{
+			kind: "reaskDecision",
+			decisionId: activeDecisionId,
+			invalidDecisionAttempt: 2,
+			error: "second",
+		},
+	]);
+	const third = state.recordInvalidDecision(activeDecisionId, "third");
+	assert.deepEqual(third.effects, [
+		{ kind: "restoreDecisionTools", decisionId: activeDecisionId },
+		{ kind: "decisionFailed", error: "third" },
+	]);
+	assert.equal(state.snapshot.attempt, 0);
+	assert.equal(state.snapshot.decisionFailed, true);
+	assert.equal(state.snapshot.decisionOpen, false);
+	assert.equal(state.beginDecision().applied, false);
+});
 
-	suppliedConfig.idleDelaySeconds = 999;
-	suppliedConfig.maxRetries = 999;
-	assert.equal(arm.delaySeconds, 3);
-
-	const nonString = openDecision(state);
-	const hostile = state.recordInvalidDecision(
-		nonString.decisionId,
-		Symbol("not-a-string"),
+test("transactional rollback restores invalid and continue accounting", () => {
+	const state = controller(2);
+	state.lock();
+	const activeDecisionId = openDecision(state);
+	state.recordInvalidDecision(activeDecisionId, "temporary");
+	assert.equal(
+		state.rollbackInvalidDecision(activeDecisionId, 0, null).applied,
+		true,
 	);
+	assert.equal(state.snapshot.invalidDecisionAttempts, 0);
+	assert.equal(state.snapshot.lastInvalidDecisionError, null);
+
+	state.recordValidContinue(activeDecisionId);
+	assert.equal(state.snapshot.attempt, 1);
+	assert.equal(state.rollbackValidContinue().applied, true);
+	assert.equal(state.snapshot.attempt, 0);
+	assert.equal(state.snapshot.exhausted, false);
+	assert.equal(state.rollbackValidContinue().applied, false);
+});
+
+test("invalidating and unlocking require the current decision id", () => {
+	const state = controller();
+	state.lock();
+	const activeDecisionId = openDecision(state);
+
+	assert.equal(state.invalidateDecision(activeDecisionId + 1).applied, false);
+	assert.equal(state.recordValidUnlock(activeDecisionId + 1).applied, false);
+	assert.deepEqual(state.invalidateDecision(activeDecisionId).effects, [
+		{ kind: "restoreDecisionTools", decisionId: activeDecisionId },
+	]);
+
+	const unlockDecisionId = openDecision(state);
+	assert.deepEqual(state.recordValidUnlock(unlockDecisionId).effects, [
+		{ kind: "restoreDecisionTools", decisionId: unlockDecisionId },
+		{ kind: "notify", notification: "unlocked" },
+	]);
+	assert.equal(state.snapshot.locked, false);
+});
+
+test("snapshots are fresh and construction copies retry config", () => {
+	const supplied = { maxRetries: 2 };
+	const state = createLockDecisionController(supplied);
+	state.lock();
+	const first = state.snapshot;
+	const second = state.snapshot;
+	assert.notEqual(first, second);
+	assert.deepEqual(first, second);
+
+	supplied.maxRetries = 99;
+	state.recordValidContinue(openDecision(state));
+	state.recordValidContinue(openDecision(state));
+	assert.equal(state.snapshot.exhausted, true);
+
+	state.lock();
+	const hostileId = openDecision(state);
+	const hostile = state.recordInvalidDecision(hostileId, Symbol("invalid"));
 	assert.equal(
 		hostile.effects[0]?.kind === "reaskDecision"
 			? hostile.effects[0].error

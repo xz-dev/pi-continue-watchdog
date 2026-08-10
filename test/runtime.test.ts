@@ -170,7 +170,9 @@ interface PendingConfirm {
 	resolve(value: boolean): void;
 }
 
-function createFenceHarness() {
+function createFenceHarness(options?: {
+	readonly reject?: "markBusy" | "markIdle" | "setInternalDecision";
+}) {
 	let snapshot = idleDomainSnapshot();
 	let confirmResult = true;
 	let deferred = false;
@@ -185,11 +187,17 @@ function createFenceHarness() {
 		},
 		isRootProcess: true,
 		async attach() {},
-		async markBusy(_instance, options) {
-			internalDecisionMarks.push(options?.internalDecision ?? false);
+		async markBusy(_instance, markOptions) {
+			if (options?.reject === "markBusy") throw new Error("markBusy failed");
+			internalDecisionMarks.push(markOptions?.internalDecision ?? false);
 		},
-		async markIdle() {},
+		async markIdle() {
+			if (options?.reject === "markIdle") throw new Error("markIdle failed");
+		},
 		async setInternalDecision(_instance, internal) {
+			if (options?.reject === "setInternalDecision") {
+				throw new Error("setInternalDecision failed");
+			}
 			internalDecisionMarks.push(internal);
 		},
 		confirm(fence: DomainFence) {
@@ -571,101 +579,25 @@ test("idle arms one unref timer and opens one hidden decision-only window", asyn
 	});
 });
 
-test("compacts before sending a watchdog question near the context limit", async () => {
-	let complete: (() => void) | undefined;
-	const predictedPrompts: string[] = [];
+test("watchdog decision leaves compaction entirely to the host", async () => {
+	let predicted = 0;
+	let compacted = 0;
 	const harness = createHarness({
-		wouldTriggerAutoCompaction: (content) => {
-			predictedPrompts.push(content);
+		wouldTriggerAutoCompaction: () => {
+			predicted += 1;
 			return true;
 		},
-		onCompact: (options) => {
-			complete = options.onComplete;
+		onCompact: () => {
+			compacted += 1;
 		},
 	});
 	await startIdle(harness);
 	await harness.openDecision();
 
-	assert.equal(predictedPrompts.length, 1);
-	assert.match(predictedPrompts[0] ?? "", /exactly one <watchdog>/);
-	assert.equal(harness.sent.length, 0);
-	assert.equal(harness.controller.snapshot.decisionOpen, false);
-	assert.equal(harness.controller.snapshot.attempt, 0);
-	assert.equal(harness.widgets.length, 0);
-	assert.equal(typeof complete, "function");
-	complete?.();
-	await Promise.resolve();
-	await Promise.resolve();
-
+	assert.equal(predicted, 0);
+	assert.equal(compacted, 0);
 	assert.equal(harness.controller.snapshot.decisionOpen, true);
-	assert.equal(harness.controller.snapshot.attempt, 0);
 	assert.equal(harness.sent[0]?.message.customType, DECISION_MESSAGE_TYPE);
-});
-
-test("queued user input after pre-question compaction prevents the watchdog decision send", async () => {
-	let complete: (() => void) | undefined;
-	const harness = createHarness({
-		wouldTriggerAutoCompaction: () => true,
-		onCompact: (options) => {
-			complete = options.onComplete;
-		},
-	});
-	await startIdle(harness);
-	await harness.openDecision();
-
-	await harness.fireInput("interactive", "queued during compaction");
-	// The TUI compaction queue is private and not included by the upstream
-	// hasPendingMessages() signal, so the input lifecycle generation must fence it.
-	complete?.();
-	await Promise.resolve();
-	await Promise.resolve();
-
-	assert.equal(harness.sent.length, 0);
-	assert.equal(harness.controller.snapshot.decisionOpen, false);
-	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
-	assert.equal(harness.controller.snapshot.locked, true);
-});
-
-test("failed pre-question compaction clears the timer intent and waits for a fresh idle epoch", async () => {
-	let fail: ((error: Error) => void) | undefined;
-	const harness = createHarness({
-		wouldTriggerAutoCompaction: () => true,
-		onCompact: (options) => {
-			fail = options.onError;
-		},
-	});
-	await startIdle(harness);
-	await harness.openDecision();
-
-	assert.equal(typeof fail, "function");
-	fail?.(new Error("compaction failed"));
-	await Promise.resolve();
-	await Promise.resolve();
-	assert.equal(harness.controller.snapshot.decisionOpen, false);
-	assert.equal(harness.controller.snapshot.attempt, 0);
-	assert.equal(harness.controller.snapshot.idleTimer?.delaySeconds, 3);
-	assert.equal(harness.clock.records.at(-1)?.delayMs, 3000);
-});
-
-test("a stale pre-question compaction gate cannot open a newer timer's decision", async () => {
-	let complete: (() => void) | undefined;
-	const harness = createHarness({
-		wouldTriggerAutoCompaction: () => true,
-		onCompact: (options) => {
-			complete = options.onComplete;
-		},
-	});
-	await startIdle(harness);
-	await harness.openDecision();
-
-	await harness.runtime.restartLockCycle(harness.ctx, { notifyLocked: false });
-	complete?.();
-	await Promise.resolve();
-	await Promise.resolve();
-
-	assert.equal(harness.sent.length, 0);
-	assert.equal(harness.controller.snapshot.decisionOpen, false);
-	assert.equal(harness.clock.records.at(-1)?.delayMs, 3000);
 });
 
 test("maximum configured decision prompt still opens and re-asks with generated XML suffix", async () => {
@@ -750,11 +682,14 @@ test("busy activity cancels the current chunk of a long delay", async () => {
 		hasUI: false,
 		initialBusy: false,
 	}).attachment;
+	const activeTimer = harness.clock.records.at(-1);
+	const timersAfterBind = harness.clock.records.length;
+	assert.ok(activeTimer);
 
 	harness.hub.markBusy(child);
-	assert.equal(harness.clock.records[0]?.cleared, true);
-	harness.clock.fire(0);
-	assert.equal(harness.clock.records.length, 1);
+	assert.equal(activeTimer.cleared, true);
+	activeTimer.callback();
+	assert.equal(harness.clock.records.length, timersAfterBind);
 	assert.equal(harness.sent.length, 0);
 });
 
@@ -791,12 +726,15 @@ test("observable child busy cancels and full idle restarts the same delay", asyn
 		hasUI: false,
 		initialBusy: false,
 	}).attachment;
+	const activeTimer = harness.clock.records.at(-1);
+	const timersAfterBind = harness.clock.records.length;
+	assert.ok(activeTimer);
 
 	harness.hub.markBusy(child);
-	assert.equal(harness.clock.records[0]?.cleared, true);
+	assert.equal(activeTimer.cleared, true);
 	harness.hub.markIdle(child);
-	assert.equal(harness.clock.records.length, 2);
-	assert.equal(harness.clock.records[1]?.delayMs, 3000);
+	assert.equal(harness.clock.records.length, timersAfterBind + 1);
+	assert.equal(harness.clock.records.at(-1)?.delayMs, 3000);
 });
 
 test("agent_end finalizes while streaming but settled alone dispatches continue", async () => {
@@ -1073,19 +1011,17 @@ test("decision window blocks ordinary tool_call before execution", async () => {
 	assert.equal(await harness.blockToolCall(), undefined);
 });
 
-test("continued settle rearms exponential delay once and exhausts at max", async () => {
+test("continued settle rearms the fixed delay once and exhausts at max", async () => {
 	const harness = createHarness({ config: { maxRetries: 2 } });
 	await startIdle(harness);
 	await harness.openDecision();
 	await settleResponse(harness, harness.answerContinue());
-
-	assert.equal(harness.clock.records.at(-1)?.delayMs, 6000);
+	harness.streaming = true;
 	await harness.fire("agent_start", { type: "agent_start" });
-	assert.equal(harness.clock.records.at(-1)?.cleared, true);
+	harness.streaming = false;
 	await settleOnly(harness);
-	assert.equal(harness.controller.snapshot.idleTimer?.delaySeconds, 6);
 	const secondTimer = harness.clock.records.findIndex(
-		(record) => record.delayMs === 6000 && !record.cleared,
+		(record, index) => index > 0 && record.delayMs === 3000 && !record.cleared,
 	);
 	assert.ok(secondTimer >= 0);
 	harness.clock.fire(secondTimer);
@@ -1093,7 +1029,7 @@ test("continued settle rearms exponential delay once and exhausts at max", async
 
 	assert.equal(harness.controller.snapshot.exhausted, true);
 	assert.equal(harness.controller.snapshot.attempt, 2);
-	assert.equal(harness.controller.snapshot.idleTimer, null);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
 });
 
 test("valid unlock folds without a turn and leaves one compact persisted result", async () => {
@@ -1284,7 +1220,7 @@ test("external unlock after agent_end cancels pending continue before settle", a
 	assert.equal(harness.sent.length, sentBefore);
 	assert.equal(harness.triggeredTurns, turnsBefore);
 	assert.equal(harness.controller.snapshot.locked, false);
-	assert.equal(harness.controller.snapshot.idleTimer, null);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
 });
 
 test("Examples 1-2: restart lock cycle clears an open decision, then locks and notifies once", async () => {
@@ -1316,7 +1252,12 @@ test("Examples 1-2: restart lock cycle clears an open decision, then locks and n
 	assert.equal(harness.controller.snapshot.decisionOpen, false);
 	harness.streaming = false;
 	await settleOnly(harness);
-	assert.equal(harness.controller.snapshot.idleTimer?.delaySeconds, 3);
+	assert.equal(
+		harness.clock.records.some(
+			(record) => record.delayMs === 3000 && !record.cleared,
+		),
+		true,
+	);
 });
 
 test("Example 2: restart from unlocked still performs silent unlock cleanup before fresh lock", async () => {
@@ -1348,7 +1289,7 @@ test("manual lock after pending continue clears fold and rearms base idle delay"
 
 	await harness.runtime.restartLockCycle(harness.ctx, { notifyLocked: true });
 	assert.equal(harness.controller.snapshot.attempt, 0);
-	assert.equal(harness.controller.snapshot.idleTimer?.delaySeconds, 3);
+	assert.equal(harness.clock.records.at(-1)?.delayMs, 3000);
 });
 
 test("restart lock cycle cancels an old idle timer and reconciles one fresh base timer", async () => {
@@ -1550,6 +1491,25 @@ test("stale fenced valid continue does not consume retry or exhaust", async () =
 	);
 });
 
+test("domain uncertainty before unlock delivery defers the typed unlock", async () => {
+	const fence = createFenceHarness();
+	const harness = createHarness({ processDomain: fence.domain });
+	await startIdle(harness);
+	await harness.openDecision();
+	await Promise.resolve();
+	await Promise.resolve();
+	await harness.endDecisionMessage(harness.answerUnlock("wait", "WAIT_USER"));
+	fence.advanceFence(true);
+	await settleOnly(harness);
+
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(
+		harness.entries.some((entry) => entry.type === HUMAN_UNLOCK_ENTRY_TYPE),
+		false,
+	);
+});
+
 test("stale fenced valid unlock does not unlock", async () => {
 	const fence = createFenceHarness();
 	const harness = createHarness({ processDomain: fence.domain });
@@ -1593,7 +1553,7 @@ test("stale fenced third invalid response preserves counts and permits retry", a
 
 	// A later idle epoch remains eligible for a fresh decision attempt.
 	harness.runtime.reconcileIdle();
-	assert.equal(harness.controller.snapshot.idleTimer !== null, true);
+	assert.equal(harness.clock.records.at(-1)?.delayMs, 3000);
 });
 
 test("pending valid continue keeps reconcile inert until fold delivery", async () => {
@@ -1610,7 +1570,7 @@ test("pending valid continue keeps reconcile inert until fold delivery", async (
 	const timersAfterEnd = harness.clock.records.length;
 	harness.runtime.reconcileIdle();
 	assert.equal(harness.clock.records.length, timersAfterEnd);
-	assert.equal(harness.controller.snapshot.idleTimer, null);
+	assert.equal(harness.controller.snapshot.decisionOpen, true);
 
 	harness.streaming = false;
 	await settleOnly(harness);
@@ -1618,7 +1578,12 @@ test("pending valid continue keeps reconcile inert until fold delivery", async (
 		harness.sent.at(-1)?.message.customType,
 		DECISION_FOLD_MESSAGE_TYPE,
 	);
-	assert.equal(harness.clock.records.at(-1)?.delayMs, 6000);
+	assert.equal(
+		harness.clock.records.some(
+			(record) => record.delayMs === 3000 && !record.cleared,
+		),
+		true,
+	);
 });
 
 test("child completion only makes aggregate idle; exactly one inquiry comes from main", async () => {
@@ -1848,6 +1813,11 @@ test("effective config loads before binding is reconciled and shutdown blocks la
 	assert.ok(loadedController);
 	assert.equal(loadedController.snapshot.locked, false);
 	assert.equal(runtime.config.idleDelaySeconds, 4);
+	runtime.applyTransition(loadedController.lock(), undefined, {
+		suppressNotify: true,
+	});
+	runtime.reconcileIdle();
+	assert.equal(clock.records.at(-1)?.delayMs, 4000);
 
 	runtime.shutdown();
 	assert.equal(holder.controller, null);
@@ -1896,6 +1866,132 @@ test("local Pi busy before idle timer callback defers; next true settle rearms",
 	harness.streaming = false;
 	await settleOnly(harness);
 	assert.equal(harness.controller.snapshot.attempt, 1);
+});
+
+test("observed pending input invalidates grace and clearing starts a fresh full grace", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	harness.runtime.reconcileIdle();
+	const firstGrace = harness.clock.records.length - 1;
+	assert.equal(harness.clock.records[firstGrace]?.delayMs, 3000);
+
+	harness.pendingMessages = true;
+	harness.runtime.reconcileIdle();
+	assert.equal(harness.clock.records[firstGrace]?.cleared, true);
+
+	harness.pendingMessages = false;
+	harness.runtime.reconcileIdle();
+	const secondGrace = harness.clock.records.length - 1;
+	assert.notEqual(secondGrace, firstGrace);
+	assert.equal(harness.clock.records[secondGrace]?.delayMs, 3000);
+	harness.clock.records[firstGrace]?.callback();
+	assert.equal(harness.sent.length, 0);
+
+	harness.clock.fire(secondGrace);
+	assert.equal(harness.sent.length, 1);
+});
+
+test("pending input appearing at grace expiry blocks dispatch until a fresh full grace", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	harness.runtime.reconcileIdle();
+	const firstGrace = harness.clock.records.length - 1;
+
+	harness.pendingMessages = true;
+	harness.clock.fire(firstGrace);
+	assert.equal(harness.sent.length, 0);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+
+	harness.pendingMessages = false;
+	harness.runtime.reconcileIdle();
+	const secondGrace = harness.clock.records.length - 1;
+	assert.notEqual(secondGrace, firstGrace);
+	assert.equal(harness.clock.records[secondGrace]?.delayMs, 3000);
+});
+
+test("rejected grace-expiry fence starts no decision and waits for a fresh generation", async () => {
+	const fence = createFenceHarness();
+	const harness = createHarness({ processDomain: fence.domain });
+	await startIdle(harness);
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	fence.failConfirm();
+	harness.runtime.reconcileIdle();
+	harness.clock.fire(harness.clock.records.length - 1);
+	await Promise.resolve();
+	await Promise.resolve();
+
+	assert.equal(harness.sent.length, 0);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+
+	fence.advanceFence();
+	const rearmed = [...harness.clock.records]
+		.reverse()
+		.find((record) => record.delayMs === 3000 && !record.cleared);
+	assert.ok(rearmed);
+});
+
+test("stale rejected grace qualification leaves the newer generation deadline unchanged", async () => {
+	const fence = createFenceHarness();
+	const harness = createHarness({ processDomain: fence.domain });
+	await startIdle(harness);
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	fence.deferConfirm();
+	harness.runtime.reconcileIdle();
+	harness.clock.fire(harness.clock.records.length - 1);
+	assert.equal(fence.pendingConfirmCount(), 1);
+
+	fence.advanceFence();
+	const newerTimer = harness.clock.records.at(-1);
+	const timersBeforeStaleRejection = harness.clock.records.length;
+	assert.ok(newerTimer);
+	assert.equal(newerTimer.delayMs, 3000);
+	assert.equal(newerTimer.cleared, false);
+
+	fence.resolvePendingConfirm(false);
+	await Promise.resolve();
+	await Promise.resolve();
+
+	assert.equal(harness.clock.records.length, timersBeforeStaleRejection);
+	assert.equal(newerTimer.cleared, false);
+	assert.equal(harness.sent.length, 0);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+});
+
+test("domain generation change during grace qualification makes the old callback inert", async () => {
+	const fence = createFenceHarness();
+	const harness = createHarness({ processDomain: fence.domain });
+	await startIdle(harness);
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	fence.deferConfirm();
+	harness.runtime.reconcileIdle();
+	harness.clock.fire(harness.clock.records.length - 1);
+	assert.equal(fence.pendingConfirmCount(), 1);
+
+	fence.advanceFence();
+	fence.resolvePendingConfirm(true);
+	await Promise.resolve();
+	await Promise.resolve();
+
+	assert.equal(harness.sent.length, 0);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	const rearmed = [...harness.clock.records]
+		.reverse()
+		.find((record) => record.delayMs === 3000 && !record.cleared);
+	assert.ok(rearmed);
 });
 
 test("local Pi busy during deferred initial fence confirm defers without consuming attempts", async () => {
@@ -1969,7 +2065,7 @@ test("timer confirm busy race clears intent and waits for the next full idle del
 	await Promise.resolve();
 	await Promise.resolve();
 	assert.equal(harness.sent.length, 0);
-	assert.equal(harness.controller.snapshot.idleTimer, null);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
 	assert.equal(harness.controller.snapshot.locked, true);
 
 	harness.streaming = false;
@@ -2330,6 +2426,65 @@ test("send-time busy TOCTOU defers silently; idle send failure still fail-closed
 		),
 		true,
 	);
+});
+
+test("runtime process-domain write rejection disables watchdog without escaping", async () => {
+	for (const operation of [
+		"markBusy",
+		"markIdle",
+		"setInternalDecision",
+	] as const) {
+		const fence = createFenceHarness({ reject: operation });
+		const harness = createHarness({ processDomain: fence.domain });
+		await startIdle(harness);
+
+		if (operation === "markBusy") {
+			harness.streaming = true;
+			await harness.fire("agent_start", { type: "agent_start" });
+		} else if (operation === "markIdle") {
+			harness.streaming = true;
+			await harness.fire("agent_start", { type: "agent_start" });
+			harness.streaming = false;
+			await harness.fire("agent_settled", { type: "agent_settled" });
+		} else {
+			await harness.openDecision({ start: false });
+			await Promise.resolve();
+			await Promise.resolve();
+			assert.equal(harness.sent.length, 1);
+			await harness.startDecision();
+		}
+
+		const timersAfterFailure = harness.clock.records.length;
+		harness.runtime.reconcileIdle();
+		if (operation === "setInternalDecision") {
+			assert.equal(harness.controller.snapshot.decisionOpen, false);
+			assert.equal(harness.aborts, 1);
+			assert.deepEqual(await harness.blockToolCall(), {
+				block: true,
+				reason: DECISION_TOOL_BLOCK_REASON,
+			});
+			const replacement = (await harness.endDecisionMessage(
+				assistant([text("untrusted failed-domain output")]),
+			)) as DecisionMessageReplacement;
+			assert.deepEqual(replacement.message.content, []);
+			assert.equal(
+				harness.sent.at(-1)?.message.customType,
+				DECISION_FOLD_MESSAGE_TYPE,
+			);
+			await harness.fire("agent_end", {
+				type: "agent_end",
+				messages: [assistant([], "aborted")],
+			});
+			assert.deepEqual(await harness.blockToolCall(), {
+				block: true,
+				reason: DECISION_TOOL_BLOCK_REASON,
+			});
+			harness.streaming = false;
+			await harness.fire("agent_settled", { type: "agent_settled" });
+			assert.equal(await harness.blockToolCall(), undefined);
+		}
+		assert.equal(harness.clock.records.length, timersAfterFailure);
+	}
 });
 
 test("initial process-domain authentication failure exits this watchdog instance", async () => {

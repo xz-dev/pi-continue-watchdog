@@ -24,10 +24,7 @@ import {
 	UNLOCK_COMMAND_DESCRIPTION,
 	UNLOCK_CONTINUE_WATCHDOG_COMMAND,
 } from "../src/commands.js";
-import {
-	type ControllerEffect,
-	createLockDecisionController,
-} from "../src/controller.js";
+import { createLockDecisionController } from "../src/controller.js";
 
 type RegisteredCommand = {
 	readonly description: string | undefined;
@@ -75,10 +72,7 @@ function createHarness(): CommandHarness {
 	}> = [];
 	const effects: CommandRuntimeEffect[] = [];
 	const timeline: string[] = [];
-	const controller = createLockDecisionController({
-		idleDelaySeconds: 3,
-		maxRetries: 2,
-	});
+	const controller = createLockDecisionController({ maxRetries: 2 });
 	let currentMain = true;
 
 	const pi = {
@@ -160,21 +154,9 @@ function createHarness(): CommandHarness {
 function armDecision(
 	controller: ReturnType<typeof createLockDecisionController>,
 ): number {
-	const timer = controller
-		.onAllObservableIdle()
-		.effects.find(
-			(effect): effect is Extract<ControllerEffect, { kind: "armIdleTimer" }> =>
-				effect.kind === "armIdleTimer",
-		);
-	assert.ok(timer, "expected an idle timer");
 	const decision = controller
-		.beginDecision(timer.timerId)
-		.effects.find(
-			(
-				effect,
-			): effect is Extract<ControllerEffect, { kind: "openDecisionWindow" }> =>
-				effect.kind === "openDecisionWindow",
-		);
+		.beginDecision()
+		.effects.find((effect) => effect.kind === "openDecisionWindow");
 	assert.ok(decision, "expected a decision window");
 	return decision.decisionId;
 }
@@ -343,24 +325,14 @@ test("Examples 2-3 RED: command transitions reset exhausted or decision-failed s
 	const continued = armDecision(harness.controller);
 	harness.controller.recordValidContinue(continued);
 	assert.equal(harness.controller.snapshot.attempt, 1);
-	const pendingTimer = harness.controller
-		.onAllObservableIdle()
-		.effects.find(
-			(effect): effect is Extract<ControllerEffect, { kind: "armIdleTimer" }> =>
-				effect.kind === "armIdleTimer",
-		);
-	assert.ok(pendingTimer);
 	harness.timeline.splice(0);
 	harness.effects.splice(0);
 	await harness.invoke(UNLOCK_CONTINUE_WATCHDOG_COMMAND);
 	assert.equal(harness.controller.snapshot.locked, false);
 	assert.equal(harness.controller.snapshot.attempt, 1);
-	assert.deepEqual(harness.effects, [
-		{ kind: "cancelIdleTimer", timerId: pendingTimer.timerId },
-	]);
+	assert.deepEqual(harness.effects, []);
 	assert.deepEqual(harness.timeline, [
 		"cleanup:locked=false",
-		"cancelIdleTimer",
 		"notify:Continue watchdog unlocked",
 	]);
 

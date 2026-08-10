@@ -110,25 +110,13 @@ function notifyCtx(
 }
 
 function makeController(): LockDecisionController {
-	return createLockDecisionController({ idleDelaySeconds: 3, maxRetries: 2 });
+	return createLockDecisionController({ maxRetries: 2 });
 }
 
 function decisionId(controller: LockDecisionController): number {
-	const timer = controller
-		.onAllObservableIdle()
-		.effects.find(
-			(effect): effect is Extract<ControllerEffect, { kind: "armIdleTimer" }> =>
-				effect.kind === "armIdleTimer",
-		);
-	assert.ok(timer);
 	const decision = controller
-		.beginDecision(timer.timerId)
-		.effects.find(
-			(
-				effect,
-			): effect is Extract<ControllerEffect, { kind: "openDecisionWindow" }> =>
-				effect.kind === "openDecisionWindow",
-		);
+		.beginDecision()
+		.effects.find((effect) => effect.kind === "openDecisionWindow");
 	assert.ok(decision);
 	return decision.decisionId;
 }

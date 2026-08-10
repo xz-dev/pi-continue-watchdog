@@ -22,13 +22,13 @@ silent cleanup → fresh watchdog lock
 observe main and same-process children
           │
           ▼
-all observable agents remain idle
+new authoritative aggregate all-idle generation
           │
           ▼
-wait idleDelaySeconds × 2^attempt
+wait one fixed idleDelaySeconds grace
           │
           ▼
-re-check ownership and aggregate idle
+qualify the same generation and re-check ownership/auth
           │
           ▼
 open one hidden XML decision check
@@ -43,8 +43,9 @@ open one hidden XML decision check
 | Module | Responsibility |
 |---|---|
 | `src/hub.ts` | Process-wide attachment registration, main election, and aggregate busy/idle state |
-| `src/controller.ts` | Pure lock/attempt/timer/decision state machine and ordered effects |
-| `src/runtime.ts` | Pi lifecycle wiring, timers, ownership fencing, XML capture, audit entries, and finalization delivery |
+| `src/activity-grace.ts` | One fixed grace per authoritative aggregate activity generation; stale callbacks are inert |
+| `src/controller.ts` | Pure lock, attempt, exhaustion, failure, and decision-window accounting |
+| `src/runtime.ts` | Aggregate generation wiring, ownership/auth fencing, XML capture, audit entries, and finalization delivery |
 | `src/decision-protocol.ts` | Fixed XML prompt suffix, XML extraction, validation, and three-response re-ask protocol |
 | `src/context-fold.ts` | Correlate complete decision exchanges and remove or replace them before provider requests |
 | `src/abort-outcome.ts` | Detect canonical main-run `stopReason: "aborted"` outcomes |
@@ -71,7 +72,7 @@ Observers contribute to aggregate busy/idle truth, but only the exact current ma
 
 - effective watchdog configuration;
 - the controller;
-- idle timers;
+- aggregate grace qualification;
 - decision checks;
 - notifications and TUI-only entries;
 - terminal `user-ready` publication.
@@ -88,7 +89,6 @@ attempt
 exhausted
 decisionFailed
 invalidDecisionAttempts
-idleTimer
 decisionOpen
 ```
 
@@ -115,15 +115,13 @@ An ordinary non-user `agent_start` only performs `ensureLocked()`:
 
 Unlock first assigns `locked = false`, then cancels operational timer and decision work. Ordinary unlock preserves retry/failure accounting; only a fresh lock cycle resets it.
 
-### Backoff
+### Aggregate-generation grace
 
-After each accepted continue decision, the next aggregate-idle delay is:
-
-```text
-delaySeconds = idleDelaySeconds × 2^attempt
-```
-
-With the defaults, the sequence starts at `10s, 20s, 40s, 80s, …`. Only valid continue decisions consume `maxRetries`.
+The runtime composes broker activity, main ownership, and local activity into
+one generation. Any activity, pending input/spawn, ownership change, or domain
+uncertainty invalidates that generation. Each new authoritative all-idle
+generation gets exactly one fixed `idleDelaySeconds` grace. Valid continue
+decisions consume `maxRetries` only; they do not change the grace duration.
 
 ## Ownership and stale-work fencing
 
@@ -131,7 +129,7 @@ Timers and asynchronous callbacks are not trusted merely because they fired. Run
 
 - the exact main ownership claim;
 - lifecycle and activity generations;
-- timer ID;
+- aggregate activity generation;
 - decision ID;
 - exchange ID;
 - decision cycle ID.
@@ -205,7 +203,7 @@ For unlock:
 - `reason_content` must be nonblank and at most 500 Unicode code points;
 - invalid AI reasons are rejected rather than truncated.
 
-The model receives at most three total decision responses. Invalid responses trigger immediate hidden re-asks and do not consume the exponential continue budget. The third invalid response enters `decisionFailed` until a fresh cycle.
+The model receives at most three total decision responses. Invalid responses trigger immediate hidden re-asks and do not consume the valid-continue retry budget. The third invalid response enters `decisionFailed` until a fresh cycle.
 
 ## Hiding the provider XML
 
@@ -360,7 +358,7 @@ Packed E2E creates a persistent session, triggers a decision, shuts it down, reo
 - append the terminal fold marker;
 - fold the exchange into `continuePrompt`;
 - trigger the next ordinary turn;
-- re-arm exponential delay after that work settles if still locked.
+- wait one fixed grace for the next authoritative all-idle generation if still locked.
 
 ### AI unlock
 
@@ -423,7 +421,7 @@ built-in defaults
 
 Project configuration is ignored when Pi does not trust the project. Invalid fields fall back to the next lower valid value and produce bounded diagnostics.
 
-Lock state, timers, ownership, and pending decisions are runtime-only. They are not restored across reload, new session, resume, restart, or shutdown. A later real main user message starts a fresh lock cycle.
+Lock state, aggregate grace, ownership, and pending decisions are runtime-only. They are not restored across reload, new session, resume, restart, or shutdown. A later real main user message starts a fresh lock cycle.
 
 ## Isolation guarantees and limits
 
@@ -454,7 +452,7 @@ The folder fails closed in those cases to avoid deleting genuine user conversati
 
 - multi-loader, same-process aggregate-idle ownership;
 - threshold compaction recovery;
-- the real default three-second decision path;
+- the real default ten-second decision path;
 - stable ordinary tools during decision and continuation;
 - continue and typed unlock outcomes;
 - final XML replacement and context-excluded audits;
@@ -474,7 +472,7 @@ same-process watchdog attachments
   <- inherited child/nested Pi observer participants
 ```
 
-`pi-process-domain` supplies immutable certain/all-idle snapshots and `{brokerEpoch, activityGeneration}` fences. The root captures a fence for each delay/decision and confirms it before automatic effects. Root's artificial watchdog decision run is suppressed only for that exact local attachment; any other local or remote work invalidates the decision. Stale automated exchanges are folded from later model context.
+`pi-process-domain` supplies immutable certain/all-idle snapshots and `{brokerEpoch, activityGeneration}` fences. The root captures a fence for each aggregate grace/decision and confirms it before automatic effects. Root's artificial watchdog decision run is suppressed only for that exact local attachment; any other local or remote work invalidates the decision. Stale automated exchanges are folded from later model context.
 
 The domain creator is decision root while its embedded broker is open. `PI_CONTINUE_WATCHDOG_ROOT_PID` marks that creator role and keeps inherited processes observer-only; final root detach clears the marker, closes the broker, and a later attachment creates a fresh domain instead of preserving a closed topology. Authentication remains the domain's 256-bit capability, which is never part of the endpoint path. Attachments await domain open before hub/controller participation and detach the shared participant after the final local shutdown.
 

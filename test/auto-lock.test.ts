@@ -6,10 +6,7 @@ import {
 	type MainUserAutoLockBinding,
 	registerMainUserAutoLock,
 } from "../src/auto-lock.js";
-import {
-	type ControllerEffect,
-	createLockDecisionController,
-} from "../src/controller.js";
+import { createLockDecisionController } from "../src/controller.js";
 import { createContinueWatchdogExtension } from "../src/extension.js";
 import {
 	createHubAttachmentInstance,
@@ -111,10 +108,7 @@ function fireHandlers(
 
 function createHarness(): Harness {
 	const hub = createObservableAgentHub();
-	const controller = createLockDecisionController({
-		idleDelaySeconds: 3,
-		maxRetries: 1,
-	});
+	const controller = createLockDecisionController({ maxRetries: 1 });
 	const handlers = new Map<string, LifecycleHandler[]>();
 	const calls: string[] = [];
 	const commandNames: string[] = [];
@@ -159,21 +153,9 @@ function userMessageStart(): unknown {
 function decisionId(
 	controller: ReturnType<typeof createLockDecisionController>,
 ): number {
-	const timer = controller
-		.onAllObservableIdle()
-		.effects.find(
-			(effect): effect is Extract<ControllerEffect, { kind: "armIdleTimer" }> =>
-				effect.kind === "armIdleTimer",
-		);
-	assert.ok(timer, "expected an idle timer");
 	const decision = controller
-		.beginDecision(timer.timerId)
-		.effects.find(
-			(
-				effect,
-			): effect is Extract<ControllerEffect, { kind: "openDecisionWindow" }> =>
-				effect.kind === "openDecisionWindow",
-		);
+		.beginDecision()
+		.effects.find((effect) => effect.kind === "openDecisionWindow");
 	assert.ok(decision, "expected a decision window");
 	return decision.decisionId;
 }
@@ -214,11 +196,6 @@ test("actual main user message_start locks without a command notification", () =
 		decisionFailed: false,
 		invalidDecisionAttempts: 0,
 		lastInvalidDecisionError: null,
-		idleTimer: {
-			id: 1,
-			attempt: 0,
-			delaySeconds: 3,
-		},
 		decisionOpen: false,
 	});
 });
@@ -300,10 +277,7 @@ test("non-user roles and missing messages are inert", () => {
 test("child, demoted, and detached handlers stay inert; reclaim restores main", () => {
 	const hub = createObservableAgentHub();
 	const oldMain = bindMain(hub, "headless-main", false);
-	const oldController = createLockDecisionController({
-		idleDelaySeconds: 3,
-		maxRetries: 1,
-	});
+	const oldController = createLockDecisionController({ maxRetries: 1 });
 	const oldHandlers = new Map<string, LifecycleHandler[]>();
 	registerMainUserAutoLock(
 		createMultiHandlerPi({ handlers: oldHandlers }),
@@ -316,10 +290,7 @@ test("child, demoted, and detached handlers stay inert; reclaim restores main", 
 		hasUI: false,
 	});
 	assert.ok(child.attachment);
-	const childController = createLockDecisionController({
-		idleDelaySeconds: 3,
-		maxRetries: 1,
-	});
+	const childController = createLockDecisionController({ maxRetries: 1 });
 	const childHandlers = new Map<string, LifecycleHandler[]>();
 	registerMainUserAutoLock(createMultiHandlerPi({ handlers: childHandlers }), {
 		isCurrentMain: () => false,
@@ -327,10 +298,7 @@ test("child, demoted, and detached handlers stay inert; reclaim restores main", 
 	});
 
 	const electedMain = bindMain(hub, "ui-main", true);
-	const electedController = createLockDecisionController({
-		idleDelaySeconds: 3,
-		maxRetries: 1,
-	});
+	const electedController = createLockDecisionController({ maxRetries: 1 });
 	const electedHandlers = new Map<string, LifecycleHandler[]>();
 	registerMainUserAutoLock(
 		createMultiHandlerPi({ handlers: electedHandlers }),

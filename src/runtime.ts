@@ -12,6 +12,10 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { isProcessDomainFatalError } from "pi-process-domain";
 
 import {
+	type ActivityGeneration,
+	createActivityGraceCoordinator,
+} from "./activity-grace.js";
+import {
 	CONTINUE_ENTRY_TYPE,
 	HUMAN_UNLOCK_ENTRY_TYPE,
 	type HumanUnlockEntry,
@@ -72,7 +76,6 @@ const nodeClock: RuntimeClock = {
 	now: () => Date.now(),
 };
 
-const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 const WATCHDOG_STATUS_WIDGET_KEY = "pi-continue-watchdog:status";
 
 /** Context-excluded persisted metadata for one model decision response. */
@@ -107,6 +110,7 @@ interface ActiveDecision {
 	readonly claim: HubMainClaim;
 	readonly protocol: DecisionProtocolSession;
 	readonly domainFence: import("pi-process-domain").DomainFence;
+	aggregateGeneration: ActivityGeneration;
 	invalidated: boolean;
 	/** True while a public fire-and-forget dispatch awaits matching lifecycle. */
 	dispatchPending: boolean;
@@ -120,12 +124,13 @@ interface PendingFinalization {
 	readonly plan: DecisionProtocolPlan;
 }
 
-interface ArmedTimer {
-	readonly handle: RuntimeTimerHandle;
-	readonly timerId: number;
-	readonly claim: HubMainClaim;
-	readonly domainFence: import("pi-process-domain").DomainFence;
-}
+type SelfDecisionRun =
+	| { readonly kind: "none" }
+	| {
+			readonly kind: "provisional" | "confirmed";
+			readonly exchangeId: string;
+			readonly cycleId: number;
+	  };
 
 type RuntimeContext = ExtensionCommandContext | ExtensionContext;
 
@@ -261,17 +266,20 @@ export function createDecisionRuntime(
 	let configLoad: Promise<void> | null = null;
 	let configReady = options.injectedController === true;
 	let lifecycleGeneration = 0;
-	/** Bumps on every agent_start so deferred settled wakes cannot outlive that run. */
-	let agentActivityGeneration = 0;
-	/** Bumps on real user input so an in-flight compaction gate cannot overtake it. */
-	let userInputGeneration = 0;
+	let localActivityGeneration = 0;
+	let observedPendingMessages = false;
 	/** Bumps when a deferred settled-phase callback is scheduled; only the latest acts. */
 	let settledCallbackGeneration = 0;
 	let stopped = false;
-	let armedTimer: ArmedTimer | null = null;
 	let activeDecision: ActiveDecision | null = null;
-	/** Suppress the aborted assistant of a watchdog decision preempted by user input. */
+	let selfDecisionRun: SelfDecisionRun = { kind: "none" };
+	/** Suppress an aborted internal decision after user takeover or domain failure. */
 	let suppressDecisionAbort = false;
+	/** Keep one failed-domain decision turn quarantined until its lifecycle ends. */
+	let quarantinedDecision: {
+		readonly exchangeId: string;
+		readonly cycleId: number;
+	} | null = null;
 	let capturedDecisionResponse: {
 		readonly active: ActiveDecision;
 		readonly cycleId: number;
@@ -324,13 +332,6 @@ export function createDecisionRuntime(
 		return effectiveClaim !== null && options.hub.isCurrentMain(effectiveClaim)
 			? controller
 			: null;
-	};
-
-	const clearArmedTimer = (timerId?: number): void => {
-		if (armedTimer === null) return;
-		if (timerId !== undefined && armedTimer.timerId !== timerId) return;
-		clock.clearTimeout(armedTimer.handle);
-		armedTimer = null;
 	};
 
 	const renderLiveStatus = (
@@ -433,8 +434,9 @@ export function createDecisionRuntime(
 	 * Does not change controller lock/cycle accounting.
 	 */
 	const clearOperationalPendingWork = (): void => {
-		clearArmedTimer();
+		localActivityGeneration += 1;
 		activeDecision = null;
+		selfDecisionRun = { kind: "none" };
 		domainInternalDecision = false;
 		suppressDecisionAbort = false;
 		capturedDecisionResponse = null;
@@ -442,7 +444,53 @@ export function createDecisionRuntime(
 		clearLiveStatus();
 		// Human/abort unlock must not inherit a prior AI unlock publication intent.
 		pendingAiUnlock = null;
+		observeAggregate();
 	};
+
+	const disableDomain = (): void => {
+		if (domainFatal) return;
+		const active = activeDecision;
+		const quarantine =
+			active !== null &&
+			sessionContext?.isIdle() === false &&
+			(active.dispatchPending || active.submitted);
+		if (quarantine && active !== null) {
+			quarantinedDecision = {
+				exchangeId: active.exchangeId,
+				cycleId: active.protocol.currentCycleId,
+			};
+		}
+		if (active !== null) invalidateActiveDecision(true);
+		domainFatal = true;
+		domainReady = false;
+		domainInternalDecision = false;
+		clearOperationalPendingWork();
+		if (quarantine) {
+			// The trigger turn already started. Abort it and retain both tool blocking
+			// and assistant hiding until its agent lifecycle actually ends.
+			suppressDecisionAbort = true;
+			try {
+				sessionContext?.abort();
+			} catch {
+				// Quarantine remains authoritative when host abort is unavailable.
+			}
+		}
+	};
+
+	const domainWrite = async (
+		operation: () => Promise<void>,
+	): Promise<boolean> => {
+		if (!domainReady || domainFatal || options.processDomain === undefined)
+			return false;
+		try {
+			await operation();
+			return true;
+		} catch {
+			disableDomain();
+			return false;
+		}
+	};
+
 	/** Pi's same-runtime authoritative idle truth. */
 	const localIdle = (): boolean => sessionContext?.isIdle() === true;
 	/** Public queued-message signal present in every supported upstream Pi. */
@@ -451,12 +499,52 @@ export function createDecisionRuntime(
 		return typeof pending === "function" && pending.call(sessionContext);
 	};
 
+	const sameActivityGeneration = (
+		left: ActivityGeneration | null,
+		right: ActivityGeneration,
+	): boolean =>
+		left !== null &&
+		left.brokerEpoch === right.brokerEpoch &&
+		left.activityGeneration === right.activityGeneration &&
+		left.ownershipGeneration === right.ownershipGeneration &&
+		left.localActivityGeneration === right.localActivityGeneration;
+
+	const selfRunFor = (active: ActiveDecision): boolean =>
+		selfDecisionRun.kind !== "none" &&
+		selfDecisionRun.exchangeId === active.exchangeId &&
+		selfDecisionRun.cycleId === active.protocol.currentCycleId;
+
+	const externalHubIdle = (): boolean => {
+		const snapshot = options.hub.snapshot;
+		const selfBusy =
+			selfDecisionRun.kind !== "none" && attachment !== null && !localIdle();
+		return (
+			snapshot.main !== null && snapshot.busyCount - (selfBusy ? 1 : 0) === 0
+		);
+	};
+
 	const allIdleForClaim = (claim: HubMainClaim): boolean =>
 		owns(claim) &&
-		options.hub.snapshot.allObservableIdle &&
+		externalHubIdle() &&
 		domainIdle() &&
-		localIdle() &&
-		!hasPendingMessages();
+		(localIdle() || selfDecisionRun.kind !== "none") &&
+		!hasPendingMessages() &&
+		selfDecisionRun.kind !== "provisional";
+
+	let observeAggregate = (): void => {};
+	let readyGeneration: ActivityGeneration | null = null;
+	let qualifyReady = (_generation: ActivityGeneration): void => {};
+	const createGraceCoordinator = () =>
+		createActivityGraceCoordinator({
+			graceSeconds: config.idleDelaySeconds,
+			clock: {
+				setTimeout: (callback, delayMs) => clock.setTimeout(callback, delayMs),
+				clearTimeout: (handle) => clock.clearTimeout(handle),
+				now,
+			},
+			onReady: (generation) => qualifyReady(generation),
+		});
+	let graceCoordinator = createGraceCoordinator();
 
 	/**
 	 * Defer an open decision because local Pi became busy (user input took over or
@@ -481,7 +569,10 @@ export function createDecisionRuntime(
 			);
 		}
 		activeDecision = null;
+		selfDecisionRun = { kind: "none" };
 		domainInternalDecision = false;
+		localActivityGeneration += 1;
+		observeAggregate();
 		// suppressDecisionAbort is owned by the user-takeover input hook and is
 		// intentionally not cleared here.
 	};
@@ -519,7 +610,12 @@ export function createDecisionRuntime(
 		decisionPrompt: string,
 		sendOptions?: { readonly deferOnBusy?: boolean },
 	): boolean => {
-		if (active.invalidated) return false;
+		if (
+			active.invalidated ||
+			!activeGenerationCurrent(active) ||
+			hasPendingMessages()
+		)
+			return false;
 		if (!allIdleForClaim(active.claim)) {
 			// A transactional re-ask caller rolls accounting back before deferring.
 			if (sendOptions?.deferOnBusy !== false) deferDecisionOnBusy(active);
@@ -537,6 +633,10 @@ export function createDecisionRuntime(
 				}),
 				{ triggerTurn: true, deliverAs: "steer" },
 			);
+			if (hasPendingMessages() || !activeGenerationCurrent(active)) {
+				deferDecisionOnBusy(active);
+				return false;
+			}
 			return true;
 		} catch (error) {
 			active.dispatchPending = false;
@@ -568,13 +668,20 @@ export function createDecisionRuntime(
 		);
 		const domainFence = options.processDomain?.snapshot.fence ?? {
 			brokerEpoch: "local",
-			activityGeneration: BigInt(options.hub.snapshot.revision),
+			activityGeneration: 0n,
 		};
 		const active: ActiveDecision = {
 			decisionId,
 			exchangeId: createExchangeId(),
 			claim,
 			domainFence,
+			aggregateGeneration: readyGeneration ??
+				graceCoordinator.snapshot.generation ?? {
+					brokerEpoch: domainFence.brokerEpoch,
+					activityGeneration: domainFence.activityGeneration,
+					ownershipGeneration: claim.generation,
+					localActivityGeneration,
+				},
 			invalidated: false,
 			dispatchPending: false,
 			submitted: false,
@@ -611,39 +718,6 @@ export function createDecisionRuntime(
 				deferDecisionOnBusy(active);
 				return;
 			}
-			if (options.processDomain !== undefined) {
-				const processDomain = options.processDomain;
-				void (async () => {
-					try {
-						const confirmed = await processDomain.confirm(active.domainFence);
-						if (
-							!confirmed ||
-							active.invalidated ||
-							activeDecision !== active ||
-							!allIdleForClaim(active.claim)
-						) {
-							invalidateActiveDecision();
-							return;
-						}
-						sendDecisionPrompt(
-							active,
-							active.protocol.currentCycleId,
-							decisionPrompt,
-						);
-					} catch (error) {
-						if (stillOwns() && localIdle()) {
-							appendStatus({
-								kind: "other-error",
-								exchangeId: active.exchangeId,
-								cycleId: active.protocol.currentCycleId,
-								message: originalErrorMessage(error),
-							});
-						}
-						silentlyAbandonDecision();
-					}
-				})();
-				return;
-			}
 			sendDecisionPrompt(
 				active,
 				active.protocol.currentCycleId,
@@ -666,209 +740,12 @@ export function createDecisionRuntime(
 		}
 	};
 
-	const compactBeforeDecision = (
-		claim: HubMainClaim,
-		timerId: number,
-		domainFence: import("pi-process-domain").DomainFence,
-	): boolean | Promise<boolean> => {
-		const ctx = sessionContext;
-		const controller = currentController(claim);
-		if (
-			ctx === null ||
-			controller === null ||
-			controller.snapshot.idleTimer?.id !== timerId ||
-			!allIdleForClaim(claim)
-		) {
-			return false;
-		}
-		const decisionPrompt = buildDecisionPrompt(
-			config.decisionPrompt,
-			config.reasonTypes,
-		);
-		const predict = (
-			ctx as ExtensionContext & {
-				wouldTriggerAutoCompaction?: (content: string) => boolean;
-			}
-		).wouldTriggerAutoCompaction;
-		try {
-			if (predict === undefined || !predict(decisionPrompt)) return true;
-		} catch {
-			return false;
-		}
-		const inputGeneration = userInputGeneration;
-
-		return (async () => {
-			const compacted = await new Promise<boolean>((resolve) => {
-				try {
-					ctx.compact({
-						onComplete: () => resolve(true),
-						onError: () => resolve(false),
-					});
-				} catch {
-					resolve(false);
-				}
-			});
-			if (
-				!compacted ||
-				userInputGeneration !== inputGeneration ||
-				!allIdleForClaim(claim)
-			)
-				return false;
-			if (
-				options.processDomain !== undefined &&
-				!(await options.processDomain.confirm(domainFence))
-			) {
-				return false;
-			}
-			return userInputGeneration === inputGeneration && allIdleForClaim(claim);
-		})();
-	};
-
-	const armIdleTimer = (timerId: number, delaySeconds: number): void => {
-		const claim = getMainClaim();
-		if (
-			claim === null ||
-			currentController(claim) === null ||
-			!domainIdle() ||
-			!localIdle()
-		)
-			return;
-		const domainFence = options.processDomain?.snapshot.fence ?? {
-			brokerEpoch: "local",
-			activityGeneration: BigInt(options.hub.snapshot.revision),
-		};
-		clearArmedTimer();
-
-		const deadline = Math.min(now() + delaySeconds * 1000, Number.MAX_VALUE);
-		const schedule = (): void => {
-			const delayMs = Math.min(
-				Math.max(0, deadline - now()),
-				MAX_TIMER_DELAY_MS,
-			);
-			const timer: ArmedTimer = {
-				timerId,
-				claim,
-				domainFence,
-				handle: clock.setTimeout(async () => {
-					if (armedTimer !== timer) return;
-					const controller = currentController(timer.claim);
-					if (
-						stopped ||
-						controller === null ||
-						!options.hub.snapshot.allObservableIdle ||
-						!domainIdle() ||
-						controller.snapshot.idleTimer?.id !== timer.timerId
-					) {
-						armedTimer = null;
-						return;
-					}
-					if (!localIdle()) {
-						// The local lifecycle edge has not reached the aggregate hub yet.
-						// Clear the controller timer intent now so the next authoritative
-						// agent_settled can arm a fresh full delay.
-						armedTimer = null;
-						applyTransition(controller.onObservableBusy(), undefined, {
-							claim: timer.claim,
-						});
-						return;
-					}
-					if (now() < deadline) {
-						schedule();
-						return;
-					}
-					if (
-						options.processDomain !== undefined &&
-						!(await options.processDomain.confirm(timer.domainFence))
-					) {
-						armedTimer = null;
-						applyTransition(controller.onObservableBusy(), undefined, {
-							claim: timer.claim,
-						});
-						return;
-					}
-					const confirmedController = currentController(timer.claim);
-					if (
-						armedTimer !== timer ||
-						confirmedController === null ||
-						confirmedController.snapshot.idleTimer?.id !== timer.timerId ||
-						!allIdleForClaim(timer.claim)
-					) {
-						if (armedTimer === timer) armedTimer = null;
-						if (
-							confirmedController !== null &&
-							confirmedController.snapshot.idleTimer?.id === timer.timerId
-						) {
-							applyTransition(
-								confirmedController.onObservableBusy(),
-								undefined,
-								{ claim: timer.claim },
-							);
-						}
-						return;
-					}
-					const beginAfterGate = (compacted: boolean): void => {
-						const readyController = currentController(timer.claim);
-						if (armedTimer !== timer) return;
-						if (
-							!compacted ||
-							readyController === null ||
-							!allIdleForClaim(timer.claim) ||
-							readyController.snapshot.idleTimer?.id !== timer.timerId
-						) {
-							armedTimer = null;
-							if (
-								readyController !== null &&
-								readyController.snapshot.idleTimer?.id === timer.timerId
-							) {
-								applyTransition(readyController.onObservableBusy(), undefined, {
-									claim: timer.claim,
-								});
-								if (allIdleForClaim(timer.claim)) reconcileIdle();
-							}
-							return;
-						}
-						armedTimer = null;
-						applyTransition(
-							readyController.beginDecision(timer.timerId),
-							undefined,
-							{ claim: timer.claim },
-						);
-					};
-					try {
-						const gate = compactBeforeDecision(
-							timer.claim,
-							timer.timerId,
-							timer.domainFence,
-						);
-						if (typeof gate === "boolean") {
-							beginAfterGate(gate);
-							return;
-						}
-						beginAfterGate(await gate);
-					} catch {
-						beginAfterGate(false);
-					}
-				}, delayMs),
-			};
-			armedTimer = timer;
-			timer.handle.unref?.();
-		};
-
-		schedule();
-	};
-
 	const applyEffect = (
 		effect: Exclude<ControllerEffect, { kind: "notify" }>,
 		_ctx?: RuntimeContext,
 	): void => {
 		if (currentController() === null) return;
 		switch (effect.kind) {
-			case "armIdleTimer":
-				armIdleTimer(effect.timerId, effect.delaySeconds);
-				break;
-			case "cancelIdleTimer":
-				clearArmedTimer(effect.timerId);
-				break;
 			case "openDecisionWindow":
 				openDecision(effect.decisionId);
 				break;
@@ -897,6 +774,7 @@ export function createDecisionRuntime(
 	): void => {
 		const claim = applyOptions?.claim ?? getMainClaim();
 		if (claim === null || !options.hub.isCurrentMain(claim)) return;
+		let opened: ActiveDecision | null = null;
 		for (const effect of transition.effects) {
 			if (!options.hub.isCurrentMain(claim)) return;
 			if (effect.kind === "notify") {
@@ -910,26 +788,140 @@ export function createDecisionRuntime(
 				continue;
 			}
 			applyEffect(effect, ctx);
+			if (effect.kind === "openDecisionWindow") opened = activeDecision;
+		}
+		if (transition.applied) {
+			localActivityGeneration += 1;
+			observeAggregate();
+		}
+		const latestGeneration = graceCoordinator.snapshot.generation;
+		if (opened !== null && latestGeneration !== null) {
+			opened.aggregateGeneration = latestGeneration;
 		}
 	};
 
-	const reconcileIdle = (): void => {
+	const aggregateInput = (): {
+		readonly allIdle: boolean;
+		readonly generation: ActivityGeneration;
+		readonly claim: HubMainClaim | null;
+		readonly fence: import("pi-process-domain").DomainFence;
+	} => {
 		const claim = getMainClaim();
 		const controller = currentController(claim);
-		if (
-			stopped ||
-			!configReady ||
-			claim === null ||
-			controller === null ||
-			!options.hub.snapshot.allObservableIdle ||
-			!domainIdle() ||
-			!localIdle() ||
-			pendingFinalization !== null
-		) {
-			return;
+		const domain = options.processDomain?.snapshot;
+		const fence = domain?.fence ?? {
+			brokerEpoch: "local",
+			activityGeneration: 0n,
+		};
+		const controllerEligible =
+			controller?.snapshot.locked === true &&
+			!controller.snapshot.exhausted &&
+			!controller.snapshot.decisionFailed &&
+			!controller.snapshot.decisionOpen;
+		const pendingMessages = hasPendingMessages();
+		if (pendingMessages !== observedPendingMessages) {
+			observedPendingMessages = pendingMessages;
+			localActivityGeneration += 1;
 		}
-		applyTransition(controller.onAllObservableIdle(), undefined, { claim });
+		const allIdle =
+			!stopped &&
+			configReady &&
+			claim !== null &&
+			owns(claim) &&
+			(domain === undefined
+				? options.hub.snapshot.allObservableIdle
+				: domain.certain && domain.allIdle) &&
+			externalHubIdle() &&
+			localIdle() &&
+			!pendingMessages &&
+			controllerEligible &&
+			activeDecision === null &&
+			pendingFinalization === null &&
+			selfDecisionRun.kind === "none";
+		return {
+			allIdle,
+			generation: {
+				brokerEpoch: fence.brokerEpoch,
+				activityGeneration: fence.activityGeneration,
+				ownershipGeneration: claim?.generation ?? 0,
+				localActivityGeneration,
+			},
+			claim,
+			fence,
+		};
 	};
+
+	observeAggregate = (): void => {
+		const input = aggregateInput();
+		graceCoordinator.update({
+			allIdle: input.allIdle,
+			generation: input.generation,
+		});
+	};
+
+	qualifyReady = (generation): void => {
+		void (async () => {
+			const before = aggregateInput();
+			if (
+				!before.allIdle ||
+				before.claim === null ||
+				!sameActivityGeneration(
+					graceCoordinator.snapshot.generation,
+					generation,
+				)
+			) {
+				observeAggregate();
+				return;
+			}
+			if (options.processDomain !== undefined) {
+				let confirmed = false;
+				try {
+					confirmed = await options.processDomain.confirm(before.fence);
+				} catch {
+					disableDomain();
+					return;
+				}
+				if (!confirmed) {
+					if (
+						graceCoordinator.snapshot.phase !== "ready" ||
+						!sameActivityGeneration(
+							graceCoordinator.snapshot.generation,
+							generation,
+						)
+					) {
+						return;
+					}
+					graceCoordinator.invalidate();
+					observeAggregate();
+					return;
+				}
+			}
+			observeAggregate();
+			const after = aggregateInput();
+			if (
+				!after.allIdle ||
+				after.claim === null ||
+				!sameActivityGeneration(after.generation, generation) ||
+				!sameActivityGeneration(
+					graceCoordinator.snapshot.generation,
+					generation,
+				) ||
+				graceCoordinator.snapshot.phase !== "ready"
+			) {
+				return;
+			}
+			readyGeneration = generation;
+			const controller = currentController(after.claim);
+			if (controller !== null) {
+				applyTransition(controller.beginDecision(), undefined, {
+					claim: after.claim,
+				});
+			}
+			readyGeneration = null;
+		})();
+	};
+
+	const reconcileIdle = (): void => observeAggregate();
 
 	/**
 	 * Fresh lock is deliberately a real unlock followed by cleanup and a new
@@ -1012,7 +1004,12 @@ export function createDecisionRuntime(
 		if (options.processDomain !== undefined) {
 			const snapshot = options.processDomain.snapshot;
 			if (!snapshot.certain || !snapshot.allIdle) return;
-			if (!(await options.processDomain.confirm(snapshot.fence))) return;
+			try {
+				if (!(await options.processDomain.confirm(snapshot.fence))) return;
+			} catch {
+				disableDomain();
+				return;
+			}
 			if (!allIdleForClaim(claim)) return;
 		}
 		if (aiUnlockIntent !== null) {
@@ -1086,6 +1083,10 @@ export function createDecisionRuntime(
 				return;
 			}
 			config = { ...loaded.config };
+			graceCoordinator.dispose();
+			graceCoordinator = createGraceCoordinator();
+			readyGeneration = null;
+			localActivityGeneration += 1;
 			options.controllerHolder.controller =
 				createLockDecisionController(config);
 			configReady = true;
@@ -1130,15 +1131,19 @@ export function createDecisionRuntime(
 			void maybePublishUserReady();
 		} else {
 			publishedForIdleEpoch = false;
-			applyTransition(controller.onObservableBusy(), undefined, { claim });
+			observeAggregate();
 		}
 	};
 
 	const unsubscribe = options.hub.subscribe(() => {
-		if (!stopped) syncHubState();
+		if (stopped) return;
+		const ownDecisionOnly =
+			selfDecisionRun.kind !== "none" && options.hub.snapshot.busyCount <= 1;
+		if (!ownDecisionOnly) localActivityGeneration += 1;
+		syncHubState();
 	});
 
-	const invalidateActiveDecision = (force = false): void => {
+	function invalidateActiveDecision(force = false): void {
 		const active = activeDecision;
 		const controller = options.controllerHolder.controller;
 		if (active === null || active.invalidated || controller === null) return;
@@ -1153,6 +1158,8 @@ export function createDecisionRuntime(
 			return;
 		}
 		active.invalidated = true;
+		localActivityGeneration += 1;
+		selfDecisionRun = { kind: "none" };
 		capturedDecisionResponse = null;
 		pendingFinalization = null;
 		clearLiveStatus();
@@ -1175,7 +1182,8 @@ export function createDecisionRuntime(
 		} catch {
 			// Context folding is best effort; no external watchdog outcome is emitted.
 		}
-	};
+		observeAggregate();
+	}
 
 	const unsubscribeDomain = options.processDomain?.subscribe(
 		(_snapshot, source) => {
@@ -1191,21 +1199,38 @@ export function createDecisionRuntime(
 		},
 	);
 
+	const activeGenerationCurrent = (active: ActiveDecision): boolean => {
+		const current = graceCoordinator.snapshot.generation;
+		return (
+			current !== null &&
+			sameActivityGeneration(current, active.aggregateGeneration)
+		);
+	};
+
 	const withDecisionFence = async (
 		active: ActiveDecision,
 		effect: () => void,
 	): Promise<boolean> => {
-		if (!allIdleForClaim(active.claim)) return false;
-		if (
-			options.processDomain !== undefined &&
-			!(await options.processDomain.confirm(active.domainFence))
-		) {
-			invalidateActiveDecision(true);
+		if (!activeGenerationCurrent(active) || !allIdleForClaim(active.claim))
 			return false;
+		if (options.processDomain !== undefined) {
+			let confirmed = false;
+			try {
+				confirmed = await options.processDomain.confirm(active.domainFence);
+			} catch {
+				disableDomain();
+				return false;
+			}
+			if (!confirmed) {
+				invalidateActiveDecision(true);
+				return false;
+			}
 		}
-		if (!allIdleForClaim(active.claim)) return false;
+		observeAggregate();
+		if (!activeGenerationCurrent(active) || !allIdleForClaim(active.claim))
+			return false;
 		effect();
-		return allIdleForClaim(active.claim);
+		return activeGenerationCurrent(active) && allIdleForClaim(active.claim);
 	};
 
 	/**
@@ -1233,18 +1258,28 @@ export function createDecisionRuntime(
 			return false;
 		}
 		const readyToFinalize = (): boolean =>
-			plan.outcome === "unlock"
-				? owns(active.claim) && localIdle()
-				: allIdleForClaim(active.claim);
+			activeGenerationCurrent(active) &&
+			owns(active.claim) &&
+			domainIdle() &&
+			externalHubIdle() &&
+			localIdle() &&
+			!hasPendingMessages();
 		if (!readyToFinalize()) {
-			if (plan.outcome !== "unlock") deferDecisionOnBusy(active);
+			deferDecisionOnBusy(active);
 			return false;
 		}
 		// Exact claim carried by this decision exchange — not a live re-lookup.
 		const claim = active.claim;
-		if (options.processDomain !== undefined && plan.outcome !== "unlock") {
+		if (options.processDomain !== undefined) {
 			if (!readyToFinalize()) return false;
-			if (!(await options.processDomain.confirm(active.domainFence))) {
+			let confirmed = false;
+			try {
+				confirmed = await options.processDomain.confirm(active.domainFence);
+			} catch {
+				disableDomain();
+				return false;
+			}
+			if (!confirmed) {
 				invalidateActiveDecision(true);
 				return false;
 			}
@@ -1256,7 +1291,7 @@ export function createDecisionRuntime(
 		// Local Pi and every observable attachment must still be idle to finalize;
 		// a busy race must not commit an invalid response or dispatch a re-ask.
 		if (!readyToFinalize()) {
-			if (plan.outcome !== "unlock") deferDecisionOnBusy(active);
+			deferDecisionOnBusy(active);
 			return false;
 		}
 		// Invalid re-asks have re-entrant status/UI work before dispatch. Keep the
@@ -1275,7 +1310,7 @@ export function createDecisionRuntime(
 				silentlyAbandonDecision();
 				return false;
 			}
-			if (!allIdleForClaim(claim)) return false;
+			if (!readyToFinalize()) return false;
 		}
 
 		const controllerBeforeCommit =
@@ -1285,7 +1320,7 @@ export function createDecisionRuntime(
 
 		if (finalization.outcome === "reask") {
 			if (stopIfStale(claim)) return false;
-			if (!allIdleForClaim(claim)) {
+			if (!readyToFinalize()) {
 				// Local Pi became busy after this invalid response was committed but
 				// before the re-ask could dispatch. Defer the whole exchange so the
 				// next settle cannot re-commit or consume another attempt.
@@ -1294,14 +1329,14 @@ export function createDecisionRuntime(
 			}
 			if (
 				stopIfStale(claim) ||
-				!allIdleForClaim(claim) ||
+				!readyToFinalize() ||
 				finalization.reaskPrompt === undefined ||
 				!active.protocol.advanceAfterReask(cycleId)
 			) {
 				silentlyAbandonDecision();
 				return false;
 			}
-			if (stopIfStale(claim) || !allIdleForClaim(claim)) {
+			if (stopIfStale(claim) || !readyToFinalize()) {
 				deferDecisionOnBusy(active);
 				return false;
 			}
@@ -1426,9 +1461,14 @@ export function createDecisionRuntime(
 			if (stopIfStale(claim)) return false;
 			if (!allIdleForClaim(claim)) return deferAcceptedContinue();
 			if (options.processDomain !== undefined) {
-				if (!(await options.processDomain.confirm(active.domainFence))) {
-					return deferAcceptedContinue();
+				let confirmed = false;
+				try {
+					confirmed = await options.processDomain.confirm(active.domainFence);
+				} catch {
+					disableDomain();
+					return false;
 				}
+				if (!confirmed) return deferAcceptedContinue();
 				if (!allIdleForClaim(claim)) return deferAcceptedContinue();
 			}
 			if (!allIdleForClaim(claim)) return deferAcceptedContinue();
@@ -1540,6 +1580,17 @@ export function createDecisionRuntime(
 	};
 
 	const handleDecisionMessageEnd = (event: MessageEndEvent) => {
+		if (quarantinedDecision !== null && event.message.role === "assistant") {
+			return {
+				message: {
+					...event.message,
+					content: [],
+					...(isAbortedAssistant(event.message)
+						? { stopReason: "stop" as const }
+						: {}),
+				},
+			};
+		}
 		// Suppress the aborted assistant of a watchdog decision preempted by user
 		// input so the TUI does not show `Operation aborted` for the internal run.
 		// The TUI renders abort text from `stopReason`, so neutralize both fields;
@@ -1620,6 +1671,11 @@ export function createDecisionRuntime(
 	};
 
 	const handleAgentEnd = (event: AgentEndEvent): void => {
+		if (quarantinedDecision !== null) {
+			// Keep blocking and hiding until authoritative agent_settled. Some hosts
+			// emit message_end after agent_end, so clearing here could leak output.
+			return;
+		}
 		const active = activeDecision;
 		if (active?.dispatchPending && !active.submitted && !active.invalidated) {
 			// A foreign run may end before the correlated decision message_start is
@@ -1698,39 +1754,50 @@ export function createDecisionRuntime(
 		}
 		active.dispatchPending = false;
 		active.submitted = true;
+		selfDecisionRun = {
+			kind: "confirmed",
+			exchangeId: active.exchangeId,
+			cycleId: active.protocol.currentCycleId,
+		};
 		domainInternalDecision = true;
-		if (domainReady && !domainFatal && options.processDomain !== undefined) {
-			await options.processDomain.setInternalDecision(
-				options.attachmentInstance,
-				true,
+		observeAggregate();
+		if (
+			domainReady &&
+			!domainFatal &&
+			options.processDomain !== undefined &&
+			!(await domainWrite(
+				() =>
+					options.processDomain?.setInternalDecision(
+						options.attachmentInstance,
+						true,
+					) ?? Promise.resolve(),
+			))
+		) {
+			return;
+		}
+		if (
+			options.processDomain !== undefined &&
+			(activeDecision !== active || active.invalidated || !owns(active.claim))
+		) {
+			domainInternalDecision = false;
+			await domainWrite(
+				() =>
+					options.processDomain?.setInternalDecision(
+						options.attachmentInstance,
+						false,
+					) ?? Promise.resolve(),
 			);
-			if (
-				activeDecision !== active ||
-				active.invalidated ||
-				!owns(active.claim)
-			) {
-				domainInternalDecision = false;
-				await options.processDomain.setInternalDecision(
-					options.attachmentInstance,
-					false,
-				);
-			}
 		}
 	};
 
 	const registerLifecycle = (): void => {
 		options.pi.on("session_start", async (_event, ctx: ExtensionContext) => {
 			++lifecycleGeneration;
+			localActivityGeneration += 1;
 			sessionContext = ctx;
 			if (options.processDomain !== undefined) {
 				let initialAttachComplete = false;
 				let initialAuthenticationExitRequested = false;
-				const disableDomain = (): void => {
-					domainFatal = true;
-					domainReady = false;
-					domainInternalDecision = false;
-					clearOperationalPendingWork();
-				};
 				const exitForInitialAuthenticationFailure = (error: Error): boolean => {
 					if (
 						initialAttachComplete ||
@@ -1776,8 +1843,6 @@ export function createDecisionRuntime(
 		});
 
 		options.pi.on("agent_start", async () => {
-			// Invalidate any deferred settled wake from a previous run on this attachment.
-			agentActivityGeneration += 1;
 			const claim = getMainClaim();
 			const controller = currentController(claim);
 			// A run that starts before the watchdog decision was actually submitted is
@@ -1798,7 +1863,17 @@ export function createDecisionRuntime(
 				!active.invalidated &&
 				owns(active.claim) &&
 				((active.dispatchPending && !active.submitted) ||
-					(active.submitted && domainInternalDecision));
+					(active.submitted && selfRunFor(active)));
+			if (provisionalInternal && active !== null) {
+				selfDecisionRun = {
+					kind: active.submitted ? "confirmed" : "provisional",
+					exchangeId: active.exchangeId,
+					cycleId: active.protocol.currentCycleId,
+				};
+			} else {
+				selfDecisionRun = { kind: "none" };
+				localActivityGeneration += 1;
+			}
 			domainInternalDecision = provisionalInternal;
 			if (claim !== null && controller !== null) {
 				const transition = controller.ensureLocked();
@@ -1814,10 +1889,14 @@ export function createDecisionRuntime(
 			}
 			if (attachment !== null) options.hub.markBusy(attachment);
 			if (domainReady && !domainFatal && options.processDomain !== undefined) {
-				await options.processDomain.markBusy(options.attachmentInstance, {
-					internalDecision: provisionalInternal,
-				});
+				await domainWrite(
+					() =>
+						options.processDomain?.markBusy(options.attachmentInstance, {
+							internalDecision: provisionalInternal,
+						}) ?? Promise.resolve(),
+				);
 			}
+			observeAggregate();
 		});
 
 		// A real user input (interactive or RPC) that arrives while a submitted
@@ -1831,7 +1910,9 @@ export function createDecisionRuntime(
 			if (event.source !== "interactive" && event.source !== "rpc") {
 				return;
 			}
-			userInputGeneration += 1;
+			localActivityGeneration += 1;
+			selfDecisionRun = { kind: "none" };
+			observeAggregate();
 			if (
 				active === null ||
 				active.invalidated ||
@@ -1860,6 +1941,12 @@ export function createDecisionRuntime(
 		// While a decision is open, block ordinary tools before execution. The
 		// agent loop continues so the final assistant XML can still be validated.
 		options.pi.on("tool_call", (_event) => {
+			if (quarantinedDecision !== null) {
+				return {
+					block: true,
+					reason: DECISION_TOOL_BLOCK_REASON,
+				};
+			}
 			const active = activeDecision;
 			if (
 				active === null ||
@@ -1879,10 +1966,25 @@ export function createDecisionRuntime(
 			// extension can start a nested run from an earlier settled handler.
 			if (stopped || !ctx.isIdle()) return;
 
+			if (quarantinedDecision !== null) {
+				quarantinedDecision = null;
+				suppressDecisionAbort = false;
+			}
+			if (selfDecisionRun.kind === "none") localActivityGeneration += 1;
 			if (attachment !== null) options.hub.markIdle(attachment);
+			if (selfDecisionRun.kind === "provisional") {
+				const pending = activeDecision;
+				selfDecisionRun = { kind: "none" };
+				localActivityGeneration += 1;
+				if (pending !== null) deferDecisionOnBusy(pending);
+			}
 			domainInternalDecision = false;
 			if (domainReady && !domainFatal && options.processDomain !== undefined) {
-				await options.processDomain.markIdle(options.attachmentInstance);
+				await domainWrite(
+					() =>
+						options.processDomain?.markIdle(options.attachmentInstance) ??
+						Promise.resolve(),
+				);
 			}
 			if (!isCurrentMain() || options.controllerHolder.controller === null)
 				return;
@@ -1894,7 +1996,7 @@ export function createDecisionRuntime(
 			// true-idle settle must leave this callback inert even if ctx is idle again.
 			const settledClaim = getMainClaim();
 			const settledLifecycleGeneration = lifecycleGeneration;
-			const settledActivityGeneration = agentActivityGeneration;
+			const settledAggregateGeneration = graceCoordinator.snapshot.generation;
 			const settledToken = ++settledCallbackGeneration;
 			const handle = clock.setTimeout(async () => {
 				// Later agent_start, a newer settle, session rebind, demotion, or nested
@@ -1903,7 +2005,15 @@ export function createDecisionRuntime(
 				if (
 					stopped ||
 					settledLifecycleGeneration !== lifecycleGeneration ||
-					settledActivityGeneration !== agentActivityGeneration ||
+					!sameActivityGeneration(
+						settledAggregateGeneration,
+						graceCoordinator.snapshot.generation ?? {
+							brokerEpoch: "stale",
+							activityGeneration: -1n,
+							ownershipGeneration: -1,
+							localActivityGeneration: -1,
+						},
+					) ||
 					settledToken !== settledCallbackGeneration ||
 					settledClaim === null ||
 					!options.hub.isCurrentMain(settledClaim) ||
@@ -1940,6 +2050,9 @@ export function createDecisionRuntime(
 		if (stopped) return;
 		stopped = true;
 		lifecycleGeneration += 1;
+		localActivityGeneration += 1;
+		quarantinedDecision = null;
+		graceCoordinator.dispose();
 		const detached = attachment;
 		if (detached !== null) options.hub.detach(detached);
 		// Hub ownership invalidation happens before local cleanup effects.
@@ -1950,7 +2063,11 @@ export function createDecisionRuntime(
 		unsubscribeDomain?.();
 		if (domainAttached && options.processDomain !== undefined) {
 			domainAttached = false;
-			await options.processDomain.detach(options.attachmentInstance);
+			try {
+				await options.processDomain.detach(options.attachmentInstance);
+			} catch {
+				// Runtime coordination is already disabled and local teardown is complete.
+			}
 		}
 	};
 

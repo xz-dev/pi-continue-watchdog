@@ -190,6 +190,10 @@ function createSemanticHarness(options?: {
 	readonly hasUI?: boolean;
 	readonly processDomain?: ProcessDomainCoordinator;
 	readonly isIdle?: () => boolean;
+	readonly onSend?: (
+		customType: string,
+		hub: ReturnType<typeof createObservableAgentHub>,
+	) => void;
 }): SemanticHarness {
 	const config: ContinueWatchdogConfig = {
 		idleDelaySeconds: options?.config?.idleDelaySeconds ?? 3,
@@ -240,10 +244,12 @@ function createSemanticHarness(options?: {
 		},
 		events: bus,
 		sendMessage(message: { customType?: string; details?: unknown }): void {
-			sentTypes.push(message.customType ?? "unknown");
+			const customType = message.customType ?? "unknown";
+			sentTypes.push(customType);
 			if (message.customType === "pi-continue-watchdog:decision") {
 				lastDecisionMessage = message;
 			}
+			options?.onSend?.(customType, hub);
 		},
 		appendEntry(): void {},
 	} as unknown as ExtensionAPI;
@@ -531,10 +537,13 @@ test("human unlock, abort unlock, continue, and initial unlocked idle publish no
 		suppressNotify: true,
 	});
 	human.runtime.clearOperationalPendingWork();
-	const timersBeforeArm = human.clock.records.length;
 	human.runtime.reconcileIdle();
-	assert.equal(human.clock.records.length, timersBeforeArm + 1);
-	assert.equal(human.clock.records.at(-1)?.delayMs, 3000);
+	assert.equal(
+		human.clock.records.some(
+			(record) => record.delayMs === 3000 && !record.cleared,
+		),
+		true,
+	);
 	human.runtime.applyTransition(human.controller.unlock(), undefined, {
 		suppressNotify: true,
 	});
@@ -560,30 +569,41 @@ test("human unlock, abort unlock, continue, and initial unlocked idle publish no
 	await settleResponse(continued, continued.answerContinue());
 	// Intermediate post-continue rearm must not publish.
 	assert.equal(continued.received.length, 0);
-	assert.notEqual(continued.controller.snapshot.idleTimer, null);
-	// Locked pending idle timer epoch stays quiet.
+	assert.equal(continued.controller.snapshot.locked, true);
+	// Locked pending grace epoch stays quiet.
 	continued.runtime.reconcileIdle();
 	assert.equal(continued.received.length, 0);
 });
 
 test("AI unlock intent waits for aggregate idle and publishes typed pair only once", async () => {
-	const harness = createSemanticHarness();
+	let child:
+		| ReturnType<
+				ReturnType<typeof createObservableAgentHub>["bind"]
+		  >["attachment"]
+		| null = null;
+	const harness = createSemanticHarness({
+		onSend(customType, hub) {
+			if (customType !== "pi-continue-watchdog:decision-fold") return;
+			child = hub.bind({
+				instance: createHubAttachmentInstance(),
+				sessionId: "child",
+				hasUI: false,
+				initialBusy: true,
+			}).attachment;
+		},
+	});
 	await startIdle(harness);
 	await harness.openDecision();
-	const child = harness.hub.bind({
-		instance: createHubAttachmentInstance(),
-		sessionId: "child",
-		hasUI: false,
-		initialBusy: true,
-	}).attachment;
 	await settleResponse(
 		harness,
 		harness.answerUnlock("Need deploy approval.", "wait_user"),
 	);
 	// Main settled but child busy: retain complete pair, no publish yet.
 	assert.equal(harness.received.length, 0);
+	assert.ok(child);
 
 	harness.hub.markIdle(child);
+	await Promise.resolve();
 	assert.equal(harness.received.length, 1);
 	assert.deepEqual(harness.received[0]?.values, {
 		STOP_KIND: "AI_UNLOCK",
@@ -782,20 +802,30 @@ async function establishPendingAiUnlock(
 	>["attachment"];
 }> {
 	const reasonType = options?.reasonType ?? "JOB_DONE";
+	let child:
+		| ReturnType<
+				ReturnType<typeof createObservableAgentHub>["bind"]
+		  >["attachment"]
+		| null = null;
 	const harness = createSemanticHarness({
 		hasUI: options?.hasUI ?? true,
+		onSend(customType, hub) {
+			if (customType !== "pi-continue-watchdog:decision-fold") return;
+			child = hub.bind({
+				instance: createHubAttachmentInstance(),
+				sessionId: `child-${reason}`,
+				hasUI: false,
+				initialBusy: true,
+			}).attachment;
+		},
 	});
 	await startIdle(harness);
 	await harness.openDecision();
-	const child = harness.hub.bind({
-		instance: createHubAttachmentInstance(),
-		sessionId: `child-${reason}`,
-		hasUI: false,
-		initialBusy: true,
-	}).attachment;
 	await settleResponse(harness, harness.answerUnlock(reason, reasonType));
+	await Promise.resolve();
 	assert.equal(harness.received.length, 0);
 	assert.equal(harness.snapshotController().locked, false);
+	assert.ok(child);
 	return { harness, child };
 }
 

@@ -43,17 +43,10 @@ function unlockXml(
 }
 
 function openDecision(reasonTypes: readonly string[] = REASON_TYPES) {
-	const controller = createLockDecisionController({
-		idleDelaySeconds: 3,
-		maxRetries: 2,
-	});
+	const controller = createLockDecisionController({ maxRetries: 2 });
 	controller.lock();
-	const timer = controller
-		.onAllObservableIdle()
-		.effects.find((effect) => effect.kind === "armIdleTimer");
-	assert.ok(timer);
 	const opened = controller
-		.beginDecision(timer.timerId)
+		.beginDecision()
 		.effects.find((effect) => effect.kind === "openDecisionWindow");
 	assert.ok(opened);
 	return {
