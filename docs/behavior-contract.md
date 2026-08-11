@@ -100,6 +100,7 @@ Continue until user assistance is required.
 6. **Universal main-run coverage.** Every current-main `agent_start` ensures the watchdog is locked. If already locked, the existing cycle is preserved; watchdog decision and continuation turns do not reset themselves. If unlocked, the start silently begins a fresh lock cycle.
 7. **Abort unlock.** When the current main run is **actually aborted as Pi reports** (the same outcome the TUI shows as aborted), unlock reasonlessly and immediately. Ordinary natural settle does **not** unlock. Never inspect or infer why a child stopped. Implementation may inspect Pi’s public session history to detect the main aborted outcome; the detection mechanism is replaceable as long as this behavior holds.
 8. **Stop-reason-independent idle recovery.** For any non-aborted main stop—including normal completion, Provider/model failure, extension runtime failure, or auto-compaction failure—the plugin uses only Pi's true idle lifecycle. It does not match error strings or special-case compaction.
+9. **Binary AI activity.** Each observable attachment is only `busy` or `idle`: `agent_start` assigns busy, and a true `agent_settled` assigns idle. Tool execution, model output, and waiting for Provider output are all part of the same busy interval and never become separate watchdog states.
 
 ---
 
@@ -444,7 +445,7 @@ With defaults, every eligible all-idle generation waits **10s**.
 **When** all observable sessions are idle again
 **Then** the **full** delay for the **same** current attempt restarts from zero
 
-At each `agent_settled`, only Pi's live `ctx.isIdle()` truth may mark that attachment idle. Every true-idle settle explicitly reconciles aggregate idle even when the hub already considered the attachment idle. A false-idle outer settle caused by an earlier extension starting a nested turn must not arm; the later true settle must arm normally.
+At each `agent_settled`, only Pi's live `ctx.isIdle()` truth may close that attachment's binary busy interval. Every true-idle settle explicitly reconciles aggregate idle even when the hub already considered the attachment idle. `ctx.isIdle()` is not polled between lifecycle boundaries to invent tool/output/wait sub-states. A false-idle outer settle caused by an earlier extension starting a nested turn must not arm; the later true settle must arm normally.
 
 Stale timer callbacks (wrong generation/epoch/ownership) must not open a decision window or wake main.
 

@@ -1823,7 +1823,27 @@ test("effective config loads before binding is reconciled and shutdown blocks la
 	assert.equal(holder.controller, null);
 });
 
-test("local Pi busy before idle timer callback defers; next true settle rearms", async () => {
+test("local AI state changes only at agent lifecycle boundaries", async () => {
+	let liveIdle = true;
+	const harness = createHarness({ isIdle: () => liveIdle });
+	await startIdle(harness);
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	harness.runtime.reconcileIdle();
+	const timer = harness.clock.records.at(-1);
+	assert.ok(timer);
+
+	// Pi lifecycle owns the binary AI state. Host subphase detail changing without
+	// agent_start must not invent a second busy/idle transition.
+	liveIdle = false;
+	harness.clock.fire(harness.clock.records.length - 1);
+
+	assert.equal(harness.sent.length, 1);
+	assert.equal(harness.sent[0]?.message.customType, DECISION_MESSAGE_TYPE);
+});
+
+test("agent_start before idle timer callback defers; next true settle rearms", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
 	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
@@ -1834,8 +1854,9 @@ test("local Pi busy before idle timer callback defers; next true settle rearms",
 	assert.ok(timer);
 	assert.equal(timer.delayMs, 3000);
 
-	// Local Pi becomes busy without any hub/domain edge (smallest scheduling window).
+	// One binary lifecycle edge covers tool execution, model output, and waiting.
 	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
 	harness.clock.fire(harness.clock.records.length - 1);
 
 	assert.equal(harness.sent.length, 0);
@@ -2067,6 +2088,7 @@ test("timer confirm busy race clears intent and waits for the next full idle del
 	assert.equal(fence.pendingConfirmCount(), 1);
 
 	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
 	fence.resolvePendingConfirm(true);
 	await Promise.resolve();
 	await Promise.resolve();
@@ -2226,7 +2248,7 @@ test("accepted continue busy races roll back retry and defer without unlocking",
 	await Promise.resolve();
 	await Promise.resolve();
 	assert.equal(fence.pendingConfirmCount(), 1);
-	duringConfirm.streaming = true;
+	await duringConfirm.startUnrelatedRun();
 	fence.resolvePendingConfirm(true);
 	await Promise.resolve();
 	await Promise.resolve();
@@ -2234,12 +2256,19 @@ test("accepted continue busy races roll back retry and defer without unlocking",
 	assert.equal(duringConfirm.controller.snapshot.locked, true);
 	assert.equal(duringConfirm.triggeredTurns, 1);
 
-	let sendBusy = false;
-	const atSend = createHarness({
-		isIdle: () => !sendBusy,
+	let atSend: Harness;
+	atSend = createHarness({
 		onSend(message) {
 			if (message.customType === DECISION_FOLD_MESSAGE_TYPE) {
-				sendBusy = true;
+				atSend.streaming = true;
+				void atSend.fire("agent_start", { type: "agent_start" });
+				void atSend.runtime.handleMessageStart({
+					message: {
+						role: "user",
+						content: [text("unrelated user work")],
+						timestamp: Date.now(),
+					},
+				});
 				return new Error("busy");
 			}
 			return undefined;
@@ -2376,14 +2405,14 @@ test("fire-and-forget ghost decision send is deferred instead of becoming a malf
 });
 
 test("send-time busy TOCTOU defers silently; idle send failure still fail-closed", async () => {
-	// Busy at the final send boundary: the hook flips local idle and throws the
-	// stock busy error; the watchdog must defer without unlock or error cards.
-	let busyHookStreaming = false;
-	const busy = createHarness({
-		isIdle: () => !busyHookStreaming,
+	// Busy at the final send boundary: only agent_start changes the binary AI
+	// state. The stock busy error must defer without unlock or error cards.
+	let busy: Harness;
+	busy = createHarness({
 		onSend(message) {
 			if (message.customType === DECISION_MESSAGE_TYPE) {
-				busyHookStreaming = true;
+				busy.streaming = true;
+				void busy.fire("agent_start", { type: "agent_start" });
 				return new Error(
 					"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
 				);

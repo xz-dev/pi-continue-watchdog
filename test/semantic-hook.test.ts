@@ -618,11 +618,7 @@ test("AI unlock intent waits for aggregate idle and publishes typed pair only on
 
 test("AI unlock intent is retained until publication confirmation succeeds", async () => {
 	const fence = deferredDomain();
-	let locallyIdle = true;
-	const harness = createSemanticHarness({
-		processDomain: fence.domain,
-		isIdle: () => locallyIdle,
-	});
+	const harness = createSemanticHarness({ processDomain: fence.domain });
 	await startIdle(harness);
 	fence.setDeferred(false);
 	await harness.openDecision();
@@ -660,17 +656,8 @@ test("AI unlock intent is retained until publication confirmation succeeds", asy
 	assert.ok(fence.confirmCallCount() >= 2);
 	assert.equal(fence.hasPending(), true);
 
-	// C2: only publication is now pending. Become locally busy before resolving
-	// it, so the retained intent cannot be consumed or emitted.
-	locallyIdle = false;
-	fence.resolve(true);
-	await new Promise<void>((resolve) => setImmediate(resolve));
-	assert.equal(harness.received.length, 0);
-
-	// A later genuine aggregate busy→idle edge with immediate confirmation emits
-	// the retained typed intent exactly once.
-	locallyIdle = true;
-	fence.setDeferred(false);
+	// C2: only publication is now pending. Another observable AI becomes busy
+	// before resolution, retaining the intent without inventing local sub-states.
 	const child = harness.hub.bind({
 		instance: createHubAttachmentInstance(),
 		sessionId: "publication-retry-child",
@@ -678,6 +665,12 @@ test("AI unlock intent is retained until publication confirmation succeeds", asy
 		initialBusy: false,
 	}).attachment;
 	harness.hub.markBusy(child);
+	fence.resolve(true);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(harness.received.length, 0);
+
+	// That AI's later idle edge with immediate confirmation publishes once.
+	fence.setDeferred(false);
 	harness.hub.markIdle(child);
 	for (
 		let attempt = 0;

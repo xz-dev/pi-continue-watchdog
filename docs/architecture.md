@@ -60,7 +60,11 @@ Every session attachment that loads this extension registers with one process-wi
 
 - session ID;
 - whether it has UI;
-- busy or idle state.
+- one binary AI activity state.
+
+Local activity has only two lifecycle transitions: `agent_start` assigns busy;
+a true `agent_settled` assigns idle. Tool execution, model output, and waiting for
+Provider output remain inside that busy interval and are not separate states.
 
 The election rules are:
 
@@ -117,11 +121,13 @@ Unlock first assigns `locked = false`, then cancels operational timer and decisi
 
 ### Aggregate-generation grace
 
-The runtime composes broker activity, main ownership, and local activity into
-one generation. Any activity, pending input/spawn, ownership change, or domain
-uncertainty invalidates that generation. Each new authoritative all-idle
-generation gets exactly one fixed `idleDelaySeconds` grace. Valid continue
-decisions consume `maxRetries` only; they do not change the grace duration.
+The runtime composes broker activity, main ownership, and binary local AI
+activity into one generation. Any busy transition, pending input/spawn,
+ownership change, or domain uncertainty invalidates that generation. Each new
+authoritative all-idle generation gets exactly one fixed `idleDelaySeconds`
+grace. Valid continue decisions consume `maxRetries` only; they do not change
+the grace duration. The runtime does not poll host subphases between lifecycle
+boundaries to reinterpret tool execution, output, or Provider wait as new states.
 
 ## Ownership and stale-work fencing
 

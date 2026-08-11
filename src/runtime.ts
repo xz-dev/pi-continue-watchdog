@@ -267,6 +267,8 @@ export function createDecisionRuntime(
 	let configReady = options.injectedController === true;
 	let lifecycleGeneration = 0;
 	let localActivityGeneration = 0;
+	/** Binary AI lifecycle state: agent_start = busy, true agent_settled = idle. */
+	let localAiBusy = true;
 	let observedPendingMessages = false;
 	/** Bumps when a deferred settled-phase callback is scheduled; only the latest acts. */
 	let settledCallbackGeneration = 0;
@@ -452,7 +454,7 @@ export function createDecisionRuntime(
 		const active = activeDecision;
 		const quarantine =
 			active !== null &&
-			sessionContext?.isIdle() === false &&
+			localAiBusy &&
 			(active.dispatchPending || active.submitted);
 		if (quarantine && active !== null) {
 			quarantinedDecision = {
@@ -491,8 +493,8 @@ export function createDecisionRuntime(
 		}
 	};
 
-	/** Pi's same-runtime authoritative idle truth. */
-	const localIdle = (): boolean => sessionContext?.isIdle() === true;
+	/** Binary local AI state; tool/output/provider-wait subphases stay busy. */
+	const localIdle = (): boolean => !localAiBusy;
 	/** Public queued-message signal present in every supported upstream Pi. */
 	const hasPendingMessages = (): boolean => {
 		const pending = sessionContext?.hasPendingMessages;
@@ -1795,6 +1797,7 @@ export function createDecisionRuntime(
 			++lifecycleGeneration;
 			localActivityGeneration += 1;
 			sessionContext = ctx;
+			localAiBusy = !ctx.isIdle();
 			if (options.processDomain !== undefined) {
 				let initialAttachComplete = false;
 				let initialAuthenticationExitRequested = false;
@@ -1813,7 +1816,7 @@ export function createDecisionRuntime(
 				};
 				try {
 					await options.processDomain.attach(options.attachmentInstance, {
-						initialBusy: !ctx.isIdle(),
+						initialBusy: localAiBusy,
 						onFatal: (error) => {
 							disableDomain();
 							exitForInitialAuthenticationFailure(error);
@@ -1835,7 +1838,7 @@ export function createDecisionRuntime(
 				instance: options.attachmentInstance,
 				sessionId: ctx.sessionManager.getSessionId(),
 				hasUI: ctx.hasUI,
-				initialBusy: !ctx.isIdle(),
+				initialBusy: localAiBusy,
 			});
 			attachment = bound.attachment;
 			syncHubState();
@@ -1843,6 +1846,7 @@ export function createDecisionRuntime(
 		});
 
 		options.pi.on("agent_start", async () => {
+			localAiBusy = true;
 			const claim = getMainClaim();
 			const controller = currentController(claim);
 			// A run that starts before the watchdog decision was actually submitted is
@@ -1962,9 +1966,10 @@ export function createDecisionRuntime(
 		});
 
 		options.pi.on("agent_settled", async (_event, ctx: ExtensionContext) => {
-			// Only Pi's live idle truth may mark this attachment idle. Another
-			// extension can start a nested run from an earlier settled handler.
+			// Only a true Pi settled boundary changes the binary AI state to idle.
+			// A later nested agent_start changes it back to busy before any wake acts.
 			if (stopped || !ctx.isIdle()) return;
+			localAiBusy = false;
 
 			if (quarantinedDecision !== null) {
 				quarantinedDecision = null;
@@ -2017,7 +2022,7 @@ export function createDecisionRuntime(
 					settledToken !== settledCallbackGeneration ||
 					settledClaim === null ||
 					!options.hub.isCurrentMain(settledClaim) ||
-					!ctx.isIdle()
+					!localIdle()
 				) {
 					return;
 				}
