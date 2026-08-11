@@ -280,6 +280,91 @@ test("partial or marker-inconsistent declarations fail closed", async () => {
 	}
 });
 
+test("failed initial attach rolls back and a later attachment opens fresh", async () => {
+	for (const failure of ["open", "snapshot", "subscribe", "marker"] as const) {
+		let failMarker = failure === "marker";
+		const env: NodeJS.ProcessEnv =
+			failure === "marker"
+				? new Proxy<NodeJS.ProcessEnv>(
+						{},
+						{
+							set(target, property, value) {
+								Reflect.set(target, property, value);
+								if (failMarker) {
+									failMarker = false;
+									throw new Error("transient marker failure");
+								}
+								return true;
+							},
+						},
+					)
+				: {};
+		const failedDomain = new FakeDomain();
+		const domain = new FakeDomain();
+		if (failure === "marker") {
+			failedDomain.close = async () => {
+				failedDomain.closeCount += 1;
+				throw new Error("rollback close failure");
+			};
+		}
+		let opens = 0;
+		let firstFatal = 0;
+		let secondFatal = 0;
+		if (failure === "snapshot") {
+			failedDomain.snapshot = () => {
+				throw new Error("transient snapshot failure");
+			};
+		}
+		if (failure === "subscribe") {
+			failedDomain.subscribe = () => {
+				throw new Error("transient subscribe failure");
+			};
+		}
+		const coordinator = createProcessDomainCoordinator({
+			env,
+			pid: 100,
+			open: async () => {
+				opens += 1;
+				if (opens === 1) {
+					if (failure === "open") throw new Error("transient open failure");
+					return { domain: failedDomain, created: true };
+				}
+				return { domain, created: true };
+			},
+		});
+		await assert.rejects(
+			coordinator.attach(
+				{},
+				{
+					initialBusy: false,
+					onFatal() {
+						firstFatal += 1;
+					},
+				},
+			),
+			new RegExp(`transient ${failure} failure`),
+		);
+		assert.equal(failedDomain.closeCount, failure === "open" ? 0 : 1);
+		assert.equal(env[WATCHDOG_ROOT_PID_ENV], undefined);
+		assert.equal(coordinator.isRootProcess, false);
+		assert.equal(coordinator.snapshot.domainId, "pending");
+
+		const second = {};
+		await coordinator.attach(second, {
+			initialBusy: false,
+			onFatal() {
+				secondFatal += 1;
+			},
+		});
+		assert.equal(opens, 2);
+		assert.equal(firstFatal, 1);
+		assert.equal(secondFatal, 0);
+		assert.equal(coordinator.isRootProcess, true);
+		await coordinator.detach(second);
+		assert.equal(domain.closeCount, 1);
+	}
+});
+
 test("final root detach recovers from a rejected write and reopens fresh", async () => {
 	const domains = [new FakeDomain(), new FakeDomain()];
 	const env: NodeJS.ProcessEnv = {};

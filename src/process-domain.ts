@@ -185,28 +185,53 @@ export function createProcessDomainCoordinator(
 				metadata: { role: "pi-continue-watchdog", pid: String(pid) },
 				onFatal: reportFatal,
 			});
-			handle = result.domain;
-			lastWritten = desiredActivity();
-			if (result.created) {
-				if (declared || marker !== undefined) {
-					await handle.close();
-					handle = null;
+			const opened = result.domain;
+			let openedSnapshot: DomainSnapshot | undefined;
+			let openedUnsubscribe: (() => void) | null = null;
+			let markerWritten = false;
+			try {
+				if (result.created && (declared || marker !== undefined)) {
 					throw new ProcessDomainFatalError(
 						"INVALID_DECLARATION",
 						"watchdog root role is inconsistent with domain creation",
 					);
 				}
-				env[WATCHDOG_ROOT_PID_ENV] = String(pid);
-				root = true;
-			} else {
-				// A declared domain without watchdog root metadata is observer-only.
-				// The marker is created only together with a brand-new declaration.
-				root = exactPid(marker) === pid;
+				openedSnapshot = opened.snapshot();
+				if (result.created) {
+					markerWritten = true;
+					env[WATCHDOG_ROOT_PID_ENV] = String(pid);
+				}
+				openedUnsubscribe = opened.subscribe((snapshot) => {
+					openedSnapshot = snapshot;
+					if (handle === opened) {
+						notify(snapshot, localWriteInFlight ? "local" : "domain");
+					}
+				});
+			} catch (error) {
+				if (markerWritten && exactPid(env[WATCHDOG_ROOT_PID_ENV]) === pid) {
+					try {
+						delete env[WATCHDOG_ROOT_PID_ENV];
+					} catch {
+						// Preserve the initialization failure; no coordinator state was published.
+					}
+				}
+				try {
+					openedUnsubscribe?.();
+				} catch {
+					// Preserve the initialization failure; no coordinator state was published.
+				}
+				try {
+					await opened.close();
+				} catch {
+					// Preserve the initialization failure; no coordinator state was published.
+				}
+				throw error;
 			}
-			notify(handle.snapshot(), "domain");
-			unsubscribeDomain = handle.subscribe((snapshot) =>
-				notify(snapshot, localWriteInFlight ? "local" : "domain"),
-			);
+			handle = opened;
+			unsubscribeDomain = openedUnsubscribe;
+			lastWritten = desiredActivity();
+			root = result.created || exactPid(marker) === pid;
+			notify(openedSnapshot, "domain");
 		})().catch((error: unknown) => {
 			const fatal =
 				error instanceof Error
@@ -230,20 +255,25 @@ export function createProcessDomainCoordinator(
 		},
 		attach(instance, attachOptions): Promise<void> {
 			return queueLifecycle(async () => {
-				if (!attachments.has(instance)) {
-					attachments.set(instance, {
-						busy: attachOptions.initialBusy,
-						internalDecision: false,
-						onFatal: attachOptions.onFatal,
-					});
-				}
-				await ensureOpen();
-				await queueWrite();
-				if (handle === null) {
-					throw new ProcessDomainFatalError(
-						"BROKER_UNAVAILABLE",
-						"watchdog process domain closed during attachment",
-					);
+				if (attachments.has(instance)) return;
+				attachments.set(instance, {
+					busy: attachOptions.initialBusy,
+					internalDecision: false,
+					onFatal: attachOptions.onFatal,
+				});
+				try {
+					await ensureOpen();
+					await queueWrite();
+					if (handle === null) {
+						throw new ProcessDomainFatalError(
+							"BROKER_UNAVAILABLE",
+							"watchdog process domain closed during attachment",
+						);
+					}
+				} catch (error) {
+					attachments.delete(instance);
+					if (attachments.size === 0 && handle === null) opening = null;
+					throw error;
 				}
 			});
 		},

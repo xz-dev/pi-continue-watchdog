@@ -25,6 +25,7 @@ export interface ActivityGraceCoordinator {
 		readonly allIdle: boolean;
 		readonly generation: ActivityGeneration;
 	}): void;
+	/** Block the current generation until a different generation is observed. */
 	invalidate(): void;
 	dispose(): void;
 }
@@ -138,7 +139,6 @@ export function createActivityGraceCoordinator(options: {
 			token += 1;
 			clearTimer();
 			phase = "blocked";
-			generation = null;
 			deadlineMs = null;
 		},
 		dispose(): void {

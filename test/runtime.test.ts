@@ -1924,13 +1924,19 @@ test("rejected grace-expiry fence starts no decision and waits for a fresh gener
 	});
 	fence.failConfirm();
 	harness.runtime.reconcileIdle();
-	harness.clock.fire(harness.clock.records.length - 1);
+	const rejectedGrace = harness.clock.records.length - 1;
+	harness.clock.fire(rejectedGrace);
 	await Promise.resolve();
 	await Promise.resolve();
 
 	assert.equal(harness.sent.length, 0);
 	assert.equal(harness.controller.snapshot.decisionOpen, false);
 	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(
+		harness.clock.records.length,
+		rejectedGrace + 1,
+		"the rejected authoritative generation stays consumed",
+	);
 
 	fence.advanceFence();
 	const rearmed = [...harness.clock.records]

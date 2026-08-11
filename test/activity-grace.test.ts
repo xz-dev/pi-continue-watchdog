@@ -224,7 +224,7 @@ test("timer safety does not depend on unique handles", () => {
 	assert.deepEqual(ready, [generation(3)]);
 });
 
-test("explicit invalidation requires a new observation before rearming", () => {
+test("explicit invalidation consumes the generation until activity changes", () => {
 	const clock = new FakeClock();
 	const ready: ActivityGeneration[] = [];
 	const coordinator = createActivityGraceCoordinator({
@@ -236,16 +236,20 @@ test("explicit invalidation requires a new observation before rearming", () => {
 	coordinator.update({ allIdle: true, generation: generation(1) });
 	coordinator.invalidate();
 	assert.equal(coordinator.snapshot.phase, "blocked");
-	assert.equal(coordinator.snapshot.generation, null);
+	assert.deepEqual(coordinator.snapshot.generation, generation(1));
 	assert.equal(clock.records[0]?.cleared, true);
 
 	coordinator.update({ allIdle: true, generation: generation(1) });
-	assert.equal(coordinator.snapshot.phase, "grace");
-	assert.equal(clock.records[1]?.delayMs, 10_000);
+	assert.equal(coordinator.snapshot.phase, "blocked");
+	assert.equal(clock.records.length, 1);
 	clock.records[0]?.callback();
 	assert.deepEqual(ready, []);
+
+	coordinator.update({ allIdle: true, generation: generation(2) });
+	assert.equal(coordinator.snapshot.phase, "grace");
+	assert.equal(clock.records[1]?.delayMs, 10_000);
 	clock.fire(1);
-	assert.deepEqual(ready, [generation(1)]);
+	assert.deepEqual(ready, [generation(2)]);
 });
 
 test("dispose makes every previously captured callback inert", () => {
