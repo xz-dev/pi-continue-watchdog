@@ -52,7 +52,7 @@ Observable behavior only (implementation details may change):
 4. During every decision cycle, a live colored Pi-TUI widget shows `Continue watchdog checking` and the current attempt. Each watchdog validation re-ask and non-watchdog error is also retained as a colored TUI-only event card with its exact safe parser/original error. **Continue** then appends `Continue watchdog continued`, so repeated automatic continuation is visible and cannot silently consume tokens. The complete hidden exchange folds into the compact prompt `Continue until user assistance is required.` (configurable), and ordinary work resumes without further user input.
 5. **AI unlock** requires an allowed `reason_type` and concise nonblank `reason_content` of at most 500 Unicode code points. It shows one muted persistent TUI line, `Continue watchdog unlocked · <TYPE> · <reason>`, with no duplicate transient notification, and does **not** start another work turn. Future model context drops the complete decision exchange. Human command unlock remains untyped.
 6. A decision gets up to **3 total attempts**. An invalid final XML response counts as one attempt; blocked ordinary tool calls and provisional Provider errors that Pi retries within the same run do not. Invalid raw text is not retained. After the third invalid response, the extension stays locked/failed until a new main user message or manual lock, and the failed exchange is folded out of future model context.
-7. After each valid continue, the next idle delay doubles: default **10s, 20s, 40s, …** up to **10** valid continues per lock cycle.
+7. After each valid continue, the next authoritative all-idle generation waits the same fixed delay: default **10s** each time, up to **10** valid continues per lock cycle.
 8. An **aborted** main run unlocks immediately (reasonless). Child stop reasons are never inspected.
 
 Design note: the extension does **not** blindly continue. It asks first so completed or intentionally waiting work can unlock cleanly.
@@ -63,6 +63,7 @@ Design note: the extension does **not** blindly continue. It asks first so compl
 |---|---|
 | `/lock-continue-watchdog` | Silently perform full unlock cleanup first, then start a fresh lock cycle and emit exactly one TUI notification: `Continue watchdog locked` |
 | `/unlock-continue-watchdog [reason]` | Set unlocked and cancel pending checks while preserving cycle counters/failure state. Blank reason: notify `Continue watchdog unlocked`; nonblank reason: persist one muted `Continue watchdog unlocked · <reason>` entry |
+| `/status-continue-watchdog` | Show current main/lock/attempt state, trigger blocker, grace phase, observable busy counts, and pending spawns without changing watchdog state |
 
 Same-state commands still assign (no silent no-op). A manual lock always runs the complete unlock-cleanup → fresh-lock sequence even when already unlocked or locked, suppresses prerequisite unlock output, and emits only `Continue watchdog locked`. A direct manual unlock still emits its normal output. Only fresh lock semantics reset the cycle; a real main user message applies the same full sequence with both notifications suppressed. Ordinary main `agent_start` without a new user message remains ensure-lock behavior and preserves an already locked cycle.
 

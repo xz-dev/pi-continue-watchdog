@@ -85,6 +85,7 @@ export function createContinueWatchdogExtension(
 				return holder.controller;
 			},
 			isCurrentMain: runtime.isCurrentMain,
+			getTriggerStatus: runtime.getTriggerStatus,
 			getMainClaim: runtime.getMainClaim,
 			isCurrentMainClaim: runtime.isCurrentMainClaim,
 			restartLockCycle: (ctx, restartOptions) =>

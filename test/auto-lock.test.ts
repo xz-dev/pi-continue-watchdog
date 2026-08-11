@@ -178,6 +178,7 @@ test("actual main user message_start locks without a command notification", () =
 	assert.deepEqual(harness.commandNames, [
 		"lock-continue-watchdog",
 		"unlock-continue-watchdog",
+		"status-continue-watchdog",
 	]);
 	assert.deepEqual(harness.entryRendererTypes, [
 		"pi-continue-watchdog:status",

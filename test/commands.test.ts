@@ -17,10 +17,13 @@ import {
 	createMainCommands,
 	createWatchdogStatusEntryRenderer,
 	formatUnlockEntryText,
+	formatWatchdogTriggerStatus,
 	HUMAN_UNLOCK_ENTRY_TYPE,
 	LOCK_COMMAND_DESCRIPTION,
 	LOCK_CONTINUE_WATCHDOG_COMMAND,
 	type MainCommandRuntime,
+	STATUS_COMMAND_DESCRIPTION,
+	STATUS_CONTINUE_WATCHDOG_COMMAND,
 	UNLOCK_COMMAND_DESCRIPTION,
 	UNLOCK_CONTINUE_WATCHDOG_COMMAND,
 } from "../src/commands.js";
@@ -100,6 +103,18 @@ function createHarness(): CommandHarness {
 	const runtime: MainCommandRuntime = {
 		controller,
 		isCurrentMain: () => currentMain,
+		getTriggerStatus: () => ({
+			main: currentMain,
+			locked: controller.snapshot.locked,
+			attempt: controller.snapshot.attempt,
+			maxRetries: 2,
+			blocker: currentMain ? "observable-agent-busy" : "not-main",
+			gracePhase: "blocked",
+			graceRemainingMs: null,
+			observableBusyCount: 1,
+			domainBusyParticipants: 2,
+			domainPendingSpawns: 1,
+		}),
 		restartLockCycle(ctx, options): void {
 			if (!currentMain) return;
 			timeline.push(`restartLockCycle:notifyLocked=${options.notifyLocked}`);
@@ -184,7 +199,11 @@ test("Slice 4 RED: registers the exact human command names, descriptions, and TU
 
 	assert.deepEqual(
 		[...harness.commands.keys()],
-		[LOCK_CONTINUE_WATCHDOG_COMMAND, UNLOCK_CONTINUE_WATCHDOG_COMMAND],
+		[
+			LOCK_CONTINUE_WATCHDOG_COMMAND,
+			UNLOCK_CONTINUE_WATCHDOG_COMMAND,
+			STATUS_CONTINUE_WATCHDOG_COMMAND,
+		],
 	);
 	assert.equal(
 		harness.commands.get(LOCK_CONTINUE_WATCHDOG_COMMAND)?.description,
@@ -194,12 +213,68 @@ test("Slice 4 RED: registers the exact human command names, descriptions, and TU
 		harness.commands.get(UNLOCK_CONTINUE_WATCHDOG_COMMAND)?.description,
 		"Unlock the continue watchdog (optional reason).",
 	);
+	assert.equal(
+		harness.commands.get(STATUS_CONTINUE_WATCHDOG_COMMAND)?.description,
+		"Show why the continue watchdog is waiting.",
+	);
 	assert.equal(LOCK_COMMAND_DESCRIPTION, "Lock the continue watchdog.");
 	assert.equal(
 		UNLOCK_COMMAND_DESCRIPTION,
 		"Unlock the continue watchdog (optional reason).",
 	);
+	assert.equal(
+		STATUS_COMMAND_DESCRIPTION,
+		"Show why the continue watchdog is waiting.",
+	);
 	assert.equal(harness.entryRenderers.has(HUMAN_UNLOCK_ENTRY_TYPE), true);
+});
+
+test("status command reports the current trigger blocker without changing state", async () => {
+	const harness = createHarness();
+	const before = harness.controller.snapshot;
+
+	await harness.invoke(STATUS_CONTINUE_WATCHDOG_COMMAND);
+
+	assert.deepEqual(harness.controller.snapshot, before);
+	assert.deepEqual(harness.entries, []);
+	assert.deepEqual(harness.effects, []);
+	assert.deepEqual(harness.notifications, [
+		[
+			"Continue watchdog status",
+			"Main: yes",
+			"Lock: unlocked",
+			"Attempt: 0/2",
+			"Trigger: blocked · observable agent busy",
+			"Grace: blocked",
+			"Busy: observable 1, domain 2, pending spawns 1",
+		].join("\n"),
+	]);
+});
+
+test("status formatter shows an eligible grace countdown", () => {
+	assert.equal(
+		formatWatchdogTriggerStatus({
+			main: true,
+			locked: true,
+			attempt: 3,
+			maxRetries: 10,
+			blocker: null,
+			gracePhase: "grace",
+			graceRemainingMs: 9_001,
+			observableBusyCount: 0,
+			domainBusyParticipants: 0,
+			domainPendingSpawns: 0,
+		}),
+		[
+			"Continue watchdog status",
+			"Main: yes",
+			"Lock: locked",
+			"Attempt: 3/10",
+			"Trigger: eligible",
+			"Grace: waiting · 10s remaining",
+			"Busy: observable 0, domain 0, pending spawns 0",
+		].join("\n"),
+	);
 });
 
 test("watchdog status entries render standard colored Pi-TUI boxes", () => {

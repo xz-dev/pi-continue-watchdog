@@ -8,14 +8,21 @@ import { Box, Text, visibleWidth } from "@earendil-works/pi-tui";
 
 import type { ControllerEffect, LockDecisionController } from "./controller.js";
 import type { HubMainClaim } from "./hub.js";
+import type {
+	WatchdogTriggerBlocker,
+	WatchdogTriggerStatus,
+} from "./runtime.js";
 
 /** Pi command names omit the slash used for interactive invocation. */
 export const LOCK_CONTINUE_WATCHDOG_COMMAND = "lock-continue-watchdog";
 export const UNLOCK_CONTINUE_WATCHDOG_COMMAND = "unlock-continue-watchdog";
+export const STATUS_CONTINUE_WATCHDOG_COMMAND = "status-continue-watchdog";
 
 export const LOCK_COMMAND_DESCRIPTION = "Lock the continue watchdog.";
 export const UNLOCK_COMMAND_DESCRIPTION =
 	"Unlock the continue watchdog (optional reason).";
+export const STATUS_COMMAND_DESCRIPTION =
+	"Show why the continue watchdog is waiting.";
 
 /** Persisted TUI-only entry for every accepted automatic continue. */
 export const CONTINUE_ENTRY_TYPE = "pi-continue-watchdog:continue";
@@ -67,6 +74,7 @@ export type CommandRuntimeEffect = Exclude<
 export interface MainCommandRuntime {
 	readonly controller: LockDecisionController | null;
 	readonly isCurrentMain: () => boolean;
+	readonly getTriggerStatus: () => WatchdogTriggerStatus;
 	/** Capture and revalidate the exact current ownership generation. */
 	readonly getMainClaim?: () => HubMainClaim | null;
 	readonly isCurrentMainClaim?: (claim: HubMainClaim) => boolean;
@@ -333,11 +341,63 @@ function currentControllerClaim(runtime: MainCommandRuntime): {
 	return { controller, claim };
 }
 
+const BLOCKER_TEXT: Readonly<Record<WatchdogTriggerBlocker, string>> = {
+	"not-main": "not main",
+	"config-loading": "config loading",
+	unlocked: "unlocked",
+	exhausted: "retry limit exhausted",
+	"decision-failed": "decision failed",
+	"domain-uncertain": "process domain uncertain",
+	"observable-agent-busy": "observable agent busy",
+	"local-agent-busy": "local agent busy",
+	"pending-messages": "pending messages",
+	"decision-open": "decision open",
+	"decision-finalizing": "decision finalizing",
+};
+
+export function formatWatchdogTriggerStatus(
+	status: WatchdogTriggerStatus,
+): string {
+	const lines = [
+		"Continue watchdog status",
+		`Main: ${status.main ? "yes" : "no"}`,
+		`Lock: ${
+			status.locked === null
+				? "unavailable"
+				: status.locked
+					? "locked"
+					: "unlocked"
+		}`,
+		`Attempt: ${status.attempt ?? "unavailable"}/${status.maxRetries}`,
+		`Trigger: ${
+			status.blocker === null
+				? "eligible"
+				: `blocked · ${BLOCKER_TEXT[status.blocker]}`
+		}`,
+		`Grace: ${
+			status.gracePhase === "grace" && status.graceRemainingMs !== null
+				? `waiting · ${Math.ceil(status.graceRemainingMs / 1000)}s remaining`
+				: status.gracePhase
+		}`,
+		`Busy: observable ${status.observableBusyCount}, domain ${
+			status.domainBusyParticipants ?? "unavailable"
+		}, pending spawns ${status.domainPendingSpawns ?? "unavailable"}`,
+	];
+	return lines.join("\n");
+}
+
 async function handleLock(
 	runtime: MainCommandRuntime,
 	ctx: ExtensionCommandContext,
 ): Promise<void> {
 	await runtime.restartLockCycle(ctx, { notifyLocked: true });
+}
+
+function handleStatus(
+	runtime: MainCommandRuntime,
+	ctx: ExtensionCommandContext,
+): void {
+	ctx.ui.notify(formatWatchdogTriggerStatus(runtime.getTriggerStatus()));
 }
 
 async function handleUnlock(
@@ -402,5 +462,9 @@ export function createMainCommands(
 	pi.registerCommand(UNLOCK_CONTINUE_WATCHDOG_COMMAND, {
 		description: UNLOCK_COMMAND_DESCRIPTION,
 		handler: async (args, ctx) => handleUnlock(pi, runtime, args, ctx),
+	});
+	pi.registerCommand(STATUS_CONTINUE_WATCHDOG_COMMAND, {
+		description: STATUS_COMMAND_DESCRIPTION,
+		handler: async (_args, ctx) => handleStatus(runtime, ctx),
 	});
 }

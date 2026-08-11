@@ -149,9 +149,36 @@ export interface DecisionRuntimeOptions {
 	readonly agentDir?: string;
 }
 
+export type WatchdogTriggerBlocker =
+	| "not-main"
+	| "config-loading"
+	| "unlocked"
+	| "exhausted"
+	| "decision-failed"
+	| "domain-uncertain"
+	| "observable-agent-busy"
+	| "local-agent-busy"
+	| "pending-messages"
+	| "decision-open"
+	| "decision-finalizing";
+
+export interface WatchdogTriggerStatus {
+	readonly main: boolean;
+	readonly locked: boolean | null;
+	readonly attempt: number | null;
+	readonly maxRetries: number;
+	readonly blocker: WatchdogTriggerBlocker | null;
+	readonly gracePhase: "blocked" | "grace" | "ready";
+	readonly graceRemainingMs: number | null;
+	readonly observableBusyCount: number;
+	readonly domainBusyParticipants: number | null;
+	readonly domainPendingSpawns: number | null;
+}
+
 export interface DecisionRuntime {
 	readonly controller: LockDecisionController | null;
 	readonly config: ContinueWatchdogConfig;
+	getTriggerStatus(): WatchdogTriggerStatus;
 	isCurrentMain(): boolean;
 	getMainClaim(): HubMainClaim | null;
 	isCurrentMainClaim(claim: HubMainClaim): boolean;
@@ -800,6 +827,51 @@ export function createDecisionRuntime(
 		if (opened !== null && latestGeneration !== null) {
 			opened.aggregateGeneration = latestGeneration;
 		}
+	};
+
+	const getTriggerStatus = (): WatchdogTriggerStatus => {
+		const claim = getMainClaim();
+		const controller = currentController(claim);
+		const controllerSnapshot = controller?.snapshot;
+		const domain = options.processDomain?.snapshot;
+		const pendingMessages = hasPendingMessages();
+		let blocker: WatchdogTriggerBlocker | null = null;
+		if (claim === null || !owns(claim)) blocker = "not-main";
+		else if (!configReady || controllerSnapshot === undefined)
+			blocker = "config-loading";
+		else if (!controllerSnapshot.locked) blocker = "unlocked";
+		else if (controllerSnapshot.exhausted) blocker = "exhausted";
+		else if (controllerSnapshot.decisionFailed) blocker = "decision-failed";
+		else if (pendingFinalization !== null) blocker = "decision-finalizing";
+		else if (
+			controllerSnapshot.decisionOpen ||
+			activeDecision !== null ||
+			selfDecisionRun.kind !== "none"
+		)
+			blocker = "decision-open";
+		else if (pendingMessages) blocker = "pending-messages";
+		else if (!localIdle()) blocker = "local-agent-busy";
+		else if (domain !== undefined && !domain.certain)
+			blocker = "domain-uncertain";
+		else if (!externalHubIdle() || domain?.allIdle === false)
+			blocker = "observable-agent-busy";
+
+		const grace = graceCoordinator.snapshot;
+		return {
+			main: claim !== null && owns(claim),
+			locked: controllerSnapshot?.locked ?? null,
+			attempt: controllerSnapshot?.attempt ?? null,
+			maxRetries: config.maxRetries,
+			blocker,
+			gracePhase: grace.phase,
+			graceRemainingMs:
+				grace.phase === "grace" && grace.deadlineMs !== null
+					? Math.max(0, Math.ceil(grace.deadlineMs - now()))
+					: null,
+			observableBusyCount: options.hub.snapshot.busyCount,
+			domainBusyParticipants: domain?.busyParticipants ?? null,
+			domainPendingSpawns: domain?.pendingSpawns ?? null,
+		};
 	};
 
 	const aggregateInput = (): {
@@ -2083,6 +2155,7 @@ export function createDecisionRuntime(
 		get config(): ContinueWatchdogConfig {
 			return { ...config };
 		},
+		getTriggerStatus,
 		isCurrentMain,
 		getMainClaim,
 		isCurrentMainClaim: (claim) => options.hub.isCurrentMain(claim),

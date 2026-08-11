@@ -579,6 +579,35 @@ test("idle arms one unref timer and opens one hidden decision-only window", asyn
 	});
 });
 
+test("trigger status reports real runtime grace and finalization state without mutation", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	assert.equal(harness.runtime.getTriggerStatus().blocker, "unlocked");
+
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	harness.runtime.reconcileIdle();
+	const waiting = harness.runtime.getTriggerStatus();
+	assert.equal(waiting.blocker, null);
+	assert.equal(waiting.gracePhase, "grace");
+	assert.equal(waiting.graceRemainingMs, 3000);
+	assert.equal(waiting.observableBusyCount, 0);
+
+	harness.clock.fire(0);
+	await harness.startDecision();
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [harness.answerContinue()],
+	});
+	const before = harness.controller.snapshot;
+	const finalizing = harness.runtime.getTriggerStatus();
+	assert.equal(finalizing.blocker, "decision-finalizing");
+	assert.deepEqual(harness.controller.snapshot, before);
+	assert.equal(harness.sent.length, 1);
+	assert.equal(harness.entries.length, 0);
+});
+
 test("watchdog decision leaves compaction entirely to the host", async () => {
 	let predicted = 0;
 	let compacted = 0;
