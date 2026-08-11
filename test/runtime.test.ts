@@ -808,7 +808,7 @@ test("agent_end finalizes while streaming but settled alone dispatches continue"
 	});
 });
 
-test("continue entry persistence failure does not cancel an already dispatched continuation", async () => {
+test("continue entry persistence failure stops automatic continuation", async () => {
 	const harness = createHarness({
 		appendThrows: "pi-continue-watchdog:continue",
 	});
@@ -818,10 +818,44 @@ test("continue entry persistence failure does not cancel an already dispatched c
 
 	await settleResponse(harness, harness.answerContinue());
 
-	assert.equal(harness.controller.snapshot.locked, true);
-	assert.equal(harness.sent.length, sentBefore + 1);
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.sent.length, sentBefore);
+	assert.equal(harness.triggeredTurns, 1);
+	assert.deepEqual(harness.entries, [
+		{
+			type: "pi-continue-watchdog:status",
+			data: {
+				kind: "other-error",
+				exchangeId: "exchange-1",
+				cycleId: 1,
+				message: "append failed",
+			},
+		},
+	]);
+});
+
+test("continue evidence is persisted before automatic continuation dispatch", async () => {
+	const timeline: string[] = [];
+	const harness = createHarness({
+		onAppend(type) {
+			if (type === CONTINUE_ENTRY_TYPE) timeline.push("evidence");
+		},
+		onSend(message) {
+			if (message.customType === DECISION_FOLD_MESSAGE_TYPE) {
+				timeline.push("dispatch");
+			}
+			return undefined;
+		},
+	});
+	await startIdle(harness);
+	await harness.openDecision();
+
+	await settleResponse(harness, harness.answerContinue());
+
+	assert.deepEqual(timeline, ["evidence", "dispatch"]);
+	assert.equal(harness.controller.snapshot.attempt, 1);
 	assert.equal(harness.triggeredTurns, 2);
-	assert.deepEqual(harness.entries, []);
 });
 
 test("decision message_end hides XML, persists a context-excluded audit, and finalizes from the captured response", async () => {
@@ -2308,13 +2342,13 @@ test("accepted continue busy races roll back retry and defer without unlocking",
 	await settleResponse(atSend, atSend.answerContinue());
 	assert.equal(atSend.controller.snapshot.attempt, 0);
 	assert.equal(atSend.controller.snapshot.locked, true);
-	assert.equal(
+	assert.deepEqual(
 		atSend.entries.filter(
 			(entry) =>
 				entry.type === "pi-continue-watchdog:status" ||
 				entry.type === CONTINUE_ENTRY_TYPE,
-		).length,
-		0,
+		),
+		[{ type: CONTINUE_ENTRY_TYPE, data: {} }],
 	);
 });
 

@@ -48,6 +48,7 @@ Any acceptance text, test name, README, or implementation that still requires pe
 |---|---|---|
 | Lock command | `/lock-continue-watchdog` | Human (TUI) |
 | Unlock command | `/unlock-continue-watchdog [reason]` | Human (TUI); reason optional; **untyped** (no `reasonType`) |
+| Status command | `/status-continue-watchdog` | Human (TUI); read-only trigger diagnosis |
 | Continue XML decision | `<watchdog><function>continue_watchdog</function></watchdog>` | Main/root decision window only |
 | Unlock XML decision | `function=unlock_continue_watchdog` plus `reason_type` and `reason_content` | Main/root decision window only |
 | Default `decisionPrompt` | see exact default below | Hidden semantic prefix; runtime always appends the fixed XML protocol and effective reason types |
@@ -260,6 +261,7 @@ On invalid decision:
 - show a live colored TUI widget with `Continue watchdog checking` and the current decision cycle while the check is active; clear it on terminal continue, unlock, failure, abort, or cleanup
 - persist a colored TUI-only event card for each watchdog validation re-ask with its safe parser error and cycle number; persist non-watchdog failures as `Other error` with the original error content
 - append exactly one persistent TUI-only entry with exact text `Continue watchdog continued`, so repeated automatic continuation remains observable without entering model context or adding a duplicate transient notification
+- persist that entry before dispatching continuation; if persistence fails, fail closed and start no automatic continuation turn
 - The continued ordinary turn receives exactly one compact model-bound message containing `continuePrompt`; the XML decision exchange is otherwise hidden from later context
 - Consumes **one** valid-continue retry (attempt advances)
 - The next authoritative aggregate all-idle generation uses the same fixed grace

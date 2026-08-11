@@ -1547,6 +1547,21 @@ export function createDecisionRuntime(
 			}
 			if (!allIdleForClaim(claim)) return deferAcceptedContinue();
 			try {
+				options.pi.appendEntry(CONTINUE_ENTRY_TYPE, {});
+			} catch (error) {
+				options.controllerHolder.controller?.rollbackValidContinue();
+				appendStatus({
+					kind: "other-error",
+					exchangeId: active.exchangeId,
+					cycleId: finalCycleId,
+					message: originalErrorMessage(error),
+				});
+				// No automatic continuation without durable visible evidence.
+				silentlyAbandonDecision();
+				return false;
+			}
+			if (stopIfStale(claim)) return false;
+			try {
 				options.pi.sendMessage(
 					createDecisionFoldMessage({
 						exchangeId: active.exchangeId,
@@ -1560,13 +1575,6 @@ export function createDecisionRuntime(
 				if (!allIdleForClaim(claim)) return deferAcceptedContinue();
 				silentlyAbandonDecision();
 				return false;
-			}
-			// Persist accepted-continuation evidence only after dispatch succeeds, so a
-			// busy send rollback cannot leave a false `continued` card.
-			try {
-				options.pi.appendEntry(CONTINUE_ENTRY_TYPE, {});
-			} catch {
-				// Dispatch has already succeeded; history persistence is best effort.
 			}
 			// Demotion after a successful send still must not claim intermediate continue.
 			if (stopIfStale(claim)) return false;

@@ -361,6 +361,7 @@ Packed E2E creates a persistent session, triggers a decision, shuts it down, reo
 - increment the continue attempt;
 - clear the live checking widget;
 - append one TUI-only `Continue watchdog continued` entry so automatic continuation and possible token-consuming loops remain visible;
+- if that entry cannot be persisted, fail closed without dispatching continuation;
 - append the terminal fold marker;
 - fold the exchange into `continuePrompt`;
 - trigger the next ordinary turn;
