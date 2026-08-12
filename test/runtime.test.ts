@@ -92,15 +92,12 @@ interface SentMessage {
 		display: boolean;
 		details: unknown;
 	};
-	options?: { triggerTurn?: boolean; deliverAs?: string };
-	streaming: boolean;
-}
-
-interface DecisionMessageReplacement {
-	readonly message: {
-		readonly role: "assistant";
-		readonly content: readonly unknown[];
+	options?: {
+		triggerTurn?: boolean;
+		deliverAs?: string;
+		presentation?: "visible" | "hidden";
 	};
+	streaming: boolean;
 }
 
 interface Harness {
@@ -576,6 +573,7 @@ test("idle arms one unref timer and opens one hidden decision-only window", asyn
 	assert.deepEqual(harness.sent[0]?.options, {
 		triggerTurn: true,
 		deliverAs: "steer",
+		presentation: "hidden",
 	});
 });
 
@@ -858,7 +856,7 @@ test("continue evidence is persisted before automatic continuation dispatch", as
 	assert.equal(harness.triggeredTurns, 2);
 });
 
-test("decision message_end hides XML, persists a context-excluded audit, and finalizes from the captured response", async () => {
+test("decision message_end captures XML without mutating live context and persists a context-excluded audit", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
 	const answer = harness.answerUnlock("Waiting for approval.", "WAIT_USER");
@@ -867,11 +865,7 @@ test("decision message_end hides XML, persists a context-excluded audit, and fin
 	assert.deepEqual(harness.entries, []);
 
 	await harness.openDecision();
-	const replacement = (await harness.endDecisionMessage(
-		answer,
-	)) as DecisionMessageReplacement;
-	assert.equal(replacement.message.role, "assistant");
-	assert.deepEqual(replacement.message.content, []);
+	assert.equal(await harness.endDecisionMessage(answer), undefined);
 	assert.deepEqual(harness.entries.at(-1), {
 		type: "pi-continue-watchdog:decision-audit",
 		data: {
@@ -885,12 +879,12 @@ test("decision message_end hides XML, persists a context-excluded audit, and fin
 	});
 
 	// The decision prompt itself already caused agent_start. At this point the
-	// finalized replacement belongs to that submitted run; do not synthesize a
+	// finalized response belongs to that submitted run; do not synthesize a
 	// second start after message_end reset the submission phase.
 	harness.streaming = true;
 	await harness.fire("agent_end", {
 		type: "agent_end",
-		messages: [replacement.message],
+		messages: [answer],
 	});
 	harness.streaming = false;
 	await settleOnly(harness);
@@ -918,10 +912,7 @@ test("decision provider error stays provisional so the same Pi run can retry and
 		"All requested work is complete.",
 		"JOB_DONE",
 	);
-	const replacement = (await harness.endDecisionMessage(
-		unlock,
-	)) as DecisionMessageReplacement;
-	assert.deepEqual(replacement.message.content, []);
+	assert.equal(await harness.endDecisionMessage(unlock), undefined);
 	await harness.fire("agent_end", {
 		type: "agent_end",
 		messages: [unlock],
@@ -1038,11 +1029,12 @@ test("decision message_end audit records invalid output without retaining raw te
 	const harness = createHarness();
 	await startIdle(harness);
 	await harness.openDecision();
-	const replacement = (await harness.endDecisionMessage(
-		harness.answerInvalid("private malformed watchdog answer"),
-	)) as DecisionMessageReplacement;
-
-	assert.deepEqual(replacement.message.content, []);
+	assert.equal(
+		await harness.endDecisionMessage(
+			harness.answerInvalid("private malformed watchdog answer"),
+		),
+		undefined,
+	);
 	assert.deepEqual(harness.entries.at(-1), {
 		type: "pi-continue-watchdog:decision-audit",
 		data: {
@@ -1176,6 +1168,11 @@ test("invalid decisions reask only after settle and third failure stays stopped"
 				harness.sent.at(-1)?.message.content ?? "",
 				/previous decision response was invalid/,
 			);
+			assert.deepEqual(harness.sent.at(-1)?.options, {
+				triggerTurn: true,
+				deliverAs: "steer",
+				presentation: "hidden",
+			});
 			assert.equal(
 				harness.controller.snapshot.invalidDecisionAttempts,
 				attempt,
@@ -2367,14 +2364,16 @@ test("real user input silently preempts a submitted decision and extension input
 		assert.equal(harness.controller.snapshot.decisionOpen, false);
 		assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
 
-		const replacement = (await harness.endDecisionMessage(
+		const abortReplacement = (await harness.endDecisionMessage(
 			assistant([], "aborted"),
-		)) as DecisionMessageReplacement;
-		assert.deepEqual(replacement.message.content, []);
-		assert.equal(
-			(replacement.message as { stopReason?: string }).stopReason,
-			"stop",
-		);
+		)) as {
+			readonly message: {
+				readonly content: readonly unknown[];
+				readonly stopReason?: string;
+			};
+		};
+		assert.deepEqual(abortReplacement.message.content, []);
+		assert.equal(abortReplacement.message.stopReason, "stop");
 		assert.equal(harness.runtime.consumeDecisionAbortSuppression(), true);
 		assert.equal(harness.runtime.consumeDecisionAbortSuppression(), false);
 		assert.deepEqual(harness.notifications, []);
@@ -2561,10 +2560,10 @@ test("runtime process-domain write rejection disables watchdog without escaping"
 				block: true,
 				reason: DECISION_TOOL_BLOCK_REASON,
 			});
-			const replacement = (await harness.endDecisionMessage(
+			const quarantineReplacement = (await harness.endDecisionMessage(
 				assistant([text("untrusted failed-domain output")]),
-			)) as DecisionMessageReplacement;
-			assert.deepEqual(replacement.message.content, []);
+			)) as { readonly message: { readonly content: readonly unknown[] } };
+			assert.deepEqual(quarantineReplacement.message.content, []);
 			assert.equal(
 				harness.sent.at(-1)?.message.customType,
 				DECISION_FOLD_MESSAGE_TYPE,

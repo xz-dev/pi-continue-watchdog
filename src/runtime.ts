@@ -654,13 +654,18 @@ export function createDecisionRuntime(
 		active.dispatchPending = true;
 		active.submitted = false;
 		try {
+			const hiddenDecisionOptions = {
+				triggerTurn: true,
+				deliverAs: "steer",
+				presentation: "hidden",
+			} as const;
 			options.pi.sendMessage(
 				createDecisionPromptMessage({
 					exchangeId: active.exchangeId,
 					cycleId,
 					decisionPrompt,
 				}),
-				{ triggerTurn: true, deliverAs: "steer" },
+				hiddenDecisionOptions,
 			);
 			if (hasPendingMessages() || !activeGenerationCurrent(active)) {
 				deferDecisionOnBusy(active);
@@ -1744,12 +1749,7 @@ export function createDecisionRuntime(
 			// Audit persistence is optional; context hiding must still succeed.
 		}
 
-		return {
-			message: {
-				...event.message,
-				content: [],
-			},
-		};
+		return undefined;
 	};
 
 	const handleAgentEnd = (event: AgentEndEvent): void => {

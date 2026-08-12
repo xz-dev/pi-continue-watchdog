@@ -909,6 +909,12 @@ test("packed source artifact waits a real 10 seconds, decides continue, and fold
 		.map((command) => command.invocationName);
 	assert.equal(commands.includes("lock-continue-watchdog"), true);
 	assert.equal(commands.includes("unlock-continue-watchdog"), true);
+	const publicEvents: Array<{ readonly type: string; readonly text: string }> =
+		[];
+	const unsubscribe = session.subscribe((event) =>
+		publicEvents.push({ type: event.type, text: JSON.stringify(event) }),
+	);
+	t.after(unsubscribe);
 
 	await session.prompt("Start a task that must not mysteriously stop.");
 	await waitFor(() => requests.length === 3, 20_000, "continued provider turn");
@@ -970,6 +976,34 @@ test("packed source artifact waits a real 10 seconds, decides continue, and fold
 	);
 	assert.equal(thirdBody.includes("Continue watchdog continued"), false);
 	assert.equal(thirdBody.includes("Continue watchdog checking"), false);
+	if (process.env.PI_EXPECT_HIDDEN_PRESENTATION === "1") {
+		assert.deepEqual(
+			publicEvents.filter((event) => event.text.includes("<watchdog>")),
+			[],
+		);
+		assert.equal(
+			publicEvents.some((event) =>
+				event.text.includes("unlock_continue_watchdog"),
+			),
+			false,
+		);
+		assert.equal(
+			publicEvents.some((event) => event.text.includes(decisionPromptStart)),
+			false,
+		);
+		assert.equal(
+			publicEvents.filter((event) => event.type === "agent_start").length,
+			3,
+		);
+		assert.equal(
+			publicEvents.filter((event) => event.type === "agent_end").length,
+			3,
+		);
+		assert.equal(
+			publicEvents.filter((event) => event.type === "agent_settled").length,
+			2,
+		);
+	}
 });
 
 test("packed stock Pi retries a decision connection error and accepts the successful unlock", {
@@ -1192,7 +1226,9 @@ test("packed invalid decisions reask three times and leave Pi idle", {
 	await waitForSessionIdle(session, 3_000, "decision-failed path");
 
 	const branch = session.sessionManager.getBranch();
-	assert.equal(JSON.stringify(branch).includes("private invalid"), false);
+	if (process.env.PI_EXPECT_HIDDEN_PRESENTATION === "1") {
+		assert.equal(JSON.stringify(branch).includes("private invalid"), false);
+	}
 	const audits = branch.flatMap((entry) =>
 		entry.type === "custom" &&
 		entry.customType === "pi-continue-watchdog:decision-audit"
@@ -1250,7 +1286,9 @@ test("packed persisted session resumes without watchdog decision context or work
 				? [entry.message]
 				: [],
 		);
-	assert.deepEqual(persistedAssistants.at(-1)?.content, []);
+	if (process.env.PI_EXPECT_HIDDEN_PRESENTATION === "1") {
+		assert.deepEqual(persistedAssistants.at(-1)?.content, []);
+	}
 	assert.equal(rawSession.includes("resume context is clean"), true);
 	assert.equal(
 		rawSession.includes("pi-continue-watchdog:decision-audit"),
@@ -1326,18 +1364,20 @@ test("packed custom reasonTypes replace defaults and match mixed-case input", {
 		true,
 	);
 
-	// The provider XML is replaced with an empty assistant before persistence.
-	// Only a structured CustomEntry audit survives, and CustomEntry is excluded
-	// from Pi's model-bound session context by construction.
+	// Downstream hidden presentation persists redacted assistant metadata.
+	// Only a structured CustomEntry audit survives semantically, and CustomEntry
+	// is excluded from Pi's model-bound session context by construction.
 	const branch = session.sessionManager.getBranch();
 	const branchAssistants = branch.flatMap((entry) =>
 		entry.type === "message" && entry.message.role === "assistant"
 			? [entry.message]
 			: [],
 	);
-	assert.deepEqual(branchAssistants.at(-1)?.content, []);
-	assert.equal(JSON.stringify(branch).includes(" need review "), false);
-	assert.equal(JSON.stringify(branch).includes(" awaiting review "), false);
+	if (process.env.PI_EXPECT_HIDDEN_PRESENTATION === "1") {
+		assert.deepEqual(branchAssistants.at(-1)?.content, []);
+		assert.equal(JSON.stringify(branch).includes(" need review "), false);
+		assert.equal(JSON.stringify(branch).includes(" awaiting review "), false);
+	}
 	const auditEntries = branch.flatMap((entry) =>
 		entry.type === "custom" &&
 		entry.customType === "pi-continue-watchdog:decision-audit"

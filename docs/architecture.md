@@ -152,10 +152,15 @@ After the aggregate idle delay expires, the runtime re-checks that all observabl
   display: false,
   content: decisionPromptWithFixedXmlSuffix,
   details: { version, exchangeId, cycleId }
+},
+{
+  triggerTurn: true,
+  deliverAs: "steer",
+  presentation: "hidden"
 }
 ```
 
-`display: false` hides the question from normal TUI history. It remains model-visible for this decision request because the model must read it to decide.
+`display: false` hides the question itself from normal TUI history. `presentation: "hidden"` keeps Pi's native run, provider hooks, retries, compaction, usage, tools, and extension lifecycle active while suppressing its assistant/thinking/tool presentation from TUI, JSON, and RPC subscribers. The prompt remains model-visible for this decision request because the model must read it to decide.
 
 The configurable prompt supplies decision intent. Runtime always appends a fixed suffix that:
 
@@ -213,39 +218,19 @@ The model receives at most three total decision responses. Invalid responses tri
 
 ## Hiding the provider XML
 
-Pi 0.83 exposes a public `message_end` replacement seam. During an active decision, the runtime:
+The downstream Pi hidden-presentation seam separates extension lifecycle from public presentation and persistence. During an active decision:
 
-1. reads and normalizes the original finalized assistant response;
-2. stores that normalized response only in runtime memory;
-3. validates it and appends a structured audit entry;
-4. returns a same-role replacement with empty content.
+1. Pi runs the normal Agent/provider/tool/retry/compaction pipeline;
+2. extension handlers receive original message, tool, `agent_end`, and `agent_settled` lifecycle events;
+3. this runtime reads and normalizes the original finalized assistant response, validates it, and appends a structured audit entry;
+4. public subscribers receive only `agent_start` and redacted `agent_end` metadata; public `agent_settled` is suppressed for the hidden run;
+5. session persistence clears assistant content and clears both tool-result content and `details` without mutating the live model-facing messages.
 
-Conceptually:
-
-```ts
-pi.on("message_end", event => {
-  captureAndAudit(event.message);
-  return {
-    message: {
-      ...event.message,
-      content: [],
-    },
-  };
-});
-```
-
-Pi applies this replacement before final listeners and `SessionManager.appendMessage()`, and mutates the finalized message object in place. Consequently:
-
-- the final TUI history no longer retains the XML;
-- Agent state and later lifecycle events see the empty replacement;
-- the persisted assistant entry has empty content;
-- the raw XML is not stored as assistant content.
-
-The original response is held only until runtime finalization. `agent_end` uses the captured response rather than trying to parse the empty replacement. Provider `stopReason: "error"` messages remain provisional because Pi may automatically retry within the same run; the first later successful response is captured and finalized normally, while a true final settle with no verifiable response consumes one invalid attempt. Captured data is cleared on terminal delivery, cleanup, ownership loss, restart, abort, and shutdown so it cannot leak into a later cycle.
+The original response is held only until runtime finalization. `agent_end` uses the captured response rather than trying to parse persisted redacted metadata. Provider `stopReason: "error"` messages remain provisional because Pi may automatically retry within the same hidden run; the first later successful response is captured and finalized normally, while a true final settle with no verifiable response consumes one invalid attempt. Captured data is cleared on terminal delivery, cleanup, ownership loss, restart, abort, and shutdown so it cannot leak into a later cycle.
 
 ### Streaming boundary
 
-`message_end` is a finalization seam. While a provider is streaming, Pi may briefly render partial XML through `message_update`; final TUI history is cleared at `message_end`. Preventing even transient streaming display would require an earlier Pi-level hidden-stream facility.
+Hidden presentation begins before the Agent run. Streaming `message_update`, thinking, and tool execution events remain available to extension handlers for correlation but are never emitted to TUI, JSON, or RPC presentation subscribers. An aborted partial response is persisted with empty content while retaining its native `stopReason` and usage metadata.
 
 ## Context-excluded audit records
 
@@ -297,7 +282,7 @@ Continue watchdog unlocked · WAIT_USER · User approval is required.
 The session remains append-only and still contains Pi-recognizable protocol entries such as:
 
 - the hidden decision `CustomMessage`;
-- the empty replacement assistant;
+- the redacted persisted assistant metadata;
 - blocked tool results, if any;
 - hidden re-asks;
 - a terminal fold marker.
@@ -378,7 +363,7 @@ Packed E2E creates a persistent session, triggers a decision, shuts it down, reo
 
 ### Invalid response
 
-- replace the raw response with an empty assistant;
+- capture the raw response in the extension lifecycle while Pi persists redacted assistant metadata;
 - append a structured invalid audit without raw text;
 - use the captured response to compute the fixed validator error;
 - re-ask after settle;
@@ -445,7 +430,7 @@ Lock state, aggregate grace, ownership, and pending decisions are runtime-only. 
 
 ### Deliberate limits
 
-The session file is append-only. It may retain the hidden question, empty assistant replacement, blocked tool result, re-ask, and fold marker as Pi-recognizable protocol entries. Context folding removes a complete terminal exchange before provider requests, but cannot provide the same guarantee if:
+The session file is append-only. It may retain the hidden question, redacted assistant/tool-result metadata, re-ask, and fold marker as Pi-recognizable protocol entries. Context folding removes a complete terminal exchange before provider requests, but cannot provide the same guarantee if:
 
 - the extension fails to load during recovery;
 - the process dies before a terminal fold marker is persisted;
