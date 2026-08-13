@@ -27,6 +27,7 @@ import { type LoadedConfig, loadRuntimeConfig } from "./config-loader.js";
 import {
 	createDecisionFoldMessage,
 	createDecisionPromptMessage,
+	PREEMPTED_DECISION_ERROR,
 } from "./context-fold.js";
 import {
 	type ControllerEffect,
@@ -654,18 +655,16 @@ export function createDecisionRuntime(
 		active.dispatchPending = true;
 		active.submitted = false;
 		try {
-			const hiddenDecisionOptions = {
-				triggerTurn: true,
-				deliverAs: "steer",
-				presentation: "hidden",
-			} as const;
 			options.pi.sendMessage(
 				createDecisionPromptMessage({
 					exchangeId: active.exchangeId,
 					cycleId,
 					decisionPrompt,
 				}),
-				hiddenDecisionOptions,
+				{
+					triggerTurn: true,
+					deliverAs: "steer",
+				},
 			);
 			if (hasPendingMessages() || !activeGenerationCurrent(active)) {
 				deferDecisionOnBusy(active);
@@ -1692,6 +1691,7 @@ export function createDecisionRuntime(
 					...event.message,
 					content: [],
 					stopReason: "stop" as const,
+					errorMessage: PREEMPTED_DECISION_ERROR,
 				},
 			};
 		}
@@ -1984,11 +1984,10 @@ export function createDecisionRuntime(
 		});
 
 		// A real user input (interactive or RPC) that arrives while a submitted
-		// internal watchdog decision is running must preempt it: Pi keeps the user
-		// message queued (we return `continue`), and we abort the internal decision
-		// so the queued user turn takes over promptly. Extension-injected messages
-		// never preempt the watchdog. The suppressed aborted assistant is the
-		// watchdog's own response only; normal user aborts are unaffected.
+		// watchdog decision is running must preempt it. Pi keeps the original user
+		// message queued when we return `continue`; do not re-send it. Abort only
+		// the watchdog decision, neutralize its aborted assistant, and persist a
+		// foldable preempted marker. Extension-injected messages never preempt.
 		options.pi.on("input", (event) => {
 			const active = activeDecision;
 			if (event.source !== "interactive" && event.source !== "rpc") {
@@ -2005,16 +2004,30 @@ export function createDecisionRuntime(
 			) {
 				return;
 			}
-			const shouldAbort = active.submitted;
-			if (shouldAbort) suppressDecisionAbort = true;
+			suppressDecisionAbort = true;
+			const exchangeId = active.exchangeId;
+			const cycleId = active.protocol.currentCycleId;
 			deferDecisionOnBusy(active);
-			if (shouldAbort) {
-				try {
-					sessionContext?.abort();
-				} catch {
-					// Abort is best effort; the decision was already deferred so the next
-					// settle will not misattribute this run.
-				}
+			// Abort first: stock interactive Pi clears its steering/follow-up queues
+			// while restoring queued text to the editor. Queueing the fold marker before
+			// that host abort hook would lose the marker and retain decision context.
+			try {
+				sessionContext?.abort();
+			} catch {
+				// Abort is best effort; the decision was already deferred so the next
+				// settle will not misattribute this run.
+			}
+			try {
+				options.pi.sendMessage(
+					createDecisionFoldMessage({
+						exchangeId,
+						cycleId,
+						outcome: "preempted",
+					}),
+					{ triggerTurn: false, deliverAs: "steer" },
+				);
+			} catch {
+				// Fold is best effort; the already-queued user input still runs.
 			}
 			return { action: "continue" };
 		});

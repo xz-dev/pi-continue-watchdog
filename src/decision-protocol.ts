@@ -80,7 +80,7 @@ export interface DecisionProtocolFinalization {
 	readonly outcome: DecisionProtocolOutcome;
 	readonly transition: ControllerTransition;
 	readonly error?: string;
-	/** Present only for a re-ask, before the runtime dispatches its hidden prompt. */
+	/** Present only for a re-ask, before the runtime dispatches its automated prompt. */
 	readonly reaskPrompt?: string;
 	readonly reasonType?: string;
 	readonly reason?: string;
@@ -108,7 +108,7 @@ export type DecisionProtocolPlan =
 export interface DecisionProtocolSessionOptions {
 	readonly controller: LockDecisionController;
 	readonly decisionId: number;
-	/** The configured base hidden decision prompt, used only for invalid re-asks. */
+	/** The configured base automated decision prompt, used only for invalid re-asks. */
 	readonly decisionPrompt: string;
 	/** Effective allowed AI unlock reason types for this decision window. */
 	readonly reasonTypes: readonly string[];
@@ -139,7 +139,7 @@ export interface DecisionProtocolSession {
 	) => DecisionProtocolFinalization;
 	/**
 	 * Acknowledge a cached re-ask. Runtime code must call this immediately before
-	 * it dispatches that re-ask's hidden prompt, so a synchronous next response
+	 * it dispatches that re-ask's automated prompt, so a synchronous next response
 	 * is collected in the new cycle rather than rejected as stale.
 	 */
 	readonly advanceAfterReask: (cycleId: number) => boolean;
@@ -539,7 +539,7 @@ export function normalizeAssistantDecisionResponse(
 	return { content: normalized };
 }
 
-/** Build the hidden immediate re-ask body from a safe fixed validator error. */
+/** Build the immediate re-ask body from a safe fixed validator error. */
 export function buildDecisionReaskPrompt(
 	decisionPrompt: string,
 	error: string,

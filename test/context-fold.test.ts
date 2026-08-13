@@ -116,7 +116,7 @@ function toolResult(
 function foldMarker(options: {
 	readonly exchangeId?: string;
 	readonly cycleId?: number;
-	readonly outcome: "continue" | "unlock" | "decision-failed";
+	readonly outcome: "continue" | "unlock" | "decision-failed" | "preempted";
 	readonly continuePrompt?: string;
 	readonly timestamp: number;
 }): Message {
@@ -243,6 +243,25 @@ test("builders emit exact decision and fold custom messages", () => {
 			},
 		},
 	);
+
+	assert.deepEqual(
+		createDecisionFoldMessage({
+			exchangeId: EXCHANGE_ID,
+			cycleId: 1,
+			outcome: "preempted",
+		}),
+		{
+			customType: DECISION_FOLD_MESSAGE_TYPE,
+			content: "",
+			display: false,
+			details: {
+				version: DECISION_PROTOCOL_VERSION,
+				exchangeId: EXCHANGE_ID,
+				cycleId: 1,
+				outcome: "preempted",
+			},
+		},
+	);
 });
 
 test("valid continue folds the complete exchange into the compact continue prompt", () => {
@@ -261,6 +280,36 @@ test("valid continue folds the complete exchange into the compact continue promp
 		user("task", 1),
 		continuationMessage(4),
 		user("later", 5),
+	]);
+});
+
+test("user-preempted decisions fold without a terminal assistant or replacement", () => {
+	const withoutAssistant = [
+		user("task", 1),
+		decision(EXCHANGE_ID, 1, 2),
+		foldMarker({ outcome: "preempted", timestamp: 3 }),
+		user("takeover", 4),
+	];
+	assert.deepEqual(foldDecisionContext(withoutAssistant), [
+		user("task", 1),
+		user("takeover", 4),
+	]);
+
+	const neutralizedAssistant = {
+		...assistant([], 3),
+		stopReason: "stop",
+		errorMessage: "pi-continue-watchdog:preempted",
+	};
+	const withNeutralizedAssistant = [
+		user("task", 1),
+		decision(EXCHANGE_ID, 1, 2),
+		neutralizedAssistant,
+		foldMarker({ outcome: "preempted", timestamp: 4 }),
+		user("takeover", 5),
+	];
+	assert.deepEqual(foldDecisionContext(withNeutralizedAssistant), [
+		user("task", 1),
+		user("takeover", 5),
 	]);
 });
 

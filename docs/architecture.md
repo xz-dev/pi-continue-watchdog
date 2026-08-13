@@ -31,7 +31,7 @@ wait one fixed idleDelaySeconds grace
 qualify the same generation and re-check ownership/auth
           │
           ▼
-open one hidden XML decision check
+open one XML decision check
           │
           ├─ continue ─► fold exchange ─► compact continuation turn
           ├─ unlock  ──► unlock ────────► one muted result entry
@@ -144,7 +144,7 @@ Before and after re-entrant Pi calls, the runtime verifies that the original cla
 
 ## Decision request
 
-After the aggregate idle delay expires, the runtime re-checks that all observable attachments are still idle and sends a hidden Pi `CustomMessage`:
+After the aggregate idle delay expires, the runtime re-checks that all observable attachments are still idle and sends a Pi `CustomMessage`:
 
 ```ts
 {
@@ -155,12 +155,11 @@ After the aggregate idle delay expires, the runtime re-checks that all observabl
 },
 {
   triggerTurn: true,
-  deliverAs: "steer",
-  presentation: "hidden"
+  deliverAs: "steer"
 }
 ```
 
-`display: false` hides the question itself from normal TUI history. `presentation: "hidden"` keeps Pi's native run, provider hooks, retries, compaction, usage, tools, and extension lifecycle active while suppressing its assistant/thinking/tool presentation from TUI, JSON, and RPC subscribers. The prompt remains model-visible for this decision request because the model must read it to decide.
+`display: false` hides the question itself from normal TUI history. The decision assistant may stream in TUI/RPC while the check runs. Ordinary tools stay advertised. The prompt remains model-visible because the model must read it to decide. This package does not request `presentation: "hidden"` and does not depend on a downstream Pi hidden-run seam.
 
 The configurable prompt supplies decision intent. Runtime always appends a fixed suffix that:
 
@@ -214,23 +213,21 @@ For unlock:
 - `reason_content` must be nonblank and at most 500 Unicode code points;
 - invalid AI reasons are rejected rather than truncated.
 
-The model receives at most three total decision responses. Invalid responses trigger immediate hidden re-asks and do not consume the valid-continue retry budget. The third invalid response enters `decisionFailed` until a fresh cycle.
+The model receives at most three total decision responses. Invalid responses trigger immediate re-asks and do not consume the valid-continue retry budget. The third invalid response enters `decisionFailed` until a fresh cycle.
 
-## Hiding the provider XML
+## Decision streaming and user takeover
 
-The downstream Pi hidden-presentation seam separates extension lifecycle from public presentation and persistence. During an active decision:
+The decision uses ordinary Pi `sendMessage({ triggerTurn: true, deliverAs: "steer" })`. Public subscribers may see the live assistant stream. After a completed decision, `message_end` captures the original response for validation/audit, then context folding removes the complete exchange from later provider requests.
 
-1. Pi runs the normal Agent/provider/tool/retry/compaction pipeline;
-2. extension handlers receive original message, tool, `agent_end`, and `agent_settled` lifecycle events;
-3. this runtime reads and normalizes the original finalized assistant response, validates it, and appends a structured audit entry;
-4. public subscribers receive only `agent_start` and redacted `agent_end` metadata; public `agent_settled` is suppressed for the hidden run;
-5. session persistence clears assistant content and clears both tool-result content and `details` without mutating the live model-facing messages.
+Interactive or RPC user input during a submitted decision preempts that check:
 
-The original response is held only until runtime finalization. `agent_end` uses the captured response rather than trying to parse persisted redacted metadata. Provider `stopReason: "error"` messages remain provisional because Pi may automatically retry within the same hidden run; the first later successful response is captured and finalized normally, while a true final settle with no verifiable response consumes one invalid attempt. Captured data is cleared on terminal delivery, cleanup, ownership loss, restart, abort, and shutdown so it cannot leak into a later cycle.
+1. the original user message stays in Pi's queue and is not re-sent by the watchdog;
+2. the runtime persists a foldable `preempted` marker and aborts only the watchdog decision;
+3. `message_end` clears the aborted decision assistant and sets `stopReason` to `stop` so TUI does not show `Operation aborted`;
+4. abort-unlock is suppressed for that one decision, so lock remains and no `Continue watchdog unlocked` notice appears;
+5. the user message starts a fresh lock cycle exactly once.
 
-### Streaming boundary
-
-Hidden presentation begins before the Agent run. Streaming `message_update`, thinking, and tool execution events remain available to extension handlers for correlation but are never emitted to TUI, JSON, or RPC presentation subscribers. An aborted partial response is persisted with empty content while retaining its native `stopReason` and usage metadata.
+Manual Esc / ordinary abort of a non-preempted main run still unlocks reasonlessly. Provider `stopReason: "error"` remains provisional because Pi may automatically retry within the same run.
 
 ## Context-excluded audit records
 
@@ -281,11 +278,11 @@ Continue watchdog unlocked · WAIT_USER · User approval is required.
 
 The session remains append-only and still contains Pi-recognizable protocol entries such as:
 
-- the hidden decision `CustomMessage`;
-- the redacted persisted assistant metadata;
+- the decision `CustomMessage`;
+- any streamed or finalized assistant metadata;
 - blocked tool results, if any;
-- hidden re-asks;
-- a terminal fold marker.
+- re-asks;
+- a terminal fold marker, including `preempted` after user takeover.
 
 Before every provider request, `src/context-fold.ts` correlates a complete exchange by protocol version, exchange ID, and cycle IDs. Complete exchanges fold normally, and a canonical decision prompt followed by an aborted assistant is removed as a bounded plugin-owned pair. An unrelated, incomplete, or malformed exchange fails closed locally for its own correlation ID; it cannot disable folding for later independent exchanges.
 
@@ -307,7 +304,7 @@ ordinary conversation
 
 The compact continuation message triggers the next ordinary work turn.
 
-### Unlock and decision failure
+### Unlock, decision failure, and user preemption
 
 ```text
 ordinary conversation
@@ -369,9 +366,9 @@ Packed E2E creates a persistent session, triggers a decision, shuts it down, reo
 - re-ask after settle;
 - after the third invalid response, enter `decisionFailed`, append a terminal fold marker, warn the user, and return to idle.
 
-### Main abort
+### Main abort and user preemption
 
-Abort detection uses Pi's persisted canonical assistant outcome `stopReason: "aborted"`, not raw keyboard guesses. A main abort unlocks reasonlessly and cancels watchdog work. Its bounded decision prompt/aborted-assistant pair is removed from later provider context without requiring a persisted fold marker. Child abort causes are not inspected and do not unlock main.
+Abort detection uses Pi's persisted canonical assistant outcome `stopReason: "aborted"`, not raw keyboard guesses. A main abort that is not a user-preempted watchdog decision unlocks reasonlessly and cancels watchdog work. Its bounded decision prompt/aborted-assistant pair is removed from later provider context without requiring a persisted fold marker. User input that takes over a submitted watchdog decision is not treated as that abort: the assistant is neutralized, a `preempted` fold marker is persisted, lock remains, and the original user message starts the next cycle. Child abort causes are not inspected and do not unlock main.
 
 ## Avoiding a persistent `working` state
 
@@ -419,9 +416,9 @@ Lock state, aggregate grace, ownership, and pending decisions are runtime-only. 
 
 ### Guaranteed in normal completed flows
 
-- the hidden question is not shown in normal TUI history;
-- the final XML is removed from final TUI history;
-- raw XML is not persisted as assistant content;
+- the decision question is not shown in normal TUI history (`display: false`);
+- a completed decision exchange is folded out of later provider context;
+- a user-preempted decision leaves no assistant/XML residue in later provider context;
 - raw invalid model text is not retained in audits;
 - audit and visible-result custom entries never enter Agent/provider context;
 - complete terminal decision exchanges are absent from later provider requests;
@@ -430,7 +427,7 @@ Lock state, aggregate grace, ownership, and pending decisions are runtime-only. 
 
 ### Deliberate limits
 
-The session file is append-only. It may retain the hidden question, redacted assistant/tool-result metadata, re-ask, and fold marker as Pi-recognizable protocol entries. Context folding removes a complete terminal exchange before provider requests, but cannot provide the same guarantee if:
+The session file is append-only. It may retain the decision question, streamed assistant/tool-result metadata, re-ask, and fold marker as Pi-recognizable protocol entries. Live TUI/RPC frames during an in-flight decision are not retracted. Context folding removes a complete or preempted exchange before later provider requests, but cannot provide the same guarantee if:
 
 - the extension fails to load during recovery;
 - the process dies before a terminal fold marker is persisted;
@@ -447,7 +444,7 @@ The folder fails closed in those cases to avoid deleting genuine user conversati
 - the real default ten-second decision path;
 - stable ordinary tools during decision and continuation;
 - continue and typed unlock outcomes;
-- final XML replacement and context-excluded audits;
+- context-excluded audits and future-context folding;
 - three invalid responses and terminal idle;
 - canonical abort behavior;
 - semantic-hook publication;

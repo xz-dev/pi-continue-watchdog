@@ -342,6 +342,62 @@ test("aborted terminal unlock restores tools then notifies bare text", async () 
 	]);
 });
 
+test("user-preempted decision abort does not unlock or notify", async () => {
+	const hub = createObservableAgentHub();
+	const controller = makeController();
+	controller.lock();
+	const bound = hub.bind({
+		instance: createHubAttachmentInstance(),
+		sessionId: "main",
+		hasUI: true,
+	});
+	assert.ok(bound.attachment);
+	const handlers = new Map<string, LifecycleHandler[]>();
+	const notifications: string[] = [];
+	const sessionManager = createSessionManager();
+	let remainingSuppressions = 1;
+	registerMainAbortUnlock(multiOn(handlers), {
+		isCurrentMain() {
+			const claim = hub.mainClaimFor(bound.attachment);
+			return claim !== null && hub.isCurrentMain(claim);
+		},
+		getMainClaim() {
+			return hub.mainClaimFor(bound.attachment);
+		},
+		isCurrentMainClaim(claim) {
+			return hub.isCurrentMain(claim);
+		},
+		controller,
+		clearOperationalPendingWork() {
+			if (remainingSuppressions > 0) {
+				throw new Error("preempted abort must not unlock");
+			}
+		},
+		applyEffect() {
+			if (remainingSuppressions > 0) {
+				throw new Error("preempted abort must not apply effects");
+			}
+		},
+		consumeDecisionAbortSuppression() {
+			if (remainingSuppressions === 0) return false;
+			remainingSuppressions -= 1;
+			return true;
+		},
+	});
+	const ctx = notifyCtx(sessionManager, notifications);
+	await fireHandlers(handlers, "agent_start", { type: "agent_start" }, ctx);
+	sessionManager.append(assistant("a1", "aborted"));
+	await fireHandlers(handlers, "agent_settled", { type: "agent_settled" }, ctx);
+	assert.equal(controller.snapshot.locked, true);
+	assert.deepEqual(notifications, []);
+
+	await fireHandlers(handlers, "agent_start", { type: "agent_start" }, ctx);
+	sessionManager.append(assistant("a2", "aborted"));
+	await fireHandlers(handlers, "agent_settled", { type: "agent_settled" }, ctx);
+	assert.equal(controller.snapshot.locked, false);
+	assert.deepEqual(notifications, ["Continue watchdog unlocked"]);
+});
+
 test("already-unlocked abort still notifies bare text", async () => {
 	const harness = createAbortHarness({ locked: false });
 	await harness.start();

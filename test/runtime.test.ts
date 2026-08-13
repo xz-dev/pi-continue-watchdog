@@ -555,7 +555,7 @@ async function settleResponse(
 	await settleOnly(harness);
 }
 
-test("idle arms one unref timer and opens one hidden decision-only window", async () => {
+test("idle arms one unref timer and opens one visible decision-only window", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
 	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
@@ -573,7 +573,6 @@ test("idle arms one unref timer and opens one hidden decision-only window", asyn
 	assert.deepEqual(harness.sent[0]?.options, {
 		triggerTurn: true,
 		deliverAs: "steer",
-		presentation: "hidden",
 	});
 });
 
@@ -1171,7 +1170,6 @@ test("invalid decisions reask only after settle and third failure stays stopped"
 			assert.deepEqual(harness.sent.at(-1)?.options, {
 				triggerTurn: true,
 				deliverAs: "steer",
-				presentation: "hidden",
 			});
 			assert.equal(
 				harness.controller.snapshot.invalidDecisionAttempts,
@@ -2357,12 +2355,35 @@ test("real user input silently preempts a submitted decision and extension input
 		await harness.startDecision();
 		assert.equal(harness.controller.snapshot.decisionOpen, true);
 		assert.equal(harness.aborts, 0);
+		const sentBefore = harness.sent.length;
 
-		assert.deepEqual(await harness.fireInput(source), { action: "continue" });
+		assert.deepEqual(await harness.fireInput(source, "user takeover"), {
+			action: "continue",
+		});
 		assert.equal(harness.aborts, 1);
 		assert.equal(harness.controller.snapshot.locked, true);
 		assert.equal(harness.controller.snapshot.decisionOpen, false);
 		assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
+		assert.equal(harness.sent.length, sentBefore + 1);
+		assert.deepEqual(harness.sent.at(-1), {
+			message: {
+				customType: DECISION_FOLD_MESSAGE_TYPE,
+				content: "",
+				display: false,
+				details: {
+					version: 1,
+					exchangeId: "exchange-1",
+					cycleId: 1,
+					outcome: "preempted",
+				},
+			},
+			options: { triggerTurn: false, deliverAs: "steer" },
+			streaming: true,
+		});
+		assert.equal(
+			harness.sent.some((entry) => entry.message.content === "user takeover"),
+			false,
+		);
 
 		const abortReplacement = (await harness.endDecisionMessage(
 			assistant([], "aborted"),
@@ -2374,6 +2395,11 @@ test("real user input silently preempts a submitted decision and extension input
 		};
 		assert.deepEqual(abortReplacement.message.content, []);
 		assert.equal(abortReplacement.message.stopReason, "stop");
+		assert.equal(
+			(abortReplacement.message as { readonly errorMessage?: string })
+				.errorMessage,
+			"pi-continue-watchdog:preempted",
+		);
 		assert.equal(harness.runtime.consumeDecisionAbortSuppression(), true);
 		assert.equal(harness.runtime.consumeDecisionAbortSuppression(), false);
 		assert.deepEqual(harness.notifications, []);
@@ -2386,6 +2412,20 @@ test("real user input silently preempts a submitted decision and extension input
 	assert.equal(await extension.fireInput("extension"), undefined);
 	assert.equal(extension.aborts, 0);
 	assert.equal(extension.controller.snapshot.decisionOpen, true);
+});
+
+test("ordinary aborted decision assistant stays aborted without user takeover", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	await harness.openDecision();
+	await harness.startDecision();
+	assert.equal(
+		await harness.endDecisionMessage(assistant([], "aborted")),
+		undefined,
+	);
+	assert.equal(harness.runtime.consumeDecisionAbortSuppression(), false);
+	assert.equal(harness.aborts, 0);
+	assert.equal(harness.controller.snapshot.locked, true);
 });
 
 test("provider retry agent_start preserves a confirmed internal decision classification", async () => {

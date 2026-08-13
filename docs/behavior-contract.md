@@ -51,7 +51,7 @@ Any acceptance text, test name, README, or implementation that still requires pe
 | Status command | `/status-continue-watchdog` | Human (TUI); read-only trigger diagnosis |
 | Continue XML decision | `<watchdog><function>continue_watchdog</function></watchdog>` | Main/root decision window only |
 | Unlock XML decision | `function=unlock_continue_watchdog` plus `reason_type` and `reason_content` | Main/root decision window only |
-| Default `decisionPrompt` | see exact default below | Hidden semantic prefix; runtime always appends the fixed XML protocol and effective reason types |
+| Default `decisionPrompt` | see exact default below | Automated semantic prefix; runtime always appends the fixed XML protocol and effective reason types |
 | Default `continuePrompt` | `Continue until user assistance is required.` | Compact model-visible replacement after valid continue fold |
 | Default `reasonTypes` | `JOB_DONE`, `WAIT_USER`, `JOB_BLOCKED` | Built-in allowed AI unlock type list; a valid configured list **replaces** this default |
 | Lock TUI notify | `Continue watchdog locked` | User-only TUI notify |
@@ -111,7 +111,7 @@ Continue until user assistance is required.
 |---|---|---|
 | `idleDelaySeconds` | `10` | Base delay in seconds; any finite number `>= 0`. Zero schedules an asynchronous 0 ms decision and fractions are allowed. |
 | `maxRetries` | `10` | Maximum **valid continue** decisions per lock cycle (not invalid re-asks); safe integer in `[1, 10]` |
-| `decisionPrompt` | exact default above | Hidden custom-role body; explicitly identifies extension automation and says it is not a user message/request; nonblank and at most 16,384 Unicode code points |
+| `decisionPrompt` | exact default above | Automated custom-role body; explicitly identifies extension automation and says it is not a user message/request; nonblank and at most 16,384 Unicode code points |
 | `continuePrompt` | exact default above | Compact fold-in after valid continue; nonblank and at most 16,384 Unicode code points |
 | `reasonTypes` | `["JOB_DONE","WAIT_USER","JOB_BLOCKED"]` | Allowed AI unlock types. A valid configured list **replaces** the default (it does not extend it). Valid = nonempty array of strings, each trim-nonblank. No identifier regex; no artificial length/count/collision hardening. |
 
@@ -144,7 +144,7 @@ Per main ownership generation / lock cycle, at least:
 | `exhausted` | `locked` and `maxRetries` valid continues already consumed; no new grace until reset |
 | `decisionFailed` | After 3 invalid decision attempts; locked remains true; no new grace until reset |
 | aggregate grace | One fixed grace for the current authoritative all-idle activity generation |
-| decision window | Hidden XML decision prompt in flight / re-ask; ordinary tools stay stable but calls are blocked |
+| decision window | Automated XML decision prompt in flight / re-ask; ordinary tools stay stable but calls are blocked |
 
 **Unconditional assignment:** manual lock/unlock **never** no-op on same-state. They always assign the target state. A direct manual unlock emits its corresponding TUI output; a manual lock emits only its final lock notification. The silent prerequisite unlock of a fresh lock cycle never emits unlock output. No “already locked/unlocked” short-circuit may skip either transition.
 
@@ -194,7 +194,7 @@ Unlock first makes `locked=false`, then invalidates the current aggregate grace 
 **Then** the plugin:
 
 1. Keeps ordinary active tools and the system-prompt tool list unchanged.
-2. Sends a **hidden custom-role** message—not a user-role message—whose body is the configured `decisionPrompt` plus a fixed XML suffix, using `{ triggerTurn: true, deliverAs: "steer", presentation: "hidden" }`. Pi keeps native Agent/provider/tool/retry/compaction/usage and extension lifecycle semantics, but TUI, JSON/RPC presentation subscribers, and session persistence receive no decision assistant/thinking/tool body. The suffix tells the model to use existing task context, not call tools, put exactly one watchdog block at the response end, never output multiple watchdog blocks, and use an effective allowed `reason_type` for unlock.
+2. Sends a **custom-role** message—not a user-role message—whose body is the configured `decisionPrompt` plus a fixed XML suffix, using `{ triggerTurn: true, deliverAs: "steer" }`. Ordinary tools stay advertised. The live decision assistant may stream in TUI/RPC. The suffix tells the model to use existing task context, not call tools, put exactly one watchdog block at the response end, never output multiple watchdog blocks, and use an effective allowed `reason_type` for unlock. This package does not request `presentation: "hidden"` and does not require a downstream Pi hidden-run API.
 3. Blocks every ordinary tool call before execution while the decision is active and returns a reminder to answer from existing context with XML. A blocked call does not itself consume an invalid attempt; final assistant text is authoritative.
 4. Does **not** send the rejected direct-continuation message as the idle wake path.
 
@@ -228,8 +228,8 @@ Thinking blocks are ignored. Concatenate final assistant text and trim it. It mu
 
 On invalid decision:
 
-1. Immediately re-ask with another hidden decision prompt.
-2. The next hidden prompt includes the **exact previous error** and explains why the response was invalid.
+1. Immediately re-ask with another decision prompt.
+2. The next prompt includes the **exact previous error** and explains why the response was invalid.
 3. Re-asks keep ordinary tools unchanged, continue blocking tool execution, and repeat the fixed XML suffix contract.
 4. Invalid checks **do not** consume the `maxRetries` valid-continue budget.
 5. After the **third** invalid attempt:
@@ -247,7 +247,7 @@ On invalid decision:
 - Append exactly one muted **persisted TUI-only** AI unlock entry, `Continue watchdog unlocked · <TYPE> · <reason>`, where `<TYPE>` is the matched configured type uppercased and `<reason>` is the validated reason (user-visible history, not model-bound as ordinary assistant prose)
 - Do **not** also emit a transient reasoned unlock notification
 - **No further work turn** is started for that unlock decision
-- Pi's extension `message_end` captures the validated original decision; hidden presentation suppresses every public streaming/message/tool row, and persistence stores only redacted assistant/tool-result metadata, so raw XML is neither shown nor stored as assistant content
+- Pi's extension `message_end` captures the validated original decision for audit/finalization. Live TUI/RPC may have streamed the decision. Future model-bound context then removes the entire exchange and inserts nothing.
 - **Future model-bound context** removes the **entire** decision exchange (prompt, redacted assistant/tool-result metadata, re-asks, and fold marker) and **inserts nothing** in its place
 - A context-excluded `pi-continue-watchdog:decision-audit` CustomEntry preserves only the structured validated outcome; Pi does not project CustomEntry into Agent/provider context
 
@@ -257,12 +257,12 @@ On invalid decision:
 
 - Reasonless (`reason_type` and `reason_content` are not required or used)
 - The decision turn ends, and ordinary work continues automatically without further user input
-- extension `message_end` captures the provider XML while hidden presentation prevents public output and persists redacted metadata; context folding then removes the complete prompt / redacted assistant and tool-result metadata and replaces them with **one** compact custom message containing the configured `continuePrompt` (exact default: `Continue until user assistance is required.`)
+- extension `message_end` captures the provider XML for validation; context folding then removes the complete prompt / assistant and tool-result metadata and replaces them with **one** compact custom message containing the configured `continuePrompt` (exact default: `Continue until user assistance is required.`)
 - show a live colored TUI widget with `Continue watchdog checking` and the current decision cycle while the check is active; clear it on terminal continue, unlock, failure, abort, or cleanup
 - persist a colored TUI-only event card for each watchdog validation re-ask with its safe parser error and cycle number; persist non-watchdog failures as `Other error` with the original error content
 - append exactly one persistent TUI-only entry with exact text `Continue watchdog continued`, so repeated automatic continuation remains observable without entering model context or adding a duplicate transient notification
 - persist that entry before dispatching continuation; if persistence fails, fail closed and start no automatic continuation turn
-- The continued ordinary turn receives exactly one compact model-bound message containing `continuePrompt`; the XML decision exchange is otherwise hidden from later context
+- The continued ordinary turn receives exactly one compact model-bound message containing `continuePrompt`; the XML decision exchange is otherwise removed from later context
 - Consumes **one** valid-continue retry (attempt advances)
 - The next authoritative aggregate all-idle generation uses the same fixed grace
 - After `maxRetries` valid continues, remain locked/exhausted with no timer until reset
@@ -366,6 +366,19 @@ These examples are the accepted product contract. Each is externally observable 
 
 Ordinary natural idle settle never counts as abort.
 
+### Example 4b — Interactive or RPC input preempts a submitted watchdog decision
+
+**Given** a submitted watchdog decision is running
+**When** interactive or RPC user input arrives
+**Then**
+
+- the original user message is admitted exactly once and is not re-sent by the watchdog
+- the watchdog decision is aborted and folded as `preempted`
+- the aborted decision assistant is cleared and does not remain in later model context
+- TUI/session show neither `Operation aborted` nor `Continue watchdog unlocked` for that preemption
+- lock remains; the user message start begins a fresh lock cycle
+- a later ordinary Esc/abort of the user-owned run still unlocks reasonlessly
+
 ### Example 5 — Locked + authoritative aggregate idle → fixed-grace **decision entry**
 
 **Given** main is locked, not exhausted, not decision-failed, and every observable same-process session is idle
@@ -374,7 +387,7 @@ Ordinary natural idle settle never counts as abort.
 
 - exactly one decision window is opened for that attempt (not a direct continue custom message)
 - ordinary active tools and the system-prompt tool list stay unchanged; attempted tool calls are blocked before execution with an XML reminder
-- a **hidden custom-role** decision message uses configured `decisionPrompt` plus the fixed XML suffix, identifies itself as extension automation, states it is not a user message/request, lists effective `reasonTypes`, and is never injected with user role
+- a **custom-role** decision message uses configured `decisionPrompt` plus the fixed XML suffix, identifies itself as extension automation, states it is not a user message/request, lists effective `reasonTypes`, and is never injected with user role
 - the model may narrate before XML or output only XML, but the trimmed response must end with exactly one watchdog block; multiple watchdog blocks are invalid
 - the rejected direct-continuation default
   `Continue the task. If you are intentionally waiting for the user or all tasks are complete, call unlock_continue_watchdog.`
@@ -422,7 +435,7 @@ With defaults, every eligible all-idle generation waits **10s**.
 **When** the model responds invalidly (missing or malformed watchdog XML, multiple watchdog blocks, trailing text after the block, unknown function, missing/blank/unknown `reason_type`, empty `reason_content`, or reason > 500 Unicode characters) **or the decision turn truly settles without any verifiable response**
 **Then**
 
-- immediately re-ask with a hidden prompt that includes the exact previous error and explains invalidity
+- immediately re-ask with a prompt that includes the exact previous error and explains invalidity
 - ordinary tools remain unchanged and execution stays blocked during the re-ask
 - invalid type and invalid reason both count under the same fixed three invalid attempts total
 - invalid re-asks do **not** advance the valid-continue attempt / do not count toward `maxRetries`
@@ -572,7 +585,7 @@ These are product constraints, not optional polish. Implementation details are r
 | Context folding is model-bound | Future model requests drop/replace the decision exchange; persisted structured audits are CustomEntry records excluded from Agent/provider context |
 | Ordinary tools remain advertised during decisions | Prompt/tool prefixes stay stable; the extension blocks execution until the final XML decision arrives |
 | Unlock ends the decision path without starting more work | Valid unlock must not start a further ordinary work turn |
-| Raw session is append-only | Hidden prompt, redacted assistant/tool-result metadata, and fold-marker records may remain on disk, but complete terminal exchanges are folded before provider requests; raw assistant XML and invalid answer text are not retained |
+| Raw session is append-only | Automated prompt, assistant/tool-result metadata, and fold-marker records may remain on disk, but complete terminal exchanges are folded before provider requests; raw assistant XML and invalid answer text are not retained |
 | XML extraction is suffix-based | Narration may precede the sole watchdog block; multiple watchdog blocks or trailing non-whitespace are invalid |
 
 ---
@@ -613,7 +626,7 @@ These are product constraints, not optional polish. Implementation details are r
 For each example above, implementation slices must leave evidence that can be re-run:
 
 - **Unit / component:** pure state machine (including decision-failed and attempt advancement rules), config precedence including `reasonTypes` replace semantics, XML suffix extraction and exactly-one-block validation, AI type case-insensitive match + uppercased matched configured value, reason trim/truncate/length (AI no-truncation vs human truncate), aggregate-grace cancel/restart, generation guards, and decision validity matrix
-- **Integration / E2E (stock Pi, packed install):** auto-lock on real main user message start; command lock/unlock notifies and optional untyped reason; ordinary-tool stability with XML decision prompts; at least one real fixed-grace path into a decision window; final XML hidden before persistence; structured CustomEntry audit excluded from context; continue/unlock/three-invalid/error/abort paths return to idle within bounded time; persisted session resume sends no watchdog question, answer, audit, or fold marker to the provider; delayed `AI_UNLOCK` user-ready while a child is busy; exhaustion or multi-attempt accounting (real or injected clock, documented)
+- **Integration / E2E (stock Pi, packed install):** auto-lock on real main user message start; command lock/unlock notifies and optional untyped reason; ordinary-tool stability with XML decision prompts; at least one real fixed-grace path into a decision window; structured CustomEntry audit excluded from context; continue/unlock/three-invalid/error/abort/user-takeover paths return to idle within bounded time; persisted session resume sends no watchdog question, answer, audit, or fold marker to the provider; delayed `AI_UNLOCK` user-ready while a child is busy; exhaustion or multi-attempt accounting (real or injected clock, documented)
 - **Human accept:** product authority reviews evidence against this file; AI does not self-accept
 
 **Contract status:** this file remains the accepted **behavior** contract. Implementation history is preserved in Git.
@@ -624,7 +637,7 @@ For each example above, implementation slices must leave evidence that can be re
 2. A child Pi inheriting the declaration, private endpoint identity, and root PID connects as an observer; it cannot create or revive the broker. It reports `agent_start` busy, `agent_settled` idle, and shutdown detach, but never loads watchdog config, locks, inquires, continues, unlocks, or publishes `user-ready`.
 3. Same-realm watchdog attachments aggregate into exactly one broker participant. Local hub election still chooses the one root-process main attachment. Final root detach closes the embedded broker and clears its root marker; a later attachment creates a fresh domain rather than reopening the closed topology.
 4. A remote busy participant invalidates the root aggregate generation. Busy then idle begins a fresh complete grace and fence.
-5. Activity-generation or broker-epoch change during a decision invalidates the response without consuming a retry. It cannot continue, unlock, exhaust, decision-fail, persist a continue status, or publish `user-ready`; the hidden exchange folds as `invalidated`.
+5. Activity-generation or broker-epoch change during a decision invalidates the response without consuming a retry. It cannot continue, unlock, exhaust, decision-fail, persist a continue status, or publish `user-ready`; the exchange folds as `invalidated`.
 6. Every automatic outcome is committed only while the root claim remains current and a certain/all-idle broker fence confirms. Manual commands and immediate main-abort unlock retain their explicit semantics.
 7. Root main abort unlocks immediately regardless of child activity. Child abort is only child activity settling; it never unlocks root.
 8. Initial partial/malformed declarations, wrong keys, unavailable startup brokers, incompatible protocol, and unsafe endpoints fail closed with sanitized output and status 78. Runtime lease rejection, reconnect failure, or broker loss instead makes watchdog decisions uncertain/fail-closed without terminating Pi or reviving the protocol-v2 broker. Per-domain Unix socket/named-pipe paths do not contain the domain key. No domain key, HMAC, token, declaration, or private endpoint is rendered.

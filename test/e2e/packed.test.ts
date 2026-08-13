@@ -376,6 +376,7 @@ async function createSession(
 		readonly maxTokens?: number;
 		readonly cwd?: string;
 		readonly uiContext?: ExtensionUIContext;
+		readonly abortHandler?: (session: AgentSession) => void;
 		readonly additionalExtensionPaths?: string[];
 		readonly sessionManager?: SessionManager;
 	},
@@ -457,9 +458,15 @@ async function createSession(
 			sessionManager: options?.sessionManager ?? SessionManager.inMemory(),
 		});
 		await session.bindExtensions(
-			options?.uiContext === undefined
-				? { mode: "print" }
-				: { mode: "rpc", uiContext: options.uiContext },
+			options?.abortHandler !== undefined
+				? {
+						mode: "tui",
+						uiContext: options.uiContext ?? createRpcUiContext(),
+						abortHandler: () => options.abortHandler?.(session),
+					}
+				: options?.uiContext === undefined
+					? { mode: "print" }
+					: { mode: "rpc", uiContext: options.uiContext },
 		);
 		return { session, extensionPath: loaded.path, loader };
 	} finally {
@@ -976,34 +983,11 @@ test("packed source artifact waits a real 10 seconds, decides continue, and fold
 	);
 	assert.equal(thirdBody.includes("Continue watchdog continued"), false);
 	assert.equal(thirdBody.includes("Continue watchdog checking"), false);
-	if (process.env.PI_EXPECT_HIDDEN_PRESENTATION === "1") {
-		assert.deepEqual(
-			publicEvents.filter((event) => event.text.includes("<watchdog>")),
-			[],
-		);
-		assert.equal(
-			publicEvents.some((event) =>
-				event.text.includes("unlock_continue_watchdog"),
-			),
-			false,
-		);
-		assert.equal(
-			publicEvents.some((event) => event.text.includes(decisionPromptStart)),
-			false,
-		);
-		assert.equal(
-			publicEvents.filter((event) => event.type === "agent_start").length,
-			3,
-		);
-		assert.equal(
-			publicEvents.filter((event) => event.type === "agent_end").length,
-			3,
-		);
-		assert.equal(
-			publicEvents.filter((event) => event.type === "agent_settled").length,
-			2,
-		);
-	}
+	// Decision content may stream publicly. Later provider context must still fold it.
+	assert.equal(
+		publicEvents.some((event) => event.type === "message_update"),
+		true,
+	);
 });
 
 test("packed stock Pi retries a decision connection error and accepts the successful unlock", {
@@ -1124,6 +1108,117 @@ test("packed command unlock and canonical programmatic abort prevent a decision 
 	assert.equal(requests.length, 1);
 });
 
+test("packed interactive and RPC input preempt a streaming decision once", {
+	timeout: 30_000,
+}, async (t) => {
+	for (const source of ["interactive", "rpc"] as const) {
+		const fixture = await makePackedFixture(t, {
+			watchdogConfig: { idleDelaySeconds: 0.1 },
+		});
+		let markDecisionStarted: (() => void) | undefined;
+		const decisionStarted = new Promise<void>((resolveStarted) => {
+			markDecisionStarted = resolveStarted;
+		});
+		const { baseUrl, requests } = await startMockServer(t, [
+			{ kind: "stop", text: "ordinary work complete" },
+			{ kind: "delayed", started: () => markDecisionStarted?.() },
+			{ kind: "stop", text: "user takeover response" },
+		]);
+		let tuiAbortHandlerCalls = 0;
+		const { session } = await createSession(fixture, baseUrl, {
+			uiContext: createRpcUiContext(),
+			abortHandler:
+				source === "interactive"
+					? (activeSession) => {
+							tuiAbortHandlerCalls += 1;
+							activeSession.clearQueue();
+							activeSession.agent.abort();
+						}
+					: undefined,
+		});
+		let sessionClosed = false;
+		t.after(async () => {
+			if (!sessionClosed) await shutdownSession(session);
+		});
+
+		const publicEvents: Array<{
+			readonly type: string;
+			readonly text: string;
+		}> = [];
+		const unsubscribe = session.subscribe((event) =>
+			publicEvents.push({ type: event.type, text: JSON.stringify(event) }),
+		);
+		t.after(unsubscribe);
+
+		await session.prompt("Open a decision that user input will preempt.");
+		await waitFor(
+			() => requests.length === 2,
+			8_000,
+			`${source} decision stream`,
+		);
+		await decisionStarted;
+
+		const takeover = session.prompt("user takeover", {
+			source,
+			streamingBehavior: "steer",
+		});
+		await waitFor(
+			() => requests.length === 3,
+			8_000,
+			`${source} user takeover turn`,
+		);
+		await takeover;
+		await waitForSessionIdle(session, 5_000, `${source} user takeover idle`);
+
+		const userStarts = publicEvents.filter((event) => {
+			if (event.type !== "message_start") return false;
+			const parsed = JSON.parse(event.text) as {
+				readonly message?: {
+					readonly role?: string;
+					readonly content?: unknown;
+				};
+			};
+			return (
+				parsed.message?.role === "user" &&
+				JSON.stringify(parsed.message.content).includes("user takeover")
+			);
+		});
+		assert.equal(userStarts.length, 1);
+		assert.equal(tuiAbortHandlerCalls, source === "interactive" ? 1 : 0);
+		assert.equal(
+			publicEvents.some((event) => event.text.includes("Operation aborted")),
+			false,
+		);
+		assert.equal(
+			publicEvents.some((event) =>
+				event.text.includes("Continue watchdog unlocked"),
+			),
+			false,
+		);
+
+		const serialized = session.sessionManager
+			.getEntries()
+			.map((entry) => JSON.stringify(entry));
+		assert.equal(
+			serialized.some((entry) => entry.includes('"outcome":"preempted"')),
+			true,
+		);
+		const laterPayload = JSON.stringify(requests[2]);
+		assert.equal(laterPayload.includes(decisionPromptStart), false);
+		assert.equal(laterPayload.includes("<watchdog>"), false);
+		assert.equal(
+			requests.filter((request) =>
+				request.messages.some((message) =>
+					textOf(message).includes("user takeover"),
+				),
+			).length,
+			1,
+		);
+		await shutdownSession(session);
+		sessionClosed = true;
+	}
+});
+
 test("packed neutral probe receives AI unlock user-ready and suppresses continue", {
 	timeout: 45_000,
 }, async (t) => {
@@ -1226,9 +1321,6 @@ test("packed invalid decisions reask three times and leave Pi idle", {
 	await waitForSessionIdle(session, 3_000, "decision-failed path");
 
 	const branch = session.sessionManager.getBranch();
-	if (process.env.PI_EXPECT_HIDDEN_PRESENTATION === "1") {
-		assert.equal(JSON.stringify(branch).includes("private invalid"), false);
-	}
 	const audits = branch.flatMap((entry) =>
 		entry.type === "custom" &&
 		entry.customType === "pi-continue-watchdog:decision-audit"
@@ -1278,17 +1370,6 @@ test("packed persisted session resumes without watchdog decision context or work
 	await shutdownSession(first.session);
 
 	const rawSession = await readFile(sessionFile, "utf8");
-	const persistedBeforeResume = SessionManager.open(sessionFile);
-	const persistedAssistants = persistedBeforeResume
-		.getBranch()
-		.flatMap((entry) =>
-			entry.type === "message" && entry.message.role === "assistant"
-				? [entry.message]
-				: [],
-		);
-	if (process.env.PI_EXPECT_HIDDEN_PRESENTATION === "1") {
-		assert.deepEqual(persistedAssistants.at(-1)?.content, []);
-	}
 	assert.equal(rawSession.includes("resume context is clean"), true);
 	assert.equal(
 		rawSession.includes("pi-continue-watchdog:decision-audit"),
@@ -1343,7 +1424,7 @@ test("packed custom reasonTypes replace defaults and match mixed-case input", {
 	await waitFor(() => requests.length === 2, 8_000, "unlock decision request");
 	await waitForSessionIdle(session, 3_000, "custom reason unlock path");
 
-	// The hidden prompt advertises only the effective custom list while ordinary
+	// The decision prompt advertises only the effective custom list while ordinary
 	// tools remain unchanged for prompt-prefix stability.
 	const decisionRequest = requests[1];
 	assert.ok(decisionRequest);
@@ -1364,20 +1445,9 @@ test("packed custom reasonTypes replace defaults and match mixed-case input", {
 		true,
 	);
 
-	// Downstream hidden presentation persists redacted assistant metadata.
-	// Only a structured CustomEntry audit survives semantically, and CustomEntry
-	// is excluded from Pi's model-bound session context by construction.
+	// Live decision content may remain in the append-only session. CustomEntry
+	// audits stay excluded from Pi's model-bound session context by construction.
 	const branch = session.sessionManager.getBranch();
-	const branchAssistants = branch.flatMap((entry) =>
-		entry.type === "message" && entry.message.role === "assistant"
-			? [entry.message]
-			: [],
-	);
-	if (process.env.PI_EXPECT_HIDDEN_PRESENTATION === "1") {
-		assert.deepEqual(branchAssistants.at(-1)?.content, []);
-		assert.equal(JSON.stringify(branch).includes(" need review "), false);
-		assert.equal(JSON.stringify(branch).includes(" awaiting review "), false);
-	}
 	const auditEntries = branch.flatMap((entry) =>
 		entry.type === "custom" &&
 		entry.customType === "pi-continue-watchdog:decision-audit"

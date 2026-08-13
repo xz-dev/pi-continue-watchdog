@@ -9,7 +9,7 @@ Pi extension that notices when every watchdog-loaded Pi process in an inherited 
 ## Requirements
 
 - Node.js `>= 22.19`
-- xz-dev/pi downstream build containing [`patch/hidden-internal-runs`](https://github.com/xz-dev/pi/tree/patch/hidden-internal-runs), integrated in `xz-dev/pi` main `20ba61510996da87f2f854bbb39243fefacab1eb` or later. Stock Pi does not provide the required hidden-presentation API for this watchdog revision.
+- Current Pi with the public extension `sendMessage` / lifecycle APIs. This watchdog does not require a downstream hidden-presentation seam.
 - Uses the exact reviewed Git-pinned `pi-process-domain` library; no dependency on a subagent plugin
 
 ## Install
@@ -32,7 +32,7 @@ Observable behavior only (implementation details may change):
 
 1. Whenever the **main agent starts running**, the continue watchdog ensures it is locked. If already locked, the current cycle is preserved. A real main user message starts a fresh cycle by silently performing a full unlock cleanup first—canceling timers and pending decision work—then locking again to reset old cycle accounting, without either notification.
 2. While locked, after every participant in the inherited authenticated process domain stays idle for the current delay, the extension confirms an immutable broker fence and opens a short **decision check** on the root main—regardless of whether Pi stopped normally, after compaction, or because of a Provider/extension error.
-3. The decision is a **hidden automated** custom message, not a user message. Ordinary active tools and the system-prompt tool list remain unchanged for prompt-cache stability. The model decides quickly from existing conversation knowledge without tools and finishes with exactly one XML block:
+3. The decision is an **automated custom message**, not a user message. It may stream in the live TUI/RPC while the check runs. Ordinary active tools and the system-prompt tool list remain unchanged for prompt-cache stability. The model decides quickly from existing conversation knowledge without tools and finishes with exactly one XML block:
 
    ```xml
    <watchdog><function>continue_watchdog</function></watchdog>
@@ -48,8 +48,8 @@ Observable behavior only (implementation details may change):
    </watchdog>
    ```
 
-   It may explain first or output only XML, but after trimming the sole `</watchdog>` must be the end of the response. Multiple watchdog blocks are invalid. If it tries an ordinary tool during the decision, the extension blocks execution and reminds it to answer from existing context with XML. The extension dispatches this check with Pi's downstream hidden-presentation option: extension lifecycle hooks still receive the native run, while TUI, JSON/RPC subscribers, and session persistence receive no decision assistant/thinking/tool body. The `message_end` hook still captures and validates the original response before Pi persists only redacted metadata.
-4. During every decision cycle, a live colored Pi-TUI widget shows `Continue watchdog checking` and the current attempt. Each watchdog validation re-ask and non-watchdog error is also retained as a colored TUI-only event card with its exact safe parser/original error. **Continue** must persist `Continue watchdog continued` before dispatch, so repeated automatic continuation is visible and cannot silently consume tokens; if persistence fails, it fails closed without starting another turn. The complete hidden exchange folds into the compact prompt `Continue until user assistance is required.` (configurable), and ordinary work resumes without further user input.
+   It may explain first or output only XML, but after trimming the sole `</watchdog>` must be the end of the response. Multiple watchdog blocks are invalid. If it tries an ordinary tool during the decision, the extension blocks execution and reminds it to answer from existing context with XML. Interactive or RPC user input during the check preempts it: the original user message runs exactly once, the aborted decision assistant is cleared, and no `Operation aborted` or `Continue watchdog unlocked` notice is shown. Future model context then drops the preempted exchange.
+4. During every decision cycle, a live colored Pi-TUI widget shows `Continue watchdog checking` and the current attempt. Each watchdog validation re-ask and non-watchdog error is also retained as a colored TUI-only event card with its exact safe parser/original error. **Continue** must persist `Continue watchdog continued` before dispatch, so repeated automatic continuation is visible and cannot silently consume tokens; if persistence fails, it fails closed without starting another turn. The complete decision exchange folds into the compact prompt `Continue until user assistance is required.` (configurable), and ordinary work resumes without further user input.
 5. **AI unlock** requires an allowed `reason_type` and concise nonblank `reason_content` of at most 500 Unicode code points. It shows one muted persistent TUI line, `Continue watchdog unlocked · <TYPE> · <reason>`, with no duplicate transient notification, and does **not** start another work turn. Future model context drops the complete decision exchange. Human command unlock remains untyped.
 6. A decision gets up to **3 total attempts**. An invalid final XML response counts as one attempt; blocked ordinary tool calls and provisional Provider errors that Pi retries within the same run do not. Invalid raw text is not retained. After the third invalid response, the extension stays locked/failed until a new main user message or manual lock, and the failed exchange is folded out of future model context.
 7. After each valid continue, the next authoritative all-idle generation waits the same fixed delay: default **10s** each time, up to **10** valid continues per lock cycle.
@@ -175,7 +175,7 @@ Publication is at most once per such terminal idle epoch. It does **not** publis
 
 ## Context cleanliness
 
-After valid continue, valid unlock, or terminal decision failure, future **model-bound** context drops the complete decision exchange, including the hidden question, redacted assistant/tool-result metadata, re-asks, and fold marker. Continue replaces it with the compact continue prompt; unlock and failure replace it with nothing. Canonical aborted decision pairs are also removed. A malformed or incomplete historical exchange fails closed only for its own correlation ID; it cannot disable folding for later independent exchanges.
+After valid continue, valid unlock, terminal decision failure, or user preemption, future **model-bound** context drops the complete decision exchange, including the decision question, any streamed assistant/tool-result residue, re-asks, and fold marker. Continue replaces it with the compact continue prompt; unlock, failure, and preemption replace it with nothing. Canonical aborted decision pairs are also removed. A malformed or incomplete historical exchange fails closed only for its own correlation ID; it cannot disable folding for later independent exchanges.
 
 Each decision stores only a structured `pi-continue-watchdog:decision-audit` custom entry. Pi explicitly excludes plain custom entries from Agent/provider context, so the audit survives `pi -c` without becoming conversation. Valid unlock audits keep the validated type and reason; invalid audits keep only the fixed validation error, never raw model text. The original XML is not retained as assistant content.
 

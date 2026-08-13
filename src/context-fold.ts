@@ -5,14 +5,17 @@ import { isValidPrompt } from "./config.js";
 /** Stable persisted metadata version for decision exchanges and their fold marker. */
 export const DECISION_PROTOCOL_VERSION = 1;
 
-/** Hidden message that opens an automated decision-response cycle. */
+/** Automated custom message that opens a decision-response cycle. */
 export const DECISION_MESSAGE_TYPE = "pi-continue-watchdog:decision";
 
-/** Hidden terminal record that makes a complete decision exchange foldable. */
+/** Terminal record that makes a complete decision exchange foldable. */
 export const DECISION_FOLD_MESSAGE_TYPE = "pi-continue-watchdog:decision-fold";
 
 /** Model-bound compact replacement emitted only by the context hook. */
 export const CONTINUATION_MESSAGE_TYPE = "pi-continue-watchdog:continuation";
+
+/** Internal persisted marker used to redact a decision that user input took over. */
+export const PREEMPTED_DECISION_ERROR = "pi-continue-watchdog:preempted";
 
 export interface DecisionMessageDetails {
 	readonly version: typeof DECISION_PROTOCOL_VERSION;
@@ -25,7 +28,11 @@ export type DecisionFoldDetails =
 			readonly version: typeof DECISION_PROTOCOL_VERSION;
 			readonly exchangeId: string;
 			readonly cycleId: number;
-			readonly outcome: "unlock" | "decision-failed" | "invalidated";
+			readonly outcome:
+				| "unlock"
+				| "decision-failed"
+				| "invalidated"
+				| "preempted";
 	  }
 	| {
 			readonly version: typeof DECISION_PROTOCOL_VERSION;
@@ -45,7 +52,11 @@ export type DecisionFoldMessageInput =
 	| {
 			readonly exchangeId: string;
 			readonly cycleId: number;
-			readonly outcome: "unlock" | "decision-failed" | "invalidated";
+			readonly outcome:
+				| "unlock"
+				| "decision-failed"
+				| "invalidated"
+				| "preempted";
 	  }
 	| {
 			readonly exchangeId: string;
@@ -73,7 +84,11 @@ type ParsedFoldMarker =
 			readonly type: "fold";
 			readonly exchangeId: string;
 			readonly cycleId: number;
-			readonly outcome: "unlock" | "decision-failed" | "invalidated";
+			readonly outcome:
+				| "unlock"
+				| "decision-failed"
+				| "invalidated"
+				| "preempted";
 			readonly timestamp: number;
 	  }
 	| {
@@ -176,7 +191,8 @@ function foldDetails(input: unknown): DecisionFoldDetails | undefined {
 	if (
 		outcome === "unlock" ||
 		outcome === "decision-failed" ||
-		outcome === "invalidated"
+		outcome === "invalidated" ||
+		outcome === "preempted"
 	) {
 		return {
 			version: DECISION_PROTOCOL_VERSION,
@@ -253,6 +269,17 @@ function isAbortedAssistant(input: unknown): boolean {
 	);
 }
 
+function isPreemptedAssistant(input: unknown): boolean {
+	return (
+		isObject(input) &&
+		input.role === "assistant" &&
+		input.stopReason === "stop" &&
+		input.errorMessage === PREEMPTED_DECISION_ERROR &&
+		Array.isArray(input.content) &&
+		input.content.length === 0
+	);
+}
+
 function createContinuationMessage<T extends object>(
 	marker: Extract<ParsedFoldMarker, { outcome: "continue" }>,
 ): T {
@@ -304,7 +331,9 @@ function findDecisionSegment<T extends object>(
 			if (
 				pluginMessage.exchangeId !== start.exchangeId ||
 				pluginMessage.cycleId !== cycleId ||
-				(pluginMessage.outcome !== "decision-failed" && !sawTerminalAssistant)
+				(pluginMessage.outcome !== "decision-failed" &&
+					pluginMessage.outcome !== "preempted" &&
+					!sawTerminalAssistant)
 			) {
 				return { kind: "incomplete" };
 			}
@@ -322,6 +351,7 @@ function findDecisionSegment<T extends object>(
 
 		if (!isObject(message)) return { kind: "incomplete" };
 		if (message.role === "assistant") {
+			if (isPreemptedAssistant(message)) continue;
 			if (isAbortedAssistant(message)) {
 				return { kind: "aborted", endIndex: index };
 			}
@@ -343,7 +373,7 @@ function findDecisionSegment<T extends object>(
 }
 
 /**
- * Build a hidden decision custom message with exact persisted correlation data.
+ * Build an automated decision custom message with exact persisted correlation data.
  * This only creates the public sendMessage payload; the runtime decides delivery.
  */
 export function createDecisionPromptMessage(
@@ -370,7 +400,7 @@ export function createDecisionPromptMessage(
 }
 
 /**
- * Build the hidden terminal record that permits a later model-context fold.
+ * Build the terminal record that permits a later model-context fold.
  * It is persisted with the raw session, so reloads need no external fold state.
  */
 export function createDecisionFoldMessage(
