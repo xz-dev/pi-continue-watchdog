@@ -1,4 +1,7 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	SessionEntry,
+} from "@earendil-works/pi-coding-agent";
 
 import { isValidPrompt } from "./config.js";
 
@@ -176,6 +179,53 @@ function decisionDetails(input: unknown): DecisionMessageDetails | undefined {
 	};
 }
 
+/** Locate the persisted assistant for one exact watchdog decision cycle. */
+export function findDecisionAssistantEntryId(
+	entries: readonly SessionEntry[],
+	exchangeId: string,
+	cycleId: number,
+): string | null {
+	let decisionIndex = -1;
+	for (let index = entries.length - 1; index >= 0; index -= 1) {
+		const entry = entries[index];
+		if (
+			entry?.type === "custom_message" &&
+			entry.customType === DECISION_MESSAGE_TYPE
+		) {
+			const details = decisionDetails(entry.details);
+			if (details?.exchangeId === exchangeId && details.cycleId === cycleId) {
+				decisionIndex = index;
+				break;
+			}
+		}
+	}
+	if (decisionIndex === -1) return null;
+
+	let assistantId: string | null = null;
+	for (let index = decisionIndex + 1; index < entries.length; index += 1) {
+		const entry = entries[index];
+		if (entry?.type === "message") {
+			if (entry.message?.role === "assistant") {
+				if (assistantId !== null) return null;
+				assistantId = entry.id;
+				continue;
+			}
+			if (entry.message?.role === "toolResult") continue;
+			return null;
+		}
+		if (entry?.type !== "custom_message") continue;
+		if (entry.customType === DECISION_MESSAGE_TYPE) return null;
+		if (entry.customType === DECISION_FOLD_MESSAGE_TYPE) {
+			const fold = foldDetails(entry.details);
+			return fold?.exchangeId === exchangeId && fold.cycleId === cycleId
+				? assistantId
+				: null;
+		}
+		return null;
+	}
+	return null;
+}
+
 function foldDetails(input: unknown): DecisionFoldDetails | undefined {
 	if (!isObject(input)) return undefined;
 	const exchangeId = input.exchangeId;
@@ -308,7 +358,6 @@ function findDecisionSegment<T extends object>(
 	start: ParsedDecisionMessage,
 ): DecisionSegment<T> {
 	let cycleId = start.cycleId;
-	let sawTerminalAssistant = false;
 
 	for (let index = startIndex + 1; index < messages.length; index += 1) {
 		const message = messages[index];
@@ -323,17 +372,13 @@ function findDecisionSegment<T extends object>(
 				return { kind: "incomplete" };
 			}
 			cycleId = pluginMessage.cycleId;
-			sawTerminalAssistant = false;
 			continue;
 		}
 
 		if (pluginMessage.type === "fold") {
 			if (
 				pluginMessage.exchangeId !== start.exchangeId ||
-				pluginMessage.cycleId !== cycleId ||
-				(pluginMessage.outcome !== "decision-failed" &&
-					pluginMessage.outcome !== "preempted" &&
-					!sawTerminalAssistant)
+				pluginMessage.cycleId !== cycleId
 			) {
 				return { kind: "incomplete" };
 			}
@@ -355,7 +400,6 @@ function findDecisionSegment<T extends object>(
 			if (isAbortedAssistant(message)) {
 				return { kind: "aborted", endIndex: index };
 			}
-			sawTerminalAssistant = true;
 			continue;
 		}
 		if (message.role === "toolResult") {

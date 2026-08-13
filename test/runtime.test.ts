@@ -23,6 +23,7 @@ import {
 import {
 	DECISION_FOLD_MESSAGE_TYPE,
 	DECISION_MESSAGE_TYPE,
+	foldDecisionContext,
 } from "../src/context-fold.js";
 import { createLockDecisionController } from "../src/controller.js";
 import { DECISION_TOOL_BLOCK_REASON } from "../src/decision-protocol.js";
@@ -109,6 +110,16 @@ interface SentMessage {
 	streaming: boolean;
 }
 
+interface BranchEntry {
+	readonly id: string;
+	readonly type: "custom_message" | "message";
+	readonly customType?: string;
+	readonly details?: unknown;
+	readonly message?: {
+		readonly role: "assistant";
+	};
+}
+
 interface Harness {
 	readonly handlers: Map<string, Handler[]>;
 	readonly clock: FakeClock;
@@ -119,6 +130,8 @@ interface Harness {
 	readonly sent: SentMessage[];
 	readonly notifications: Array<{ message: string; level?: string }>;
 	readonly entries: Array<{ type: string; data: unknown }>;
+	readonly branch: BranchEntry[];
+	readonly spliceAttempts: string[];
 	aborts: number;
 	pendingMessages: boolean;
 	ctx: ExtensionContext;
@@ -256,6 +269,9 @@ function createHarness(options?: {
 	readonly onSend?: (message: SentMessage["message"]) => Error | undefined;
 	readonly appendThrows?: boolean | string;
 	readonly onAppend?: (type: string) => void;
+	readonly spliceBehavior?: "success" | "false" | "throw" | "absent";
+	readonly branchThrows?: boolean;
+	readonly appendUnrelatedAssistantBeforeFold?: boolean;
 	readonly hasUI?: boolean;
 	readonly onNotify?: (message: string) => void;
 	readonly processDomain?: ProcessDomainCoordinator;
@@ -285,6 +301,8 @@ function createHarness(options?: {
 	const sent: SentMessage[] = [];
 	const notifications: Array<{ message: string; level?: string }> = [];
 	const entries: Array<{ type: string; data: unknown }> = [];
+	const branch: BranchEntry[] = [];
+	const spliceAttempts: string[] = [];
 	const widgets: Array<{ key: string; value: unknown }> = [];
 	const aborts = 0;
 	let runtime: ReturnType<typeof createDecisionRuntime>;
@@ -300,6 +318,8 @@ function createHarness(options?: {
 		sent,
 		notifications,
 		entries,
+		branch,
+		spliceAttempts,
 		widgets,
 		aborts,
 		pendingMessages: false,
@@ -332,6 +352,24 @@ function createHarness(options?: {
 				startedDecisionDetails !== message.details
 			)
 				decisionStarted = false;
+			if (
+				message.customType === DECISION_FOLD_MESSAGE_TYPE &&
+				sendOptions?.triggerTurn === false
+			) {
+				if (options?.appendUnrelatedAssistantBeforeFold) {
+					branch.push({
+						id: `unrelated-${branch.length + 1}`,
+						type: "message",
+						message: { role: "assistant" },
+					});
+				}
+				branch.push({
+					id: `fold-${branch.length + 1}`,
+					type: "custom_message",
+					customType: message.customType,
+					details: message.details,
+				});
+			}
 			if (sendOptions?.triggerTurn && !harness.streaming) {
 				harness.triggeredTurns += 1;
 			}
@@ -343,6 +381,21 @@ function createHarness(options?: {
 			}
 			entries.push({ type, data });
 		},
+		...(options?.spliceBehavior === "absent"
+			? {}
+			: {
+					spliceEntry(entryId: string): boolean | undefined {
+						spliceAttempts.push(entryId);
+						if (options?.spliceBehavior === "throw") {
+							throw new Error("splice failed");
+						}
+						if (options?.spliceBehavior === "success") {
+							const index = branch.findIndex((entry) => entry.id === entryId);
+							if (index !== -1) branch.splice(index, 1);
+						}
+						return options?.spliceBehavior === "false" ? false : undefined;
+					},
+				}),
 	} as unknown as ExtensionAPI;
 
 	const ctx = {
@@ -357,7 +410,13 @@ function createHarness(options?: {
 			onError?: (error: Error) => void;
 		}) => options?.onCompact?.(compactOptions),
 		isProjectTrusted: () => true,
-		sessionManager: { getSessionId: () => "main" },
+		sessionManager: {
+			getSessionId: () => "main",
+			getBranch: () => {
+				if (options?.branchThrows) throw new Error("branch failed");
+				return branch;
+			},
+		},
 		ui: {
 			notify(message: string, level?: string): void {
 				notifications.push({ message, level });
@@ -429,6 +488,12 @@ function createHarness(options?: {
 			.reverse()
 			.find((entry) => entry.message.customType === DECISION_MESSAGE_TYPE);
 		assert.ok(decision, "expected a dispatched watchdog decision");
+		branch.push({
+			id: `decision-${branch.length + 1}`,
+			type: "custom_message",
+			customType: decision.message.customType,
+			details: decision.message.details,
+		});
 		await harness.fire("message_start", {
 			type: "message_start",
 			message: {
@@ -464,6 +529,18 @@ function createHarness(options?: {
 		let result: unknown;
 		for (const handler of handlers.get("message_end") ?? []) {
 			result = await handler({ type: "message_end", message } as never, ctx);
+		}
+		if (
+			message !== null &&
+			typeof message === "object" &&
+			"role" in message &&
+			message.role === "assistant"
+		) {
+			branch.push({
+				id: `assistant-${branch.length + 1}`,
+				type: "message",
+				message: { role: "assistant" },
+			});
 		}
 		return result;
 	};
@@ -863,6 +940,97 @@ test("continue evidence is persisted before automatic continuation dispatch", as
 	assert.equal(harness.controller.snapshot.attempt, 1);
 	assert.equal(harness.triggeredTurns, 2);
 });
+
+for (const spliceBehavior of [
+	"success",
+	"false",
+	"throw",
+	"absent",
+	"branch-throw",
+	"unrelated-assistant",
+] as const) {
+	test(`decision cleanup remains compatible when splice API is ${spliceBehavior}`, async () => {
+		const harness = createHarness({
+			spliceBehavior:
+				spliceBehavior === "branch-throw" ||
+				spliceBehavior === "unrelated-assistant"
+					? "success"
+					: spliceBehavior,
+			branchThrows: spliceBehavior === "branch-throw",
+			appendUnrelatedAssistantBeforeFold:
+				spliceBehavior === "unrelated-assistant",
+		});
+		await startIdle(harness);
+		await harness.openDecision();
+		const answer = harness.answerUnlock("Waiting for approval.", "WAIT_USER");
+
+		const replacement = (await harness.endDecisionMessage(
+			answer,
+		)) as DecisionMessageReplacement;
+		assert.deepEqual(replacement.message.content, []);
+		assert.equal(harness.spliceAttempts.length, 0);
+
+		await harness.fire("agent_end", {
+			type: "agent_end",
+			messages: [answer],
+		});
+		harness.streaming = false;
+		await settleOnly(harness);
+
+		assert.equal(harness.controller.snapshot.locked, false);
+		assert.deepEqual(replacement.message.content, []);
+		assert.equal(
+			harness.sent.at(-1)?.message.customType,
+			DECISION_FOLD_MESSAGE_TYPE,
+		);
+		const fold = harness.sent.at(-1)?.message;
+		assert.ok(fold);
+		assert.deepEqual(
+			harness.entries.filter(
+				(entry) => entry.type === "pi-continue-watchdog:decision-audit",
+			),
+			[
+				{
+					type: "pi-continue-watchdog:decision-audit",
+					data: {
+						version: 1,
+						exchangeId: "exchange-1",
+						cycleId: 1,
+						outcome: "unlock",
+						reasonType: "WAIT_USER",
+						reason: "Waiting for approval.",
+					},
+				},
+			],
+		);
+		assert.deepEqual(
+			harness.spliceAttempts,
+			spliceBehavior === "absent" ||
+				spliceBehavior === "branch-throw" ||
+				spliceBehavior === "unrelated-assistant"
+				? []
+				: ["assistant-2"],
+		);
+		if (spliceBehavior === "success") {
+			const messages = [
+				{
+					role: "custom",
+					customType: harness.branch[0]?.customType,
+					content: "Decide now.",
+					display: false,
+					details: harness.branch[0]?.details,
+					timestamp: 1,
+				},
+				{
+					role: "custom",
+					...fold,
+					timestamp: 2,
+				},
+			];
+			assert.deepEqual(foldDecisionContext(messages), []);
+		}
+	});
+}
 
 test("decision message_end captures XML, clears its assistant, and persists a context-excluded audit", async () => {
 	const harness = createHarness();

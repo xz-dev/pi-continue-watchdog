@@ -27,6 +27,7 @@ import { type LoadedConfig, loadRuntimeConfig } from "./config-loader.js";
 import {
 	createDecisionFoldMessage,
 	createDecisionPromptMessage,
+	findDecisionAssistantEntryId,
 	PREEMPTED_DECISION_ERROR,
 } from "./context-fold.js";
 import {
@@ -123,6 +124,10 @@ interface PendingFinalization {
 	readonly active: ActiveDecision;
 	readonly cycleId: number;
 	readonly plan: DecisionProtocolPlan;
+}
+
+interface SpliceEntryAPI {
+	spliceEntry(entryId: string): void;
 }
 
 type SelfDecisionRun =
@@ -315,6 +320,10 @@ export function createDecisionRuntime(
 		readonly cycleId: number;
 		readonly response: DecisionResponse;
 	} | null = null;
+	let decisionAssistantToSplice: {
+		readonly exchangeId: string;
+		readonly cycleId: number;
+	} | null = null;
 	let pendingFinalization: PendingFinalization | null = null;
 	/** Retained only for AI decision unlock until the next all-idle settle. */
 	let pendingAiUnlock: {
@@ -470,6 +479,7 @@ export function createDecisionRuntime(
 		domainInternalDecision = false;
 		suppressDecisionAbort = false;
 		capturedDecisionResponse = null;
+		decisionAssistantToSplice = null;
 		pendingFinalization = null;
 		clearLiveStatus();
 		// Human/abort unlock must not inherit a prior AI unlock publication intent.
@@ -527,6 +537,26 @@ export function createDecisionRuntime(
 	const hasPendingMessages = (): boolean => {
 		const pending = sessionContext?.hasPendingMessages;
 		return typeof pending === "function" && pending.call(sessionContext);
+	};
+
+	const spliceDecisionAssistant = (ctx: ExtensionContext): void => {
+		const pending = decisionAssistantToSplice;
+		decisionAssistantToSplice = null;
+		if (pending === null) return;
+
+		try {
+			const spliceEntry = (options.pi as ExtensionAPI & Partial<SpliceEntryAPI>)
+				.spliceEntry;
+			if (typeof spliceEntry !== "function") return;
+			const entryId = findDecisionAssistantEntryId(
+				ctx.sessionManager.getBranch(),
+				pending.exchangeId,
+				pending.cycleId,
+			);
+			if (entryId !== null) spliceEntry.call(options.pi, entryId);
+		} catch {
+			// Tree cleanup is best effort and never replaces message clearing/folding.
+		}
 	};
 
 	const sameActivityGeneration = (
@@ -587,6 +617,7 @@ export function createDecisionRuntime(
 		active.invalidated = true;
 		const controller = options.controllerHolder.controller;
 		capturedDecisionResponse = null;
+		decisionAssistantToSplice = null;
 		pendingFinalization = null;
 		clearLiveStatus();
 		if (controller !== null) {
@@ -1239,6 +1270,7 @@ export function createDecisionRuntime(
 		localActivityGeneration += 1;
 		selfDecisionRun = { kind: "none" };
 		capturedDecisionResponse = null;
+		decisionAssistantToSplice = null;
 		pendingFinalization = null;
 		clearLiveStatus();
 		applyTransition(
@@ -1722,6 +1754,10 @@ export function createDecisionRuntime(
 		// misattributed as this decision's answer.
 		active.dispatchPending = false;
 		active.submitted = false;
+		decisionAssistantToSplice = {
+			exchangeId: active.exchangeId,
+			cycleId,
+		};
 
 		const validation = validateDecisionResponse(response, config.reasonTypes);
 		const audit: DecisionAuditEntry = validation.valid
@@ -2147,6 +2183,7 @@ export function createDecisionRuntime(
 					finalizeActiveDecision("missing");
 				}
 				const continued = await deliverPending(ctx);
+				spliceDecisionAssistant(ctx);
 				// Explicit reconcile even when hub markIdle was a no-op edge.
 				reconcileIdle();
 				// Valid continue remains intermediate; wait for the next real idle epoch.
