@@ -85,6 +85,15 @@ class FakeClock implements RuntimeClock {
 
 type Handler = (event: never, ctx: ExtensionContext) => unknown;
 
+interface DecisionMessageReplacement {
+	readonly message: {
+		readonly role: "assistant";
+		readonly content: readonly unknown[];
+		readonly stopReason?: string;
+		readonly errorMessage?: string;
+	};
+}
+
 interface SentMessage {
 	message: {
 		customType: string;
@@ -855,7 +864,7 @@ test("continue evidence is persisted before automatic continuation dispatch", as
 	assert.equal(harness.triggeredTurns, 2);
 });
 
-test("decision message_end captures XML without mutating live context and persists a context-excluded audit", async () => {
+test("decision message_end captures XML, clears its assistant, and persists a context-excluded audit", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
 	const answer = harness.answerUnlock("Waiting for approval.", "WAIT_USER");
@@ -864,7 +873,12 @@ test("decision message_end captures XML without mutating live context and persis
 	assert.deepEqual(harness.entries, []);
 
 	await harness.openDecision();
-	assert.equal(await harness.endDecisionMessage(answer), undefined);
+	const replacement = (await harness.endDecisionMessage(
+		answer,
+	)) as DecisionMessageReplacement;
+	assert.equal(replacement.message.role, "assistant");
+	assert.deepEqual(replacement.message.content, []);
+	assert.equal(replacement.message.stopReason, "stop");
 	assert.deepEqual(harness.entries.at(-1), {
 		type: "pi-continue-watchdog:decision-audit",
 		data: {
@@ -911,7 +925,10 @@ test("decision provider error stays provisional so the same Pi run can retry and
 		"All requested work is complete.",
 		"JOB_DONE",
 	);
-	assert.equal(await harness.endDecisionMessage(unlock), undefined);
+	const replacement = (await harness.endDecisionMessage(
+		unlock,
+	)) as DecisionMessageReplacement;
+	assert.deepEqual(replacement.message.content, []);
 	await harness.fire("agent_end", {
 		type: "agent_end",
 		messages: [unlock],
@@ -1028,12 +1045,10 @@ test("decision message_end audit records invalid output without retaining raw te
 	const harness = createHarness();
 	await startIdle(harness);
 	await harness.openDecision();
-	assert.equal(
-		await harness.endDecisionMessage(
-			harness.answerInvalid("private malformed watchdog answer"),
-		),
-		undefined,
-	);
+	const replacement = (await harness.endDecisionMessage(
+		harness.answerInvalid("private malformed watchdog answer"),
+	)) as DecisionMessageReplacement;
+	assert.deepEqual(replacement.message.content, []);
 	assert.deepEqual(harness.entries.at(-1), {
 		type: "pi-continue-watchdog:decision-audit",
 		data: {
@@ -2414,15 +2429,17 @@ test("real user input silently preempts a submitted decision and extension input
 	assert.equal(extension.controller.snapshot.decisionOpen, true);
 });
 
-test("ordinary aborted decision assistant stays aborted without user takeover", async () => {
+test("ordinary aborted decision assistant is cleared without being reclassified as user takeover", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
 	await harness.openDecision();
 	await harness.startDecision();
-	assert.equal(
-		await harness.endDecisionMessage(assistant([], "aborted")),
-		undefined,
-	);
+	const replacement = (await harness.endDecisionMessage(
+		assistant([text("partial private watchdog answer")], "aborted"),
+	)) as DecisionMessageReplacement;
+	assert.deepEqual(replacement.message.content, []);
+	assert.equal(replacement.message.stopReason, "aborted");
+	assert.equal(replacement.message.errorMessage, undefined);
 	assert.equal(harness.runtime.consumeDecisionAbortSuppression(), false);
 	assert.equal(harness.aborts, 0);
 	assert.equal(harness.controller.snapshot.locked, true);

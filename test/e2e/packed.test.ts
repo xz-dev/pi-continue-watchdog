@@ -983,10 +983,38 @@ test("packed source artifact waits a real 10 seconds, decides continue, and fold
 	);
 	assert.equal(thirdBody.includes("Continue watchdog continued"), false);
 	assert.equal(thirdBody.includes("Continue watchdog checking"), false);
-	// Decision content may stream publicly. Later provider context must still fold it.
+	// Decision content may stream while the provider runs, then message_end clears
+	// the finalized assistant before public completion and session persistence.
 	assert.equal(
 		publicEvents.some((event) => event.type === "message_update"),
 		true,
+	);
+	const firstDecisionUpdate = publicEvents.findIndex(
+		(event) =>
+			event.type === "message_update" &&
+			event.text.includes("continue_watchdog"),
+	);
+	const publicDecisionEnd = publicEvents.findIndex(
+		(event, index) =>
+			index > firstDecisionUpdate &&
+			event.type === "message_end" &&
+			event.text.includes('"role":"assistant"') &&
+			event.text.includes('"content":[]'),
+	);
+	assert.ok(firstDecisionUpdate >= 0);
+	assert.ok(publicDecisionEnd > firstDecisionUpdate);
+	const persistedAssistants = session.sessionManager
+		.getBranch()
+		.flatMap((entry) =>
+			entry.type === "message" && entry.message.role === "assistant"
+				? [entry.message]
+				: [],
+		);
+	assert.equal(
+		persistedAssistants.some((message) =>
+			JSON.stringify(message).includes("continue_watchdog"),
+		),
+		false,
 	);
 });
 
@@ -1189,6 +1217,19 @@ test("packed interactive and RPC input preempt a streaming decision once", {
 			publicEvents.some((event) => event.text.includes("Operation aborted")),
 			false,
 		);
+		const decisionUpdate = publicEvents.findIndex(
+			(event) =>
+				event.type === "message_update" && event.text.includes("partial"),
+		);
+		const clearedDecisionEnd = publicEvents.findIndex(
+			(event, index) =>
+				index > decisionUpdate &&
+				event.type === "message_end" &&
+				event.text.includes('"role":"assistant"') &&
+				event.text.includes('"content":[]'),
+		);
+		assert.ok(decisionUpdate >= 0);
+		assert.ok(clearedDecisionEnd > decisionUpdate);
 		assert.equal(
 			publicEvents.some((event) =>
 				event.text.includes("Continue watchdog unlocked"),
@@ -1202,6 +1243,10 @@ test("packed interactive and RPC input preempt a streaming decision once", {
 		assert.equal(
 			serialized.some((entry) => entry.includes('"outcome":"preempted"')),
 			true,
+		);
+		assert.equal(
+			serialized.some((entry) => entry.includes("partial")),
+			false,
 		);
 		const laterPayload = JSON.stringify(requests[2]);
 		assert.equal(laterPayload.includes(decisionPromptStart), false);

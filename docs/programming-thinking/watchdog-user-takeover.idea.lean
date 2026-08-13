@@ -43,7 +43,7 @@ def environmentAdmitted (environment : EnvironmentAssumptions) : Prop :=
   environment.abortedDecisionEnds = true ∧
     environment.userRunSettles = true
 
--- Named states make the complete object flow explicit; only the initial decision may expose transient streamed content.
+-- Named states make the complete object flow explicit; only the in-flight decision may expose transient streamed content, which finalization clears.
 def decisionState (streamVisible : Bool) : ProcessState :=
   {
     phase := .decisionStreaming
@@ -185,7 +185,7 @@ def processInvariant (streamWasVisible : Bool) (state : ProcessState) : Prop :=
     state = userWorkState ∨
     state = completedUserWorkState
 
--- The deterministic transition clears decision content and records the fold before waiting for abort completion and user work.
+-- The deterministic transition models public message-end replacement clearing decision content and records the fold before waiting for abort completion and user work.
 def takeoverStep
     (environment : EnvironmentAssumptions)
     (state : ProcessState) : ProcessState :=
@@ -361,7 +361,7 @@ structure TakeoverGuarantees
     (iterate (takeoverStep environment) 3
       (decisionState streamWasVisible))
 
--- Top-level correctness proves the gathered obligations for either visible or not-yet-visible initial decision streaming.
+-- Top-level correctness proves the gathered obligations for either visible or not-yet-visible in-flight decision streaming; no finalized decision content survives.
 theorem process_is_correct
     (environment : EnvironmentAssumptions)
     (assumptions : environmentAdmitted environment)

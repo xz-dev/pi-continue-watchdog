@@ -32,7 +32,7 @@ Observable behavior only (implementation details may change):
 
 1. Whenever the **main agent starts running**, the continue watchdog ensures it is locked. If already locked, the current cycle is preserved. A real main user message starts a fresh cycle by silently performing a full unlock cleanup first—canceling timers and pending decision work—then locking again to reset old cycle accounting, without either notification.
 2. While locked, after every participant in the inherited authenticated process domain stays idle for the current delay, the extension confirms an immutable broker fence and opens a short **decision check** on the root main—regardless of whether Pi stopped normally, after compaction, or because of a Provider/extension error.
-3. The decision is an **automated custom message**, not a user message. It may stream in the live TUI/RPC while the check runs. Ordinary active tools and the system-prompt tool list remain unchanged for prompt-cache stability. The model decides quickly from existing conversation knowledge without tools and finishes with exactly one XML block:
+3. The decision is an **automated custom message**, not a user message. It may stream in the live TUI/RPC while the check runs; when it ends, the extension clears the decision assistant from final TUI history and persisted assistant content. Ordinary active tools and the system-prompt tool list remain unchanged for prompt-cache stability. The model decides quickly from existing conversation knowledge without tools and finishes with exactly one XML block:
 
    ```xml
    <watchdog><function>continue_watchdog</function></watchdog>
@@ -177,7 +177,7 @@ Publication is at most once per such terminal idle epoch. It does **not** publis
 
 After valid continue, valid unlock, terminal decision failure, or user preemption, future **model-bound** context drops the complete decision exchange, including the decision question, any streamed assistant/tool-result residue, re-asks, and fold marker. Continue replaces it with the compact continue prompt; unlock, failure, and preemption replace it with nothing. Canonical aborted decision pairs are also removed. A malformed or incomplete historical exchange fails closed only for its own correlation ID; it cannot disable folding for later independent exchanges.
 
-Each decision stores only a structured `pi-continue-watchdog:decision-audit` custom entry. Pi explicitly excludes plain custom entries from Agent/provider context, so the audit survives `pi -c` without becoming conversation. Valid unlock audits keep the validated type and reason; invalid audits keep only the fixed validation error, never raw model text. The original XML is not retained as assistant content.
+Each decision stores only a structured `pi-continue-watchdog:decision-audit` custom entry. Pi explicitly excludes plain custom entries from Agent/provider context, so the audit survives `pi -c` without becoming conversation. Valid unlock audits keep the validated type and reason; invalid audits keep only the fixed validation error, never raw model text. The original XML and any aborted partial decision are not retained as assistant content. Pi's public `message_end` replacement leaves an empty assistant metadata record rather than deleting the append-only entry.
 
 ## Development
 

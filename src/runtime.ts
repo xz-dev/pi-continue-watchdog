@@ -1701,11 +1701,18 @@ export function createDecisionRuntime(
 			!active.submitted ||
 			pendingFinalization !== null ||
 			event.message.role !== "assistant" ||
-			isAbortedAssistant(event.message) ||
 			isErroredAssistant(event.message) ||
 			!options.hub.isCurrentMain(active.claim)
 		) {
 			return undefined;
+		}
+		if (isAbortedAssistant(event.message)) {
+			return {
+				message: {
+					...event.message,
+					content: [],
+				},
+			};
 		}
 		const cycleId = active.protocol.currentCycleId;
 		const response = normalizeAssistantDecisionResponse(event.message);
@@ -1749,7 +1756,12 @@ export function createDecisionRuntime(
 			// Audit persistence is optional; context hiding must still succeed.
 		}
 
-		return undefined;
+		return {
+			message: {
+				...event.message,
+				content: [],
+			},
+		};
 	};
 
 	const handleAgentEnd = (event: AgentEndEvent): void => {

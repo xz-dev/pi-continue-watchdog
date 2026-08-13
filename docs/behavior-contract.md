@@ -194,7 +194,7 @@ Unlock first makes `locked=false`, then invalidates the current aggregate grace 
 **Then** the plugin:
 
 1. Keeps ordinary active tools and the system-prompt tool list unchanged.
-2. Sends a **custom-role** message—not a user-role message—whose body is the configured `decisionPrompt` plus a fixed XML suffix, using `{ triggerTurn: true, deliverAs: "steer" }`. Ordinary tools stay advertised. The live decision assistant may stream in TUI/RPC. The suffix tells the model to use existing task context, not call tools, put exactly one watchdog block at the response end, never output multiple watchdog blocks, and use an effective allowed `reason_type` for unlock. This package does not request `presentation: "hidden"` and does not require a downstream Pi hidden-run API.
+2. Sends a **custom-role** message—not a user-role message—whose body is the configured `decisionPrompt` plus a fixed XML suffix, using `{ triggerTurn: true, deliverAs: "steer" }`. Ordinary tools stay advertised. The live decision assistant may stream in TUI/RPC, but public `message_end` replacement clears its finalized or aborted content from TUI history and persistence. The suffix tells the model to use existing task context, not call tools, put exactly one watchdog block at the response end, never output multiple watchdog blocks, and use an effective allowed `reason_type` for unlock. This package does not request `presentation: "hidden"` and does not require a downstream Pi hidden-run API.
 3. Blocks every ordinary tool call before execution while the decision is active and returns a reminder to answer from existing context with XML. A blocked call does not itself consume an invalid attempt; final assistant text is authoritative.
 4. Does **not** send the rejected direct-continuation message as the idle wake path.
 
@@ -247,7 +247,7 @@ On invalid decision:
 - Append exactly one muted **persisted TUI-only** AI unlock entry, `Continue watchdog unlocked · <TYPE> · <reason>`, where `<TYPE>` is the matched configured type uppercased and `<reason>` is the validated reason (user-visible history, not model-bound as ordinary assistant prose)
 - Do **not** also emit a transient reasoned unlock notification
 - **No further work turn** is started for that unlock decision
-- Pi's extension `message_end` captures the validated original decision for audit/finalization. Live TUI/RPC may have streamed the decision. Future model-bound context then removes the entire exchange and inserts nothing.
+- Pi's extension `message_end` captures the validated original decision for audit/finalization, then replaces the finalized assistant with empty content. Live TUI/RPC may have streamed the decision before completion. Future model-bound context then removes the entire exchange and inserts nothing.
 - **Future model-bound context** removes the **entire** decision exchange (prompt, redacted assistant/tool-result metadata, re-asks, and fold marker) and **inserts nothing** in its place
 - A context-excluded `pi-continue-watchdog:decision-audit` CustomEntry preserves only the structured validated outcome; Pi does not project CustomEntry into Agent/provider context
 
@@ -257,7 +257,7 @@ On invalid decision:
 
 - Reasonless (`reason_type` and `reason_content` are not required or used)
 - The decision turn ends, and ordinary work continues automatically without further user input
-- extension `message_end` captures the provider XML for validation; context folding then removes the complete prompt / assistant and tool-result metadata and replaces them with **one** compact custom message containing the configured `continuePrompt` (exact default: `Continue until user assistance is required.`)
+- extension `message_end` captures the provider XML for validation and replaces the finalized assistant with empty content; context folding then removes the complete prompt / assistant and tool-result metadata and replaces them with **one** compact custom message containing the configured `continuePrompt` (exact default: `Continue until user assistance is required.`)
 - show a live colored TUI widget with `Continue watchdog checking` and the current decision cycle while the check is active; clear it on terminal continue, unlock, failure, abort, or cleanup
 - persist a colored TUI-only event card for each watchdog validation re-ask with its safe parser error and cycle number; persist non-watchdog failures as `Other error` with the original error content
 - append exactly one persistent TUI-only entry with exact text `Continue watchdog continued`, so repeated automatic continuation remains observable without entering model context or adding a duplicate transient notification

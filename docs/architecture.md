@@ -217,7 +217,7 @@ The model receives at most three total decision responses. Invalid responses tri
 
 ## Decision streaming and user takeover
 
-The decision uses ordinary Pi `sendMessage({ triggerTurn: true, deliverAs: "steer" })`. Public subscribers may see the live assistant stream. After a completed decision, `message_end` captures the original response for validation/audit, then context folding removes the complete exchange from later provider requests.
+The decision uses ordinary Pi `sendMessage({ triggerTurn: true, deliverAs: "steer" })`. Public subscribers may see the live assistant stream. At `message_end`, the runtime captures the original response for validation/audit and returns a same-role empty-content replacement. Stock Pi updates the current TUI component and persists the replacement, so finalized XML or aborted partial content does not remain in history. Context folding then removes the complete exchange from later provider requests.
 
 Interactive or RPC user input during a submitted decision preempts that check:
 
@@ -227,7 +227,7 @@ Interactive or RPC user input during a submitted decision preempts that check:
 4. abort-unlock is suppressed for that one decision, so lock remains and no `Continue watchdog unlocked` notice appears;
 5. the user message starts a fresh lock cycle exactly once.
 
-Manual Esc / ordinary abort of a non-preempted main run still unlocks reasonlessly. Provider `stopReason: "error"` remains provisional because Pi may automatically retry within the same run.
+Manual Esc / ordinary abort of a non-preempted main run still unlocks reasonlessly. If that run is a watchdog decision, `message_end` keeps `stopReason: "aborted"` for abort attribution while clearing partial content. Provider `stopReason: "error"` remains provisional and visible because Pi may automatically retry within the same run.
 
 ## Context-excluded audit records
 
@@ -427,7 +427,7 @@ Lock state, aggregate grace, ownership, and pending decisions are runtime-only. 
 
 ### Deliberate limits
 
-The session file is append-only. It may retain the decision question, streamed assistant/tool-result metadata, re-ask, and fold marker as Pi-recognizable protocol entries. Live TUI/RPC frames during an in-flight decision are not retracted. Context folding removes a complete or preempted exchange before later provider requests, but cannot provide the same guarantee if:
+The session file is append-only. It may retain the decision question, an empty assistant metadata entry, tool-result metadata, re-ask, and fold marker as Pi-recognizable protocol entries. Live TUI/RPC frames during an in-flight decision are not retroactively retracted, but the finalized TUI component and persisted assistant content are cleared at `message_end`. Context folding removes a complete or preempted exchange before later provider requests, but cannot provide the same guarantee if:
 
 - the extension fails to load during recovery;
 - the process dies before a terminal fold marker is persisted;
