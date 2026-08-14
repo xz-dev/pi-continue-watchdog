@@ -2116,6 +2116,7 @@ export function createDecisionRuntime(
 				quarantinedDecision = null;
 				suppressDecisionAbort = false;
 			}
+			const spliceBeforeNextTurn = decisionAssistantToSplice;
 			if (selfDecisionRun.kind === "none") localActivityGeneration += 1;
 			if (attachment !== null) options.hub.markIdle(attachment);
 			if (selfDecisionRun.kind === "provisional") {
@@ -2141,6 +2142,15 @@ export function createDecisionRuntime(
 			// Capture per-run and per-settle identity: a later agent_start or a newer
 			// true-idle settle must leave this callback inert even if ctx is idle again.
 			const settledClaim = getMainClaim();
+			if (
+				spliceBeforeNextTurn !== null &&
+				ctx.isIdle() &&
+				localIdle() &&
+				pendingFinalization === null &&
+				decisionAssistantToSplice === spliceBeforeNextTurn
+			) {
+				spliceDecisionAssistant(ctx);
+			}
 			const settledLifecycleGeneration = lifecycleGeneration;
 			const settledAggregateGeneration = graceCoordinator.snapshot.generation;
 			const settledToken = ++settledCallbackGeneration;
@@ -2183,7 +2193,9 @@ export function createDecisionRuntime(
 					finalizeActiveDecision("missing");
 				}
 				const continued = await deliverPending(ctx);
-				spliceDecisionAssistant(ctx);
+				// Continue/re-ask dispatch begins another run before this callback regains
+				// control. Keep its assistant pending until the next true idle boundary.
+				if (!continued && ctx.isIdle()) spliceDecisionAssistant(ctx);
 				// Explicit reconcile even when hub markIdle was a no-op edge.
 				reconcileIdle();
 				// Valid continue remains intermediate; wait for the next real idle epoch.

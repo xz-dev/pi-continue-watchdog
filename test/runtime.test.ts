@@ -23,6 +23,7 @@ import {
 import {
 	DECISION_FOLD_MESSAGE_TYPE,
 	DECISION_MESSAGE_TYPE,
+	findDecisionAssistantEntryId,
 	foldDecisionContext,
 } from "../src/context-fold.js";
 import { createLockDecisionController } from "../src/controller.js";
@@ -1031,6 +1032,100 @@ for (const spliceBehavior of [
 		}
 	});
 }
+
+test("decision assistant lookup skips matching audit and continue evidence before fold", () => {
+	const exchangeId = "exchange-1";
+	const entries = [
+		{
+			type: "custom_message",
+			id: "decision",
+			parentId: "parent",
+			customType: DECISION_MESSAGE_TYPE,
+			content: "Decide",
+			display: false,
+			details: { version: 1, exchangeId, cycleId: 1 },
+			timestamp: "2026-01-01T00:00:00.000Z",
+		},
+		{
+			type: "custom",
+			id: "audit",
+			parentId: "decision",
+			customType: "pi-continue-watchdog:decision-audit",
+			data: { version: 1, exchangeId, cycleId: 1, outcome: "continue" },
+			timestamp: "2026-01-01T00:00:01.000Z",
+		},
+		{
+			type: "message",
+			id: "assistant",
+			parentId: "audit",
+			message: { role: "assistant", content: [] },
+			timestamp: "2026-01-01T00:00:02.000Z",
+		},
+		{
+			type: "custom",
+			id: "continue",
+			parentId: "assistant",
+			customType: "pi-continue-watchdog:continue",
+			data: {},
+			timestamp: "2026-01-01T00:00:03.000Z",
+		},
+		{
+			type: "custom_message",
+			id: "fold",
+			parentId: "continue",
+			customType: DECISION_FOLD_MESSAGE_TYPE,
+			content: "Continue until user assistance is required.",
+			display: false,
+			details: {
+				version: 1,
+				exchangeId,
+				cycleId: 1,
+				outcome: "continue",
+				continuePrompt: "Continue until user assistance is required.",
+			},
+			timestamp: "2026-01-01T00:00:04.000Z",
+		},
+	] as never;
+	assert.equal(
+		findDecisionAssistantEntryId(entries, exchangeId, 1),
+		"assistant",
+	);
+});
+
+test("continue decision cleanup waits for the next settled boundary before splicing", async () => {
+	const harness = createHarness({ spliceBehavior: "success" });
+	await startIdle(harness);
+	await harness.openDecision();
+	const answer = harness.answerContinue();
+
+	const replacement = (await harness.endDecisionMessage(
+		answer,
+	)) as DecisionMessageReplacement;
+	assert.deepEqual(replacement.message.content, []);
+	await harness.fire("agent_end", { type: "agent_end", messages: [answer] });
+	harness.streaming = false;
+	await settleOnly(harness);
+
+	assert.deepEqual(harness.spliceAttempts, []);
+	assert.equal(
+		harness.sent.at(-1)?.message.customType,
+		DECISION_FOLD_MESSAGE_TYPE,
+	);
+	harness.branch.push({
+		id: `fold-${harness.branch.length + 1}`,
+		type: "custom_message",
+		customType: DECISION_FOLD_MESSAGE_TYPE,
+		details: harness.sent.at(-1)?.message.details,
+	});
+
+	harness.streaming = false;
+	await harness.fire("agent_settled", { type: "agent_settled" });
+	assert.deepEqual(harness.spliceAttempts, ["assistant-2"]);
+	assert.equal(
+		harness.branch.some((entry) => entry.id === "assistant-2"),
+		false,
+	);
+});
 
 test("decision message_end captures XML, clears its assistant, and persists a context-excluded audit", async () => {
 	const harness = createHarness();

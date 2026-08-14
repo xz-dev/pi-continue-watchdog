@@ -213,6 +213,15 @@ export function findDecisionAssistantEntryId(
 			if (entry.message?.role === "toolResult") continue;
 			return null;
 		}
+		if (entry?.type === "custom") {
+			if (
+				entry.customType === "pi-continue-watchdog:decision-audit" ||
+				entry.customType === "pi-continue-watchdog:continue"
+			) {
+				continue;
+			}
+			return null;
+		}
 		if (entry?.type !== "custom_message") continue;
 		if (entry.customType === DECISION_MESSAGE_TYPE) return null;
 		if (entry.customType === DECISION_FOLD_MESSAGE_TYPE) {
