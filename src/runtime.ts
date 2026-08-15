@@ -130,6 +130,16 @@ interface SpliceEntryAPI {
 	spliceEntry(entryId: string): void;
 }
 
+interface UninterruptibleMessageEndAPI {
+	on(
+		event: "message_end",
+		handler: (
+			event: MessageEndEvent,
+		) => { readonly message: MessageEndEvent["message"] } | undefined,
+		options: { readonly uninterruptible: true },
+	): void;
+}
+
 type SelfDecisionRun =
 	| { readonly kind: "none" }
 	| {
@@ -249,6 +259,16 @@ function hasAssistantStopReason(message: unknown, stopReason: string): boolean {
 
 function isAbortedAssistant(message: unknown): boolean {
 	return hasAssistantStopReason(message, "aborted");
+}
+
+function isPreemptedAssistant(message: unknown): boolean {
+	return (
+		hasAssistantStopReason(message, "stop") &&
+		typeof message === "object" &&
+		message !== null &&
+		(message as { readonly errorMessage?: unknown }).errorMessage ===
+			PREEMPTED_DECISION_ERROR
+	);
 }
 
 function isErroredAssistant(message: unknown): boolean {
@@ -617,7 +637,6 @@ export function createDecisionRuntime(
 		active.invalidated = true;
 		const controller = options.controllerHolder.controller;
 		capturedDecisionResponse = null;
-		decisionAssistantToSplice = null;
 		pendingFinalization = null;
 		clearLiveStatus();
 		if (controller !== null) {
@@ -1714,9 +1733,9 @@ export function createDecisionRuntime(
 		// The TUI renders abort text from `stopReason`, so neutralize both fields;
 		// this only ever applies to the watchdog's own preempted internal turn.
 		if (
-			suppressDecisionAbort &&
 			event.message.role === "assistant" &&
-			isAbortedAssistant(event.message)
+			((suppressDecisionAbort && isAbortedAssistant(event.message)) ||
+				isPreemptedAssistant(event.message))
 		) {
 			return {
 				message: {
@@ -2055,6 +2074,7 @@ export function createDecisionRuntime(
 			suppressDecisionAbort = true;
 			const exchangeId = active.exchangeId;
 			const cycleId = active.protocol.currentCycleId;
+			decisionAssistantToSplice = { exchangeId, cycleId };
 			deferDecisionOnBusy(active);
 			// Abort first: stock interactive Pi clears its steering/follow-up queues
 			// while restoring queued text to the editor. Queueing the fold marker before
@@ -2080,7 +2100,13 @@ export function createDecisionRuntime(
 			return { action: "continue" };
 		});
 
-		options.pi.on("message_end", handleDecisionMessageEnd);
+		(options.pi as ExtensionAPI & Partial<UninterruptibleMessageEndAPI>).on(
+			"message_end",
+			handleDecisionMessageEnd,
+			{
+				uninterruptible: true,
+			},
+		);
 		options.pi.on("agent_end", handleAgentEnd);
 
 		// While a decision is open, block ordinary tools before execution. The
