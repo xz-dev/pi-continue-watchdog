@@ -33,14 +33,16 @@ structure ProcessState where
   watchdogLocked : Bool
   deriving DecidableEq, Repr
 
--- Environmental assumptions bound liveness to host completion of the aborted decision and the subsequent user run.
+-- Environmental assumptions bound liveness to host completion of abort-safe terminal cleanup, the aborted decision, and the subsequent user run.
 structure EnvironmentAssumptions where
+  uninterruptibleCleanupRuns : Bool
   abortedDecisionEnds : Bool
   userRunSettles : Bool
   deriving DecidableEq, Repr
 
 def environmentAdmitted (environment : EnvironmentAssumptions) : Prop :=
-  environment.abortedDecisionEnds = true ∧
+  environment.uninterruptibleCleanupRuns = true ∧
+    environment.abortedDecisionEnds = true ∧
     environment.userRunSettles = true
 
 -- Named states make the complete object flow explicit; only the in-flight decision may expose transient streamed content, which finalization clears.
@@ -185,12 +187,16 @@ def processInvariant (streamWasVisible : Bool) (state : ProcessState) : Prop :=
     state = userWorkState ∨
     state = completedUserWorkState
 
--- The deterministic transition models public message-end replacement clearing decision content and records the fold before waiting for abort completion and user work.
+-- The deterministic transition models abort-safe public message-end replacement clearing decision content and records the fold before waiting for abort completion and user work.
 def takeoverStep
     (environment : EnvironmentAssumptions)
     (state : ProcessState) : ProcessState :=
   match state.phase with
-  | .decisionStreaming => takeoverPendingState
+  | .decisionStreaming =>
+      if environment.uninterruptibleCleanupRuns = true then
+        takeoverPendingState
+      else
+        state
   | .takeoverPending =>
       if environment.abortedDecisionEnds = true then
         userWorkState
@@ -260,7 +266,8 @@ theorem takeover_step_preserves_invariant
     (invariant : processInvariant streamWasVisible state) :
     processInvariant streamWasVisible (takeoverStep environment state) := by
   rcases invariant with rfl | rfl | rfl | rfl
-  · simp [takeoverStep, processInvariant, decisionState]
+  · cases cleanupRuns : environment.uninterruptibleCleanupRuns <;>
+      simp [takeoverStep, processInvariant, decisionState, cleanupRuns]
   · cases decisionEnds : environment.abortedDecisionEnds <;>
       simp [takeoverStep, processInvariant, takeoverPendingState, decisionEnds]
   · cases userSettles : environment.userRunSettles <;>
@@ -301,10 +308,11 @@ theorem safety_after_every_step
 
 theorem immediate_takeover_cleanup
     (environment : EnvironmentAssumptions)
+    (assumptions : environmentAdmitted environment)
     (streamWasVisible : Bool) :
     takeoverPostcondition
       (takeoverStep environment (decisionState streamWasVisible)) := by
-  simp [takeoverStep, takeoverPostcondition, decisionState,
+  simp [takeoverStep, assumptions.1, takeoverPostcondition, decisionState,
     takeoverPendingState]
 
 theorem progress
@@ -316,7 +324,7 @@ theorem progress
     (notFinal : ¬finalState state) :
     takeoverStep environment state ≠ state := by
   rcases invariant with rfl | rfl | rfl | rfl <;>
-    simp [takeoverStep, assumptions.1, assumptions.2, finalState,
+    simp [takeoverStep, assumptions.1, assumptions.2.1, assumptions.2.2, finalState,
       decisionState, takeoverPendingState, userWorkState,
       completedUserWorkState] at *
 
@@ -326,7 +334,8 @@ theorem termination
     (streamWasVisible : Bool) :
     iterate (takeoverStep environment) 3 (decisionState streamWasVisible) =
       completedUserWorkState := by
-  simp [iterate, takeoverStep, assumptions.1, assumptions.2,
+  simp [iterate, takeoverStep, assumptions.1, assumptions.2.1,
+    assumptions.2.2,
     decisionState, takeoverPendingState, userWorkState]
 
 theorem postcondition
@@ -339,7 +348,7 @@ theorem postcondition
   rw [termination environment assumptions streamWasVisible]
   simp [outputPostcondition, completedUserWorkState]
 
--- The guarantee record gathers all whole-process obligations under the two explicit host-settlement assumptions.
+-- The guarantee record gathers all whole-process obligations under abort-safe cleanup and the two explicit host-settlement assumptions.
 structure TakeoverGuarantees
     (environment : EnvironmentAssumptions)
     (streamWasVisible : Bool) : Prop where
@@ -371,7 +380,7 @@ theorem process_is_correct
     initialization := initialization streamWasVisible
     preservation := takeover_step_preserves_invariant environment streamWasVisible
     guardDiscipline := phase_guards_complete_and_exclusive
-    immediateCleanup := immediate_takeover_cleanup environment streamWasVisible
+    immediateCleanup := immediate_takeover_cleanup environment assumptions streamWasVisible
     safety := safety_after_every_step environment streamWasVisible
     progress := progress environment assumptions streamWasVisible
     termination := termination environment assumptions streamWasVisible
@@ -418,7 +427,9 @@ end WatchdogUserTakeover
 -- The executable summary demonstrates the accepted visible-stream boundary and both proved cleanup milestones.
 def main : IO Unit := do
   let environment : WatchdogUserTakeover.EnvironmentAssumptions :=
-    { abortedDecisionEnds := true, userRunSettles := true }
+    { uninterruptibleCleanupRuns := true,
+      abortedDecisionEnds := true,
+      userRunSettles := true }
   let visibleDecision := WatchdogUserTakeover.decisionState true
   let takeover := WatchdogUserTakeover.takeoverStep environment visibleDecision
   let completed := WatchdogUserTakeover.iterate

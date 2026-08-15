@@ -123,6 +123,7 @@ interface BranchEntry {
 
 interface Harness {
 	readonly handlers: Map<string, Handler[]>;
+	readonly handlerOptions: Map<string, unknown[]>;
 	readonly clock: FakeClock;
 	readonly widgets: Array<{ key: string; value: unknown }>;
 	readonly config: ContinueWatchdogConfig;
@@ -298,6 +299,7 @@ function createHarness(options?: {
 	const controller = createLockDecisionController(config);
 	const holder = { controller };
 	const handlers = new Map<string, Handler[]>();
+	const handlerOptions = new Map<string, unknown[]>();
 	const clock = new FakeClock();
 	const sent: SentMessage[] = [];
 	const notifications: Array<{ message: string; level?: string }> = [];
@@ -312,6 +314,7 @@ function createHarness(options?: {
 
 	const harness = {
 		handlers,
+		handlerOptions,
 		clock,
 		config,
 		controller,
@@ -329,10 +332,13 @@ function createHarness(options?: {
 	} as Harness;
 
 	const pi = {
-		on(name: string, handler: Handler): void {
+		on(name: string, handler: Handler, registrationOptions?: unknown): void {
 			const list = handlers.get(name) ?? [];
 			list.push(handler);
 			handlers.set(name, list);
+			const registrations = handlerOptions.get(name) ?? [];
+			registrations.push(registrationOptions);
+			handlerOptions.set(name, registrations);
 		},
 		sendMessage(
 			message: SentMessage["message"],
@@ -1032,6 +1038,84 @@ for (const spliceBehavior of [
 		}
 	});
 }
+
+test("preempted decision assistant lookup accepts fold-before-assistant ordering", () => {
+	const exchangeId = "exchange-1";
+	const entries = [
+		{
+			type: "custom_message",
+			id: "decision",
+			parentId: "parent",
+			customType: DECISION_MESSAGE_TYPE,
+			content: "Decide",
+			display: false,
+			details: { version: 1, exchangeId, cycleId: 1 },
+			timestamp: "2026-01-01T00:00:00.000Z",
+		},
+		{
+			type: "custom_message",
+			id: "fold",
+			parentId: "decision",
+			customType: DECISION_FOLD_MESSAGE_TYPE,
+			content: "",
+			display: false,
+			details: { version: 1, exchangeId, cycleId: 1, outcome: "preempted" },
+			timestamp: "2026-01-01T00:00:01.000Z",
+		},
+		{
+			type: "message",
+			id: "assistant",
+			parentId: "fold",
+			message: {
+				role: "assistant",
+				content: [],
+				stopReason: "stop",
+				errorMessage: "pi-continue-watchdog:preempted",
+			},
+			timestamp: "2026-01-01T00:00:02.000Z",
+		},
+	] as never;
+
+	assert.equal(
+		findDecisionAssistantEntryId(entries, exchangeId, 1),
+		"assistant",
+	);
+});
+
+test("preempted decision assistant lookup rejects unmarked assistant after fold", () => {
+	const exchangeId = "exchange-1";
+	const entries = [
+		{
+			type: "custom_message",
+			id: "decision",
+			parentId: "parent",
+			customType: DECISION_MESSAGE_TYPE,
+			content: "Decide",
+			display: false,
+			details: { version: 1, exchangeId, cycleId: 1 },
+			timestamp: "2026-01-01T00:00:00.000Z",
+		},
+		{
+			type: "custom_message",
+			id: "fold",
+			parentId: "decision",
+			customType: DECISION_FOLD_MESSAGE_TYPE,
+			content: "",
+			display: false,
+			details: { version: 1, exchangeId, cycleId: 1, outcome: "preempted" },
+			timestamp: "2026-01-01T00:00:01.000Z",
+		},
+		{
+			type: "message",
+			id: "unrelated-assistant",
+			parentId: "fold",
+			message: { role: "assistant", content: [] },
+			timestamp: "2026-01-01T00:00:02.000Z",
+		},
+	] as never;
+
+	assert.equal(findDecisionAssistantEntryId(entries, exchangeId, 1), null);
+});
 
 test("decision assistant lookup skips matching audit and continue evidence before fold", () => {
 	const exchangeId = "exchange-1";
@@ -2625,9 +2709,16 @@ test("accepted continue busy races roll back retry and defer without unlocking",
 	);
 });
 
+test("decision message cleanup is registered as uninterruptible terminal work", () => {
+	const harness = createHarness();
+	const messageEndOptions = harness.handlerOptions.get("message_end");
+	assert.ok(messageEndOptions);
+	assert.deepEqual(messageEndOptions.at(-1), { uninterruptible: true });
+});
+
 test("real user input silently preempts a submitted decision and extension input stays inert", async () => {
 	for (const source of ["interactive", "rpc"] as const) {
-		const harness = createHarness();
+		const harness = createHarness({ spliceBehavior: "success" });
 		await startIdle(harness);
 		await harness.openDecision();
 		await harness.startDecision();
@@ -2663,8 +2754,9 @@ test("real user input silently preempts a submitted decision and extension input
 			false,
 		);
 
+		const abortedDecision = assistant([], "aborted");
 		const abortReplacement = (await harness.endDecisionMessage(
-			assistant([], "aborted"),
+			abortedDecision,
 		)) as {
 			readonly message: {
 				readonly content: readonly unknown[];
@@ -2678,9 +2770,21 @@ test("real user input silently preempts a submitted decision and extension input
 				.errorMessage,
 			"pi-continue-watchdog:preempted",
 		);
+		const persistedDecision = harness.branch.at(-1);
+		assert.ok(persistedDecision?.type === "message");
+		(persistedDecision as { message: unknown }).message =
+			abortReplacement.message;
 		assert.equal(harness.runtime.consumeDecisionAbortSuppression(), true);
 		assert.equal(harness.runtime.consumeDecisionAbortSuppression(), false);
 		assert.deepEqual(harness.notifications, []);
+
+		harness.streaming = false;
+		await harness.fire("agent_settled", { type: "agent_settled" });
+		assert.deepEqual(harness.spliceAttempts, ["assistant-3"]);
+		assert.equal(
+			harness.branch.some((entry) => entry.id === "assistant-3"),
+			false,
+		);
 	}
 
 	const extension = createHarness();
@@ -2690,6 +2794,28 @@ test("real user input silently preempts a submitted decision and extension input
 	assert.equal(await extension.fireInput("extension"), undefined);
 	assert.equal(extension.aborts, 0);
 	assert.equal(extension.controller.snapshot.decisionOpen, true);
+});
+
+test("preempted decision cleanup stays idempotent after another handler tags the assistant", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	await harness.openDecision();
+	assert.deepEqual(await harness.fireInput("interactive", "take over"), {
+		action: "continue",
+	});
+
+	const replacement = (await harness.endDecisionMessage({
+		role: "assistant",
+		content: [text("private partial")],
+		stopReason: "stop",
+		errorMessage: "pi-continue-watchdog:preempted",
+	})) as DecisionMessageReplacement;
+	assert.deepEqual(replacement.message.content, []);
+	assert.equal(replacement.message.stopReason, "stop");
+	assert.equal(
+		replacement.message.errorMessage,
+		"pi-continue-watchdog:preempted",
+	);
 });
 
 test("ordinary aborted decision assistant is cleared without being reclassified as user takeover", async () => {

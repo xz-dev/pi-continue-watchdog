@@ -202,21 +202,24 @@ export function findDecisionAssistantEntryId(
 	if (decisionIndex === -1) return null;
 
 	let assistantId: string | null = null;
+	let foldSeen = false;
 	for (let index = decisionIndex + 1; index < entries.length; index += 1) {
 		const entry = entries[index];
 		if (entry?.type === "message") {
 			if (entry.message?.role === "assistant") {
 				if (assistantId !== null) return null;
+				if (foldSeen && !isPreemptedAssistant(entry.message)) return null;
 				assistantId = entry.id;
 				continue;
 			}
-			if (entry.message?.role === "toolResult") continue;
+			if (entry.message?.role === "toolResult" && !foldSeen) continue;
 			return null;
 		}
 		if (entry?.type === "custom") {
 			if (
-				entry.customType === "pi-continue-watchdog:decision-audit" ||
-				entry.customType === "pi-continue-watchdog:continue"
+				!foldSeen &&
+				(entry.customType === "pi-continue-watchdog:decision-audit" ||
+					entry.customType === "pi-continue-watchdog:continue")
 			) {
 				continue;
 			}
@@ -224,15 +227,14 @@ export function findDecisionAssistantEntryId(
 		}
 		if (entry?.type !== "custom_message") continue;
 		if (entry.customType === DECISION_MESSAGE_TYPE) return null;
-		if (entry.customType === DECISION_FOLD_MESSAGE_TYPE) {
-			const fold = foldDetails(entry.details);
-			return fold?.exchangeId === exchangeId && fold.cycleId === cycleId
-				? assistantId
-				: null;
-		}
-		return null;
+		if (entry.customType !== DECISION_FOLD_MESSAGE_TYPE || foldSeen)
+			return null;
+		const fold = foldDetails(entry.details);
+		if (fold?.exchangeId !== exchangeId || fold.cycleId !== cycleId)
+			return null;
+		foldSeen = true;
 	}
-	return null;
+	return foldSeen ? assistantId : null;
 }
 
 function foldDetails(input: unknown): DecisionFoldDetails | undefined {
