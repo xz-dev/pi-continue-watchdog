@@ -21,10 +21,12 @@ import {
 } from "../src/runtime.js";
 import {
 	createUserReadyEnvelope,
+	createWatchdogContinuedEnvelope,
 	emitSemanticHook,
 	SEMANTIC_HOOK_CHANNEL,
 	type SemanticHookEnvelope,
 	USER_READY_HOOK_NAME,
+	WATCHDOG_CONTINUED_HOOK_NAME,
 } from "../src/semantic-hook.js";
 
 interface TimerRecord {
@@ -109,8 +111,11 @@ function text(value: string): unknown {
 	return { type: "text", text: value };
 }
 
-function continueXml(): string {
-	return "<watchdog><function>continue_watchdog</function></watchdog>";
+function continueXml(
+	reasonType = "WORK_REMAINS",
+	reason = "Implementation work remains.",
+): string {
+	return `<watchdog><function>continue_watchdog</function><reason_type>${reasonType}</reason_type><reason_content>${reason}</reason_content></watchdog>`;
 }
 
 function unlockXml(
@@ -194,6 +199,7 @@ function createSemanticHarness(options?: {
 		customType: string,
 		hub: ReturnType<typeof createObservableAgentHub>,
 	) => void;
+	readonly appendThrows?: string;
 }): SemanticHarness {
 	const config: ContinueWatchdogConfig = {
 		idleDelaySeconds: options?.config?.idleDelaySeconds ?? 3,
@@ -204,6 +210,11 @@ function createSemanticHarness(options?: {
 			"JOB_DONE",
 			"WAIT_USER",
 			"JOB_BLOCKED",
+		],
+		continueReasonTypes: options?.config?.continueReasonTypes ?? [
+			"WORK_REMAINS",
+			"VERIFYING",
+			"WAIT_AUTOMATION",
 		],
 	};
 	const hub = createObservableAgentHub();
@@ -251,7 +262,9 @@ function createSemanticHarness(options?: {
 			}
 			options?.onSend?.(customType, hub);
 		},
-		appendEntry(): void {},
+		appendEntry(type: string): void {
+			if (type === options?.appendThrows) throw new Error("append failed");
+		},
 	} as unknown as ExtensionAPI;
 
 	const ctx = {
@@ -396,7 +409,7 @@ function assertFrozenEnvelope(envelope: SemanticHookEnvelope): void {
 	});
 }
 
-test("protocol builders emit exact three envelopes as fresh frozen plain data", () => {
+test("protocol builders emit exact terminal and continue envelopes as fresh frozen plain data", () => {
 	const unlock = createUserReadyEnvelope({
 		STOP_KIND: "AI_UNLOCK",
 		REASON_TYPE: "JOB_DONE",
@@ -404,6 +417,10 @@ test("protocol builders emit exact three envelopes as fresh frozen plain data", 
 	});
 	const exhausted = createUserReadyEnvelope({ STOP_KIND: "EXHAUSTED" });
 	const failed = createUserReadyEnvelope({ STOP_KIND: "DECISION_FAILED" });
+	const continued = createWatchdogContinuedEnvelope({
+		REASON_TYPE: "VERIFYING",
+		REASON: "Tests still need to run.",
+	});
 
 	assert.deepEqual(unlock, {
 		version: 1,
@@ -424,11 +441,20 @@ test("protocol builders emit exact three envelopes as fresh frozen plain data", 
 		name: USER_READY_HOOK_NAME,
 		values: { STOP_KIND: "DECISION_FAILED" },
 	});
+	assert.deepEqual(continued, {
+		version: 1,
+		name: WATCHDOG_CONTINUED_HOOK_NAME,
+		values: {
+			REASON_TYPE: "VERIFYING",
+			REASON: "Tests still need to run.",
+		},
+	});
 	assert.notEqual(unlock, exhausted);
 	assert.notEqual(exhausted, failed);
 	assertFrozenEnvelope(unlock);
 	assertFrozenEnvelope(exhausted);
 	assertFrozenEnvelope(failed);
+	assertFrozenEnvelope(continued);
 
 	const bus = createEventBus();
 	const seen: unknown[] = [];
@@ -475,6 +501,7 @@ test("exhausted and decisionFailed publish exact STOP_KIND envelopes once", asyn
 	await startIdle(exhausted);
 	await exhausted.openDecision();
 	await settleResponse(exhausted, exhausted.answerContinue());
+	assert.equal(exhausted.received[0]?.name, "watchdog-continued");
 	assert.equal(exhausted.snapshotController().exhausted, true);
 	// Continue turn settles into terminal exhausted idle.
 	exhausted.streaming = true;
@@ -485,8 +512,8 @@ test("exhausted and decisionFailed publish exact STOP_KIND envelopes once", asyn
 	});
 	exhausted.streaming = false;
 	await settleOnly(exhausted);
-	assert.equal(exhausted.received.length, 1);
-	const exhaustedEnvelope = exhausted.received[0];
+	assert.equal(exhausted.received.length, 2);
+	const exhaustedEnvelope = exhausted.received[1];
 	assert.ok(exhaustedEnvelope);
 	assert.deepEqual(exhaustedEnvelope, {
 		version: 1,
@@ -497,7 +524,7 @@ test("exhausted and decisionFailed publish exact STOP_KIND envelopes once", asyn
 	// Same terminal idle epoch: settled/reconcile without becoming busy again.
 	exhausted.runtime.reconcileIdle();
 	await settleOnly(exhausted);
-	assert.equal(exhausted.received.length, 1);
+	assert.equal(exhausted.received.length, 2);
 
 	const failed = createSemanticHarness();
 	await startIdle(failed);
@@ -525,7 +552,22 @@ test("exhausted and decisionFailed publish exact STOP_KIND envelopes once", asyn
 	assert.equal(failed.received.length, 1);
 });
 
-test("human unlock, abort unlock, continue, and initial unlocked idle publish nothing", async () => {
+test("continue persistence failure publishes no hook and dispatches no continuation", async () => {
+	const harness = createSemanticHarness({
+		appendThrows: "pi-continue-watchdog:continue",
+	});
+	await startIdle(harness);
+	await harness.openDecision();
+	const sentBefore = harness.sentTypes.length;
+	await settleResponse(harness, harness.answerContinue());
+
+	assert.equal(harness.received.length, 0);
+	assert.equal(harness.sentTypes.length, sentBefore);
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+});
+
+test("accepted continue publishes its typed reason while unlock-free idle stays quiet", async () => {
 	const human = createSemanticHarness();
 	await startIdle(human);
 	// Initial ordinary unlocked idle.
@@ -566,13 +608,23 @@ test("human unlock, abort unlock, continue, and initial unlocked idle publish no
 	const continued = createSemanticHarness({ config: { maxRetries: 3 } });
 	await startIdle(continued);
 	await continued.openDecision();
-	await settleResponse(continued, continued.answerContinue());
-	// Intermediate post-continue rearm must not publish.
-	assert.equal(continued.received.length, 0);
+	await settleResponse(
+		continued,
+		assistant([text(continueXml("verifying", "Tests still need to run."))]),
+	);
+	assert.deepEqual(continued.received, [
+		{
+			version: 1,
+			name: "watchdog-continued",
+			values: {
+				REASON_TYPE: "VERIFYING",
+				REASON: "Tests still need to run.",
+			},
+		},
+	]);
 	assert.equal(continued.controller.snapshot.locked, true);
-	// Locked pending grace epoch stays quiet.
 	continued.runtime.reconcileIdle();
-	assert.equal(continued.received.length, 0);
+	assert.equal(continued.received.length, 1);
 });
 
 test("AI unlock intent waits for aggregate idle and publishes typed pair only once", async () => {
@@ -745,6 +797,22 @@ test("absent and throwing consumers leave controller and results unchanged", asy
 		attempt: 0,
 	});
 	assert.equal(noConsumer.received.length, 0);
+
+	const continueWithoutConsumer = createSemanticHarness();
+	continueWithoutConsumer.bus.clear();
+	await startIdle(continueWithoutConsumer);
+	await continueWithoutConsumer.openDecision();
+	await settleResponse(
+		continueWithoutConsumer,
+		continueWithoutConsumer.answerContinue(),
+	);
+	assert.deepEqual(continueWithoutConsumer.snapshotController(), {
+		locked: true,
+		exhausted: false,
+		decisionFailed: false,
+		attempt: 1,
+	});
+	assert.equal(continueWithoutConsumer.received.length, 0);
 
 	const throwing = createSemanticHarness();
 	throwing.bus.on(SEMANTIC_HOOK_CHANNEL, () => {

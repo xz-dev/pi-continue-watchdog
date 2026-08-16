@@ -25,6 +25,7 @@ import {
 	DECISION_MESSAGE_TYPE,
 	findDecisionAssistantEntryId,
 	foldDecisionContext,
+	INQUIRY_MARKER_ENTRY_TYPE,
 } from "../src/context-fold.js";
 import { createLockDecisionController } from "../src/controller.js";
 import { DECISION_TOOL_BLOCK_REASON } from "../src/decision-protocol.js";
@@ -113,8 +114,9 @@ interface SentMessage {
 
 interface BranchEntry {
 	readonly id: string;
-	readonly type: "custom_message" | "message";
+	readonly type: "custom" | "custom_message" | "message";
 	readonly customType?: string;
+	readonly data?: unknown;
 	readonly details?: unknown;
 	readonly message?: {
 		readonly role: "assistant";
@@ -160,8 +162,11 @@ function text(value: string): unknown {
 	return { type: "text", text: value };
 }
 
-function continueXml(): string {
-	return "<watchdog><function>continue_watchdog</function></watchdog>";
+function continueXml(
+	reasonType = "WORK_REMAINS",
+	reason = "Implementation work remains.",
+): string {
+	return `<watchdog><function>continue_watchdog</function><reason_type>${reasonType}</reason_type><reason_content>${reason}</reason_content></watchdog>`;
 }
 
 function unlockXml(
@@ -294,6 +299,11 @@ function createHarness(options?: {
 			"WAIT_USER",
 			"JOB_BLOCKED",
 		],
+		continueReasonTypes: options?.config?.continueReasonTypes ?? [
+			"WORK_REMAINS",
+			"VERIFYING",
+			"WAIT_AUTOMATION",
+		],
 	};
 	const hub = createObservableAgentHub();
 	const controller = createLockDecisionController(config);
@@ -387,6 +397,12 @@ function createHarness(options?: {
 				throw new Error("append failed");
 			}
 			entries.push({ type, data });
+			branch.push({
+				id: `custom-${branch.length + 1}`,
+				type: "custom",
+				customType: type,
+				data,
+			});
 		},
 		...(options?.spliceBehavior === "absent"
 			? {}
@@ -695,7 +711,12 @@ test("trigger status reports real runtime grace and finalization state without m
 	assert.equal(finalizing.blocker, "decision-finalizing");
 	assert.deepEqual(harness.controller.snapshot, before);
 	assert.equal(harness.sent.length, 1);
-	assert.equal(harness.entries.length, 0);
+	assert.deepEqual(harness.entries, [
+		{
+			type: INQUIRY_MARKER_ENTRY_TYPE,
+			data: { version: 1, exchangeId: "exchange-1", cycleId: 1 },
+		},
+	]);
 });
 
 test("watchdog decision leaves compaction entirely to the host", async () => {
@@ -860,7 +881,12 @@ test("agent_end finalizes while streaming but settled alone dispatches continue"
 	const harness = createHarness();
 	await startIdle(harness);
 	await harness.openDecision();
-	assert.deepEqual(harness.entries, []);
+	assert.deepEqual(harness.entries, [
+		{
+			type: INQUIRY_MARKER_ENTRY_TYPE,
+			data: { version: 1, exchangeId: "exchange-1", cycleId: 1 },
+		},
+	]);
 	assert.equal(harness.widgets.at(-1)?.key, "pi-continue-watchdog:status");
 	assert.notEqual(harness.widgets.at(-1)?.value, undefined);
 	const before = harness.sent.length;
@@ -886,16 +912,86 @@ test("agent_end finalizes while streaming but settled alone dispatches continue"
 	});
 	assert.equal(harness.triggeredTurns, turnsBefore + 1);
 	assert.equal(harness.controller.snapshot.attempt, 1);
-	assert.deepEqual(harness.entries, [
-		{
-			type: "pi-continue-watchdog:continue",
-			data: {},
-		},
-	]);
+	assert.deepEqual(
+		harness.entries.filter((entry) => entry.type !== INQUIRY_MARKER_ENTRY_TYPE),
+		[
+			{
+				type: "pi-continue-watchdog:continue",
+				data: {
+					reasonType: "WORK_REMAINS",
+					reason: "Implementation work remains.",
+				},
+			},
+		],
+	);
 	assert.deepEqual(harness.widgets.at(-1), {
 		key: "pi-continue-watchdog:status",
 		value: undefined,
 	});
+});
+
+test("inquiry marker is persisted before the decision prompt", async () => {
+	const timeline: string[] = [];
+	const harness = createHarness({
+		onAppend(type) {
+			if (type === INQUIRY_MARKER_ENTRY_TYPE) timeline.push("marker");
+		},
+		onSend(message) {
+			if (message.customType === DECISION_MESSAGE_TYPE) timeline.push("prompt");
+			return undefined;
+		},
+	});
+	await startIdle(harness);
+	await harness.openDecision({ start: false });
+
+	assert.deepEqual(timeline, ["marker", "prompt"]);
+	assert.deepEqual(harness.entries[0], {
+		type: INQUIRY_MARKER_ENTRY_TYPE,
+		data: { version: 1, exchangeId: "exchange-1", cycleId: 1 },
+	});
+});
+
+test("inquiry marker persistence failure prevents decision dispatch", async () => {
+	const harness = createHarness({ appendThrows: INQUIRY_MARKER_ENTRY_TYPE });
+	await startIdle(harness);
+	await harness.openDecision({ start: false });
+
+	assert.equal(harness.sent.length, 0);
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+});
+
+test("marker written before a send-time busy race still defers silently", async () => {
+	let harness: Harness;
+	harness = createHarness({
+		onSend(message) {
+			if (message.customType === DECISION_MESSAGE_TYPE) {
+				harness.streaming = true;
+				void harness.fire("agent_start", { type: "agent_start" });
+				return new Error("busy");
+			}
+			return undefined;
+		},
+	});
+	await startIdle(harness);
+	await harness.openDecision({ start: false });
+
+	assert.deepEqual(harness.entries, [
+		{
+			type: INQUIRY_MARKER_ENTRY_TYPE,
+			data: { version: 1, exchangeId: "exchange-1", cycleId: 1 },
+		},
+	]);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(
+		harness.entries.some(
+			(entry) =>
+				entry.type === "pi-continue-watchdog:status" &&
+				(entry.data as { kind?: string }).kind === "other-error",
+		),
+		false,
+	);
 });
 
 test("continue entry persistence failure stops automatic continuation", async () => {
@@ -912,17 +1008,20 @@ test("continue entry persistence failure stops automatic continuation", async ()
 	assert.equal(harness.controller.snapshot.attempt, 0);
 	assert.equal(harness.sent.length, sentBefore);
 	assert.equal(harness.triggeredTurns, 1);
-	assert.deepEqual(harness.entries, [
-		{
-			type: "pi-continue-watchdog:status",
-			data: {
-				kind: "other-error",
-				exchangeId: "exchange-1",
-				cycleId: 1,
-				message: "append failed",
+	assert.deepEqual(
+		harness.entries.filter((entry) => entry.type !== INQUIRY_MARKER_ENTRY_TYPE),
+		[
+			{
+				type: "pi-continue-watchdog:status",
+				data: {
+					kind: "other-error",
+					exchangeId: "exchange-1",
+					cycleId: 1,
+					message: "append failed",
+				},
 			},
-		},
-	]);
+		],
+	);
 });
 
 test("continue evidence is persisted before automatic continuation dispatch", async () => {
@@ -1010,22 +1109,19 @@ for (const spliceBehavior of [
 				},
 			],
 		);
-		assert.deepEqual(
-			harness.spliceAttempts,
-			spliceBehavior === "absent" ||
-				spliceBehavior === "branch-throw" ||
-				spliceBehavior === "unrelated-assistant"
-				? []
-				: ["assistant-2"],
-		);
+		assert.deepEqual(harness.spliceAttempts, []);
 		if (spliceBehavior === "success") {
+			const decision = harness.branch.find(
+				(entry) => entry.customType === DECISION_MESSAGE_TYPE,
+			);
+			assert.ok(decision);
 			const messages = [
 				{
 					role: "custom",
-					customType: harness.branch[0]?.customType,
+					customType: decision.customType,
 					content: "Decide now.",
 					display: false,
-					details: harness.branch[0]?.details,
+					details: decision.details,
 					timestamp: 1,
 				},
 				{
@@ -1039,41 +1135,79 @@ for (const spliceBehavior of [
 	});
 }
 
-test("preempted decision assistant lookup accepts fold-before-assistant ordering", () => {
+function inquiryMarker(exchangeId: string, cycleId = 1) {
+	return {
+		type: "custom",
+		id: `marker-${exchangeId}-${cycleId}`,
+		parentId: "parent",
+		customType: INQUIRY_MARKER_ENTRY_TYPE,
+		data: { version: 1, exchangeId, cycleId },
+		timestamp: "2026-01-01T00:00:00.000Z",
+	};
+}
+
+function decisionEntry(exchangeId: string, cycleId = 1) {
+	return {
+		type: "custom_message",
+		id: `decision-${exchangeId}-${cycleId}`,
+		parentId: "parent",
+		customType: DECISION_MESSAGE_TYPE,
+		content: "Decide",
+		display: false,
+		details: { version: 1, exchangeId, cycleId },
+		timestamp: "2026-01-01T00:00:01.000Z",
+	};
+}
+
+function preemptedFoldEntry(exchangeId: string, cycleId = 1) {
+	return {
+		type: "custom_message",
+		id: `fold-${exchangeId}-${cycleId}`,
+		parentId: "parent",
+		customType: DECISION_FOLD_MESSAGE_TYPE,
+		content: "",
+		display: false,
+		details: { version: 1, exchangeId, cycleId, outcome: "preempted" },
+		timestamp: "2026-01-01T00:00:02.000Z",
+	};
+}
+
+function preemptedAssistantEntry(id = "assistant") {
+	return {
+		type: "message",
+		id,
+		parentId: "parent",
+		message: {
+			role: "assistant",
+			content: [],
+			stopReason: "stop",
+			errorMessage: "pi-continue-watchdog:preempted",
+		},
+		timestamp: "2026-01-01T00:00:03.000Z",
+	};
+}
+
+test("preempted assistant lookup survives interleaved plugin entries", () => {
 	const exchangeId = "exchange-1";
 	const entries = [
+		inquiryMarker(exchangeId),
+		{ type: "custom", id: "plugin-before", customType: "other:state" },
+		decisionEntry(exchangeId),
 		{
 			type: "custom_message",
-			id: "decision",
-			parentId: "parent",
-			customType: DECISION_MESSAGE_TYPE,
-			content: "Decide",
-			display: false,
-			details: { version: 1, exchangeId, cycleId: 1 },
-			timestamp: "2026-01-01T00:00:00.000Z",
+			id: "plugin-message",
+			customType: "other:message",
 		},
+		preemptedFoldEntry(exchangeId),
+		{ type: "custom", id: "plugin-after", customType: "other:audit" },
+		preemptedAssistantEntry(),
 		{
 			type: "custom_message",
-			id: "fold",
-			parentId: "decision",
-			customType: DECISION_FOLD_MESSAGE_TYPE,
-			content: "",
-			display: false,
-			details: { version: 1, exchangeId, cycleId: 1, outcome: "preempted" },
-			timestamp: "2026-01-01T00:00:01.000Z",
+			id: "later-plugin-message",
+			customType: "other:later",
+			details: { version: 1, exchangeId: "foreign", cycleId: 9 },
 		},
-		{
-			type: "message",
-			id: "assistant",
-			parentId: "fold",
-			message: {
-				role: "assistant",
-				content: [],
-				stopReason: "stop",
-				errorMessage: "pi-continue-watchdog:preempted",
-			},
-			timestamp: "2026-01-01T00:00:02.000Z",
-		},
+		{ type: "message", id: "later-user", message: { role: "user" } },
 	] as never;
 
 	assert.equal(
@@ -1082,97 +1216,76 @@ test("preempted decision assistant lookup accepts fold-before-assistant ordering
 	);
 });
 
-test("preempted decision assistant lookup rejects unmarked assistant after fold", () => {
+test("preempted assistant lookup rejects unmarked or cross-boundary assistants", () => {
 	const exchangeId = "exchange-1";
-	const entries = [
+	const unmarked = [
+		inquiryMarker(exchangeId),
+		decisionEntry(exchangeId),
+		preemptedFoldEntry(exchangeId),
 		{
-			type: "custom_message",
-			id: "decision",
-			parentId: "parent",
-			customType: DECISION_MESSAGE_TYPE,
-			content: "Decide",
-			display: false,
-			details: { version: 1, exchangeId, cycleId: 1 },
-			timestamp: "2026-01-01T00:00:00.000Z",
-		},
-		{
-			type: "custom_message",
-			id: "fold",
-			parentId: "decision",
-			customType: DECISION_FOLD_MESSAGE_TYPE,
-			content: "",
-			display: false,
-			details: { version: 1, exchangeId, cycleId: 1, outcome: "preempted" },
-			timestamp: "2026-01-01T00:00:01.000Z",
-		},
-		{
-			type: "message",
-			id: "unrelated-assistant",
-			parentId: "fold",
+			...preemptedAssistantEntry("unrelated-assistant"),
 			message: { role: "assistant", content: [] },
-			timestamp: "2026-01-01T00:00:02.000Z",
 		},
 	] as never;
+	assert.equal(findDecisionAssistantEntryId(unmarked, exchangeId, 1), null);
 
-	assert.equal(findDecisionAssistantEntryId(entries, exchangeId, 1), null);
+	const crossed = [
+		inquiryMarker(exchangeId),
+		decisionEntry(exchangeId),
+		inquiryMarker("exchange-2"),
+		preemptedFoldEntry(exchangeId),
+		preemptedAssistantEntry(),
+	] as never;
+	assert.equal(findDecisionAssistantEntryId(crossed, exchangeId, 1), null);
 });
 
-test("decision assistant lookup skips matching audit and continue evidence before fold", () => {
+test("preempted assistant lookup requires an exact inquiry marker and preempted fold", () => {
 	const exchangeId = "exchange-1";
-	const entries = [
+	const withoutMarker = [
+		decisionEntry(exchangeId),
+		preemptedFoldEntry(exchangeId),
+		preemptedAssistantEntry(),
+	] as never;
+	assert.equal(
+		findDecisionAssistantEntryId(withoutMarker, exchangeId, 1),
+		null,
+	);
+
+	const wrongFold = [
+		inquiryMarker(exchangeId),
+		decisionEntry(exchangeId),
 		{
-			type: "custom_message",
-			id: "decision",
-			parentId: "parent",
-			customType: DECISION_MESSAGE_TYPE,
-			content: "Decide",
-			display: false,
-			details: { version: 1, exchangeId, cycleId: 1 },
-			timestamp: "2026-01-01T00:00:00.000Z",
-		},
-		{
-			type: "custom",
-			id: "audit",
-			parentId: "decision",
-			customType: "pi-continue-watchdog:decision-audit",
-			data: { version: 1, exchangeId, cycleId: 1, outcome: "continue" },
-			timestamp: "2026-01-01T00:00:01.000Z",
-		},
-		{
-			type: "message",
-			id: "assistant",
-			parentId: "audit",
-			message: { role: "assistant", content: [] },
-			timestamp: "2026-01-01T00:00:02.000Z",
-		},
-		{
-			type: "custom",
-			id: "continue",
-			parentId: "assistant",
-			customType: "pi-continue-watchdog:continue",
-			data: {},
-			timestamp: "2026-01-01T00:00:03.000Z",
-		},
-		{
-			type: "custom_message",
-			id: "fold",
-			parentId: "continue",
-			customType: DECISION_FOLD_MESSAGE_TYPE,
-			content: "Continue until user assistance is required.",
-			display: false,
+			...preemptedFoldEntry(exchangeId),
 			details: {
 				version: 1,
 				exchangeId,
 				cycleId: 1,
-				outcome: "continue",
-				continuePrompt: "Continue until user assistance is required.",
+				outcome: "unlock",
 			},
-			timestamp: "2026-01-01T00:00:04.000Z",
 		},
+		preemptedAssistantEntry(),
 	] as never;
+	assert.equal(findDecisionAssistantEntryId(wrongFold, exchangeId, 1), null);
+});
+
+test("session start recovers exactly marked preempted assistants", async () => {
+	const exchangeId = "exchange-1";
+	const harness = createHarness({ spliceBehavior: "success" });
+	(harness.branch as unknown[]).push(
+		inquiryMarker(exchangeId),
+		{ type: "custom", id: "other-before", customType: "other:before" },
+		decisionEntry(exchangeId),
+		preemptedFoldEntry(exchangeId),
+		{ type: "custom", id: "other-after", customType: "other:after" },
+		preemptedAssistantEntry("recovered-assistant"),
+	);
+
+	await startIdle(harness);
+
+	assert.deepEqual(harness.spliceAttempts, ["recovered-assistant"]);
 	assert.equal(
-		findDecisionAssistantEntryId(entries, exchangeId, 1),
-		"assistant",
+		harness.branch.some((entry) => entry.id === "recovered-assistant"),
+		false,
 	);
 });
 
@@ -1204,11 +1317,32 @@ test("continue decision cleanup waits for the next settled boundary before splic
 
 	harness.streaming = false;
 	await harness.fire("agent_settled", { type: "agent_settled" });
-	assert.deepEqual(harness.spliceAttempts, ["assistant-2"]);
-	assert.equal(
-		harness.branch.some((entry) => entry.id === "assistant-2"),
-		false,
-	);
+	assert.deepEqual(harness.spliceAttempts, []);
+});
+
+test("continue message_end audit retains only validated type and reason", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	await harness.openDecision();
+	const answer = assistant([
+		text(continueXml("verifying", "Tests still need to run.")),
+	]);
+
+	const replacement = (await harness.endDecisionMessage(
+		answer,
+	)) as DecisionMessageReplacement;
+	assert.deepEqual(replacement.message.content, []);
+	assert.deepEqual(harness.entries.at(-1), {
+		type: "pi-continue-watchdog:decision-audit",
+		data: {
+			version: 1,
+			exchangeId: "exchange-1",
+			cycleId: 1,
+			outcome: "continue",
+			reasonType: "VERIFYING",
+			reason: "Tests still need to run.",
+		},
+	});
 });
 
 test("decision message_end captures XML, clears its assistant, and persists a context-excluded audit", async () => {
@@ -1315,7 +1449,9 @@ test("decision provider error stays provisional so the same Pi run can retry and
 	});
 	assert.deepEqual(
 		harness.entries.filter(
-			(entry) => entry.type !== "pi-continue-watchdog:status",
+			(entry) =>
+				entry.type !== "pi-continue-watchdog:status" &&
+				entry.type !== INQUIRY_MARKER_ENTRY_TYPE,
 		),
 		[
 			{
@@ -1465,7 +1601,9 @@ test("valid unlock folds without a turn and leaves one compact persisted result"
 	assert.equal(harness.triggeredTurns, turnsBefore);
 	assert.deepEqual(
 		harness.entries.filter(
-			(entry) => entry.type !== "pi-continue-watchdog:status",
+			(entry) =>
+				entry.type !== "pi-continue-watchdog:status" &&
+				entry.type !== INQUIRY_MARKER_ENTRY_TYPE,
 		),
 		[
 			{
@@ -1494,7 +1632,9 @@ test("Example 7: AI unlock retains typed entry data only; no transient notificat
 
 	assert.deepEqual(
 		harness.entries.filter(
-			(entry) => entry.type !== "pi-continue-watchdog:status",
+			(entry) =>
+				entry.type !== "pi-continue-watchdog:status" &&
+				entry.type !== INQUIRY_MARKER_ENTRY_TYPE,
 		),
 		[
 			{
@@ -2013,6 +2153,7 @@ test("child completion only makes aggregate idle; exactly one inquiry comes from
 		decisionPrompt: "Decide now.",
 		continuePrompt: "Continue compactly.",
 		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
+		continueReasonTypes: ["WORK_REMAINS", "VERIFYING", "WAIT_AUTOMATION"],
 	};
 	const hub = createObservableAgentHub();
 	const clock = new FakeClock();
@@ -2099,6 +2240,7 @@ test("shared hub reclaims main after UI shutdown then prefers a new UI bind", as
 		decisionPrompt: "Decide now.",
 		continuePrompt: "Continue compactly.",
 		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
+		continueReasonTypes: ["WORK_REMAINS", "VERIFYING", "WAIT_AUTOMATION"],
 	};
 
 	function attach(sessionId: string, hasUI: boolean) {
@@ -2223,6 +2365,7 @@ test("effective config loads before binding is reconciled and shutdown blocks la
 			decisionPrompt: "Loaded decision.",
 			continuePrompt: "Loaded continue.",
 			reasonTypes: ["JOB_DONE"],
+			continueReasonTypes: ["WORK_REMAINS", "VERIFYING", "WAIT_AUTOMATION"],
 		},
 		diagnostics: [],
 	});
@@ -2705,7 +2848,15 @@ test("accepted continue busy races roll back retry and defer without unlocking",
 				entry.type === "pi-continue-watchdog:status" ||
 				entry.type === CONTINUE_ENTRY_TYPE,
 		),
-		[{ type: CONTINUE_ENTRY_TYPE, data: {} }],
+		[
+			{
+				type: CONTINUE_ENTRY_TYPE,
+				data: {
+					reasonType: "WORK_REMAINS",
+					reason: "Implementation work remains.",
+				},
+			},
+		],
 	);
 });
 
@@ -2724,6 +2875,14 @@ test("real user input silently preempts a submitted decision and extension input
 		await harness.startDecision();
 		assert.equal(harness.controller.snapshot.decisionOpen, true);
 		assert.equal(harness.aborts, 0);
+		assert.deepEqual(harness.entries[0], {
+			type: INQUIRY_MARKER_ENTRY_TYPE,
+			data: {
+				version: 1,
+				exchangeId: "exchange-1",
+				cycleId: 1,
+			},
+		});
 		const sentBefore = harness.sent.length;
 
 		assert.deepEqual(await harness.fireInput(source, "user takeover"), {
@@ -2780,9 +2939,9 @@ test("real user input silently preempts a submitted decision and extension input
 
 		harness.streaming = false;
 		await harness.fire("agent_settled", { type: "agent_settled" });
-		assert.deepEqual(harness.spliceAttempts, ["assistant-3"]);
+		assert.deepEqual(harness.spliceAttempts, ["assistant-4"]);
 		assert.equal(
-			harness.branch.some((entry) => entry.id === "assistant-3"),
+			harness.branch.some((entry) => entry.id === "assistant-4"),
 			false,
 		);
 	}

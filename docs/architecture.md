@@ -144,7 +144,17 @@ Before and after re-entrant Pi calls, the runtime verifies that the original cla
 
 ## Decision request
 
-After the aggregate idle delay expires, the runtime re-checks that all observable attachments are still idle and sends a Pi `CustomMessage`:
+After the aggregate idle delay expires, the runtime re-checks that all observable attachments are still idle. Immediately before dispatch it persists a context-excluded inquiry boundary:
+
+```ts
+pi.appendEntry("pi-continue-watchdog:inquiry-marker", {
+  version: 1,
+  exchangeId,
+  cycleId,
+});
+```
+
+Only after that succeeds does it send the Pi `CustomMessage`:
 
 ```ts
 {
@@ -159,6 +169,8 @@ After the aggregate idle delay expires, the runtime re-checks that all observabl
 }
 ```
 
+The marker and decision repeat the same unique exchange/cycle identity. This is a logical boundary, not a physical-adjacency contract: unrelated plugin custom entries or messages may appear between the marker, decision prompt, fold marker, and finalized assistant.
+
 `display: false` hides the question itself from normal TUI history. The decision assistant may stream in TUI/RPC while the check runs. Ordinary tools stay advertised. The prompt remains model-visible because the model must read it to decide. This package does not request `presentation: "hidden"` and does not depend on a downstream Pi hidden-run seam.
 
 The configurable prompt supplies decision intent. Runtime always appends a fixed suffix that:
@@ -167,8 +179,9 @@ The configurable prompt supplies decision intent. Runtime always appends a fixed
 - tells the model to use existing conversation context and decide quickly;
 - forbids tool use;
 - requires exactly one trailing `<watchdog>...</watchdog>` block;
-- lists the effective configured reason types;
-- gives canonical continue and unlock examples.
+- explicitly prohibits making decisions on the user's behalf;
+- lists the independent effective unlock and continue reason types;
+- gives canonical typed continue and unlock examples.
 
 ## Stable tools and blocked execution
 
@@ -181,7 +194,11 @@ Tool availability in the request does not imply execution is allowed. While a ma
 A continue response ends with:
 
 ```xml
-<watchdog><function>continue_watchdog</function></watchdog>
+<watchdog>
+  <function>continue_watchdog</function>
+  <reason_type>WORK_REMAINS</reason_type>
+  <reason_content>Implementation work remains.</reason_content>
+</watchdog>
 ```
 
 An unlock response ends with:
@@ -206,9 +223,9 @@ The parser:
 
 Narration may precede the XML, but nothing except whitespace may follow it. Multiple watchdog blocks are invalid.
 
-For unlock:
+For both decisions:
 
-- `reason_type` is trimmed and matched case-insensitively against effective `reasonTypes`;
+- `reason_type` is trimmed and matched case-insensitively against the independent effective list (`continueReasonTypes` for continue, `reasonTypes` for unlock);
 - the matched configured value is emitted in uppercase;
 - `reason_content` must be nonblank and at most 500 Unicode code points;
 - invalid AI reasons are rejected rather than truncated.
@@ -284,7 +301,7 @@ The session remains append-only and still contains Pi-recognizable protocol entr
 - re-asks;
 - a terminal fold marker, including `preempted` after user takeover.
 
-Before every provider request, `src/context-fold.ts` correlates a complete exchange by protocol version, exchange ID, and cycle IDs. Complete exchanges fold normally, and a canonical decision prompt followed by an aborted assistant is removed as a bounded plugin-owned pair. An unrelated, incomplete, or malformed exchange fails closed locally for its own correlation ID; it cannot disable folding for later independent exchanges.
+Before every provider request, `src/context-fold.ts` correlates a complete exchange by protocol version, exchange ID, and cycle IDs. Complete exchanges fold normally, and a canonical decision prompt followed by an aborted assistant is removed as a bounded plugin-owned pair. Unrelated custom messages may be interleaved inside a correlated exchange; folding preserves those entries while removing only watchdog-owned messages. An unrelated, incomplete, or malformed exchange fails closed locally for its own correlation ID; it cannot disable folding for later independent exchanges.
 
 Terminal outcomes transform context as follows.
 
@@ -368,7 +385,7 @@ Packed E2E creates a persistent session, triggers a decision, shuts it down, reo
 
 ### Main abort and user preemption
 
-Abort detection uses Pi's persisted canonical assistant outcome `stopReason: "aborted"`, not raw keyboard guesses. A main abort that is not a user-preempted watchdog decision unlocks reasonlessly and cancels watchdog work. Its bounded decision prompt/aborted-assistant pair is removed from later provider context without requiring a persisted fold marker. User input that takes over a submitted watchdog decision is not treated as that abort: the assistant is neutralized, a `preempted` fold marker is persisted, lock remains, and the original user message starts the next cycle. Child abort causes are not inspected and do not unlock main.
+Abort detection uses Pi's persisted canonical assistant outcome `stopReason: "aborted"`, not raw keyboard guesses. A main abort that is not a user-preempted watchdog decision unlocks reasonlessly and cancels watchdog work. Its bounded decision prompt/aborted-assistant pair is removed from later provider context without requiring a persisted fold marker. User input that takes over a submitted watchdog decision is not treated as that abort: the assistant is neutralized, a `preempted` fold marker is persisted, lock remains, and the original user message starts the next cycle. At a true idle boundary, splice lookup requires the exact inquiry marker, matching decision and preempted fold, plus an empty `stopReason: "stop"` assistant carrying `pi-continue-watchdog:preempted`; unrelated plugin entries are skipped rather than treated as ownership. On session start while idle, the same scan recovers marked assistants left by a process exit before splice. Child abort causes are not inspected and do not unlock main.
 
 ## Avoiding a persistent `working` state
 
@@ -430,8 +447,8 @@ Lock state, aggregate grace, ownership, and pending decisions are runtime-only. 
 The session file is append-only. It may retain the decision question, an empty assistant metadata entry, tool-result metadata, re-ask, and fold marker as Pi-recognizable protocol entries. Live TUI/RPC frames during an in-flight decision are not retroactively retracted, but the finalized TUI component and persisted assistant content are cleared at `message_end`. Context folding removes a complete or preempted exchange before later provider requests, but cannot provide the same guarantee if:
 
 - the extension fails to load during recovery;
-- the process dies before a terminal fold marker is persisted;
-- correlation metadata is manually damaged or interleaved with unrelated messages.
+- the process dies before the abort-safe terminal assistant replacement or preempted fold marker is persisted;
+- correlation metadata is manually damaged.
 
 The folder fails closed in those cases to avoid deleting genuine user conversation. The current design therefore provides normal-run and normal-resume provider-context isolation while keeping the extension bounded and reviewable; it is not destructive session-file erasure.
 

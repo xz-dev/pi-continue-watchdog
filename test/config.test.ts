@@ -7,6 +7,7 @@ import test, { type TestContext } from "node:test";
 import {
 	BUILT_IN_CONFIG,
 	DEFAULT_CONTINUE_PROMPT,
+	DEFAULT_CONTINUE_REASON_TYPES,
 	DEFAULT_DECISION_PROMPT,
 	DEFAULT_REASON_TYPES,
 	loadConfigText,
@@ -58,6 +59,15 @@ test("built-in defaults match acceptance and reject the stale direct reminder", 
 		"JOB_BLOCKED",
 	]);
 	assert.deepEqual(DEFAULT_REASON_TYPES, BUILT_IN_CONFIG.reasonTypes);
+	assert.deepEqual(BUILT_IN_CONFIG.continueReasonTypes, [
+		"WORK_REMAINS",
+		"VERIFYING",
+		"WAIT_AUTOMATION",
+	]);
+	assert.deepEqual(
+		DEFAULT_CONTINUE_REASON_TYPES,
+		BUILT_IN_CONFIG.continueReasonTypes,
+	);
 	assert.equal(DEFAULT_DECISION_PROMPT, BUILT_IN_CONFIG.decisionPrompt);
 	assert.equal(DEFAULT_CONTINUE_PROMPT, BUILT_IN_CONFIG.continuePrompt);
 	assert.notEqual(BUILT_IN_CONFIG.decisionPrompt, REJECTED_DIRECT_REMINDER);
@@ -84,6 +94,10 @@ test("global and trusted project overrides apply field-by-field", () => {
 	);
 	assert.equal(globalOnly.config.continuePrompt, DEFAULT_CONTINUE_PROMPT);
 	assert.deepEqual(globalOnly.config.reasonTypes, DEFAULT_REASON_TYPES);
+	assert.deepEqual(
+		globalOnly.config.continueReasonTypes,
+		DEFAULT_CONTINUE_REASON_TYPES,
+	);
 	assert.deepEqual(globalOnly.diagnostics, []);
 
 	const withProject = mergeConfig(
@@ -93,11 +107,13 @@ test("global and trusted project overrides apply field-by-field", () => {
 			decisionPrompt: "Global decision",
 			continuePrompt: "Global continue",
 			reasonTypes: ["GlobalType"],
+			continueReasonTypes: ["GlobalWork"],
 		},
 		{
 			idleDelaySeconds: 9,
 			continuePrompt: "Project continue",
 			reasonTypes: [" ProjectType ", "shipped"],
+			continueReasonTypes: [" ProjectWork ", "verifying"],
 		},
 	);
 	assert.equal(withProject.config.idleDelaySeconds, 9);
@@ -105,6 +121,10 @@ test("global and trusted project overrides apply field-by-field", () => {
 	assert.equal(withProject.config.decisionPrompt, "Global decision");
 	assert.equal(withProject.config.continuePrompt, "Project continue");
 	assert.deepEqual(withProject.config.reasonTypes, ["ProjectType", "shipped"]);
+	assert.deepEqual(withProject.config.continueReasonTypes, [
+		"ProjectWork",
+		"verifying",
+	]);
 	assert.deepEqual(withProject.diagnostics, []);
 });
 
@@ -137,6 +157,26 @@ test("valid reasonTypes replace defaults and invalid lists fall back", () => {
 		{ reasonTypes: [] },
 	);
 	assert.deepEqual(preserved.config.reasonTypes, ["KeepMe"]);
+});
+
+test("valid continueReasonTypes replace defaults and invalid lists fall back", () => {
+	const replaced = mergeConfig({
+		continueReasonTypes: [" Work_Remains ", "verifying"],
+	});
+	assert.deepEqual(replaced.config.continueReasonTypes, [
+		"Work_Remains",
+		"verifying",
+	]);
+	assert.ok(!replaced.config.continueReasonTypes.includes("WAIT_AUTOMATION"));
+
+	const fallback = mergeConfig(
+		{ continueReasonTypes: ["GlobalWork"] },
+		{ continueReasonTypes: ["ok", "  "] },
+	);
+	assert.deepEqual(fallback.config.continueReasonTypes, ["GlobalWork"]);
+	assert.ok(
+		fallback.diagnostics.some((d) => /continueReasonTypes/.test(d.message)),
+	);
 });
 
 test("invalid higher-precedence fields preserve lower valid values", () => {

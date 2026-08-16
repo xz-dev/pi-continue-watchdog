@@ -17,6 +17,7 @@ import {
 } from "./activity-grace.js";
 import {
 	CONTINUE_ENTRY_TYPE,
+	type ContinueEntry,
 	HUMAN_UNLOCK_ENTRY_TYPE,
 	type HumanUnlockEntry,
 	WATCHDOG_STATUS_ENTRY_TYPE,
@@ -28,6 +29,8 @@ import {
 	createDecisionFoldMessage,
 	createDecisionPromptMessage,
 	findDecisionAssistantEntryId,
+	findPreemptedDecisionAssistantEntryIds,
+	INQUIRY_MARKER_ENTRY_TYPE,
 	PREEMPTED_DECISION_ERROR,
 } from "./context-fold.js";
 import {
@@ -55,7 +58,11 @@ import type {
 	ObservableAgentHub,
 } from "./hub.js";
 import type { ProcessDomainCoordinator } from "./process-domain.js";
-import { createUserReadyEnvelope, emitSemanticHook } from "./semantic-hook.js";
+import {
+	createUserReadyEnvelope,
+	createWatchdogContinuedEnvelope,
+	emitSemanticHook,
+} from "./semantic-hook.js";
 
 export interface RuntimeControllerHolder {
 	controller: LockDecisionController | null;
@@ -89,6 +96,8 @@ export type DecisionAuditEntry =
 			readonly exchangeId: string;
 			readonly cycleId: number;
 			readonly outcome: "continue";
+			readonly reasonType: string;
+			readonly reason: string;
 	  }
 	| {
 			readonly version: 1;
@@ -124,6 +133,12 @@ interface PendingFinalization {
 	readonly active: ActiveDecision;
 	readonly cycleId: number;
 	readonly plan: DecisionProtocolPlan;
+}
+
+interface InquiryMarkerEntry {
+	readonly version: 1;
+	readonly exchangeId: string;
+	readonly cycleId: number;
 }
 
 interface SpliceEntryAPI {
@@ -579,6 +594,21 @@ export function createDecisionRuntime(
 		}
 	};
 
+	const recoverPreemptedDecisionAssistants = (ctx: ExtensionContext): void => {
+		try {
+			const spliceEntry = (options.pi as ExtensionAPI & Partial<SpliceEntryAPI>)
+				.spliceEntry;
+			if (typeof spliceEntry !== "function" || !ctx.isIdle()) return;
+			for (const entryId of findPreemptedDecisionAssistantEntryIds(
+				ctx.sessionManager.getBranch(),
+			)) {
+				spliceEntry.call(options.pi, entryId);
+			}
+		} catch {
+			// Resume recovery is best effort; context folding remains authoritative.
+		}
+	};
+
 	const sameActivityGeneration = (
 		left: ActivityGeneration | null,
 		right: ActivityGeneration,
@@ -705,6 +735,16 @@ export function createDecisionRuntime(
 		active.dispatchPending = true;
 		active.submitted = false;
 		try {
+			options.pi.appendEntry<InquiryMarkerEntry>(INQUIRY_MARKER_ENTRY_TYPE, {
+				version: 1,
+				exchangeId: active.exchangeId,
+				cycleId,
+			});
+		} catch (error) {
+			active.dispatchPending = false;
+			throw error;
+		}
+		try {
 			options.pi.sendMessage(
 				createDecisionPromptMessage({
 					exchangeId: active.exchangeId,
@@ -748,6 +788,7 @@ export function createDecisionRuntime(
 		const decisionPrompt = buildDecisionPrompt(
 			config.decisionPrompt,
 			config.reasonTypes,
+			config.continueReasonTypes,
 		);
 		const domainFence = options.processDomain?.snapshot.fence ?? {
 			brokerEpoch: "local",
@@ -773,6 +814,7 @@ export function createDecisionRuntime(
 				decisionId,
 				decisionPrompt,
 				reasonTypes: config.reasonTypes,
+				continueReasonTypes: config.continueReasonTypes,
 			}),
 		};
 		activeDecision = active;
@@ -1581,6 +1623,16 @@ export function createDecisionRuntime(
 			activeDecision = null;
 			capturedDecisionResponse = null;
 			const finalCycleId = finalization.cycleId;
+			const reasonType = finalization.reasonType;
+			const reason = finalization.reason;
+			if (
+				typeof reasonType !== "string" ||
+				reasonType.length === 0 ||
+				typeof reason !== "string" ||
+				reason.length === 0
+			) {
+				return false;
+			}
 			const deferAcceptedContinue = (): false => {
 				options.controllerHolder.controller?.rollbackValidContinue();
 				active.invalidated = true;
@@ -1602,7 +1654,10 @@ export function createDecisionRuntime(
 			}
 			if (!allIdleForClaim(claim)) return deferAcceptedContinue();
 			try {
-				options.pi.appendEntry(CONTINUE_ENTRY_TYPE, {});
+				options.pi.appendEntry<ContinueEntry>(CONTINUE_ENTRY_TYPE, {
+					reasonType,
+					reason,
+				});
 			} catch (error) {
 				options.controllerHolder.controller?.rollbackValidContinue();
 				appendStatus({
@@ -1614,6 +1669,18 @@ export function createDecisionRuntime(
 				// No automatic continuation without durable visible evidence.
 				silentlyAbandonDecision();
 				return false;
+			}
+			if (stopIfStale(claim)) return false;
+			try {
+				emitSemanticHook(
+					options.pi.events,
+					createWatchdogContinuedEnvelope({
+						REASON_TYPE: reasonType,
+						REASON: reason,
+					}),
+				);
+			} catch {
+				// Listener failures never gate continuation.
 			}
 			if (stopIfStale(claim)) return false;
 			try {
@@ -1773,12 +1840,12 @@ export function createDecisionRuntime(
 		// misattributed as this decision's answer.
 		active.dispatchPending = false;
 		active.submitted = false;
-		decisionAssistantToSplice = {
-			exchangeId: active.exchangeId,
-			cycleId,
-		};
 
-		const validation = validateDecisionResponse(response, config.reasonTypes);
+		const validation = validateDecisionResponse(
+			response,
+			config.reasonTypes,
+			config.continueReasonTypes,
+		);
 		const audit: DecisionAuditEntry = validation.valid
 			? validation.decision.kind === "continue"
 				? {
@@ -1786,6 +1853,8 @@ export function createDecisionRuntime(
 						exchangeId: active.exchangeId,
 						cycleId,
 						outcome: "continue",
+						reasonType: validation.decision.reasonType,
+						reason: validation.decision.reason,
 					}
 				: {
 						version: 1,
@@ -1990,6 +2059,7 @@ export function createDecisionRuntime(
 			attachment = bound.attachment;
 			syncHubState();
 			await configLoad;
+			if (!stopped && ctx.isIdle()) recoverPreemptedDecisionAssistants(ctx);
 		});
 
 		options.pi.on("agent_start", async () => {

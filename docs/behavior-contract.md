@@ -49,11 +49,14 @@ Any acceptance text, test name, README, or implementation that still requires pe
 | Lock command | `/lock-continue-watchdog` | Human (TUI) |
 | Unlock command | `/unlock-continue-watchdog [reason]` | Human (TUI); reason optional; **untyped** (no `reasonType`) |
 | Status command | `/status-continue-watchdog` | Human (TUI); read-only trigger diagnosis |
-| Continue XML decision | `<watchdog><function>continue_watchdog</function></watchdog>` | Main/root decision window only |
+| Continue XML decision | `function=continue_watchdog` plus `reason_type` and `reason_content` | Main/root decision window only |
 | Unlock XML decision | `function=unlock_continue_watchdog` plus `reason_type` and `reason_content` | Main/root decision window only |
 | Default `decisionPrompt` | see exact default below | Automated semantic prefix; runtime always appends the fixed XML protocol and effective reason types |
 | Default `continuePrompt` | `Continue until user assistance is required.` | Compact model-visible replacement after valid continue fold |
 | Default `reasonTypes` | `JOB_DONE`, `WAIT_USER`, `JOB_BLOCKED` | Built-in allowed AI unlock type list; a valid configured list **replaces** this default |
+| Default `continueReasonTypes` | `WORK_REMAINS`, `VERIFYING`, `WAIT_AUTOMATION` | Independent allowed AI continue type list; a valid configured list **replaces** this default |
+| Continue TUI-only entry | `Continue watchdog continued · <TYPE> · <reason>` | Persisted before semantic publication and continuation dispatch |
+| Continue semantic hook | `watchdog-continued` with `REASON_TYPE` and `REASON` | Neutral plain-data best-effort hook after durable continue evidence |
 | Lock TUI notify | `Continue watchdog locked` | User-only TUI notify |
 | Unlock TUI notify (no reason) | `Continue watchdog unlocked` | User-only TUI notify (human reasonless / abort) |
 | Human unlock TUI-only entry (with reason) | `Continue watchdog unlocked · <reason>` | Muted persistent user-only history entry; human path remains untyped |
@@ -79,7 +82,7 @@ Configured type lists may use ordinary nonblank UTF-8 text. Trust sane user conf
 This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. It does not represent any decision by the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one.
 ```
 
-At runtime the extension always appends a fixed protocol suffix. It says to use existing conversation context, not call tools, output exactly one watchdog XML block at the end, never output multiple watchdog blocks, and use one of the effective configured unlock reason types. It includes canonical continue and unlock XML examples. Parser compatibility with surplus XML keys is intentionally not advertised to the model.
+At runtime the extension always appends a fixed protocol suffix. It says to use existing conversation context, **not make decisions on the user's behalf**, not call tools, output exactly one watchdog XML block at the end, never output multiple watchdog blocks, and use the corresponding independent effective reason type list. It includes canonical typed continue and unlock XML examples. Parser compatibility with surplus XML keys is intentionally not advertised to the model.
 
 ### Exact default `continuePrompt`
 
@@ -113,7 +116,8 @@ Continue until user assistance is required.
 | `maxRetries` | `10` | Maximum **valid continue** decisions per lock cycle (not invalid re-asks); safe integer in `[1, 10]` |
 | `decisionPrompt` | exact default above | Automated custom-role body; explicitly identifies extension automation and says it is not a user message/request; nonblank and at most 16,384 Unicode code points |
 | `continuePrompt` | exact default above | Compact fold-in after valid continue; nonblank and at most 16,384 Unicode code points |
-| `reasonTypes` | `["JOB_DONE","WAIT_USER","JOB_BLOCKED"]` | Allowed AI unlock types. A valid configured list **replaces** the default (it does not extend it). Valid = nonempty array of strings, each trim-nonblank. No identifier regex; no artificial length/count/collision hardening. |
+| `reasonTypes` | `["JOB_DONE","WAIT_USER","JOB_BLOCKED"]` | Allowed AI unlock types. A valid configured list **replaces** the default. |
+| `continueReasonTypes` | `["WORK_REMAINS","VERIFYING","WAIT_AUTOMATION"]` | Independently allowed AI continue types. Same nonempty trim-nonblank validation and replace semantics as `reasonTypes`. |
 
 **Config locations and precedence** (same pattern as sibling Pi plugins):
 
@@ -194,7 +198,7 @@ Unlock first makes `locked=false`, then invalidates the current aggregate grace 
 **Then** the plugin:
 
 1. Keeps ordinary active tools and the system-prompt tool list unchanged.
-2. Sends a **custom-role** message—not a user-role message—whose body is the configured `decisionPrompt` plus a fixed XML suffix, using `{ triggerTurn: true, deliverAs: "steer" }`. Ordinary tools stay advertised. The live decision assistant may stream in TUI/RPC, but public `message_end` replacement clears its finalized or aborted content from TUI history and persistence. The suffix tells the model to use existing task context, not call tools, put exactly one watchdog block at the response end, never output multiple watchdog blocks, and use an effective allowed `reason_type` for unlock. This package does not request `presentation: "hidden"` and does not require a downstream Pi hidden-run API.
+2. Persists a context-excluded `pi-continue-watchdog:inquiry-marker` with the exact protocol version, unique `exchangeId`, and `cycleId`, then sends a **custom-role** message—not a user-role message—whose body is the configured `decisionPrompt` plus a fixed XML suffix, using `{ triggerTurn: true, deliverAs: "steer" }`. If marker persistence fails, the inquiry is not dispatched. The marker is a logical correlation boundary: other plugins may interleave entries between marker, decision prompt, assistant, and fold marker without becoming watchdog-owned. Ordinary tools stay advertised. The live decision assistant may stream in TUI/RPC, but public `message_end` replacement clears its finalized or aborted content from TUI history and persistence. The suffix tells the model to use existing task context, not call tools, put exactly one watchdog block at the response end, never output multiple watchdog blocks, and use an effective allowed `reason_type` for unlock. This package does not request `presentation: "hidden"` and does not require a downstream Pi hidden-run API.
 3. Blocks every ordinary tool call before execution while the decision is active and returns a reminder to answer from existing context with XML. A blocked call does not itself consume an invalid attempt; final assistant text is authoritative.
 4. Does **not** send the rejected direct-continuation message as the idle wake path.
 
@@ -204,17 +208,18 @@ Thinking blocks are ignored. Concatenate final assistant text and trim it. It mu
 
 | Outcome | Requirements |
 |---|---|
-| Valid **continue** | Sole block contains `function=continue_watchdog`; reason fields are not required or used |
-| Valid **unlock** | Sole block contains `function=unlock_continue_watchdog`, a valid `reason_type`, and a valid `reason_content` |
+| Valid **continue** | Sole block contains `function=continue_watchdog`, a `reason_type` allowed by `continueReasonTypes`, and a valid `reason_content` |
+| Valid **unlock** | Sole block contains `function=unlock_continue_watchdog`, a `reason_type` allowed by `reasonTypes`, and a valid `reason_content` |
 
-**Unlock `reason_type` validation (AI XML path only):**
+**AI `reason_type` validation:**
 
 - AI type is trimmed, then compared **case-insensitively** by lowercasing against each trimmed configured type
 - On match, emit/display the **uppercase** form of the **matched configured value** (not a free-form re-casing of the AI input beyond that match)
 - Missing, blank-after-trim, or unknown types are **invalid** and count under the existing fixed three invalid attempts total (two re-asks, fail on third)
+- Continue and unlock use independent allowed lists; unlock types never authorize continue
 - Human `/unlock-continue-watchdog` has no typed XML field and is unchanged
 
-**Unlock `reason_content` validation (AI XML path):**
+**AI `reason_content` validation (continue and unlock):**
 
 - After trim, reason must be **non-empty**
 - Length ≤ **500 Unicode characters** (count Unicode code points / characters as implemented consistently and tested)
@@ -255,13 +260,15 @@ On invalid decision:
 
 **When** the decision is a valid continue:
 
-- Reasonless (`reason_type` and `reason_content` are not required or used)
+- Requires a type allowed by `continueReasonTypes` and a nonblank reason of at most 500 Unicode characters
+- The matched type and validated reason are retained in context-excluded audit data
 - The decision turn ends, and ordinary work continues automatically without further user input
 - extension `message_end` captures the provider XML for validation and replaces the finalized assistant with empty content; context folding then removes the complete prompt / assistant and tool-result metadata and replaces them with **one** compact custom message containing the configured `continuePrompt` (exact default: `Continue until user assistance is required.`)
 - show a live colored TUI widget with `Continue watchdog checking` and the current decision cycle while the check is active; clear it on terminal continue, unlock, failure, abort, or cleanup
 - persist a colored TUI-only event card for each watchdog validation re-ask with its safe parser error and cycle number; persist non-watchdog failures as `Other error` with the original error content
-- append exactly one persistent TUI-only entry with exact text `Continue watchdog continued`, so repeated automatic continuation remains observable without entering model context or adding a duplicate transient notification
-- persist that entry before dispatching continuation; if persistence fails, fail closed and start no automatic continuation turn
+- append exactly one persistent TUI-only entry with exact text `Continue watchdog continued · <TYPE> · <reason>`, so repeated automatic continuation remains observable without entering model context
+- persist that entry before publishing `watchdog-continued`, then dispatch continuation; if persistence fails, fail closed with neither hook nor automatic continuation turn
+- semantic listener absence/failure is best-effort and never gates continuation after persistence succeeds
 - The continued ordinary turn receives exactly one compact model-bound message containing `continuePrompt`; the XML decision exchange is otherwise removed from later context
 - Consumes **one** valid-continue retry (attempt advances)
 - The next authoritative aggregate all-idle generation uses the same fixed grace
@@ -373,10 +380,11 @@ Ordinary natural idle settle never counts as abort.
 **Then**
 
 - the original user message is admitted exactly once and is not re-sent by the watchdog
-- the watchdog decision is aborted and folded as `preempted`
-- the aborted decision assistant is cleared and does not remain in later model context
+- the watchdog decision is aborted and folded as `preempted` using the inquiry marker's exact exchange/cycle identity
+- the aborted decision assistant is cleared and does not remain in later model context; unrelated interleaved plugin entries are preserved
 - TUI/session show neither `Operation aborted` nor `Continue watchdog unlocked` for that preemption
 - lock remains; the user message start begins a fresh lock cycle
+- at true idle, only an empty `stop` assistant carrying the exact `pi-continue-watchdog:preempted` marker inside that inquiry boundary may be spliced; session startup while idle retries the same exact cleanup after a prior process exit
 - a later ordinary Esc/abort of the user-owned run still unlocks reasonlessly
 
 ### Example 5 — Locked + authoritative aggregate idle → fixed-grace **decision entry**
@@ -387,7 +395,7 @@ Ordinary natural idle settle never counts as abort.
 
 - exactly one decision window is opened for that attempt (not a direct continue custom message)
 - ordinary active tools and the system-prompt tool list stay unchanged; attempted tool calls are blocked before execution with an XML reminder
-- a **custom-role** decision message uses configured `decisionPrompt` plus the fixed XML suffix, identifies itself as extension automation, states it is not a user message/request, lists effective `reasonTypes`, and is never injected with user role
+- a **custom-role** decision message uses configured `decisionPrompt` plus the fixed XML suffix, identifies itself as extension automation, states it is not a user message/request, explicitly forbids making decisions on the user's behalf, lists effective `reasonTypes` and `continueReasonTypes`, and is never injected with user role
 - the model may narrate before XML or output only XML, but the trimmed response must end with exactly one watchdog block; multiple watchdog blocks are invalid
 - the rejected direct-continuation default
   `Continue the task. If you are intentionally waiting for the user or all tasks are complete, call unlock_continue_watchdog.`
@@ -398,14 +406,18 @@ With defaults, every eligible all-idle generation waits **10s**.
 
 ### Example 6 — Valid continue: fold, compact prompt, retry consumption
 
-**Given** a decision window is open
-**When** the main agent returns a valid `continue_watchdog` decision
+**Given** a decision window is open with default `continueReasonTypes`
+**When** the main agent returns `continue_watchdog` with type `verifying` and reason `Tests still need to run.`
 **Then**
 
-- the decision turn ends and ordinary work continues automatically without further user input
+- type normalizes to `VERIFYING`; the validated type and reason are written into decision audit
+- one muted TUI-only entry is durably appended first: `Continue watchdog continued · VERIFYING · Tests still need to run.`
+- then one neutral `watchdog-continued` hook publishes `REASON_TYPE=VERIFYING` and `REASON=Tests still need to run.` best-effort
+- only after durable evidence does the decision turn end and ordinary work continue automatically without further user input
 - model-bound context removes the full decision exchange and inserts one compact custom message equal to configured `continuePrompt` (default `Continue until user assistance is required.`)
 - one valid-continue retry is consumed
 - after the continuation settles, if still locked and aggregate idle, the **next generation** waits the same fixed grace
+- if durable continue entry persistence fails, no hook or continuation is dispatched; hook listener failures alone do not gate continuation
 
 ### Example 7 — Valid AI unlock: typed muted entry, fold to nothing, no further work turn
 
@@ -530,13 +542,13 @@ Only AI decision unlock retains a publication intent carrying **both** matched `
 ### Example 13 — Trusted config overrides with safe fallback
 
 **Given** global and/or trusted-project `pi-continue-watchdog.json`
-**When** valid `idleDelaySeconds`, `maxRetries`, `decisionPrompt`, `continuePrompt`, and/or `reasonTypes` are provided
+**When** valid `idleDelaySeconds`, `maxRetries`, `decisionPrompt`, `continuePrompt`, `reasonTypes`, and/or `continueReasonTypes` are provided
 **Then** effective config uses field-level override (trusted project over global over defaults)
-**And** a valid `reasonTypes` list replaces the built-in default list rather than extending it
+**And** each valid reason-type list independently replaces its built-in default rather than extending it
 
 **When** values are missing, unreadable, or invalid
 **Then** retain valid lower-precedence values / defaults and emit bounded diagnostics (no crash, no silent use of nonsense numbers that would fire immediately in an unbounded way)
-**And** invalid `reasonTypes` (empty array, non-array, or any blank-after-trim entry) do not erase a valid lower-precedence / default type list
+**And** invalid `reasonTypes` or `continueReasonTypes` (empty array, non-array, or any blank-after-trim entry) do not erase the corresponding valid lower-precedence/default list
 
 ### Example 14 — Publication, language, packaging, CI
 

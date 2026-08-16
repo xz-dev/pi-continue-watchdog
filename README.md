@@ -35,7 +35,7 @@ Observable behavior only (implementation details may change):
 3. The decision is an **automated custom message**, not a user message. It may stream in the live TUI/RPC while the check runs; when it ends, the extension clears the decision assistant from final TUI history and persisted assistant content. Ordinary active tools and the system-prompt tool list remain unchanged for prompt-cache stability. The model decides quickly from existing conversation knowledge without tools and finishes with exactly one XML block:
 
    ```xml
-   <watchdog><function>continue_watchdog</function></watchdog>
+   <watchdog><function>continue_watchdog</function><reason_type>WORK_REMAINS</reason_type><reason_content>Implementation work remains.</reason_content></watchdog>
    ```
 
    or:
@@ -49,7 +49,7 @@ Observable behavior only (implementation details may change):
    ```
 
    It may explain first or output only XML, but after trimming the sole `</watchdog>` must be the end of the response. Multiple watchdog blocks are invalid. If it tries an ordinary tool during the decision, the extension blocks execution and reminds it to answer from existing context with XML. Interactive or RPC user input during the check preempts it: the original user message runs exactly once, the aborted decision assistant is cleared, and no `Operation aborted` or `Continue watchdog unlocked` notice is shown. Future model context then drops the preempted exchange.
-4. During every decision cycle, a live colored Pi-TUI widget shows `Continue watchdog checking` and the current attempt. Each watchdog validation re-ask and non-watchdog error is also retained as a colored TUI-only event card with its exact safe parser/original error. **Continue** must persist `Continue watchdog continued` before dispatch, so repeated automatic continuation is visible and cannot silently consume tokens; if persistence fails, it fails closed without starting another turn. The complete decision exchange folds into the compact prompt `Continue until user assistance is required.` (configurable), and ordinary work resumes without further user input.
+4. During every decision cycle, a live colored Pi-TUI widget shows `Continue watchdog checking` and the current attempt. Each watchdog validation re-ask and non-watchdog error is also retained as a colored TUI-only event card with its exact safe parser/original error. **Continue** requires an independently allowed type and concise reason, then persists `Continue watchdog continued · <TYPE> · <reason>` before semantic notification and dispatch, so repeated automatic continuation is visible and cannot silently consume tokens; if persistence fails, it fails closed without starting another turn. The complete decision exchange folds into the compact prompt `Continue until user assistance is required.` (configurable), and ordinary work resumes without further user input.
 5. **AI unlock** requires an allowed `reason_type` and concise nonblank `reason_content` of at most 500 Unicode code points. It shows one muted persistent TUI line, `Continue watchdog unlocked · <TYPE> · <reason>`, with no duplicate transient notification, and does **not** start another work turn. Future model context drops the complete decision exchange. Human command unlock remains untyped.
 6. A decision gets up to **3 total attempts**. An invalid final XML response counts as one attempt; blocked ordinary tool calls and provisional Provider errors that Pi retries within the same run do not. Invalid raw text is not retained. After the third invalid response, the extension stays locked/failed until a new main user message or manual lock, and the failed exchange is folded out of future model context.
 7. After each valid continue, the next authoritative all-idle generation waits the same fixed delay: default **10s** each time, up to **10** valid continues per lock cycle.
@@ -74,7 +74,11 @@ Human unlock reason is optional: trimmed and truncated to 500 Unicode characters
 Canonical continue output:
 
 ```xml
-<watchdog><function>continue_watchdog</function></watchdog>
+<watchdog>
+  <function>continue_watchdog</function>
+  <reason_type>WORK_REMAINS</reason_type>
+  <reason_content>Implementation work remains.</reason_content>
+</watchdog>
 ```
 
 Canonical unlock output:
@@ -126,7 +130,8 @@ Project config is ignored when the project is untrusted. Missing files are silen
   "maxRetries": 10,
   "decisionPrompt": "This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. It does not represent any decision by the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one.",
   "continuePrompt": "Continue until user assistance is required.",
-  "reasonTypes": ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"]
+  "reasonTypes": ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
+  "continueReasonTypes": ["WORK_REMAINS", "VERIFYING", "WAIT_AUTOMATION"]
 }
 ```
 
@@ -136,11 +141,12 @@ Project config is ignored when the project is untrusted. Missing files are silen
 | `maxRetries` | `10` | Safe integer `1`–`10` (valid continues per lock cycle) |
 | `decisionPrompt` | see above | Non-blank, ≤ **16384** Unicode code points |
 | `continuePrompt` | `Continue until user assistance is required.` | Non-blank, ≤ **16384** Unicode code points |
-| `reasonTypes` | `["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"]` | Nonempty array of trim-nonblank strings. A valid configured list **replaces** the defaults; it does not extend them. |
+| `reasonTypes` | `["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"]` | Allowed unlock types. Nonempty array of trim-nonblank strings; a valid list **replaces** the defaults. |
+| `continueReasonTypes` | `["WORK_REMAINS", "VERIFYING", "WAIT_AUTOMATION"]` | Independently allowed continue types with the same replace semantics. |
 
 Default meanings: `JOB_DONE` means all requested work is complete; `WAIT_USER` means progress genuinely requires user input or a user decision; `JOB_BLOCKED` means the job cannot continue for another concrete reason.
 
-For AI unlock, the extension trims XML `reason_type`, matches it against the effective list case-insensitively by lowercasing both values, and emits the **matched configured value uppercased**. It trims `reason_content` but does not truncate it: blank or over-500-code-point AI reasons are invalid and use the decision re-ask protocol. The effective allowed list is included in the fixed prompt suffix. Human `/unlock-continue-watchdog [reason]` remains untyped and keeps its separate truncating behavior.
+For AI unlock and continue, the extension trims XML `reason_type`, matches it against the corresponding independent effective list case-insensitively, and emits the **matched configured value uppercased**. It trims `reason_content` but does not truncate it: blank or over-500-code-point AI reasons are invalid and use the decision re-ask protocol. Both effective allowed lists and the explicit prohibition on making decisions for the user are included in the fixed prompt suffix. Human `/unlock-continue-watchdog [reason]` remains untyped and keeps its separate truncating behavior.
 
 Invalid re-ask budget is fixed at **3** (not configurable).
 
@@ -149,7 +155,9 @@ Every new authoritative all-idle activity generation waits one fixed
 accounting; they do not lengthen later grace periods.
 
 
-## Neutral `user-ready` semantic hook
+## Neutral semantic hooks
+
+After a valid continue is durably recorded, the elected main publishes a fresh `watchdog-continued` envelope on `pi:semantic-hook:v1` with `{ "REASON_TYPE": "<matched TYPE>", "REASON": "<validated reason>" }`. The persisted TUI entry is written first; listener failure is best-effort and never prevents the subsequent continuation turn. The producer has no pi-notify dependency.
 
 When the elected main attachment reaches a **terminal aggregate-idle** epoch where this extension will not start another automatic decision or continue run, it publishes one fresh plain-data envelope on Pi's public bus:
 
@@ -160,7 +168,7 @@ When the elected main attachment reaches a **terminal aggregate-idle** epoch whe
   - Max valid continues exhausted: `{ "STOP_KIND": "EXHAUSTED" }`
   - Third invalid decision: `{ "STOP_KIND": "DECISION_FAILED" }`
 
-Publication is at most once per such terminal idle epoch. It does **not** publish for human `/unlock-continue-watchdog`, abort unlock, valid continue, intermediate decision states, or ordinary unlocked idle. The producer does not import, identify, require, or wait for any consumer (including pi-notify). Delivery is best-effort current-listener-only with no ack, retry, or replay.
+`user-ready` publication is at most once per such terminal idle epoch. It does **not** publish for human `/unlock-continue-watchdog`, abort unlock, valid continue, intermediate decision states, or ordinary unlocked idle. The producer does not import, identify, require, or wait for any consumer (including pi-notify). Delivery is best-effort current-listener-only with no ack, retry, or replay.
 
 ## Scope and limitations
 
@@ -177,7 +185,7 @@ Publication is at most once per such terminal idle epoch. It does **not** publis
 
 After valid continue, valid unlock, terminal decision failure, or user preemption, future **model-bound** context drops the complete decision exchange, including the decision question, any streamed assistant/tool-result residue, re-asks, and fold marker. Continue replaces it with the compact continue prompt; unlock, failure, and preemption replace it with nothing. Canonical aborted decision pairs are also removed. A malformed or incomplete historical exchange fails closed only for its own correlation ID; it cannot disable folding for later independent exchanges.
 
-Each decision stores only a structured `pi-continue-watchdog:decision-audit` custom entry. Pi explicitly excludes plain custom entries from Agent/provider context, so the audit survives `pi -c` without becoming conversation. Valid unlock audits keep the validated type and reason; invalid audits keep only the fixed validation error, never raw model text. The original XML and any aborted partial decision are not retained as assistant content. Pi's public `message_end` replacement leaves an empty assistant metadata record rather than deleting the append-only entry.
+Each decision stores only a structured `pi-continue-watchdog:decision-audit` custom entry. Pi explicitly excludes plain custom entries from Agent/provider context, so the audit survives `pi -c` without becoming conversation. Valid continue and unlock audits keep the validated type and reason; invalid audits keep only the fixed validation error, never raw model text. The original XML and any aborted partial decision are not retained as assistant content. Pi's public `message_end` replacement leaves an empty assistant metadata record rather than deleting the append-only entry.
 
 ## Development
 

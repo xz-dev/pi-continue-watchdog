@@ -324,7 +324,7 @@ test("watchdog status entries render standard colored Pi-TUI boxes", () => {
 	assert.equal(foregrounds.includes("warning"), true);
 });
 
-test("accepted continue entry renders one persistent muted status line", () => {
+test("accepted continue entry renders its typed reason", () => {
 	assert.equal(CONTINUE_ENTRY_TEXT, "Continue watchdog continued");
 	const renderer = createContinueEntryRenderer();
 	const mutedCalls: Array<{ color: string; text: string }> = [];
@@ -335,7 +335,10 @@ test("accepted continue entry renders one persistent muted status line", () => {
 			id: "continue-entry",
 			parentId: null,
 			timestamp: new Date().toISOString(),
-			data: {},
+			data: {
+				reasonType: "VERIFYING",
+				reason: "Tests still need to run.",
+			},
 		},
 		{} as never,
 		{
@@ -347,10 +350,10 @@ test("accepted continue entry renders one persistent muted status line", () => {
 	);
 
 	assert.ok(component);
-	assert.deepEqual(component.render(10_000), [CONTINUE_ENTRY_TEXT]);
-	assert.deepEqual(mutedCalls, [
-		{ color: "toolOutput", text: CONTINUE_ENTRY_TEXT },
-	]);
+	const text =
+		"Continue watchdog continued · VERIFYING · Tests still need to run.";
+	assert.deepEqual(component.render(10_000), [text]);
+	assert.deepEqual(mutedCalls, [{ color: "toolOutput", text }]);
 	assert.equal(CONTINUE_ENTRY_TYPE, "pi-continue-watchdog:continue");
 });
 

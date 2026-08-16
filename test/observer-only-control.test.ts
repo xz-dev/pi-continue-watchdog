@@ -137,6 +137,7 @@ const CONFIG: LoadedConfig = {
 		decisionPrompt: "Decide now.",
 		continuePrompt: "Continue now.",
 		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
+		continueReasonTypes: ["WORK_REMAINS", "VERIFYING", "WAIT_AUTOMATION"],
 	},
 	diagnostics: [],
 };

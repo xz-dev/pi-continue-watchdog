@@ -8,6 +8,12 @@ export const DECISION_INVALID_ATTEMPT_LIMIT = 3;
 
 export const INVALID_DECISION_XML_ERROR =
 	"End the response with one valid watchdog XML decision block.";
+export const INVALID_CONTINUE_REASON_TYPE_ERROR =
+	"continue_watchdog requires an allowed reason_type.";
+export const INVALID_CONTINUE_REASON_ERROR =
+	"continue_watchdog requires a non-empty reason_content of at most 500 Unicode characters.";
+export const MISSING_CONTINUE_FIELDS_ERROR =
+	"continue_watchdog requires reason_type and reason_content.";
 export const INVALID_UNLOCK_REASON_TYPE_ERROR =
 	"unlock_continue_watchdog requires an allowed reason_type.";
 export const INVALID_UNLOCK_REASON_ERROR =
@@ -58,7 +64,11 @@ export interface DecisionResponse {
 }
 
 export type ValidDecision =
-	| { readonly kind: "continue" }
+	| {
+			readonly kind: "continue";
+			readonly reasonType: string;
+			readonly reason: string;
+	  }
 	| {
 			readonly kind: "unlock";
 			readonly reasonType: string;
@@ -91,7 +101,12 @@ export interface DecisionProtocolFinalization {
 
 /** A parsed response whose controller transition has not yet been committed. */
 export type DecisionProtocolPlan =
-	| { readonly outcome: "continue"; readonly cycleId: number }
+	| {
+			readonly outcome: "continue";
+			readonly cycleId: number;
+			readonly reasonType: string;
+			readonly reason: string;
+	  }
 	| {
 			readonly outcome: "unlock";
 			readonly cycleId: number;
@@ -112,6 +127,8 @@ export interface DecisionProtocolSessionOptions {
 	readonly decisionPrompt: string;
 	/** Effective allowed AI unlock reason types for this decision window. */
 	readonly reasonTypes: readonly string[];
+	/** Effective allowed automatic-continue reason types for this decision window. */
+	readonly continueReasonTypes: readonly string[];
 }
 
 /**
@@ -190,10 +207,15 @@ export function normalizeDecisionUnlockReason(reason: unknown): string | null {
 export function buildDecisionPrompt(
 	decisionPrompt: string,
 	reasonTypes: readonly string[],
+	continueReasonTypes: readonly string[],
 ): string {
 	const allowedReasonTypes = JSON.stringify(reasonTypes);
+	const allowedContinueReasonTypes = JSON.stringify(continueReasonTypes);
 	const exampleReasonType = escapeXmlText(reasonTypes[0] ?? "ALLOWED_TYPE");
-	return `${decisionPrompt}\n\nUse only the existing conversation context and decide quickly. Do not call tools. You may explain your decision first, or output only XML. In either case, output exactly one <watchdog>...</watchdog> XML block at the very end of your response. After surrounding whitespace is trimmed, </watchdog> must be the final text. Do not output multiple <watchdog>...</watchdog> blocks.\n\nTo continue, end with:\n<watchdog><function>continue_watchdog</function></watchdog>\n\nTo unlock, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedReasonTypes}. End with:\n<watchdog><function>unlock_continue_watchdog</function><reason_type>${exampleReasonType}</reason_type><reason_content>concise reason</reason_content></watchdog>`;
+	const exampleContinueReasonType = escapeXmlText(
+		continueReasonTypes[0] ?? "ALLOWED_TYPE",
+	);
+	return `${decisionPrompt}\n\nUse only the existing conversation context and decide quickly. Do not make decisions on the user's behalf. Do not call tools. You may explain your decision first, or output only XML. In either case, output exactly one <watchdog>...</watchdog> XML block at the very end of your response. After surrounding whitespace is trimmed, </watchdog> must be the final text. Do not output multiple <watchdog>...</watchdog> blocks.\n\nTo continue, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedContinueReasonTypes}. End with:\n<watchdog><function>continue_watchdog</function><reason_type>${exampleContinueReasonType}</reason_type><reason_content>concise reason</reason_content></watchdog>\n\nTo unlock, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedReasonTypes}. End with:\n<watchdog><function>unlock_continue_watchdog</function><reason_type>${exampleReasonType}</reason_type><reason_content>concise reason</reason_content></watchdog>`;
 }
 
 function escapeXmlText(value: string): string {
@@ -418,9 +440,33 @@ export function parseWatchdogDecisionXml(
 function validateParsedFields(
 	fields: ParsedWatchdogFields,
 	reasonTypes: readonly string[],
+	continueReasonTypes: readonly string[],
 ): DecisionValidation {
 	if (fields.functionName === "continue_watchdog") {
-		return { valid: true, decision: { kind: "continue" } };
+		if (fields.reasonType === undefined || fields.reasonContent === undefined) {
+			return { valid: false, error: MISSING_CONTINUE_FIELDS_ERROR };
+		}
+		const normalizedType = normalizeDecisionUnlockReasonType(
+			fields.reasonType,
+			continueReasonTypes,
+		);
+		if (normalizedType === null) {
+			return { valid: false, error: INVALID_CONTINUE_REASON_TYPE_ERROR };
+		}
+		const normalizedReason = normalizeDecisionUnlockReason(
+			fields.reasonContent,
+		);
+		if (normalizedReason === null) {
+			return { valid: false, error: INVALID_CONTINUE_REASON_ERROR };
+		}
+		return {
+			valid: true,
+			decision: {
+				kind: "continue",
+				reasonType: normalizedType,
+				reason: normalizedReason,
+			},
+		};
 	}
 	if (fields.functionName !== "unlock_continue_watchdog") {
 		return { valid: false, error: INVALID_DECISION_XML_ERROR };
@@ -456,6 +502,7 @@ function validateParsedFields(
 export function validateDecisionResponse(
 	response: DecisionResponse,
 	reasonTypes: readonly string[],
+	continueReasonTypes: readonly string[],
 ): DecisionValidation {
 	const content = response.content;
 	if (!Array.isArray(content)) {
@@ -480,7 +527,7 @@ export function validateDecisionResponse(
 	if (!parsed.ok) {
 		return { valid: false, error: INVALID_DECISION_XML_ERROR };
 	}
-	return validateParsedFields(parsed.fields, reasonTypes);
+	return validateParsedFields(parsed.fields, reasonTypes, continueReasonTypes);
 }
 
 function malformedResponse(): DecisionResponse {
@@ -605,12 +652,21 @@ export function createDecisionProtocolSession(
 		if (expectedCycleId !== cycleId || finalized !== null) {
 			return { outcome: "ignored" };
 		}
-		const validation = validateDecisionResponse(response, options.reasonTypes);
+		const validation = validateDecisionResponse(
+			response,
+			options.reasonTypes,
+			options.continueReasonTypes,
+		);
 		if (!validation.valid) {
 			return { outcome: "invalid", cycleId, error: validation.error };
 		}
 		return validation.decision.kind === "continue"
-			? { outcome: "continue", cycleId }
+			? {
+					outcome: "continue",
+					cycleId,
+					reasonType: validation.decision.reasonType,
+					reason: validation.decision.reason,
+				}
 			: {
 					outcome: "unlock",
 					cycleId,
@@ -642,7 +698,13 @@ export function createDecisionProtocolSession(
 			return finalized;
 		}
 		if (plan.outcome === "continue") {
-			finalized = { outcome: "continue", transition, cycleId };
+			finalized = {
+				outcome: "continue",
+				transition,
+				reasonType: plan.reasonType,
+				reason: plan.reason,
+				cycleId,
+			};
 			return finalized;
 		}
 		finalized = {

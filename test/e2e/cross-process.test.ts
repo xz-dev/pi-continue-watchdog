@@ -306,7 +306,7 @@ async function startMockServer(
 									index: 0,
 									delta: {
 										content:
-											"<watchdog><function>continue_watchdog</function></watchdog>",
+											"<watchdog><function>continue_watchdog</function><reason_type>WORK_REMAINS</reason_type><reason_content>Implementation work remains.</reason_content></watchdog>",
 									},
 									finish_reason: null,
 								},
@@ -328,7 +328,7 @@ async function startMockServer(
 			) {
 				const content =
 					reply.kind === "continue"
-						? "<watchdog><function>continue_watchdog</function></watchdog>"
+						? "<watchdog><function>continue_watchdog</function><reason_type>WORK_REMAINS</reason_type><reason_content>Implementation work remains.</reason_content></watchdog>"
 						: reply.kind === "unlock"
 							? `<watchdog><function>unlock_continue_watchdog</function><reason_type>${reply.reasonType ?? "JOB_DONE"}</reason_type><reason_content>${reply.reason ?? "finished"}</reason_content></watchdog>`
 							: (reply.text ?? "invalid watchdog response");

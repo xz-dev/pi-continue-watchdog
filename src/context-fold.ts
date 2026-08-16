@@ -20,6 +20,9 @@ export const CONTINUATION_MESSAGE_TYPE = "pi-continue-watchdog:continuation";
 /** Internal persisted marker used to redact a decision that user input took over. */
 export const PREEMPTED_DECISION_ERROR = "pi-continue-watchdog:preempted";
 
+/** Context-excluded boundary written immediately before one decision prompt. */
+export const INQUIRY_MARKER_ENTRY_TYPE = "pi-continue-watchdog:inquiry-marker";
+
 export interface DecisionMessageDetails {
 	readonly version: typeof DECISION_PROTOCOL_VERSION;
 	readonly exchangeId: string;
@@ -111,7 +114,7 @@ type ParsedPluginMessage =
 
 type FoldedSegment<T extends object> = {
 	readonly endIndex: number;
-	readonly replacement: T | undefined;
+	readonly replacement: readonly T[];
 };
 
 type DecisionSegment<T extends object> =
@@ -179,62 +182,117 @@ function decisionDetails(input: unknown): DecisionMessageDetails | undefined {
 	};
 }
 
-/** Locate the persisted assistant for one exact watchdog decision cycle. */
+function entryDecisionDetails(
+	entry: SessionEntry,
+): DecisionMessageDetails | undefined {
+	if (
+		entry.type === "custom_message" &&
+		entry.customType === DECISION_MESSAGE_TYPE
+	) {
+		return decisionDetails(entry.details);
+	}
+	if (
+		entry.type !== "custom" ||
+		entry.customType !== INQUIRY_MARKER_ENTRY_TYPE
+	) {
+		return undefined;
+	}
+	return decisionDetails(entry.data);
+}
+
+/** Locate one exact preempted assistant within its persisted inquiry boundary. */
 export function findDecisionAssistantEntryId(
 	entries: readonly SessionEntry[],
 	exchangeId: string,
 	cycleId: number,
 ): string | null {
-	let decisionIndex = -1;
+	let markerIndex = -1;
 	for (let index = entries.length - 1; index >= 0; index -= 1) {
 		const entry = entries[index];
 		if (
-			entry?.type === "custom_message" &&
-			entry.customType === DECISION_MESSAGE_TYPE
+			entry?.type !== "custom" ||
+			entry.customType !== INQUIRY_MARKER_ENTRY_TYPE
 		) {
-			const details = decisionDetails(entry.details);
-			if (details?.exchangeId === exchangeId && details.cycleId === cycleId) {
-				decisionIndex = index;
-				break;
-			}
+			continue;
+		}
+		const details = decisionDetails(entry.data);
+		if (details?.exchangeId === exchangeId && details.cycleId === cycleId) {
+			markerIndex = index;
+			break;
 		}
 	}
-	if (decisionIndex === -1) return null;
+	if (markerIndex === -1) return null;
 
-	let assistantId: string | null = null;
+	let decisionSeen = false;
 	let foldSeen = false;
-	for (let index = decisionIndex + 1; index < entries.length; index += 1) {
+	let assistantId: string | null = null;
+	for (let index = markerIndex + 1; index < entries.length; index += 1) {
 		const entry = entries[index];
-		if (entry?.type === "message") {
-			if (entry.message?.role === "assistant") {
-				if (assistantId !== null) return null;
-				if (foldSeen && !isPreemptedAssistant(entry.message)) return null;
-				assistantId = entry.id;
-				continue;
-			}
-			if (entry.message?.role === "toolResult" && !foldSeen) continue;
+		const boundary = entryDecisionDetails(entry);
+		if (
+			boundary !== undefined &&
+			(boundary.exchangeId !== exchangeId || boundary.cycleId !== cycleId)
+		) {
 			return null;
 		}
-		if (entry?.type === "custom") {
-			if (
-				!foldSeen &&
-				(entry.customType === "pi-continue-watchdog:decision-audit" ||
-					entry.customType === "pi-continue-watchdog:continue")
-			) {
+		if (entry?.type === "custom_message") {
+			if (entry.customType === DECISION_MESSAGE_TYPE) {
+				if (decisionSeen || foldSeen || boundary === undefined) return null;
+				decisionSeen = true;
 				continue;
 			}
+			if (entry.customType === DECISION_FOLD_MESSAGE_TYPE) {
+				if (!decisionSeen || foldSeen) return null;
+				const fold = foldDetails(entry.details);
+				if (
+					fold?.exchangeId !== exchangeId ||
+					fold.cycleId !== cycleId ||
+					fold.outcome !== "preempted"
+				) {
+					return null;
+				}
+				foldSeen = true;
+			}
+			continue;
+		}
+		if (entry?.type !== "message" || entry.message?.role !== "assistant") {
+			continue;
+		}
+		if (
+			!decisionSeen ||
+			!isPreemptedAssistant(entry.message) ||
+			assistantId !== null
+		) {
 			return null;
 		}
-		if (entry?.type !== "custom_message") continue;
-		if (entry.customType === DECISION_MESSAGE_TYPE) return null;
-		if (entry.customType !== DECISION_FOLD_MESSAGE_TYPE || foldSeen)
-			return null;
-		const fold = foldDetails(entry.details);
-		if (fold?.exchangeId !== exchangeId || fold.cycleId !== cycleId)
-			return null;
-		foldSeen = true;
+		assistantId = entry.id;
+		if (foldSeen) return assistantId;
 	}
-	return foldSeen ? assistantId : null;
+	return decisionSeen && foldSeen ? assistantId : null;
+}
+
+/** Recover every exactly bounded preempted assistant on the active branch. */
+export function findPreemptedDecisionAssistantEntryIds(
+	entries: readonly SessionEntry[],
+): string[] {
+	const ids: string[] = [];
+	for (const entry of entries) {
+		if (
+			entry.type !== "custom" ||
+			entry.customType !== INQUIRY_MARKER_ENTRY_TYPE
+		) {
+			continue;
+		}
+		const details = decisionDetails(entry.data);
+		if (details === undefined) continue;
+		const id = findDecisionAssistantEntryId(
+			entries,
+			details.exchangeId,
+			details.cycleId,
+		);
+		if (id !== null && !ids.includes(id)) ids.push(id);
+	}
+	return ids;
 }
 
 function foldDetails(input: unknown): DecisionFoldDetails | undefined {
@@ -369,6 +427,7 @@ function findDecisionSegment<T extends object>(
 	start: ParsedDecisionMessage,
 ): DecisionSegment<T> {
 	let cycleId = start.cycleId;
+	const preserved: T[] = [];
 
 	for (let index = startIndex + 1; index < messages.length; index += 1) {
 		const message = messages[index];
@@ -393,19 +452,40 @@ function findDecisionSegment<T extends object>(
 			) {
 				return { kind: "incomplete" };
 			}
+			let endIndex = index;
+			if (pluginMessage.outcome === "preempted") {
+				for (let tail = index + 1; tail < messages.length; tail += 1) {
+					const trailing = messages[tail];
+					if (isPreemptedAssistant(trailing)) {
+						endIndex = tail;
+						break;
+					}
+					const trailingPlugin = parsePluginMessage(trailing);
+					if (trailingPlugin.type !== "unrelated") break;
+					if (!isObject(trailing) || trailing.role !== "custom") break;
+					preserved.push(trailing);
+					endIndex = tail;
+				}
+			}
 			return {
 				kind: "folded",
 				segment: {
-					endIndex: index,
-					replacement:
-						pluginMessage.outcome === "continue"
-							? createContinuationMessage<T>(pluginMessage)
-							: undefined,
+					endIndex,
+					replacement: [
+						...preserved,
+						...(pluginMessage.outcome === "continue"
+							? [createContinuationMessage<T>(pluginMessage)]
+							: []),
+					],
 				},
 			};
 		}
 
 		if (!isObject(message)) return { kind: "incomplete" };
+		if (message.role === "custom") {
+			preserved.push(message);
+			continue;
+		}
 		if (message.role === "assistant") {
 			if (isPreemptedAssistant(message)) continue;
 			if (isAbortedAssistant(message)) {
@@ -525,9 +605,7 @@ export function foldDecisionContext<T extends object>(messages: T[]): T[] {
 		}
 		const result = findDecisionSegment(messages, index, pluginMessage);
 		if (result.kind === "folded") {
-			if (result.segment.replacement !== undefined) {
-				folded.push(result.segment.replacement);
-			}
+			folded.push(...result.segment.replacement);
 			index = result.segment.endIndex;
 			changed = true;
 			continue;

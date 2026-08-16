@@ -300,7 +300,7 @@ async function startMockServer(
 			) {
 				const content =
 					reply.kind === "continue"
-						? "<watchdog><function>continue_watchdog</function></watchdog>"
+						? "<watchdog><function>continue_watchdog</function><reason_type>WORK_REMAINS</reason_type><reason_content>Implementation work remains.</reason_content></watchdog>"
 						: reply.kind === "unlock"
 							? `<watchdog><function>unlock_continue_watchdog</function><reason_type>${reply.reasonType ?? "JOB_DONE"}</reason_type><reason_content>${reply.reason ?? "finished"}</reason_content></watchdog>`
 							: (reply.text ?? "invalid watchdog response");
@@ -1264,10 +1264,10 @@ test("packed interactive and RPC input preempt a streaming decision once", {
 	}
 });
 
-test("packed neutral probe receives AI unlock user-ready and suppresses continue", {
+test("packed neutral probe receives typed continue and AI unlock hooks", {
 	timeout: 45_000,
 }, async (t) => {
-	// Continue path: probe must remain empty through decision + continued work.
+	// Continue path: probe receives the accepted typed continue exactly once.
 	const continueFixture = await makePackedFixture(t, {
 		withSemanticProbe: true,
 		watchdogConfig: { idleDelaySeconds: 1 },
@@ -1297,7 +1297,16 @@ test("packed neutral probe receives AI unlock user-ready and suppresses continue
 		5_000,
 		"probe continue path",
 	);
-	assert.deepEqual(await readProbeEnvelopes(continueFixture.probeOut), []);
+	assert.deepEqual(await readProbeEnvelopes(continueFixture.probeOut), [
+		{
+			version: 1,
+			name: "watchdog-continued",
+			values: {
+				REASON_TYPE: "WORK_REMAINS",
+				REASON: "Implementation work remains.",
+			},
+		},
+	]);
 	await continueSession.session.extensionRunner.emit({
 		type: "session_shutdown",
 		reason: "quit",

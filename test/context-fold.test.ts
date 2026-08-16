@@ -311,6 +311,57 @@ test("user-preempted decisions fold without a terminal assistant or replacement"
 		user("task", 1),
 		user("takeover", 5),
 	]);
+
+	const pluginBefore = {
+		role: "custom",
+		customType: "other:before",
+		content: "before",
+		display: false,
+		timestamp: 3,
+	};
+	const pluginAfter = {
+		role: "custom",
+		customType: "other:after",
+		content: "after",
+		display: false,
+		timestamp: 6,
+	};
+	const interleaved = [
+		user("task", 1),
+		decision(EXCHANGE_ID, 1, 2),
+		pluginBefore,
+		foldMarker({ outcome: "preempted", timestamp: 4 }),
+		pluginAfter,
+		{ ...neutralizedAssistant, timestamp: 5 },
+		user("takeover", 7),
+	];
+	assert.deepEqual(foldDecisionContext(interleaved), [
+		user("task", 1),
+		pluginBefore,
+		pluginAfter,
+		user("takeover", 7),
+	]);
+
+	const invalidFirstCycle = {
+		...assistant([text("invalid")], 3),
+		content: [],
+	};
+	const betweenCycles = {
+		role: "custom",
+		customType: "other:between-cycles",
+		content: "keep me",
+		display: false,
+		timestamp: 4,
+	};
+	const multiCycle = [
+		decision(EXCHANGE_ID, 1, 2),
+		invalidFirstCycle,
+		betweenCycles,
+		decision(EXCHANGE_ID, 2, 5),
+		foldMarker({ outcome: "preempted", cycleId: 2, timestamp: 6 }),
+		{ ...neutralizedAssistant, timestamp: 7 },
+	];
+	assert.deepEqual(foldDecisionContext(multiCycle), [betweenCycles]);
 });
 
 test("valid unlock and decision-failed erase the exchange with no replacement", () => {

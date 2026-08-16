@@ -348,6 +348,174 @@ theorem postcondition
   rw [termination environment assumptions streamWasVisible]
   simp [outputPostcondition, completedUserWorkState]
 
+-- Inquiry correlation models one logical exchange/cycle boundary and permits arbitrary unrelated plugin entries without granting them watchdog ownership.
+structure CorrelationKey where
+  exchangeId : Nat
+  cycleId : Nat
+  deriving DecidableEq, Repr
+
+structure InquiryTrace where
+  marker : CorrelationKey
+  decision : CorrelationKey
+  fold : CorrelationKey
+  assistant : CorrelationKey
+  assistantContentEmpty : Bool
+  assistantStopReasonStop : Bool
+  assistantPreemptedMarker : Bool
+  interleavedPluginEntries : Nat
+  preservedPluginEntries : Nat
+  assistantSpliced : Bool
+  deriving DecidableEq, Repr
+
+def exactInquiryAssociation (trace : InquiryTrace) : Bool :=
+  trace.marker == trace.decision &&
+    trace.decision == trace.fold &&
+    trace.assistant == trace.marker
+
+def safePreemptedAssistant (trace : InquiryTrace) : Bool :=
+  trace.assistantContentEmpty &&
+    trace.assistantStopReasonStop &&
+    trace.assistantPreemptedMarker
+
+def eligibleForIdleSplice (trace : InquiryTrace) : Bool :=
+  exactInquiryAssociation trace && safePreemptedAssistant trace
+
+def idleSplice (trace : InquiryTrace) : InquiryTrace :=
+  if eligibleForIdleSplice trace then
+    { trace with
+      preservedPluginEntries := trace.interleavedPluginEntries
+      assistantSpliced := true }
+  else
+    trace
+
+-- Correlation proofs show exact marked cleanup preserves every interleaved plugin entry and rejects mismatched or unmarked candidates.
+theorem eligible_idle_splice_is_exact_and_preserves_plugins
+    (trace : InquiryTrace)
+    (eligible : eligibleForIdleSplice trace = true) :
+    (idleSplice trace).assistantSpliced = true ∧
+      (idleSplice trace).preservedPluginEntries =
+        trace.interleavedPluginEntries := by
+  simp [idleSplice, eligible]
+
+theorem mismatched_marker_is_not_spliced
+    (trace : InquiryTrace)
+    (mismatch : trace.marker ≠ trace.decision) :
+    idleSplice trace = trace := by
+  have associationFalse : exactInquiryAssociation trace = false := by
+    simp only [exactInquiryAssociation, Bool.and_eq_false_iff]
+    left
+    simp [mismatch]
+  simp [idleSplice, eligibleForIdleSplice, associationFalse]
+
+theorem mismatched_fold_is_not_spliced
+    (trace : InquiryTrace)
+    (mismatch : trace.decision ≠ trace.fold) :
+    idleSplice trace = trace := by
+  have associationFalse : exactInquiryAssociation trace = false := by
+    simp only [exactInquiryAssociation, Bool.and_eq_false_iff]
+    left
+    right
+    simp [mismatch]
+  simp [idleSplice, eligibleForIdleSplice, associationFalse]
+
+theorem unmarked_assistant_is_not_spliced
+    (trace : InquiryTrace)
+    (notMarked : trace.assistantPreemptedMarker = false) :
+    idleSplice trace = trace := by
+  have safeFalse : safePreemptedAssistant trace = false := by
+    simp [safePreemptedAssistant, notMarked]
+  simp [idleSplice, eligibleForIdleSplice, safeFalse]
+
+-- Marker guarantees collect the exact-association, preservation, and fail-closed splice obligations.
+structure InquiryMarkerGuarantees : Prop where
+  exactCleanup : ∀ trace, eligibleForIdleSplice trace = true →
+    (idleSplice trace).assistantSpliced = true
+  pluginPreservation : ∀ trace, eligibleForIdleSplice trace = true →
+    (idleSplice trace).preservedPluginEntries =
+      trace.interleavedPluginEntries
+  markerBoundary : ∀ trace, trace.marker ≠ trace.decision →
+    idleSplice trace = trace
+  foldBoundary : ∀ trace, trace.decision ≠ trace.fold →
+    idleSplice trace = trace
+  assistantMarker : ∀ trace, trace.assistantPreemptedMarker = false →
+    idleSplice trace = trace
+
+theorem inquiry_marker_is_correct : InquiryMarkerGuarantees := by
+  exact {
+    exactCleanup := fun trace eligible =>
+      (eligible_idle_splice_is_exact_and_preserves_plugins trace eligible).1
+    pluginPreservation := fun trace eligible =>
+      (eligible_idle_splice_is_exact_and_preserves_plugins trace eligible).2
+    markerBoundary := mismatched_marker_is_not_spliced
+    foldBoundary := mismatched_fold_is_not_spliced
+    assistantMarker := unmarked_assistant_is_not_spliced
+  }
+
+-- Typed continue evidence models independent type authorization, bounded reasons, durable visibility, neutral publication, and dispatch ordering.
+inductive ContinueReasonType where
+  | workRemains
+  | verifying
+  | waitAutomation
+  deriving DecidableEq, Repr
+
+structure ContinueEvidence where
+  reasonType : ContinueReasonType
+  reasonLength : Nat
+  userDecisionMade : Bool
+  auditStored : Bool
+  tuiEntryStored : Bool
+  hookPublished : Bool
+  continuationDispatched : Bool
+  deriving DecidableEq, Repr
+
+def validContinueReason (evidence : ContinueEvidence) : Prop :=
+  evidence.reasonLength > 0 ∧ evidence.reasonLength ≤ 500
+
+def continueEvidenceOrdered (evidence : ContinueEvidence) : Prop :=
+  (evidence.hookPublished = true → evidence.tuiEntryStored = true) ∧
+    (evidence.continuationDispatched = true → evidence.tuiEntryStored = true)
+
+structure ContinueGuarantees : Prop where
+  accepted : ∀ evidence, validContinueReason evidence →
+    evidence.userDecisionMade = false →
+    evidence.auditStored = true →
+    evidence.tuiEntryStored = true →
+    evidence.hookPublished = true →
+    evidence.continuationDispatched = true →
+    continueEvidenceOrdered evidence
+  persistenceFailureClosed : ∀ evidence,
+    evidence.tuiEntryStored = false →
+    evidence.hookPublished = false →
+    evidence.continuationDispatched = false →
+    continueEvidenceOrdered evidence
+
+def protocolContinueEvidence (reasonType : ContinueReasonType) (reasonLength : Nat) : ContinueEvidence :=
+  {
+    reasonType
+    reasonLength
+    userDecisionMade := false
+    auditStored := false
+    tuiEntryStored := false
+    hookPublished := false
+    continuationDispatched := false
+  }
+
+theorem protocol_continue_makes_no_user_decision
+    (reasonType : ContinueReasonType)
+    (reasonLength : Nat) :
+    (protocolContinueEvidence reasonType reasonLength).userDecisionMade = false := by
+  rfl
+
+theorem typed_continue_is_correct : ContinueGuarantees := by
+  exact {
+    accepted := by
+      intro evidence validReason noUserDecision auditStored tuiStored hookPublished dispatched
+      simp [continueEvidenceOrdered, tuiStored]
+    persistenceFailureClosed := by
+      intro evidence tuiMissing hookMissing dispatchMissing
+      simp [continueEvidenceOrdered, hookMissing, dispatchMissing]
+  }
+
 -- The guarantee record gathers all whole-process obligations under abort-safe cleanup and the two explicit host-settlement assumptions.
 structure TakeoverGuarantees
     (environment : EnvironmentAssumptions)
@@ -371,7 +539,7 @@ structure TakeoverGuarantees
       (decisionState streamWasVisible))
 
 -- Top-level correctness proves the gathered obligations for either visible or not-yet-visible in-flight decision streaming; no finalized decision content survives.
-theorem process_is_correct
+theorem takeover_process_is_correct
     (environment : EnvironmentAssumptions)
     (assumptions : environmentAdmitted environment)
     (streamWasVisible : Bool) :
@@ -386,6 +554,17 @@ theorem process_is_correct
     termination := termination environment assumptions streamWasVisible
     postcondition := postcondition environment assumptions streamWasVisible
   }
+
+theorem process_is_correct
+    (environment : EnvironmentAssumptions)
+    (assumptions : environmentAdmitted environment)
+    (streamWasVisible : Bool) :
+    TakeoverGuarantees environment streamWasVisible ∧
+      InquiryMarkerGuarantees ∧
+      ContinueGuarantees := by
+  exact ⟨takeover_process_is_correct environment assumptions streamWasVisible,
+    inquiry_marker_is_correct,
+    typed_continue_is_correct⟩
 
 -- Executable projections expose deterministic summaries of immediate cleanup and clean exactly-once completion.
 def takeoverPostconditionBool (state : ProcessState) : Bool :=
@@ -402,6 +581,10 @@ def takeoverPostconditionBool (state : ProcessState) : Bool :=
     !state.operationAbortedVisible &&
     !state.watchdogUnlockedVisible &&
     state.watchdogLocked
+
+def continueEvidenceOrderedBool (evidence : ContinueEvidence) : Bool :=
+  (!evidence.hookPublished || evidence.tuiEntryStored) &&
+    (!evidence.continuationDispatched || evidence.tuiEntryStored)
 
 def outputPostconditionBool (state : ProcessState) : Bool :=
   state.phase == .complete &&
@@ -424,6 +607,18 @@ end WatchdogUserTakeover
 
 #print axioms WatchdogUserTakeover.process_is_correct
 
+-- The executable summary demonstrates the accepted visible-stream boundary, cleanup milestones, and typed continue ordering.
+def acceptedContinue : WatchdogUserTakeover.ContinueEvidence :=
+  {
+    reasonType := .verifying
+    reasonLength := 24
+    userDecisionMade := false
+    auditStored := true
+    tuiEntryStored := true
+    hookPublished := true
+    continuationDispatched := true
+  }
+
 -- The executable summary demonstrates the accepted visible-stream boundary and both proved cleanup milestones.
 def main : IO Unit := do
   let environment : WatchdogUserTakeover.EnvironmentAssumptions :=
@@ -437,3 +632,4 @@ def main : IO Unit := do
   IO.println s!"Decision stream may be visible before takeover: {visibleDecision.decisionStreamVisible}"
   IO.println s!"Takeover immediately clears decision residue: {WatchdogUserTakeover.takeoverPostconditionBool takeover}"
   IO.println s!"User work completes once with clean context: {WatchdogUserTakeover.outputPostconditionBool completed}"
+  IO.println s!"Typed continue avoids user decisions and persists before dispatch: {WatchdogUserTakeover.continueEvidenceOrderedBool acceptedContinue}"

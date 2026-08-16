@@ -28,6 +28,11 @@ export const STATUS_COMMAND_DESCRIPTION =
 export const CONTINUE_ENTRY_TYPE = "pi-continue-watchdog:continue";
 export const CONTINUE_ENTRY_TEXT = "Continue watchdog continued";
 
+export interface ContinueEntry {
+	readonly reasonType: string;
+	readonly reason: string;
+}
+
 /** Persistent lifecycle event rendered as a standard colored Pi-TUI box. */
 export const WATCHDOG_STATUS_ENTRY_TYPE = "pi-continue-watchdog:status";
 
@@ -256,11 +261,15 @@ export function createWatchdogStatusEntryRenderer(): EntryRenderer<WatchdogStatu
 	};
 }
 
-export function createContinueEntryRenderer(): EntryRenderer<
-	Record<string, never>
-> {
-	return (_entry, _options, theme) =>
-		createStaticTextComponent(CONTINUE_ENTRY_TEXT, theme);
+export function createContinueEntryRenderer(): EntryRenderer<ContinueEntry> {
+	return (entry, _options, theme) => {
+		const reasonType = sanitizeTuiText(String(entry.data?.reasonType ?? ""));
+		const reason = sanitizeTuiText(String(entry.data?.reason ?? ""));
+		return createStaticTextComponent(
+			`${CONTINUE_ENTRY_TEXT} · ${reasonType} · ${reason}`,
+			theme,
+		);
+	};
 }
 
 export function createHumanUnlockEntryRenderer(): EntryRenderer<HumanUnlockEntry> {
@@ -447,7 +456,7 @@ export function createMainCommands(
 		WATCHDOG_STATUS_ENTRY_TYPE,
 		createWatchdogStatusEntryRenderer(),
 	);
-	pi.registerEntryRenderer<Record<string, never>>(
+	pi.registerEntryRenderer<ContinueEntry>(
 		CONTINUE_ENTRY_TYPE,
 		createContinueEntryRenderer(),
 	);

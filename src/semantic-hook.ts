@@ -11,6 +11,9 @@ export const SEMANTIC_HOOK_CHANNEL = "pi:semantic-hook:v1";
 /** Semantic name published by this producer when the watchdog will not auto-wake. */
 export const USER_READY_HOOK_NAME = "user-ready";
 
+/** Semantic name published after an accepted continue is durably recorded. */
+export const WATCHDOG_CONTINUED_HOOK_NAME = "watchdog-continued";
+
 export type UserReadyStopKind = "AI_UNLOCK" | "EXHAUSTED" | "DECISION_FAILED";
 
 export type SemanticHookValues = Readonly<Record<string, string>>;
@@ -29,18 +32,22 @@ export interface UserReadyValues {
 	readonly REASON?: string;
 }
 
+export interface WatchdogContinuedValues {
+	readonly REASON_TYPE: string;
+	readonly REASON: string;
+}
+
 /** Minimal Pi public bus surface used for emission. */
 export interface SemanticHookEventBus {
 	emit(channel: string, data: unknown): void;
 }
 
-function freezeValues(values: UserReadyValues): SemanticHookValues {
-	const frozen: Record<string, string> = { STOP_KIND: values.STOP_KIND };
-	if (values.REASON_TYPE !== undefined) {
-		frozen.REASON_TYPE = values.REASON_TYPE;
-	}
-	if (values.REASON !== undefined) {
-		frozen.REASON = values.REASON;
+function freezeValues(
+	values: Record<string, string | undefined>,
+): SemanticHookValues {
+	const frozen: Record<string, string> = {};
+	for (const [key, value] of Object.entries(values)) {
+		if (value !== undefined) frozen[key] = value;
 	}
 	return Object.freeze(frozen);
 }
@@ -55,7 +62,25 @@ export function createUserReadyEnvelope(
 	return Object.freeze({
 		version: 1 as const,
 		name: USER_READY_HOOK_NAME,
-		values: freezeValues(values),
+		values: freezeValues({
+			STOP_KIND: values.STOP_KIND,
+			REASON_TYPE: values.REASON_TYPE,
+			REASON: values.REASON,
+		}),
+	});
+}
+
+/** Build a fresh plain-data accepted-continue envelope. */
+export function createWatchdogContinuedEnvelope(
+	values: WatchdogContinuedValues,
+): SemanticHookEnvelope {
+	return Object.freeze({
+		version: 1 as const,
+		name: WATCHDOG_CONTINUED_HOOK_NAME,
+		values: freezeValues({
+			REASON_TYPE: values.REASON_TYPE,
+			REASON: values.REASON,
+		}),
 	});
 }
 

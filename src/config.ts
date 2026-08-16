@@ -6,7 +6,8 @@
  * Validation:
  * - idleDelaySeconds is any finite number >= 0; zero schedules a 0 ms timer.
  * - maxRetries remains a safe integer in [1, 10].
- * - reasonTypes is a nonempty array of trim-nonblank strings; valid lists replace.
+ * - reasonTypes and continueReasonTypes are nonempty arrays of trim-nonblank strings;
+ *   valid lists replace.
  * Invalid values are rejected (no silent clamp).
  */
 
@@ -21,6 +22,13 @@ export const DEFAULT_REASON_TYPES: readonly string[] = Object.freeze([
 	"JOB_DONE",
 	"WAIT_USER",
 	"JOB_BLOCKED",
+]);
+
+/** Built-in allowed automatic-continue reason types; configured values replace. */
+export const DEFAULT_CONTINUE_REASON_TYPES: readonly string[] = Object.freeze([
+	"WORK_REMAINS",
+	"VERIFYING",
+	"WAIT_AUTOMATION",
 ]);
 
 /** Maximum prompt size, measured in Unicode code points, accepted from config. */
@@ -44,6 +52,7 @@ export interface ContinueWatchdogConfig {
 	decisionPrompt: string;
 	continuePrompt: string;
 	reasonTypes: readonly string[];
+	continueReasonTypes: readonly string[];
 }
 
 export interface ConfigDiagnostic {
@@ -67,6 +76,7 @@ export const BUILT_IN_CONFIG: Readonly<ContinueWatchdogConfig> = Object.freeze({
 	decisionPrompt: DEFAULT_DECISION_PROMPT,
 	continuePrompt: DEFAULT_CONTINUE_PROMPT,
 	reasonTypes: DEFAULT_REASON_TYPES,
+	continueReasonTypes: DEFAULT_CONTINUE_REASON_TYPES,
 });
 
 const MAX_DIAGNOSTIC_LENGTH = 240;
@@ -77,6 +87,7 @@ const KNOWN_KEYS = new Set([
 	"decisionPrompt",
 	"continuePrompt",
 	"reasonTypes",
+	"continueReasonTypes",
 ]);
 
 function diagnostic(source: string, message: string): ConfigDiagnostic {
@@ -90,6 +101,7 @@ function copyBuiltIn(): ContinueWatchdogConfig {
 		decisionPrompt: BUILT_IN_CONFIG.decisionPrompt,
 		continuePrompt: BUILT_IN_CONFIG.continuePrompt,
 		reasonTypes: [...BUILT_IN_CONFIG.reasonTypes],
+		continueReasonTypes: [...BUILT_IN_CONFIG.continueReasonTypes],
 	};
 }
 
@@ -229,15 +241,16 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 		}
 	}
 
-	if (Object.hasOwn(input, "reasonTypes")) {
-		const reasonTypes = normalizeReasonTypes(input.reasonTypes);
+	for (const key of ["reasonTypes", "continueReasonTypes"] as const) {
+		if (!Object.hasOwn(input, key)) continue;
+		const reasonTypes = normalizeReasonTypes(input[key]);
 		if (reasonTypes !== null) {
-			config.reasonTypes = reasonTypes;
+			config[key] = reasonTypes;
 		} else {
 			diagnostics.push(
 				diagnostic(
 					source,
-					"reasonTypes must be a non-empty array of non-blank strings",
+					`${key} must be a non-empty array of non-blank strings`,
 				),
 			);
 		}
@@ -291,6 +304,9 @@ export function mergeConfig(
 		}
 		if (partial.reasonTypes !== undefined) {
 			config.reasonTypes = [...partial.reasonTypes];
+		}
+		if (partial.continueReasonTypes !== undefined) {
+			config.continueReasonTypes = [...partial.continueReasonTypes];
 		}
 	}
 

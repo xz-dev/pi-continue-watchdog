@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { DEFAULT_REASON_TYPES } from "../src/config.js";
+import {
+	DEFAULT_CONTINUE_REASON_TYPES,
+	DEFAULT_REASON_TYPES,
+} from "../src/config.js";
 import { createLockDecisionController } from "../src/controller.js";
 import {
 	buildDecisionPrompt,
@@ -10,10 +13,13 @@ import {
 	DECISION_INVALID_ATTEMPT_LIMIT,
 	type DecisionResponse,
 	formatDecisionFailedNotification,
+	INVALID_CONTINUE_REASON_ERROR,
+	INVALID_CONTINUE_REASON_TYPE_ERROR,
 	INVALID_DECISION_XML_ERROR,
 	INVALID_UNLOCK_REASON_ERROR,
 	INVALID_UNLOCK_REASON_TYPE_ERROR,
 	MALFORMED_DECISION_RESPONSE_ERROR,
+	MISSING_CONTINUE_FIELDS_ERROR,
 	MISSING_UNLOCK_FIELDS_ERROR,
 	normalizeAssistantDecisionResponse,
 	UNSUPPORTED_DECISION_CONTENT_ERROR,
@@ -22,6 +28,7 @@ import {
 
 const DECISION_PROMPT = "Decision prompt from configuration.";
 const REASON_TYPES = DEFAULT_REASON_TYPES;
+const CONTINUE_REASON_TYPES = DEFAULT_CONTINUE_REASON_TYPES;
 
 function response(content: DecisionResponse["content"]): DecisionResponse {
 	return { content };
@@ -31,8 +38,12 @@ function text(value: string): DecisionResponse["content"][number] {
 	return { type: "text", text: value };
 }
 
-function continueXml(extra = ""): string {
-	return `<watchdog><function>continue_watchdog</function>${extra}</watchdog>`;
+function continueXml(
+	reasonType = "WORK_REMAINS",
+	reasonContent = "Implementation work remains.",
+	extra = "",
+): string {
+	return `<watchdog><function>continue_watchdog</function><reason_type>${reasonType}</reason_type><reason_content>${reasonContent}</reason_content>${extra}</watchdog>`;
 }
 
 function unlockXml(
@@ -42,7 +53,10 @@ function unlockXml(
 	return `<watchdog><function>unlock_continue_watchdog</function><reason_type>${reasonType}</reason_type><reason_content>${reasonContent}</reason_content></watchdog>`;
 }
 
-function openDecision(reasonTypes: readonly string[] = REASON_TYPES) {
+function openDecision(
+	reasonTypes: readonly string[] = REASON_TYPES,
+	continueReasonTypes: readonly string[] = CONTINUE_REASON_TYPES,
+) {
 	const controller = createLockDecisionController({ maxRetries: 2 });
 	controller.lock();
 	const opened = controller
@@ -56,6 +70,7 @@ function openDecision(reasonTypes: readonly string[] = REASON_TYPES) {
 			decisionId: opened.decisionId,
 			decisionPrompt: DECISION_PROMPT,
 			reasonTypes,
+			continueReasonTypes,
 		}),
 	};
 }
@@ -81,8 +96,16 @@ test("validator accepts one trailing continue XML block after narration and igno
 				text(`I checked the existing conversation.\n\n${continueXml()}\n `),
 			]),
 			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
 		),
-		{ valid: true, decision: { kind: "continue" } },
+		{
+			valid: true,
+			decision: {
+				kind: "continue",
+				reasonType: "WORK_REMAINS",
+				reason: "Implementation work remains.",
+			},
+		},
 	);
 });
 
@@ -93,25 +116,57 @@ test("validator rejects multiple watchdog blocks anywhere in one response", () =
 		`<watchdog><function>continue_watchdog</function></watchdog></watchdog>`,
 	]) {
 		assert.deepEqual(
-			validateDecisionResponse(response([text(value)]), REASON_TYPES),
+			validateDecisionResponse(
+				response([text(value)]),
+				REASON_TYPES,
+				CONTINUE_REASON_TYPES,
+			),
 			{ valid: false, error: INVALID_DECISION_XML_ERROR },
 		);
 	}
 });
 
-test("continue XML ignores optional reason fields and extra keys", () => {
+test("continue XML requires independently configured type and nonblank reason", () => {
+	assert.deepEqual(
+		validateDecisionResponse(
+			response([text(continueXml("verifying", " Tests still need to run. "))]),
+			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
+		),
+		{
+			valid: true,
+			decision: {
+				kind: "continue",
+				reasonType: "VERIFYING",
+				reason: "Tests still need to run.",
+			},
+		},
+	);
 	assert.deepEqual(
 		validateDecisionResponse(
 			response([
-				text(
-					continueXml(
-						"<reason_type>anything</reason_type><reason_content>anything</reason_content><extra_key>ignored</extra_key>",
-					),
-				),
+				text("<watchdog><function>continue_watchdog</function></watchdog>"),
 			]),
 			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
 		),
-		{ valid: true, decision: { kind: "continue" } },
+		{ valid: false, error: MISSING_CONTINUE_FIELDS_ERROR },
+	);
+	assert.deepEqual(
+		validateDecisionResponse(
+			response([text(continueXml("JOB_DONE", "Wrong namespace."))]),
+			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
+		),
+		{ valid: false, error: INVALID_CONTINUE_REASON_TYPE_ERROR },
+	);
+	assert.deepEqual(
+		validateDecisionResponse(
+			response([text(continueXml("WORK_REMAINS", " "))]),
+			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
+		),
+		{ valid: false, error: INVALID_CONTINUE_REASON_ERROR },
 	);
 });
 
@@ -128,6 +183,7 @@ test("validator accepts unlock XML with entity decoding and case-insensitive rea
 				),
 			]),
 			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
 		),
 		{
 			valid: true,
@@ -146,6 +202,7 @@ test("unlock reason_type matches configured values case-insensitively and emits 
 		validateDecisionResponse(
 			response([text(unlockXml("needreview", "PR is open for human review."))]),
 			custom,
+			CONTINUE_REASON_TYPES,
 		),
 		{
 			valid: true,
@@ -161,6 +218,7 @@ test("unlock reason_type matches configured values case-insensitively and emits 
 		validateDecisionResponse(
 			response([text(unlockXml("JOB_DONE", "Still using defaults."))]),
 			custom,
+			CONTINUE_REASON_TYPES,
 		),
 		{ valid: false, error: INVALID_UNLOCK_REASON_TYPE_ERROR },
 	);
@@ -174,6 +232,7 @@ test("unlock reason_content is trimmed, counts Unicode code points, and never tr
 		validateDecisionResponse(
 			response([text(unlockXml("JOB_DONE", `\n${exactly500}\n`))]),
 			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
 		),
 		{
 			valid: true,
@@ -188,6 +247,7 @@ test("unlock reason_content is trimmed, counts Unicode code points, and never tr
 		validateDecisionResponse(
 			response([text(unlockXml("JOB_DONE", over500))]),
 			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
 		),
 		{ valid: false, error: INVALID_UNLOCK_REASON_ERROR },
 	);
@@ -195,6 +255,7 @@ test("unlock reason_content is trimmed, counts Unicode code points, and never tr
 		validateDecisionResponse(
 			response([text(unlockXml("JOB_DONE", " \n\t "))]),
 			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
 		),
 		{ valid: false, error: INVALID_UNLOCK_REASON_ERROR },
 	);
@@ -213,8 +274,16 @@ test("blocked ordinary toolCall blocks do not invalidate a final valid XML answe
 				text(continueXml()),
 			]),
 			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
 		),
-		{ valid: true, decision: { kind: "continue" } },
+		{
+			valid: true,
+			decision: {
+				kind: "continue",
+				reasonType: "WORK_REMAINS",
+				reason: "Implementation work remains.",
+			},
+		},
 	);
 });
 
@@ -275,7 +344,11 @@ test("validator rejects non-XML, fences, prose, and malformed documents with fix
 
 	for (const entry of cases) {
 		assert.deepEqual(
-			validateDecisionResponse(entry.value, REASON_TYPES),
+			validateDecisionResponse(
+				entry.value,
+				REASON_TYPES,
+				CONTINUE_REASON_TYPES,
+			),
 			{ valid: false, error: entry.error },
 			entry.name,
 		);
@@ -296,15 +369,23 @@ test("Pi AssistantMessage normalization maps ordinary text/thinking/toolCall sha
 			},
 		],
 	});
-	assert.deepEqual(validateDecisionResponse(normalized, REASON_TYPES), {
-		valid: true,
-		decision: { kind: "continue" },
-	});
+	assert.deepEqual(
+		validateDecisionResponse(normalized, REASON_TYPES, CONTINUE_REASON_TYPES),
+		{
+			valid: true,
+			decision: {
+				kind: "continue",
+				reasonType: "WORK_REMAINS",
+				reason: "Implementation work remains.",
+			},
+		},
+	);
 
 	assert.deepEqual(
 		validateDecisionResponse(
 			normalizeAssistantDecisionResponse({ role: "user", content: [] }),
 			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
 		),
 		{ valid: false, error: MALFORMED_DECISION_RESPONSE_ERROR },
 	);
@@ -315,36 +396,47 @@ test("Pi AssistantMessage normalization maps ordinary text/thinking/toolCall sha
 				content: [{ type: "image", url: "x" }],
 			}),
 			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
 		),
 		{ valid: false, error: UNSUPPORTED_DECISION_CONTENT_ERROR },
 	);
 });
 
-test("fixed prompt suffix requires exactly one final XML block and lists effective reason types", () => {
-	const prompt = buildDecisionPrompt(DECISION_PROMPT, [
-		"JOB_DONE",
-		"WAIT_USER",
-	]);
+test("fixed prompt suffix requires typed reasons for both decisions", () => {
+	const prompt = buildDecisionPrompt(
+		DECISION_PROMPT,
+		["JOB_DONE", "WAIT_USER"],
+		["WORK_REMAINS", "VERIFYING"],
+	);
+	assert.match(prompt, /Do not make decisions on the user's behalf/);
 	assert.match(prompt, /Do not call tools/);
 	assert.match(prompt, /existing conversation context/);
 	assert.match(prompt, /exactly one <watchdog>\.\.\.<\/watchdog>/);
 	assert.match(prompt, /very end of your response/);
 	assert.match(prompt, /Do not output multiple/);
 	assert.match(prompt, /\["JOB_DONE","WAIT_USER"\]/);
+	assert.match(prompt, /\["WORK_REMAINS","VERIFYING"\]/);
 	assert.match(prompt, /<function>continue_watchdog<\/function>/);
+	assert.match(prompt, /<reason_type>WORK_REMAINS<\/reason_type>/);
+	assert.match(prompt, /<reason_content>concise reason<\/reason_content>/);
 	assert.match(prompt, /<function>unlock_continue_watchdog<\/function>/);
 	assert.equal(/extra|ignored|unknown child/i.test(prompt), false);
 });
 
 test("fixed prompt suffix XML-escapes an arbitrary reason type and lists types unambiguously", () => {
-	const prompt = buildDecisionPrompt(DECISION_PROMPT, [
-		"Need <Review & Approval",
-		"comma, type",
-	]);
+	const prompt = buildDecisionPrompt(
+		DECISION_PROMPT,
+		["Need <Review & Approval", "comma, type"],
+		["Work <Remains & Verify"],
+	);
 	assert.match(prompt, /\["Need <Review & Approval","comma, type"\]/);
 	assert.match(
 		prompt,
 		/<reason_type>Need &lt;Review &amp; Approval<\/reason_type>/,
+	);
+	assert.match(
+		prompt,
+		/<reason_type>Work &lt;Remains &amp; Verify<\/reason_type>/,
 	);
 	assert.equal(prompt.includes("<reason_type>Need <Review & Approval"), false);
 });
@@ -369,6 +461,8 @@ test("session finalizes valid continue without temporary decision tools", () => 
 	);
 	assert.equal(finalized.outcome, "continue");
 	assert.equal(finalized.cycleId, 1);
+	assert.equal(finalized.reasonType, "WORK_REMAINS");
+	assert.equal(finalized.reason, "Implementation work remains.");
 	assert.deepEqual(finalized.transition.effects, [
 		{ kind: "restoreDecisionTools", decisionId: 1 },
 	]);
