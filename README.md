@@ -10,7 +10,7 @@ Pi extension that notices when every watchdog-loaded Pi process in an inherited 
 
 - Node.js `>= 22.19`
 - Current Pi with the public extension `sendMessage` / lifecycle APIs. This watchdog does not require a downstream hidden-presentation seam.
-- Uses the exact reviewed Git-pinned `pi-process-domain` library; no dependency on a subagent plugin
+- Uses the exact reviewed Git-pinned `pi-extension-utils` transport/XML/inquiry library; no dependency on a subagent plugin
 
 ## Install
 
@@ -22,7 +22,7 @@ pi install git:github.com/xz-dev/pi-continue-watchdog
 
 This unpinned Git source intentionally tracks the latest repository state. Use `pi update --extensions` to update installed Pi packages. The project does not publish npm versions, tags, or GitHub Releases.
 
-The tracked root `.npmrc` sets `allow-git=root`. npm 12 otherwise rejects the exact Git-pinned `pi-process-domain` dependency when Pi installs this cloned Git package. The `root` policy admits only the dependency declared directly by this reviewed package; it does not broadly allow transitive Git dependencies. The package-owned `allowScripts` entry names only `pi-process-domain`; users do not need to relax their npm configuration.
+The tracked root `.npmrc` sets `allow-git=root`. npm 12 otherwise rejects the exact Git-pinned `pi-extension-utils` dependency when Pi installs this cloned Git package. The `root` policy admits only the dependency declared directly by this reviewed package; it does not broadly allow transitive Git dependencies. The package-owned `allowScripts` entry names only `zeromq`; users do not need to relax their npm configuration.
 
 Reload Pi extensions or start a new session after install.
 
@@ -31,7 +31,7 @@ Reload Pi extensions or start a new session after install.
 Observable behavior only (implementation details may change):
 
 1. Whenever the **main agent starts running**, the continue watchdog ensures it is locked. If already locked, the current cycle is preserved. A real main user message starts a fresh cycle by silently performing a full unlock cleanup first—canceling timers and pending decision work—then locking again to reset old cycle accounting, without either notification.
-2. While locked, after every participant in the inherited authenticated process domain stays idle for the current delay, the extension confirms an immutable broker fence and opens a short **decision check** on the root main—regardless of whether Pi stopped normally, after compaction, or because of a Provider/extension error.
+2. While locked, after every participant in the inherited authenticated process domain stays idle for the current delay, the extension confirms its own immutable activity fence and opens a short **decision check** on the root main—regardless of whether Pi stopped normally, after compaction, or because of a Provider/extension error.
 3. The decision is an **automated custom message**, not a user message. It may stream in the live TUI/RPC while the check runs; when it ends, the extension clears the decision assistant from final TUI history and persisted assistant content. Ordinary active tools and the system-prompt tool list remain unchanged for prompt-cache stability. The model decides quickly from existing conversation knowledge without tools and finishes with exactly one XML block:
 
    ```xml
@@ -63,7 +63,7 @@ Design note: the extension does **not** blindly continue. It asks first so compl
 |---|---|
 | `/lock-continue-watchdog` | Silently perform full unlock cleanup first, then start a fresh lock cycle and emit exactly one TUI notification: `Continue watchdog locked` |
 | `/unlock-continue-watchdog [reason]` | Set unlocked and cancel pending checks while preserving cycle counters/failure state. Blank reason: notify `Continue watchdog unlocked`; nonblank reason: persist one muted `Continue watchdog unlocked · <reason>` entry |
-| `/status-continue-watchdog` | Show current main/lock/attempt state, trigger blocker, grace phase, observable busy counts, and pending spawns without changing watchdog state |
+| `/status-continue-watchdog` | Show current main/lock/attempt state, trigger blocker, grace phase, and observable busy counts without changing watchdog state |
 
 Same-state commands still assign (no silent no-op). A manual lock always runs the complete unlock-cleanup → fresh-lock sequence even when already unlocked or locked, suppresses prerequisite unlock output, and emits only `Continue watchdog locked`. A direct manual unlock still emits its normal output. Only fresh lock semantics reset the cycle; a real main user message applies the same full sequence with both notifications suppressed. Ordinary main `agent_start` without a new user message remains ensure-lock behavior and preserves an already locked cycle.
 
@@ -172,9 +172,10 @@ When the elected main attachment reaches a **terminal aggregate-idle** epoch whe
 
 ## Scope and limitations
 
-- **“All agents”** means watchdog-loaded Pi sessions in the authenticated `pi-process-domain` declaration inherited from the root. Same-realm attachments aggregate into one OS-process participant; inherited child and nested Pi processes join as observer-only participants. A deliberately stripped/replaced environment, a child that disables watchdog, and the unreserved gap before child `session_start` are outside coverage. Launchers needing zero-gap coverage must use `reserveSpawn()` before `spawn()`.
-- Each root Pi hosts its own embedded per-domain broker and is the sole decision authority while that domain is open. `PI_CONTINUE_WATCHDOG_ROOT_PID` marks the current creator role; final root detach clears it, closes the broker, and allows a later attachment to create a fresh domain. Inherited PIDs remain observers. The marker is topology metadata, not authentication.
-- Initial declaration/authentication/protocol/runtime-path failures fail closed with sanitized output and exit status 78, including a startup domain-key mismatch. Runtime lease, reconnect, or broker loss instead makes watchdog decisions uncertain/fail-closed without terminating Pi or reviving a protocol-v2 broker. Each domain uses a private Unix socket on Linux/macOS/FreeBSD or a Windows named pipe; endpoint names do not contain the domain key.
+- **“All agents”** means watchdog-loaded Pi sessions that inherit `PI_EXTENSION_UTILS_PROCESS_DOMAIN` from the root. Same-realm attachments aggregate into one OS-process participant; child and nested Pi processes join after their watchdog completes `session_start` and reports activity. A deliberately stripped/replaced environment or a child that does not load watchdog is outside coverage. Coverage starts only after activity registration; no earlier guarantee is claimed.
+- The root is the sole endpoint creator and watchdog decision authority. `pi-extension-utils` binds a ZeroMQ wildcard bootstrap endpoint plus one wildcard ROUTER endpoint per node; clients only connect. IPC is selected from the installed ZeroMQ build's `capability.ipc`, otherwise loopback TCP is used. `PI_CONTINUE_WATCHDOG_ROOT_PID` is topology metadata, not authentication.
+- `pi-extension-utils` supplies authenticated transport, peer status, directed/broadcast data, and Pi lifecycle facts only. This watchdog owns busy/idle reduction, participants, certainty, activity generations, fences, retries, pause/reset behavior, and decision queues. ZMTP heartbeat disconnect makes the watchdog uncertain/fail-closed until the peer reconnects and sends fresh activity.
+- Initial declaration/authentication/transport failures fail closed with sanitized output and exit status 78. Runtime disconnect or transport loss disables automatic decisions without terminating Pi. Secrets, HMAC proofs, raw declarations, and endpoints are never printed.
 - **Main election:** UI-bound session wins; pure headless uses first-bound attachment as best-effort main; later non-UI attachments do not steal main.
 - **Root ownership:** every extension-enabled attachment observes and reports busy/idle. Only the exact current main owns config, timers, XML decision messages, tool-call blocking, UI notifies, and `user-ready` publication. Non-main attachments are **observer-only** and do not load watchdog config or open decision windows.
 - **Framework boundary:** coordination uses only Pi public lifecycle/session APIs. There is no dependence on other plugins or path heuristics. Pi's `pi.events` bus is for semantic-hook delivery only, not for process coordination.

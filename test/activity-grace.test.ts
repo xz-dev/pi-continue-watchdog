@@ -53,7 +53,7 @@ class FakeClock implements ActivityGraceClock {
 
 function generation(value: number): ActivityGeneration {
 	return {
-		brokerEpoch: "epoch",
+		domainEpoch: "epoch",
 		activityGeneration: BigInt(value),
 		ownershipGeneration: 1,
 		localActivityGeneration: value,

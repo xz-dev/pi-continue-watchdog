@@ -9,7 +9,6 @@ import {
 	type MessageEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { isProcessDomainFatalError } from "pi-process-domain";
 
 import {
 	type ActivityGeneration,
@@ -31,6 +30,7 @@ import {
 	findDecisionAssistantEntryId,
 	findPreemptedDecisionAssistantEntryIds,
 	INQUIRY_MARKER_ENTRY_TYPE,
+	neutralizeDecisionAssistant,
 	PREEMPTED_DECISION_ERROR,
 } from "./context-fold.js";
 import {
@@ -57,7 +57,11 @@ import type {
 	HubMainClaim,
 	ObservableAgentHub,
 } from "./hub.js";
-import type { ProcessDomainCoordinator } from "./process-domain.js";
+import {
+	type DomainFence,
+	isProcessDomainFatalError,
+	type ProcessDomainCoordinator,
+} from "./process-domain.js";
 import {
 	createUserReadyEnvelope,
 	createWatchdogContinuedEnvelope,
@@ -120,7 +124,7 @@ interface ActiveDecision {
 	readonly exchangeId: string;
 	readonly claim: HubMainClaim;
 	readonly protocol: DecisionProtocolSession;
-	readonly domainFence: import("pi-process-domain").DomainFence;
+	readonly domainFence: DomainFence;
 	aggregateGeneration: ActivityGeneration;
 	invalidated: boolean;
 	/** True while a public fire-and-forget dispatch awaits matching lifecycle. */
@@ -203,7 +207,6 @@ export interface WatchdogTriggerStatus {
 	readonly graceRemainingMs: number | null;
 	readonly observableBusyCount: number;
 	readonly domainBusyParticipants: number | null;
-	readonly domainPendingSpawns: number | null;
 }
 
 export interface DecisionRuntime {
@@ -554,6 +557,23 @@ export function createDecisionRuntime(
 		}
 	};
 
+	const handleRuntimeDomainFailure = (): void => {
+		const active = activeDecision;
+		const shouldAbort =
+			localAiBusy &&
+			(quarantinedDecision !== null ||
+				(active !== null && (active.dispatchPending || active.submitted)));
+		invalidateActiveDecision(true);
+		observeAggregate();
+		if (!shouldAbort || suppressDecisionAbort) return;
+		suppressDecisionAbort = true;
+		try {
+			sessionContext?.abort();
+		} catch {
+			// Quarantine remains authoritative when host abort is unavailable.
+		}
+	};
+
 	const domainWrite = async (
 		operation: () => Promise<void>,
 	): Promise<boolean> => {
@@ -563,7 +583,7 @@ export function createDecisionRuntime(
 			await operation();
 			return true;
 		} catch {
-			disableDomain();
+			handleRuntimeDomainFailure();
 			return false;
 		}
 	};
@@ -616,7 +636,7 @@ export function createDecisionRuntime(
 		right: ActivityGeneration,
 	): boolean =>
 		left !== null &&
-		left.brokerEpoch === right.brokerEpoch &&
+		left.domainEpoch === right.domainEpoch &&
 		left.activityGeneration === right.activityGeneration &&
 		left.ownershipGeneration === right.ownershipGeneration &&
 		left.localActivityGeneration === right.localActivityGeneration;
@@ -793,7 +813,7 @@ export function createDecisionRuntime(
 			config.continueReasonTypes,
 		);
 		const domainFence = options.processDomain?.snapshot.fence ?? {
-			brokerEpoch: "local",
+			domainEpoch: "local",
 			activityGeneration: 0n,
 		};
 		const active: ActiveDecision = {
@@ -803,7 +823,7 @@ export function createDecisionRuntime(
 			domainFence,
 			aggregateGeneration: readyGeneration ??
 				graceCoordinator.snapshot.generation ?? {
-					brokerEpoch: domainFence.brokerEpoch,
+					domainEpoch: domainFence.domainEpoch,
 					activityGeneration: domainFence.activityGeneration,
 					ownershipGeneration: claim.generation,
 					localActivityGeneration,
@@ -968,7 +988,6 @@ export function createDecisionRuntime(
 					: null,
 			observableBusyCount: options.hub.snapshot.busyCount,
 			domainBusyParticipants: domain?.busyParticipants ?? null,
-			domainPendingSpawns: domain?.pendingSpawns ?? null,
 		};
 	};
 
@@ -976,13 +995,13 @@ export function createDecisionRuntime(
 		readonly allIdle: boolean;
 		readonly generation: ActivityGeneration;
 		readonly claim: HubMainClaim | null;
-		readonly fence: import("pi-process-domain").DomainFence;
+		readonly fence: DomainFence;
 	} => {
 		const claim = getMainClaim();
 		const controller = currentController(claim);
 		const domain = options.processDomain?.snapshot;
 		const fence = domain?.fence ?? {
-			brokerEpoch: "local",
+			domainEpoch: "local",
 			activityGeneration: 0n,
 		};
 		const controllerEligible =
@@ -1013,7 +1032,7 @@ export function createDecisionRuntime(
 		return {
 			allIdle,
 			generation: {
-				brokerEpoch: fence.brokerEpoch,
+				domainEpoch: fence.domainEpoch,
 				activityGeneration: fence.activityGeneration,
 				ownershipGeneration: claim?.generation ?? 0,
 				localActivityGeneration,
@@ -1323,7 +1342,7 @@ export function createDecisionRuntime(
 		if (
 			!force &&
 			snapshot?.certain &&
-			snapshot.fence.brokerEpoch === active.domainFence.brokerEpoch &&
+			snapshot.fence.domainEpoch === active.domainFence.domainEpoch &&
 			snapshot.fence.activityGeneration ===
 				active.domainFence.activityGeneration
 		) {
@@ -1800,13 +1819,16 @@ export function createDecisionRuntime(
 	const handleDecisionMessageEnd = (event: MessageEndEvent) => {
 		if (quarantinedDecision !== null && event.message.role === "assistant") {
 			return {
-				message: {
-					...event.message,
-					content: [],
-					...(isAbortedAssistant(event.message)
-						? { stopReason: "stop" as const }
-						: {}),
-				},
+				message: neutralizeDecisionAssistant(
+					{
+						...event.message,
+						...(isAbortedAssistant(event.message)
+							? { stopReason: "stop" as const }
+							: {}),
+					},
+					quarantinedDecision.exchangeId,
+					quarantinedDecision.cycleId,
+				),
 			};
 		}
 		// Suppress the aborted assistant of a watchdog decision preempted by user
@@ -1816,15 +1838,19 @@ export function createDecisionRuntime(
 		if (
 			event.message.role === "assistant" &&
 			((suppressDecisionAbort && isAbortedAssistant(event.message)) ||
-				isPreemptedAssistant(event.message))
+				isPreemptedAssistant(event.message)) &&
+			decisionAssistantToSplice !== null
 		) {
 			return {
-				message: {
-					...event.message,
-					content: [],
-					stopReason: "stop" as const,
-					errorMessage: PREEMPTED_DECISION_ERROR,
-				},
+				message: neutralizeDecisionAssistant(
+					{
+						...event.message,
+						stopReason: "stop" as const,
+						errorMessage: PREEMPTED_DECISION_ERROR,
+					},
+					decisionAssistantToSplice.exchangeId,
+					decisionAssistantToSplice.cycleId,
+				),
 			};
 		}
 		const active = activeDecision;
@@ -1962,8 +1988,8 @@ export function createDecisionRuntime(
 			readonly role?: unknown;
 			readonly customType?: unknown;
 			readonly details?: {
-				readonly exchangeId?: unknown;
-				readonly cycleId?: unknown;
+				readonly inquiryId?: unknown;
+				readonly attempt?: unknown;
 			};
 		};
 		if (quarantinedDecision !== null) {
@@ -1974,9 +2000,9 @@ export function createDecisionRuntime(
 			if (quarantinedDecision.inputObserved) return;
 			const matchesQuarantine =
 				message.role === "custom" &&
-				message.customType === "pi-continue-watchdog:decision" &&
-				message.details?.exchangeId === quarantinedDecision.exchangeId &&
-				message.details?.cycleId === quarantinedDecision.cycleId;
+				message.customType === "pi-continue-watchdog:inquiry" &&
+				message.details?.inquiryId === quarantinedDecision.exchangeId &&
+				message.details?.attempt === quarantinedDecision.cycleId;
 			if (matchesQuarantine) quarantinedDecision.inputObserved = true;
 			else quarantinedDecision = null;
 			return;
@@ -1992,9 +2018,9 @@ export function createDecisionRuntime(
 		}
 		const isCurrentDecision =
 			message.role === "custom" &&
-			message.customType === "pi-continue-watchdog:decision" &&
-			message.details?.exchangeId === active.exchangeId &&
-			message.details?.cycleId === active.protocol.currentCycleId;
+			message.customType === "pi-continue-watchdog:inquiry" &&
+			message.details?.inquiryId === active.exchangeId &&
+			message.details?.attempt === active.protocol.currentCycleId;
 		if (!isCurrentDecision) {
 			deferDecisionOnBusy(active);
 			return;
@@ -2045,17 +2071,16 @@ export function createDecisionRuntime(
 			localAiBusy = !ctx.isIdle();
 			if (options.processDomain !== undefined) {
 				let initialAttachComplete = false;
-				let initialAuthenticationExitRequested = false;
-				const exitForInitialAuthenticationFailure = (error: Error): boolean => {
+				let initialDomainExitRequested = false;
+				const exitForInitialDomainFailure = (error: Error): boolean => {
 					if (
 						initialAttachComplete ||
-						initialAuthenticationExitRequested ||
-						!isProcessDomainFatalError(error) ||
-						error.code !== "AUTHENTICATION_FAILED"
+						initialDomainExitRequested ||
+						!isProcessDomainFatalError(error)
 					) {
 						return false;
 					}
-					initialAuthenticationExitRequested = true;
+					initialDomainExitRequested = true;
 					options.fatalExit?.fail(error, ctx);
 					return true;
 				};
@@ -2063,8 +2088,11 @@ export function createDecisionRuntime(
 					await options.processDomain.attach(options.attachmentInstance, {
 						initialBusy: localAiBusy,
 						onFatal: (error) => {
-							disableDomain();
-							exitForInitialAuthenticationFailure(error);
+							if (exitForInitialDomainFailure(error)) {
+								disableDomain();
+								return;
+							}
+							handleRuntimeDomainFailure();
 						},
 					});
 					initialAttachComplete = true;
@@ -2074,7 +2102,7 @@ export function createDecisionRuntime(
 					const attachError =
 						error instanceof Error ? error : new Error("process domain failed");
 					disableDomain();
-					exitForInitialAuthenticationFailure(attachError);
+					exitForInitialDomainFailure(attachError);
 					return;
 				}
 			}
@@ -2289,7 +2317,7 @@ export function createDecisionRuntime(
 					!sameActivityGeneration(
 						settledAggregateGeneration,
 						graceCoordinator.snapshot.generation ?? {
-							brokerEpoch: "stale",
+							domainEpoch: "stale",
 							activityGeneration: -1n,
 							ownershipGeneration: -1,
 							localActivityGeneration: -1,

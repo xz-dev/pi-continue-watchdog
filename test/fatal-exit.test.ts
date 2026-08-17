@@ -2,12 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { ProcessDomainFatalError } from "pi-process-domain";
-
 import {
 	createFatalExitAdapter,
 	sanitizedProcessDomainError,
 } from "../src/fatal-exit.js";
+import { ProcessDomainFatalError } from "../src/process-domain.js";
 
 function harness(mode: "tui" | "rpc" | "print" | "json") {
 	let exitCode: number | undefined;
@@ -101,8 +100,11 @@ test("graceful shutdown cancels fallback but preserves fatal exit guard", () => 
 
 test("sanitized fatal output exposes only a stable code", () => {
 	const message = sanitizedProcessDomainError(
-		new ProcessDomainFatalError("DOMAIN_ABSENT", "key=hunter2 /tmp/private"),
+		new ProcessDomainFatalError(
+			"DOMAIN_UNRECOVERABLE",
+			"key=hunter2 /tmp/private",
+		),
 	);
-	assert.match(message, /DOMAIN_ABSENT/);
+	assert.match(message, /DOMAIN_UNRECOVERABLE/);
 	assert.doesNotMatch(message, /hunter2|\/tmp\/private/);
 });

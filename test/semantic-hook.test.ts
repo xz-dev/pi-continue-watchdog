@@ -5,7 +5,6 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { createEventBus } from "@earendil-works/pi-coding-agent";
-import type { DomainFence, DomainSnapshot } from "pi-process-domain";
 
 import type { ContinueWatchdogConfig } from "../src/config.js";
 import { createLockDecisionController } from "../src/controller.js";
@@ -13,7 +12,11 @@ import {
 	createHubAttachmentInstance,
 	createObservableAgentHub,
 } from "../src/hub.js";
-import type { ProcessDomainCoordinator } from "../src/process-domain.js";
+import type {
+	DomainFence,
+	DomainSnapshot,
+	ProcessDomainCoordinator,
+} from "../src/process-domain.js";
 import {
 	createDecisionRuntime,
 	type RuntimeClock,
@@ -128,15 +131,14 @@ function unlockXml(
 function idleDomainSnapshot(): DomainSnapshot {
 	return {
 		domainId: "semantic-domain",
-		brokerEpoch: "epoch",
+		domainEpoch: "epoch",
 		revision: 1n,
 		activityGeneration: 1n,
 		participants: 1,
 		busyParticipants: 0,
-		pendingSpawns: 0,
 		allIdle: true,
 		certain: true,
-		fence: { brokerEpoch: "epoch", activityGeneration: 1n },
+		fence: { domainEpoch: "epoch", activityGeneration: 1n },
 	};
 }
 
@@ -257,7 +259,7 @@ function createSemanticHarness(options?: {
 		sendMessage(message: { customType?: string; details?: unknown }): void {
 			const customType = message.customType ?? "unknown";
 			sentTypes.push(customType);
-			if (message.customType === "pi-continue-watchdog:decision") {
+			if (message.customType === "pi-continue-watchdog:inquiry") {
 				lastDecisionMessage = message;
 			}
 			options?.onSend?.(customType, hub);
@@ -635,7 +637,7 @@ test("AI unlock intent waits for aggregate idle and publishes typed pair only on
 		| null = null;
 	const harness = createSemanticHarness({
 		onSend(customType, hub) {
-			if (customType !== "pi-continue-watchdog:decision-fold") return;
+			if (customType !== "pi-continue-watchdog:inquiry-fold") return;
 			child = hub.bind({
 				instance: createHubAttachmentInstance(),
 				sessionId: "child",
@@ -871,7 +873,7 @@ async function establishPendingAiUnlock(
 	const harness = createSemanticHarness({
 		hasUI: options?.hasUI ?? true,
 		onSend(customType, hub) {
-			if (customType !== "pi-continue-watchdog:decision-fold") return;
+			if (customType !== "pi-continue-watchdog:inquiry-fold") return;
 			child = hub.bind({
 				instance: createHubAttachmentInstance(),
 				sessionId: `child-${reason}`,

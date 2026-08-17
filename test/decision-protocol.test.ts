@@ -109,12 +109,22 @@ test("validator accepts one trailing continue XML block after narration and igno
 	);
 });
 
-test("watchdog XML root, fields, and function are case-insensitive", () => {
+test("watchdog XML tags are strict while business values remain case-insensitive", () => {
+	assert.deepEqual(
+		validateDecisionResponse(
+			response([
+				text("<WaTcHdOg><FuNcTiOn>continue_watchdog</FuNcTiOn></WaTcHdOg>"),
+			]),
+			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
+		),
+		{ valid: false, error: INVALID_DECISION_XML_ERROR },
+	);
 	assert.deepEqual(
 		validateDecisionResponse(
 			response([
 				text(
-					"<WaTcHdOg><FuNcTiOn>CoNtInUe_WaTcHdOg</FuNcTiOn><ReAsOn_TyPe>work_remains</ReAsOn_TyPe><ReAsOn_CoNtEnT>still working</ReAsOn_CoNtEnT></wAtChDoG>",
+					"<watchdog><function>CoNtInUe_WaTcHdOg</function><reason_type>work_remains</reason_type><reason_content>still working</reason_content></watchdog>",
 				),
 			]),
 			REASON_TYPES,

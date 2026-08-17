@@ -1,3 +1,9 @@
+import {
+	buildXmlDocument,
+	extractTrailingXml,
+	parseTrailingXml,
+} from "pi-extension-utils/xml";
+
 import type {
 	ControllerTransition,
 	LockDecisionController,
@@ -211,114 +217,17 @@ export function buildDecisionPrompt(
 ): string {
 	const allowedReasonTypes = JSON.stringify(reasonTypes);
 	const allowedContinueReasonTypes = JSON.stringify(continueReasonTypes);
-	const exampleReasonType = escapeXmlText(reasonTypes[0] ?? "ALLOWED_TYPE");
-	const exampleContinueReasonType = escapeXmlText(
-		continueReasonTypes[0] ?? "ALLOWED_TYPE",
-	);
-	return `${decisionPrompt}\n\nUse only the existing conversation context and decide quickly. Do not make decisions on the user's behalf. Do not call tools. You may explain your decision first, or output only XML. In either case, output exactly one <watchdog>...</watchdog> XML block at the very end of your response. After surrounding whitespace is trimmed, </watchdog> must be the final text. Do not output multiple <watchdog>...</watchdog> blocks.\n\nTo continue, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedContinueReasonTypes}. End with:\n<watchdog><function>continue_watchdog</function><reason_type>${exampleContinueReasonType}</reason_type><reason_content>concise reason</reason_content></watchdog>\n\nTo unlock, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedReasonTypes}. End with:\n<watchdog><function>unlock_continue_watchdog</function><reason_type>${exampleReasonType}</reason_type><reason_content>concise reason</reason_content></watchdog>`;
-}
-
-function escapeXmlText(value: string): string {
-	return value
-		.replaceAll("&", "&amp;")
-		.replaceAll("<", "&lt;")
-		.replaceAll(">", "&gt;");
-}
-
-function decodeXmlEntities(value: string): string | null {
-	let result = "";
-	for (let index = 0; index < value.length; index += 1) {
-		const char = value[index];
-		if (char !== "&") {
-			result += char;
-			continue;
-		}
-		const semicolon = value.indexOf(";", index + 1);
-		if (semicolon === -1) return null;
-		const entity = value.slice(index + 1, semicolon);
-		if (entity === "lt") result += "<";
-		else if (entity === "gt") result += ">";
-		else if (entity === "amp") result += "&";
-		else if (entity === "quot") result += '"';
-		else if (entity === "apos") result += "'";
-		else if (/^#\d+$/.test(entity)) {
-			const codePoint = Number(entity.slice(1));
-			if (
-				!Number.isSafeInteger(codePoint) ||
-				codePoint < 0 ||
-				codePoint > 0x10ffff ||
-				(codePoint >= 0xd800 && codePoint <= 0xdfff)
-			) {
-				return null;
-			}
-			result += String.fromCodePoint(codePoint);
-		} else if (/^#x[0-9a-fA-F]+$/.test(entity)) {
-			const codePoint = Number.parseInt(entity.slice(2), 16);
-			if (
-				!Number.isSafeInteger(codePoint) ||
-				codePoint < 0 ||
-				codePoint > 0x10ffff ||
-				(codePoint >= 0xd800 && codePoint <= 0xdfff)
-			) {
-				return null;
-			}
-			result += String.fromCodePoint(codePoint);
-		} else {
-			return null;
-		}
-		index = semicolon;
-	}
-	return result;
-}
-
-function skipWhitespace(source: string, index: number): number {
-	while (index < source.length) {
-		const char = source[index];
-		if (char !== " " && char !== "\t" && char !== "\n" && char !== "\r") break;
-		index += 1;
-	}
-	return index;
-}
-
-function readName(
-	source: string,
-	index: number,
-): { readonly name: string; readonly next: number } | null {
-	if (index >= source.length) return null;
-	const start = index;
-	const first = source.charCodeAt(index);
-	const isNameStart =
-		(first >= 65 && first <= 90) ||
-		(first >= 97 && first <= 122) ||
-		first === 95;
-	if (!isNameStart) return null;
-	index += 1;
-	while (index < source.length) {
-		const code = source.charCodeAt(index);
-		const isNameChar =
-			(code >= 65 && code <= 90) ||
-			(code >= 97 && code <= 122) ||
-			(code >= 48 && code <= 57) ||
-			code === 95 ||
-			code === 45 ||
-			code === 46;
-		if (!isNameChar) break;
-		index += 1;
-	}
-	return { name: source.slice(start, index), next: index };
-}
-
-function readTextUntilTag(
-	source: string,
-	index: number,
-): { readonly text: string; readonly next: number } | null {
-	const start = index;
-	while (index < source.length && source[index] !== "<") {
-		index += 1;
-	}
-	const decoded = decodeXmlEntities(source.slice(start, index));
-	if (decoded === null) return null;
-	return { text: decoded, next: index };
+	const continueExample = buildXmlDocument("watchdog", [
+		{ name: "function", value: "continue_watchdog" },
+		{ name: "reason_type", value: continueReasonTypes[0] ?? "ALLOWED_TYPE" },
+		{ name: "reason_content", value: "concise reason" },
+	]);
+	const unlockExample = buildXmlDocument("watchdog", [
+		{ name: "function", value: "unlock_continue_watchdog" },
+		{ name: "reason_type", value: reasonTypes[0] ?? "ALLOWED_TYPE" },
+		{ name: "reason_content", value: "concise reason" },
+	]);
+	return `${decisionPrompt}\n\nUse only the existing conversation context and decide quickly. Do not make decisions on the user's behalf. Do not call tools. You may explain your decision first, or output only XML. In either case, output exactly one <watchdog>...</watchdog> XML block at the very end of your response. After surrounding whitespace is trimmed, </watchdog> must be the final text. Do not output multiple <watchdog>...</watchdog> blocks.\n\nTo continue, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedContinueReasonTypes}. End with:\n${continueExample}\n\nTo unlock, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedReasonTypes}. End with:\n${unlockExample}`;
 }
 
 interface ParsedWatchdogFields {
@@ -327,120 +236,30 @@ interface ParsedWatchdogFields {
 	readonly reasonContent?: string;
 }
 
-/**
- * Exact extraction algorithm for the final non-thinking assistant text:
- *
- * ```ts
- * const trimmed = fullNonThinkingAssistantText.trim();
- * if (!trimmed.endsWith("</watchdog>")) return null;
- * const startIndex = trimmed.lastIndexOf("<watchdog>");
- * if (startIndex === -1) return null;
- * return trimmed.slice(startIndex);
- * ```
- *
- * Leading chatter is allowed. This is not a general XML-root search and does
- * not prefer the first `<watchdog>` occurrence.
- */
 export function extractTrailingWatchdogXml(
 	fullNonThinkingAssistantText: string,
 ): string | null {
-	const trimmed = fullNonThinkingAssistantText.trim();
-	const lowered = trimmed.toLowerCase();
-	if (!lowered.endsWith("</watchdog>")) return null;
-
-	const startIndex = lowered.lastIndexOf("<watchdog>");
-	if (startIndex === -1) return null;
-	if (lowered.indexOf("<watchdog>") !== startIndex) return null;
-
-	const closeIndex = lowered.indexOf("</watchdog>");
-	if (closeIndex !== lowered.lastIndexOf("</watchdog>")) return null;
-
-	return trimmed.slice(startIndex);
+	return extractTrailingXml(fullNonThinkingAssistantText, "watchdog");
 }
 
-/**
- * Parse the trailing watchdog XML decision document.
- * After extraction, the root must still be bare `<watchdog>` (no attributes).
- * Unknown child elements are ignored. Duplicate required fields are invalid.
- */
+/** Strict XML syntax is shared; watchdog-specific required fields stay local. */
 export function parseWatchdogDecisionXml(
 	raw: string,
 ):
 	| { readonly ok: true; readonly fields: ParsedWatchdogFields }
 	| { readonly ok: false } {
-	const document = extractTrailingWatchdogXml(raw);
-	if (document === null) return { ok: false };
-
-	// Reject attribute-bearing roots such as `<watchdog id="x">...`.
-	const lowered = document.toLowerCase();
-	if (!lowered.startsWith("<watchdog>")) return { ok: false };
-	let index = "<watchdog>".length;
-
-	const seenRequired = new Set<string>();
-	let functionName: string | undefined;
-	let reasonType: string | undefined;
-	let reasonContent: string | undefined;
-
-	while (true) {
-		index = skipWhitespace(document, index);
-		if (lowered.startsWith("</watchdog>", index)) {
-			index += "</watchdog>".length;
-			// Extraction already requires the document to end at this close tag.
-			if (index !== document.length || functionName === undefined) {
-				return { ok: false };
-			}
-			return {
-				ok: true,
-				fields: {
-					functionName,
-					reasonType,
-					reasonContent,
-				},
-			};
-		}
-		if (document[index] !== "<") return { ok: false };
-		index += 1;
-		if (
-			document[index] === "/" ||
-			document[index] === "!" ||
-			document[index] === "?"
-		) {
-			return { ok: false };
-		}
-		const openName = readName(document, index);
-		if (openName === null) return { ok: false };
-		index = openName.next;
-		// No attributes on any child: the open tag must end immediately.
-		if (document[index] !== ">") return { ok: false };
-		index += 1;
-
-		const text = readTextUntilTag(document, index);
-		if (text === null) return { ok: false };
-		index = text.next;
-		const close = `</${openName.name}>`;
-		if (
-			document.slice(index, index + close.length).toLowerCase() !==
-			close.toLowerCase()
-		)
-			return { ok: false };
-		index += close.length;
-		const normalizedName = openName.name.toLowerCase();
-
-		if (
-			normalizedName !== "function" &&
-			normalizedName !== "reason_type" &&
-			normalizedName !== "reason_content"
-		) {
-			// Extra simple text elements are intentionally ignored.
-			continue;
-		}
-		if (seenRequired.has(normalizedName)) return { ok: false };
-		seenRequired.add(normalizedName);
-
-		if (normalizedName === "function") functionName = text.text.trim();
-		else if (normalizedName === "reason_type") reasonType = text.text;
-		else reasonContent = text.text;
-	}
+	const parsed = parseTrailingXml(raw, "watchdog");
+	if (!parsed.valid) return { ok: false };
+	const functionName = parsed.value.fields.get("function");
+	if (functionName === undefined) return { ok: false };
+	return {
+		ok: true,
+		fields: {
+			functionName,
+			reasonType: parsed.value.fields.get("reason_type"),
+			reasonContent: parsed.value.fields.get("reason_content"),
+		},
+	};
 }
 
 function validateParsedFields(

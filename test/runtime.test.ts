@@ -5,11 +5,6 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import {
-	type DomainFence,
-	type DomainSnapshot,
-	ProcessDomainFatalError,
-} from "pi-process-domain";
 
 import {
 	CONTINUE_ENTRY_TYPE,
@@ -21,11 +16,14 @@ import {
 	MAX_PROMPT_CHARACTERS,
 } from "../src/config.js";
 import {
+	createDecisionFoldMessage,
+	createDecisionPromptMessage,
 	DECISION_FOLD_MESSAGE_TYPE,
 	DECISION_MESSAGE_TYPE,
 	findDecisionAssistantEntryId,
 	foldDecisionContext,
 	INQUIRY_MARKER_ENTRY_TYPE,
+	neutralizeDecisionAssistant,
 } from "../src/context-fold.js";
 import { createLockDecisionController } from "../src/controller.js";
 import { DECISION_TOOL_BLOCK_REASON } from "../src/decision-protocol.js";
@@ -33,7 +31,12 @@ import {
 	createHubAttachmentInstance,
 	createObservableAgentHub,
 } from "../src/hub.js";
-import type { ProcessDomainCoordinator } from "../src/process-domain.js";
+import {
+	type DomainFence,
+	type DomainSnapshot,
+	type ProcessDomainCoordinator,
+	ProcessDomainFatalError,
+} from "../src/process-domain.js";
 import {
 	createDecisionRuntime,
 	type RuntimeClock,
@@ -179,15 +182,22 @@ function unlockXml(
 function idleDomainSnapshot(generation = 1n): DomainSnapshot {
 	return {
 		domainId: "domain",
-		brokerEpoch: "epoch",
+		domainEpoch: "epoch",
 		revision: generation,
 		activityGeneration: generation,
 		participants: 1,
 		busyParticipants: 0,
-		pendingSpawns: 0,
 		allIdle: true,
 		certain: true,
-		fence: { brokerEpoch: "epoch", activityGeneration: generation },
+		fence: { domainEpoch: "epoch", activityGeneration: generation },
+	};
+}
+
+function uncertainDomainSnapshot(generation: bigint): DomainSnapshot {
+	return {
+		...idleDomainSnapshot(generation),
+		allIdle: false,
+		certain: false,
 	};
 }
 
@@ -200,14 +210,24 @@ function createFenceHarness(options?: {
 	readonly reject?: "markBusy" | "markIdle" | "setInternalDecision";
 }) {
 	let snapshot = idleDomainSnapshot();
+	let reject = options?.reject;
 	let confirmResult = true;
 	let deferred = false;
 	let invalidateDuringInternalBusy = false;
 	const pendingConfirms: PendingConfirm[] = [];
 	const internalDecisionMarks: boolean[] = [];
+	const operationCalls: string[] = [];
 	const listeners = new Set<
 		(value: DomainSnapshot, source: "local" | "domain") => void
 	>();
+	const rejectOnce = (operation: typeof reject): void => {
+		operationCalls.push(String(operation));
+		if (reject !== operation) return;
+		reject = undefined;
+		snapshot = uncertainDomainSnapshot(snapshot.activityGeneration + 1n);
+		for (const listener of listeners) listener(snapshot, "domain");
+		throw new Error(`${operation} failed`);
+	};
 	const domain: ProcessDomainCoordinator = {
 		get snapshot() {
 			return snapshot;
@@ -215,7 +235,7 @@ function createFenceHarness(options?: {
 		isRootProcess: true,
 		async attach() {},
 		async markBusy(_instance, markOptions) {
-			if (options?.reject === "markBusy") throw new Error("markBusy failed");
+			rejectOnce("markBusy");
 			internalDecisionMarks.push(markOptions?.internalDecision ?? false);
 			if (
 				invalidateDuringInternalBusy &&
@@ -227,12 +247,10 @@ function createFenceHarness(options?: {
 			}
 		},
 		async markIdle() {
-			if (options?.reject === "markIdle") throw new Error("markIdle failed");
+			rejectOnce("markIdle");
 		},
 		async setInternalDecision(_instance, internal) {
-			if (options?.reject === "setInternalDecision") {
-				throw new Error("setInternalDecision failed");
-			}
+			rejectOnce("setInternalDecision");
 			internalDecisionMarks.push(internal);
 		},
 		confirm(fence: DomainFence) {
@@ -252,6 +270,7 @@ function createFenceHarness(options?: {
 	return {
 		domain,
 		internalDecisionMarks,
+		operationCalls,
 		failConfirm(): void {
 			confirmResult = false;
 		},
@@ -274,6 +293,10 @@ function createFenceHarness(options?: {
 			if (notify) {
 				for (const listener of listeners) listener(snapshot, "domain");
 			}
+		},
+		recover(): void {
+			snapshot = idleDomainSnapshot(snapshot.activityGeneration + 1n);
+			for (const listener of listeners) listener(snapshot, "domain");
 		},
 		invalidateNextInternalBusy(): void {
 			invalidateDuringInternalBusy = true;
@@ -1163,10 +1186,11 @@ function decisionEntry(exchangeId: string, cycleId = 1) {
 		type: "custom_message",
 		id: `decision-${exchangeId}-${cycleId}`,
 		parentId: "parent",
-		customType: DECISION_MESSAGE_TYPE,
-		content: "Decide",
-		display: false,
-		details: { version: 1, exchangeId, cycleId },
+		...createDecisionPromptMessage({
+			exchangeId,
+			cycleId,
+			decisionPrompt: "Decide",
+		}),
 		timestamp: "2026-01-01T00:00:01.000Z",
 	};
 }
@@ -1176,25 +1200,34 @@ function preemptedFoldEntry(exchangeId: string, cycleId = 1) {
 		type: "custom_message",
 		id: `fold-${exchangeId}-${cycleId}`,
 		parentId: "parent",
-		customType: DECISION_FOLD_MESSAGE_TYPE,
-		content: "",
-		display: false,
-		details: { version: 1, exchangeId, cycleId, outcome: "preempted" },
+		...createDecisionFoldMessage({
+			exchangeId,
+			cycleId,
+			outcome: "preempted",
+		}),
 		timestamp: "2026-01-01T00:00:02.000Z",
 	};
 }
 
-function preemptedAssistantEntry(id = "assistant") {
+function preemptedAssistantEntry(
+	id = "assistant",
+	exchangeId = "exchange-1",
+	cycleId = 1,
+) {
 	return {
 		type: "message",
 		id,
 		parentId: "parent",
-		message: {
-			role: "assistant",
-			content: [],
-			stopReason: "stop",
-			errorMessage: "pi-continue-watchdog:preempted",
-		},
+		message: neutralizeDecisionAssistant(
+			{
+				role: "assistant",
+				content: [],
+				stopReason: "stop",
+				errorMessage: "pi-continue-watchdog:preempted",
+			},
+			exchangeId,
+			cycleId,
+		),
 		timestamp: "2026-01-01T00:00:03.000Z",
 	};
 }
@@ -1445,17 +1478,11 @@ test("decision provider error stays provisional so the same Pi run can retry and
 		1,
 	);
 	assert.deepEqual(harness.sent.at(-1), {
-		message: {
-			customType: DECISION_FOLD_MESSAGE_TYPE,
-			content: "",
-			display: false,
-			details: {
-				version: 1,
-				exchangeId: "exchange-1",
-				cycleId: 1,
-				outcome: "unlock",
-			},
-		},
+		message: createDecisionFoldMessage({
+			exchangeId: "exchange-1",
+			cycleId: 1,
+			outcome: "unlock",
+		}),
 		options: { triggerTurn: false, deliverAs: "steer" },
 		streaming: false,
 	});
@@ -2048,12 +2075,14 @@ test("submitted decision invalidated by domain activity still redacts its assist
 
 	assert.equal(harness.controller.snapshot.locked, true);
 	assert.equal(harness.controller.snapshot.decisionOpen, false);
-	assert.deepEqual(harness.sent.at(-1)?.message.details, {
-		version: 1,
-		exchangeId: "exchange-1",
-		cycleId: 1,
-		outcome: "invalidated",
-	});
+	assert.deepEqual(
+		harness.sent.at(-1)?.message,
+		createDecisionFoldMessage({
+			exchangeId: "exchange-1",
+			cycleId: 1,
+			outcome: "invalidated",
+		}),
+	);
 
 	const answer = harness.answerUnlock();
 	await harness.fire("message_start", {
@@ -2984,17 +3013,11 @@ test("real user input silently preempts a submitted decision and extension input
 		assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
 		assert.equal(harness.sent.length, sentBefore + 1);
 		assert.deepEqual(harness.sent.at(-1), {
-			message: {
-				customType: DECISION_FOLD_MESSAGE_TYPE,
-				content: "",
-				display: false,
-				details: {
-					version: 1,
-					exchangeId: "exchange-1",
-					cycleId: 1,
-					outcome: "preempted",
-				},
-			},
+			message: createDecisionFoldMessage({
+				exchangeId: "exchange-1",
+				cycleId: 1,
+				outcome: "preempted",
+			}),
 			options: { triggerTurn: false, deliverAs: "steer" },
 			streaming: true,
 		});
@@ -3220,7 +3243,7 @@ test("send-time busy TOCTOU defers silently; idle send failure still fail-closed
 	);
 });
 
-test("runtime process-domain write rejection disables watchdog without escaping", async () => {
+test("runtime process-domain write rejection stays fail-closed and recovers", async () => {
 	for (const operation of [
 		"markBusy",
 		"markIdle",
@@ -3233,22 +3256,26 @@ test("runtime process-domain write rejection disables watchdog without escaping"
 		if (operation === "markBusy") {
 			harness.streaming = true;
 			await harness.fire("agent_start", { type: "agent_start" });
+			assert.equal(fence.domain.snapshot.certain, false);
+			fence.recover();
+			harness.streaming = false;
+			await harness.fire("agent_settled", { type: "agent_settled" });
+			assert.deepEqual(fence.operationCalls, ["markBusy", "markIdle"]);
 		} else if (operation === "markIdle") {
 			harness.streaming = true;
 			await harness.fire("agent_start", { type: "agent_start" });
 			harness.streaming = false;
 			await harness.fire("agent_settled", { type: "agent_settled" });
+			assert.equal(fence.domain.snapshot.certain, false);
+			fence.recover();
+			assert.deepEqual(fence.operationCalls, ["markBusy", "markIdle"]);
 		} else {
 			await harness.openDecision({ start: false });
 			await Promise.resolve();
 			await Promise.resolve();
 			assert.equal(harness.sent.length, 1);
 			await harness.startDecision();
-		}
-
-		const timersAfterFailure = harness.clock.records.length;
-		harness.runtime.reconcileIdle();
-		if (operation === "setInternalDecision") {
+			assert.equal(fence.domain.snapshot.certain, false);
 			assert.equal(harness.controller.snapshot.decisionOpen, false);
 			assert.equal(harness.aborts, 1);
 			assert.deepEqual(await harness.blockToolCall(), {
@@ -3274,52 +3301,49 @@ test("runtime process-domain write rejection disables watchdog without escaping"
 			harness.streaming = false;
 			await harness.fire("agent_settled", { type: "agent_settled" });
 			assert.equal(await harness.blockToolCall(), undefined);
+			fence.recover();
+			assert.deepEqual(fence.operationCalls, [
+				"markBusy",
+				"setInternalDecision",
+				"markIdle",
+			]);
 		}
-		assert.equal(harness.clock.records.length, timersAfterFailure);
+
+		const timersBeforeRecoveryReconcile = harness.clock.records.length;
+		harness.runtime.reconcileIdle();
+		assert.equal(
+			harness.clock.records.length >= timersBeforeRecoveryReconcile,
+			true,
+		);
+		assert.equal(fence.domain.snapshot.certain, true);
 	}
 });
 
-test("initial process-domain authentication failure exits this watchdog instance", async () => {
-	const fatal = fatalSpy();
-	const domain = lifecycleDomain({
-		attachError: new ProcessDomainFatalError(
-			"AUTHENTICATION_FAILED",
-			"wrong key",
-		),
-		emitAttachErrorBeforeReject: true,
-	});
-	const harness = createHarness({
-		processDomain: domain.domain,
-		fatalExit: fatal.adapter,
-	});
+for (const code of [
+	"INVALID_DECLARATION",
+	"AUTHENTICATION_FAILED",
+	"CONNECTION_UNAVAILABLE",
+] as const) {
+	test(`initial process-domain ${code} failure exits this watchdog instance`, async () => {
+		const fatal = fatalSpy();
+		const domain = lifecycleDomain({
+			attachError: new ProcessDomainFatalError(code, "private startup details"),
+			emitAttachErrorBeforeReject: true,
+		});
+		const harness = createHarness({
+			processDomain: domain.domain,
+			fatalExit: fatal.adapter,
+		});
 
-	await startIdle(harness);
-	assert.equal(fatal.errors.length, 1);
-	assert.equal(
-		(fatal.errors[0] as ProcessDomainFatalError).code,
-		"AUTHENTICATION_FAILED",
-	);
-	harness.runtime.reconcileIdle();
-	assert.equal(harness.clock.records.length, 0);
-});
-
-test("initial non-auth process-domain failure disables watchdog without exiting Pi", async () => {
-	const fatal = fatalSpy();
-	const domain = lifecycleDomain({
-		attachError: new ProcessDomainFatalError("LEASE_REJECTED", "join rejected"),
+		await startIdle(harness);
+		assert.equal(fatal.errors.length, 1);
+		assert.equal((fatal.errors[0] as ProcessDomainFatalError).code, code);
+		harness.runtime.reconcileIdle();
+		assert.equal(harness.clock.records.length, 0);
 	});
-	const harness = createHarness({
-		processDomain: domain.domain,
-		fatalExit: fatal.adapter,
-	});
+}
 
-	await startIdle(harness);
-	assert.equal(fatal.errors.length, 0);
-	harness.runtime.reconcileIdle();
-	assert.equal(harness.clock.records.length, 0);
-});
-
-test("runtime lease rejection disables watchdog without exiting Pi", async () => {
+test("runtime transport rejection disables watchdog without exiting Pi", async () => {
 	const fatal = fatalSpy();
 	const domain = lifecycleDomain();
 	const harness = createHarness({
@@ -3330,8 +3354,8 @@ test("runtime lease rejection disables watchdog without exiting Pi", async () =>
 
 	domain.emitFatal(
 		new ProcessDomainFatalError(
-			"LEASE_REJECTED",
-			"participant lease is not current",
+			"CONNECTION_UNAVAILABLE",
+			"participant transport is not current",
 		),
 	);
 	assert.equal(fatal.errors.length, 0);

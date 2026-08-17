@@ -27,6 +27,8 @@ import {
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 
+import { DECISION_FOLD_MESSAGE_TYPE } from "../../src/context-fold.js";
+
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const decisionPromptStart =
@@ -167,22 +169,22 @@ async function makePackedFixture(
 	};
 	assert.deepEqual(installedManifest.pi?.extensions, ["./src/extension.ts"]);
 	assert.equal(
-		installedManifest.dependencies?.["pi-process-domain"],
-		"git+https://github.com/xz-dev/pi-process-domain.git#e0cdac6537cc11daeba0596833f6b441d887d92f",
+		installedManifest.dependencies?.["pi-extension-utils"],
+		"git+https://github.com/xz-dev/pi-extension-utils.git#2fe6a4f73c388e3e55a95ab522ef6cdf323c77cc",
 	);
-	const domainPackage = join(installRoot, "node_modules", "pi-process-domain");
-	const domainManifest = JSON.parse(
-		await readFile(join(domainPackage, "package.json"), "utf8"),
-	) as { bin?: Record<string, string> };
-	assert.equal(
-		domainManifest.bin?.["pi-process-domain-broker"],
-		"bin/pi-process-domain-broker.mjs",
-	);
-	await readFile(join(domainPackage, "dist", "index.js"), "utf8");
+	const utilsPackage = join(installRoot, "node_modules", "pi-extension-utils");
+	const utilsManifest = JSON.parse(
+		await readFile(join(utilsPackage, "package.json"), "utf8"),
+	) as { name?: string; bin?: Record<string, string> };
+	assert.equal(utilsManifest.name, "pi-extension-utils");
+	assert.equal(utilsManifest.bin, undefined);
+	await readFile(join(utilsPackage, "dist", "index.js"), "utf8");
 	await readFile(
-		join(domainPackage, "bin", "pi-process-domain-broker.mjs"),
+		join(utilsPackage, "dist", "process-domain", "index.js"),
 		"utf8",
 	);
+	await readFile(join(utilsPackage, "dist", "xml.js"), "utf8");
+	await readFile(join(utilsPackage, "dist", "pi-inquiry.js"), "utf8");
 	assert.equal((await readdir(packageDir)).includes("test"), false);
 
 	const extensions: string[] =
@@ -419,10 +421,7 @@ async function createSession(
 	const previousProbeOut = process.env.PI_SEMANTIC_PROBE_OUT;
 	const previousRuntimeDir = process.env.XDG_RUNTIME_DIR;
 	const domainNames = [
-		"PI_PROCESS_DOMAIN_ID",
-		"PI_PROCESS_DOMAIN_KEY",
-		"PI_PROCESS_DOMAIN_PROTOCOL",
-		"PI_PROCESS_DOMAIN_RESERVATION",
+		"PI_EXTENSION_UTILS_PROCESS_DOMAIN",
 		"PI_CONTINUE_WATCHDOG_ROOT_PID",
 	] as const;
 	const previousDomain = Object.fromEntries(
@@ -702,15 +701,23 @@ function spawnPackedChild(
 	};
 }
 
-async function assertWrongDomainKeyChildFailsClosed(
+async function assertWrongCapabilityChildFailsClosed(
 	fixture: PackedFixture,
 	baseUrl: string,
 	domainEnv: NodeJS.ProcessEnv,
 ): Promise<void> {
-	const actualKey = domainEnv.PI_PROCESS_DOMAIN_KEY;
-	assert.ok(actualKey);
-	const wrongKey = randomBytes(32).toString("base64url");
-	assert.notEqual(wrongKey, actualKey);
+	const declaration = domainEnv.PI_EXTENSION_UTILS_PROCESS_DOMAIN;
+	assert.ok(declaration);
+	const decoded = JSON.parse(
+		Buffer.from(declaration, "base64url").toString("utf8"),
+	) as { capability: string; endpoint: string };
+	const actualCapability = decoded.capability;
+	const wrongCapability = randomBytes(32).toString("base64url");
+	assert.notEqual(wrongCapability, actualCapability);
+	const wrongDeclaration = Buffer.from(
+		JSON.stringify({ ...decoded, capability: wrongCapability }),
+		"utf8",
+	).toString("base64url");
 	const child = spawn(
 		process.execPath,
 		[
@@ -723,7 +730,7 @@ async function assertWrongDomainKeyChildFailsClosed(
 			env: {
 				...process.env,
 				...domainEnv,
-				PI_PROCESS_DOMAIN_KEY: wrongKey,
+				PI_EXTENSION_UTILS_PROCESS_DOMAIN: wrongDeclaration,
 				HOME: fixture.home,
 				PI_CODING_AGENT_DIR: fixture.agentDir,
 				XDG_RUNTIME_DIR: fixture.runtimeDir,
@@ -756,7 +763,7 @@ async function assertWrongDomainKeyChildFailsClosed(
 			new Promise<never>((_resolve, reject) => {
 				timeout = setTimeout(
 					() => reject(new Error("Timed out waiting for wrong-key child exit")),
-					5_000,
+					12_000,
 				);
 			}),
 		]);
@@ -782,10 +789,10 @@ async function assertWrongDomainKeyChildFailsClosed(
 		true,
 		`sanitized child output: ${output}`,
 	);
-	assert.equal(output.includes(actualKey), false);
-	assert.equal(output.includes(wrongKey), false);
+	assert.equal(output.includes(actualCapability), false);
+	assert.equal(output.includes(wrongCapability), false);
+	assert.equal(output.includes(decoded.endpoint), false);
 	assert.equal(output.includes(fixture.runtimeDir), false);
-	assert.equal(output.includes("broker.sock"), false);
 }
 
 function createRpcUiContext(): ExtensionUIContext {
@@ -809,7 +816,7 @@ function createRpcUiContext(): ExtensionUIContext {
 }
 
 test("packed stock Pi coordinates busy and decision epochs across an OS child", {
-	timeout: 45_000,
+	timeout: 65_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t, {
 		withSemanticProbe: true,
@@ -835,6 +842,7 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		{ kind: "delayed" },
 		{ kind: "stop", text: "root first epoch settled" },
 		{ kind: "unlock", reason: "first cross-process epoch complete" },
+		{ kind: "unlock", reason: "heartbeat recovery complete" },
 		{ kind: "stop", text: "root fencing epoch settled" },
 		{
 			kind: "held-continue",
@@ -855,13 +863,10 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		root.domainEnv.PI_CONTINUE_WATCHDOG_ROOT_PID,
 		String(process.pid),
 	);
-	for (const name of [
-		"PI_PROCESS_DOMAIN_ID",
-		"PI_PROCESS_DOMAIN_KEY",
-		"PI_PROCESS_DOMAIN_PROTOCOL",
-	] as const) {
-		assert.ok(root.domainEnv[name], `root created ${name}`);
-	}
+	assert.ok(
+		root.domainEnv.PI_EXTENSION_UTILS_PROCESS_DOMAIN,
+		"root created PI_EXTENSION_UTILS_PROCESS_DOMAIN",
+	);
 
 	const child = spawnPackedChild(fixture, baseUrl, "child-process-model", {
 		...root.domainEnv,
@@ -938,6 +943,28 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		"observer child must never publish user-ready",
 	);
 
+	const requestsBeforeHeartbeatLoss = requests.length;
+	assert.equal(child.process.kill("SIGSTOP"), true);
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 6_500));
+	await root.session.prompt("/lock-continue-watchdog");
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 700));
+	assert.equal(
+		requests.length,
+		requestsBeforeHeartbeatLoss,
+		"root must remain fail-closed while the idle child is heartbeat-offline",
+	);
+	assert.equal(child.process.kill("SIGCONT"), true);
+	await waitFor(
+		() => requests.filter(isDecisionRequest).length === 2,
+		8_000,
+		"heartbeat reconnect fresh-activity decision",
+	);
+	await waitForSessionIdle(root.session, 5_000, "heartbeat recovery unlock");
+	assert.equal(
+		requests.filter(isDecisionRequest)[1]?.model,
+		"root-process-model",
+	);
+
 	await root.session.prompt(
 		"Open a decision that will be invalidated by child work.",
 	);
@@ -956,7 +983,7 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 	);
 	releaseHeldDecision?.();
 	await waitFor(
-		() => requests.length === 7,
+		() => requests.length === 8,
 		5_000,
 		"invalidated decision fold settlement",
 	);
@@ -966,11 +993,12 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		.getEntries()
 		.slice(entriesBeforeInvalidation)
 		.map((entry) => JSON.stringify(entry));
+	const foldEntryToken = `"customType":${JSON.stringify(DECISION_FOLD_MESSAGE_TYPE)}`;
 	assert.equal(
 		invalidatedEntries.some(
 			(entry) =>
-				entry.includes('"customType":"pi-continue-watchdog:decision-fold"') &&
-				entry.includes('"outcome":"invalidated"'),
+				entry.includes(foldEntryToken) &&
+				entry.includes('"watchdogOutcome":"invalidated"'),
 		),
 		true,
 	);
@@ -987,11 +1015,19 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		false,
 	);
 	assert.equal(
-		invalidatedEntries.some((entry) => entry.includes('"outcome":"continue"')),
+		invalidatedEntries.some(
+			(entry) =>
+				entry.includes(foldEntryToken) &&
+				entry.includes('"watchdogOutcome":"continue"'),
+		),
 		false,
 	);
 	assert.equal(
-		invalidatedEntries.some((entry) => entry.includes('"outcome":"unlock"')),
+		invalidatedEntries.some(
+			(entry) =>
+				entry.includes(foldEntryToken) &&
+				entry.includes('"watchdogOutcome":"unlock"'),
+		),
 		false,
 	);
 	assert.equal(
@@ -1014,17 +1050,17 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		false,
 		"stale continue must not start a continuation turn",
 	);
-	assert.equal(isDecisionRequest(requests[6] as RequestRecord), false);
+	assert.equal(isDecisionRequest(requests[7] as RequestRecord), false);
 	assert.equal(
 		requests
-			.slice(6)
+			.slice(7)
 			.some((request) => request.model === "child-process-model"),
 		false,
 	);
 
 	await child.command("abort");
 	await waitFor(
-		() => requests.filter(isDecisionRequest).length === 3,
+		() => requests.filter(isDecisionRequest).length === 4,
 		5_000,
 		"fresh post-invalidation decision",
 	);
@@ -1034,7 +1070,7 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		"fresh post-invalidation unlock",
 	);
 	const decisions = requests.filter(isDecisionRequest);
-	assert.equal(decisions.length, 3);
+	assert.equal(decisions.length, 4);
 	assert.equal(
 		decisions.every((request) => request.model === "root-process-model"),
 		true,
@@ -1042,6 +1078,6 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 	const finalChild = await child.command<ChildHarnessSnapshot>("snapshot");
 	assert.deepEqual(finalChild.decisionTools, []);
 	assert.deepEqual(finalChild.customEntries, []);
-	await assertWrongDomainKeyChildFailsClosed(fixture, baseUrl, root.domainEnv);
+	await assertWrongCapabilityChildFailsClosed(fixture, baseUrl, root.domainEnv);
 	await child.stop();
 });

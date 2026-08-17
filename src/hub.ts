@@ -378,10 +378,9 @@ export function createObservableAgentHub(): ObservableAgentHub {
 }
 
 /**
- * Realm-wide process domain key. Independent jiti/module evaluations and
- * compatible physical copies in one JS realm resolve the same symbol and share
- * one ObservableAgentHub on globalThis. No plugin coupling — ordinary JS realm
- * state only.
+ * Realm-wide hub key. Independent jiti/module evaluations and compatible
+ * physical copies in one JS realm resolve the same symbol and share one
+ * ObservableAgentHub on globalThis. No plugin coupling, only JS realm state.
  */
 const PROCESS_OBSERVABLE_AGENT_DOMAIN = Symbol.for(
 	"pi-continue-watchdog:observable-agent-domain:v1",

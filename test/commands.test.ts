@@ -114,7 +114,6 @@ function createHarness(): CommandHarness {
 			graceRemainingMs: null,
 			observableBusyCount: 1,
 			domainBusyParticipants: 2,
-			domainPendingSpawns: 1,
 		}),
 		restartLockCycle(ctx, options): void {
 			if (!currentMain) return;
@@ -248,7 +247,7 @@ test("status command reports the current trigger blocker without changing state"
 			"Attempt: 0/2",
 			"Trigger: blocked · observable agent busy",
 			"Grace: blocked",
-			"Busy: observable 1, domain 2, pending spawns 1",
+			"Busy: observable 1, domain 2",
 		].join("\n"),
 	]);
 });
@@ -265,7 +264,6 @@ test("status formatter shows an eligible grace countdown", () => {
 			graceRemainingMs: 9_001,
 			observableBusyCount: 0,
 			domainBusyParticipants: 0,
-			domainPendingSpawns: 0,
 		}),
 		[
 			"Continue watchdog status",
@@ -274,7 +272,7 @@ test("status formatter shows an eligible grace countdown", () => {
 			"Attempt: 3/10",
 			"Trigger: eligible",
 			"Grace: waiting · 10s remaining",
-			"Busy: observable 0, domain 0, pending spawns 0",
+			"Busy: observable 0, domain 0",
 		].join("\n"),
 	);
 });

@@ -1,5 +1,5 @@
 export interface ActivityGeneration {
-	readonly brokerEpoch: string;
+	readonly domainEpoch: string;
 	readonly activityGeneration: bigint;
 	readonly ownershipGeneration: number;
 	readonly localActivityGeneration: number;
@@ -45,7 +45,7 @@ function sameGeneration(
 ): boolean {
 	return (
 		left !== null &&
-		left.brokerEpoch === right.brokerEpoch &&
+		left.domainEpoch === right.domainEpoch &&
 		left.activityGeneration === right.activityGeneration &&
 		left.ownershipGeneration === right.ownershipGeneration &&
 		left.localActivityGeneration === right.localActivityGeneration

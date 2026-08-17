@@ -690,7 +690,7 @@ Pi packages 本身是受信任、拥有完整本机权限的代码，因此 regi
 4. detach/stop/timeout/failure；
 5. result terminal-but-undelivered；
 6. reload/restart recovery；
-7. scheduled run launch reservation。
+7. scheduled run registration boundary。
 
 ### Phase 5：packed/process-level acceptance
 
@@ -728,7 +728,7 @@ Pi packages 本身是受信任、拥有完整本机权限的代码，因此 regi
 2. **Unknown policy：** provider recovering、抛错、返回 malformed snapshot 或异常消失时，是否按推荐 fail closed？
 3. **Restart promise：** main Pi 重启后仍存活的 async work，是否必须继续阻止 resumed session 的 watchdog decision？若是，还必须决定 expected-provider barrier 的权威来源（Pi/core、显式配置或 session durable marker）；单纯等 provider 注册后返回 recovering 不足以覆盖注册前窗口。
 4. **Outstanding 定义：** 是否采用最安全的“所有尚未 terminal-and-delivered 的 queued/running/nested/paused/needs-parent/delivering work 都 blocking”？
-5. **Scheduled work：** 是否只在到期并完成 launch reservation 后 blocking，而不是未来 schedule 创建时就一直 blocking？
+5. **Scheduled work：** 是否只在到期并完成 provider registration 后 blocking，而不是未来 schedule 创建时就一直 blocking？
 6. **Needs-parent：** child 需要 parent attention 时，是否由 orchestrator 单独负责唤醒 parent，而 watchdog 继续保持 blocked？这是推荐方案，可避免两个调度器抢控制权。
 7. **Protocol ownership：** 第一版是 watchdog-owned structural protocol、以后提议给 Pi core，还是必须先等 Pi core API？当前推荐前者。
 8. **First adapter：** 是否允许单独修改 `xz-dev/pi-subagents-nicobailon` 作为第一个 producer，前提是 watchdog 对其保持零 import、零命名、零私有路径依赖？这是修复当前问题的最短路径。
@@ -822,10 +822,10 @@ Pi packages 本身是受信任、拥有完整本机权限的代码，因此 regi
 - [Temporal Activity heartbeats](https://docs.temporal.io/develop/python/failure-detection#activity-heartbeats)
 - [Temporal Event History](https://docs.temporal.io/encyclopedia/event-history)
 
-## 16. Supersession: implemented authenticated broker architecture
+## 16. Supersession: implemented authenticated transport architecture
 
-The earlier same-process-only conclusion in this report is superseded for watchdog-loaded inherited Pi processes by the reviewed `xz-dev/pi-process-domain` architecture.
+The earlier same-process-only conclusion is superseded for watchdog-loaded inherited Pi processes by the reviewed `pi-extension-utils` transport.
 
-The shipped design uses one process-wide watchdog coordinator participant, exact local attachment aggregation, and one authenticated embedded protocol-v2 broker per root Pi domain on a private Unix socket/named pipe, with immutable certain/all-idle snapshots and confirmation fences. Only the domain-creating root PID owns watchdog decisions while that broker is open; inherited processes connect as observers and cannot create or revive it. Final root detach clears the creator marker and closes the endpoint, so a later root attachment creates a fresh isolated domain. The root decision run suppresses only its own artificial busy state, while any other activity invalidates its fence and folds the stale exchange.
+The shipped design uses one process-wide watchdog coordinator and one authenticated transport node per process. The utility package provides ZeroMQ endpoints, peer liveness, directed/broadcast data, and lifecycle facts; the watchdog owns local/remote busy reduction, certainty, generations, confirmation fences, and decision state. Only the root process owns decisions. A heartbeat-disconnected participant remains conservatively blocking until it reconnects and sends fresh activity.
 
-Guarantee boundaries remain explicit: observation is strict after inherited watchdog `session_start`; zero-gap launch coverage requires `reserveSpawn()` cooperation; stripped/replaced environment declarations and children that do not load watchdog cannot be observed.
+Guarantee boundaries remain explicit: observation begins after inherited watchdog `session_start` and activity registration. Stripped/replaced environment declarations and children that do not load watchdog cannot be observed; no pre-registration guarantee is claimed.

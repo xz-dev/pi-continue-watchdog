@@ -59,9 +59,9 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "pi-process-domain": "git+https://github.com/xz-dev/pi-process-domain.git#e0cdac6537cc11daeba0596833f6b441d887d92f"
+    "pi-extension-utils": "git+https://github.com/xz-dev/pi-extension-utils.git#2fe6a4f73c388e3e55a95ab522ef6cdf323c77cc"
   },
   "allowScripts": {
-    "pi-process-domain": true
+    "zeromq": true
   }
 }

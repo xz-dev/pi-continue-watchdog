@@ -1,5 +1,8 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { FATAL_EXIT_CODE, isProcessDomainFatalError } from "pi-process-domain";
+import {
+	FATAL_EXIT_CODE,
+	isProcessDomainFatalError,
+} from "./process-domain.js";
 
 const FALLBACK_DELAY_MS = 1_000;
 

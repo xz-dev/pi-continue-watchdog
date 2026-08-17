@@ -159,22 +159,22 @@ async function makePackedFixture(
 	};
 	assert.deepEqual(installedManifest.pi?.extensions, ["./src/extension.ts"]);
 	assert.equal(
-		installedManifest.dependencies?.["pi-process-domain"],
-		"git+https://github.com/xz-dev/pi-process-domain.git#e0cdac6537cc11daeba0596833f6b441d887d92f",
+		installedManifest.dependencies?.["pi-extension-utils"],
+		"git+https://github.com/xz-dev/pi-extension-utils.git#2fe6a4f73c388e3e55a95ab522ef6cdf323c77cc",
 	);
-	const domainPackage = join(installRoot, "node_modules", "pi-process-domain");
-	const domainManifest = JSON.parse(
-		await readFile(join(domainPackage, "package.json"), "utf8"),
-	) as { bin?: Record<string, string> };
-	assert.equal(
-		domainManifest.bin?.["pi-process-domain-broker"],
-		"bin/pi-process-domain-broker.mjs",
-	);
-	await readFile(join(domainPackage, "dist", "index.js"), "utf8");
+	const utilsPackage = join(installRoot, "node_modules", "pi-extension-utils");
+	const utilsManifest = JSON.parse(
+		await readFile(join(utilsPackage, "package.json"), "utf8"),
+	) as { name?: string; bin?: Record<string, string> };
+	assert.equal(utilsManifest.name, "pi-extension-utils");
+	assert.equal(utilsManifest.bin, undefined);
+	await readFile(join(utilsPackage, "dist", "index.js"), "utf8");
 	await readFile(
-		join(domainPackage, "bin", "pi-process-domain-broker.mjs"),
+		join(utilsPackage, "dist", "process-domain", "index.js"),
 		"utf8",
 	);
+	await readFile(join(utilsPackage, "dist", "xml.js"), "utf8");
+	await readFile(join(utilsPackage, "dist", "pi-inquiry.js"), "utf8");
 	assert.equal((await readdir(packageDir)).includes("test"), false);
 
 	const extensions: string[] =
@@ -389,10 +389,7 @@ async function createSession(
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const previousProbeOut = process.env.PI_SEMANTIC_PROBE_OUT;
 	const domainNames = [
-		"PI_PROCESS_DOMAIN_ID",
-		"PI_PROCESS_DOMAIN_KEY",
-		"PI_PROCESS_DOMAIN_PROTOCOL",
-		"PI_PROCESS_DOMAIN_RESERVATION",
+		"PI_EXTENSION_UTILS_PROCESS_DOMAIN",
 		"PI_CONTINUE_WATCHDOG_ROOT_PID",
 	] as const;
 	const previousDomain = Object.fromEntries(
@@ -1241,8 +1238,11 @@ test("packed interactive and RPC input preempt a streaming decision once", {
 			.getEntries()
 			.map((entry) => JSON.stringify(entry));
 		assert.equal(
-			serialized.some((entry) => entry.includes('"outcome":"preempted"')),
+			serialized.some((entry) =>
+				entry.includes('"watchdogOutcome":"preempted"'),
+			),
 			true,
+			serialized.join("\n"),
 		);
 		assert.equal(
 			serialized.some((entry) => entry.includes("partial")),

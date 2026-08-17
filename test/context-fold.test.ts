@@ -14,6 +14,7 @@ import {
 	DECISION_MESSAGE_TYPE,
 	DECISION_PROTOCOL_VERSION,
 	foldDecisionContext,
+	neutralizeDecisionAssistant,
 	registerDecisionContextFolding,
 } from "../src/context-fold.js";
 
@@ -33,14 +34,11 @@ function decision(
 ): Message {
 	return {
 		role: "custom",
-		customType: DECISION_MESSAGE_TYPE,
-		content: "hidden decision prompt",
-		display: false,
-		details: {
-			version: DECISION_PROTOCOL_VERSION,
+		...createDecisionPromptMessage({
 			exchangeId,
 			cycleId,
-		},
+			decisionPrompt: "hidden decision prompt",
+		}),
 		timestamp,
 	};
 }
@@ -120,37 +118,29 @@ function foldMarker(options: {
 	readonly continuePrompt?: string;
 	readonly timestamp: number;
 }): Message {
-	return {
-		role: "custom",
-		customType: DECISION_FOLD_MESSAGE_TYPE,
-		content:
-			options.outcome === "continue"
-				? (options.continuePrompt ?? CONTINUE_PROMPT)
-				: "",
-		display: false,
-		details:
-			options.outcome === "continue"
-				? {
-						version: DECISION_PROTOCOL_VERSION,
-						exchangeId: options.exchangeId ?? EXCHANGE_ID,
-						cycleId: options.cycleId ?? 1,
-						outcome: options.outcome,
-						continuePrompt: options.continuePrompt ?? CONTINUE_PROMPT,
-					}
-				: {
-						version: DECISION_PROTOCOL_VERSION,
-						exchangeId: options.exchangeId ?? EXCHANGE_ID,
-						cycleId: options.cycleId ?? 1,
-						outcome: options.outcome,
-					},
-		timestamp: options.timestamp,
-	};
+	const exchangeId = options.exchangeId ?? EXCHANGE_ID;
+	const cycleId = options.cycleId ?? 1;
+	const message =
+		options.outcome === "continue"
+			? createDecisionFoldMessage({
+					exchangeId,
+					cycleId,
+					outcome: "continue",
+					continuePrompt: options.continuePrompt ?? CONTINUE_PROMPT,
+				})
+			: createDecisionFoldMessage({
+					exchangeId,
+					cycleId,
+					outcome: options.outcome,
+				});
+	return { role: "custom", ...message, timestamp: options.timestamp };
 }
 
 function continuationMessage(
 	timestamp: number,
 	exchangeId = EXCHANGE_ID,
 	continuePrompt = CONTINUE_PROMPT,
+	attempt = 1,
 ): Message {
 	return {
 		role: "custom",
@@ -161,6 +151,12 @@ function continuationMessage(
 			version: DECISION_PROTOCOL_VERSION,
 			exchangeId,
 			outcome: "continue",
+			piInquiry: {
+				version: DECISION_PROTOCOL_VERSION,
+				namespace: "pi-continue-watchdog",
+				inquiryId: exchangeId,
+				attempt,
+			},
 		},
 		timestamp,
 	};
@@ -179,12 +175,9 @@ test("builders emit exact decision and fold custom messages", () => {
 			display: false,
 			details: {
 				version: DECISION_PROTOCOL_VERSION,
-				exchangeId: EXCHANGE_ID,
-				cycleId: 1,
-				"pi-process-domain": {
-					version: 1,
-					activity: "observation",
-				},
+				namespace: "pi-continue-watchdog",
+				inquiryId: EXCHANGE_ID,
+				attempt: 1,
 			},
 		},
 	);
@@ -202,10 +195,20 @@ test("builders emit exact decision and fold custom messages", () => {
 			display: false,
 			details: {
 				version: DECISION_PROTOCOL_VERSION,
-				exchangeId: EXCHANGE_ID,
-				cycleId: 2,
-				outcome: "continue",
-				continuePrompt: CONTINUE_PROMPT,
+				namespace: "pi-continue-watchdog",
+				inquiryId: EXCHANGE_ID,
+				attempt: 2,
+				outcome: "replace",
+				watchdogOutcome: "continue",
+				replacement: {
+					customType: CONTINUATION_MESSAGE_TYPE,
+					content: CONTINUE_PROMPT,
+					details: {
+						version: DECISION_PROTOCOL_VERSION,
+						exchangeId: EXCHANGE_ID,
+						outcome: "continue",
+					},
+				},
 			},
 		},
 	);
@@ -222,9 +225,11 @@ test("builders emit exact decision and fold custom messages", () => {
 			display: false,
 			details: {
 				version: DECISION_PROTOCOL_VERSION,
-				exchangeId: EXCHANGE_ID,
-				cycleId: 1,
-				outcome: "unlock",
+				namespace: "pi-continue-watchdog",
+				inquiryId: EXCHANGE_ID,
+				attempt: 1,
+				outcome: "remove",
+				watchdogOutcome: "unlock",
 			},
 		},
 	);
@@ -241,9 +246,11 @@ test("builders emit exact decision and fold custom messages", () => {
 			display: false,
 			details: {
 				version: DECISION_PROTOCOL_VERSION,
-				exchangeId: EXCHANGE_ID,
-				cycleId: 3,
-				outcome: "decision-failed",
+				namespace: "pi-continue-watchdog",
+				inquiryId: EXCHANGE_ID,
+				attempt: 3,
+				outcome: "remove",
+				watchdogOutcome: "decision-failed",
 			},
 		},
 	);
@@ -260,9 +267,11 @@ test("builders emit exact decision and fold custom messages", () => {
 			display: false,
 			details: {
 				version: DECISION_PROTOCOL_VERSION,
-				exchangeId: EXCHANGE_ID,
-				cycleId: 1,
-				outcome: "preempted",
+				namespace: "pi-continue-watchdog",
+				inquiryId: EXCHANGE_ID,
+				attempt: 1,
+				outcome: "remove",
+				watchdogOutcome: "preempted",
 			},
 		},
 	);
@@ -299,11 +308,15 @@ test("user-preempted decisions fold without a terminal assistant or replacement"
 		user("takeover", 4),
 	]);
 
-	const neutralizedAssistant = {
-		...assistant([], 3),
-		stopReason: "stop",
-		errorMessage: "pi-continue-watchdog:preempted",
-	};
+	const neutralizedAssistant = neutralizeDecisionAssistant(
+		{
+			...assistant([], 3),
+			stopReason: "stop",
+			errorMessage: "pi-continue-watchdog:preempted",
+		},
+		EXCHANGE_ID,
+		1,
+	);
 	const withNeutralizedAssistant = [
 		user("task", 1),
 		decision(EXCHANGE_ID, 1, 2),
@@ -363,7 +376,11 @@ test("user-preempted decisions fold without a terminal assistant or replacement"
 		betweenCycles,
 		decision(EXCHANGE_ID, 2, 5),
 		foldMarker({ outcome: "preempted", cycleId: 2, timestamp: 6 }),
-		{ ...neutralizedAssistant, timestamp: 7 },
+		neutralizeDecisionAssistant(
+			{ ...neutralizedAssistant, timestamp: 7 },
+			EXCHANGE_ID,
+			2,
+		),
 	];
 	assert.deepEqual(foldDecisionContext(multiCycle), [betweenCycles]);
 });
@@ -437,7 +454,7 @@ test("blocked ordinary tool calls and multi-round invalid re-asks fold as one ex
 
 	assert.deepEqual(foldDecisionContext(messages), [
 		user("task", 1),
-		continuationMessage(7),
+		continuationMessage(7, EXCHANGE_ID, CONTINUE_PROMPT, 2),
 	]);
 });
 

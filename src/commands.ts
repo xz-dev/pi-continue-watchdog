@@ -514,7 +514,7 @@ export function formatWatchdogTriggerStatus(
 		}`,
 		`Busy: observable ${status.observableBusyCount}, domain ${
 			status.domainBusyParticipants ?? "unavailable"
-		}, pending spawns ${status.domainPendingSpawns ?? "unavailable"}`,
+		}`,
 	];
 	return lines.join("\n");
 }
