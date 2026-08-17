@@ -349,6 +349,7 @@ export function createDecisionRuntime(
 	let quarantinedDecision: {
 		readonly exchangeId: string;
 		readonly cycleId: number;
+		inputObserved: boolean;
 	} | null = null;
 	let capturedDecisionResponse: {
 		readonly active: ActiveDecision;
@@ -533,6 +534,7 @@ export function createDecisionRuntime(
 			quarantinedDecision = {
 				exchangeId: active.exchangeId,
 				cycleId: active.protocol.currentCycleId,
+				inputObserved: active.submitted,
 			};
 		}
 		if (active !== null) invalidateActiveDecision(true);
@@ -1327,6 +1329,18 @@ export function createDecisionRuntime(
 		) {
 			return;
 		}
+		if (active.submitted || selfRunFor(active)) {
+			// Invalidating the decision rejects its outcome, but an assistant run that
+			// has already started still belongs to this internal exchange. Retain only
+			// its redaction identity until message_end/agent_settled so stale XML cannot
+			// enter TUI history or session persistence. `selfRunFor` covers the narrow
+			// agent_start -> correlated message_start interval.
+			quarantinedDecision = {
+				exchangeId: active.exchangeId,
+				cycleId: active.protocol.currentCycleId,
+				inputObserved: active.submitted,
+			};
+		}
 		active.invalidated = true;
 		localActivityGeneration += 1;
 		selfDecisionRun = { kind: "none" };
@@ -1944,6 +1958,29 @@ export function createDecisionRuntime(
 	const handleMessageStart = async (event: {
 		readonly message: unknown;
 	}): Promise<void> => {
+		const message = event.message as {
+			readonly role?: unknown;
+			readonly customType?: unknown;
+			readonly details?: {
+				readonly exchangeId?: unknown;
+				readonly cycleId?: unknown;
+			};
+		};
+		if (quarantinedDecision !== null) {
+			// Once the exact custom input has correlated this quarantine to a Pi run,
+			// retain it across every assistant/tool-result message until agent_settled.
+			// Before correlation, fail closed on the first non-matching input so an
+			// unrelated run can never have its assistant redacted.
+			if (quarantinedDecision.inputObserved) return;
+			const matchesQuarantine =
+				message.role === "custom" &&
+				message.customType === "pi-continue-watchdog:decision" &&
+				message.details?.exchangeId === quarantinedDecision.exchangeId &&
+				message.details?.cycleId === quarantinedDecision.cycleId;
+			if (matchesQuarantine) quarantinedDecision.inputObserved = true;
+			else quarantinedDecision = null;
+			return;
+		}
 		const active = activeDecision;
 		if (
 			active === null ||
@@ -1953,14 +1990,6 @@ export function createDecisionRuntime(
 		) {
 			return;
 		}
-		const message = event.message as {
-			readonly role?: unknown;
-			readonly customType?: unknown;
-			readonly details?: {
-				readonly exchangeId?: unknown;
-				readonly cycleId?: unknown;
-			};
-		};
 		const isCurrentDecision =
 			message.role === "custom" &&
 			message.customType === "pi-continue-watchdog:decision" &&

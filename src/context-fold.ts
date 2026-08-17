@@ -4,6 +4,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 import { isValidPrompt } from "./config.js";
+import { PROCESS_DOMAIN_OBSERVATION_DETAILS } from "./run-activity.js";
 
 /** Stable persisted metadata version for decision exchanges and their fold marker. */
 export const DECISION_PROTOCOL_VERSION = 1;
@@ -27,6 +28,10 @@ export interface DecisionMessageDetails {
 	readonly version: typeof DECISION_PROTOCOL_VERSION;
 	readonly exchangeId: string;
 	readonly cycleId: number;
+	readonly "pi-process-domain"?: {
+		readonly version: 1;
+		readonly activity: "observation";
+	};
 }
 
 export type DecisionFoldDetails =
@@ -530,6 +535,7 @@ export function createDecisionPromptMessage(
 			version: DECISION_PROTOCOL_VERSION,
 			exchangeId: input.exchangeId,
 			cycleId: input.cycleId,
+			...PROCESS_DOMAIN_OBSERVATION_DETAILS,
 		},
 	};
 }

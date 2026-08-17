@@ -181,6 +181,10 @@ test("builders emit exact decision and fold custom messages", () => {
 				version: DECISION_PROTOCOL_VERSION,
 				exchangeId: EXCHANGE_ID,
 				cycleId: 1,
+				"pi-process-domain": {
+					version: 1,
+					activity: "observation",
+				},
 			},
 		},
 	);

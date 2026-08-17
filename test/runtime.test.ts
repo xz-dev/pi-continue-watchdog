@@ -202,6 +202,7 @@ function createFenceHarness(options?: {
 	let snapshot = idleDomainSnapshot();
 	let confirmResult = true;
 	let deferred = false;
+	let invalidateDuringInternalBusy = false;
 	const pendingConfirms: PendingConfirm[] = [];
 	const internalDecisionMarks: boolean[] = [];
 	const listeners = new Set<
@@ -216,6 +217,14 @@ function createFenceHarness(options?: {
 		async markBusy(_instance, markOptions) {
 			if (options?.reject === "markBusy") throw new Error("markBusy failed");
 			internalDecisionMarks.push(markOptions?.internalDecision ?? false);
+			if (
+				invalidateDuringInternalBusy &&
+				markOptions?.internalDecision === true
+			) {
+				invalidateDuringInternalBusy = false;
+				snapshot = idleDomainSnapshot(snapshot.activityGeneration + 1n);
+				for (const listener of listeners) listener(snapshot, "domain");
+			}
 		},
 		async markIdle() {
 			if (options?.reject === "markIdle") throw new Error("markIdle failed");
@@ -265,6 +274,9 @@ function createFenceHarness(options?: {
 			if (notify) {
 				for (const listener of listeners) listener(snapshot, "domain");
 			}
+		},
+		invalidateNextInternalBusy(): void {
+			invalidateDuringInternalBusy = true;
 		},
 	};
 }
@@ -2022,6 +2034,84 @@ test("decision settle without agent_end reasks twice then decision-fails without
 			"Continue watchdog decision failed after 3 attempts: The decision response was malformed. End with the watchdog XML decision block.",
 		level: "warning",
 	});
+});
+
+test("submitted decision invalidated by domain activity still redacts its assistant", async () => {
+	const fence = createFenceHarness();
+	const harness = createHarness({ processDomain: fence.domain });
+	await startIdle(harness);
+	await harness.openDecision({ start: false });
+	await Promise.resolve();
+	await Promise.resolve();
+	fence.invalidateNextInternalBusy();
+	await harness.startDecision();
+
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.deepEqual(harness.sent.at(-1)?.message.details, {
+		version: 1,
+		exchangeId: "exchange-1",
+		cycleId: 1,
+		outcome: "invalidated",
+	});
+
+	const answer = harness.answerUnlock();
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: answer,
+	});
+	const replacement = (await harness.endDecisionMessage(
+		answer,
+	)) as DecisionMessageReplacement;
+	assert.deepEqual(replacement.message.content, []);
+	assert.equal(
+		harness.entries.some(
+			(entry) => entry.type === "pi-continue-watchdog:decision-audit",
+		),
+		false,
+	);
+	assert.equal(
+		harness.entries.some((entry) => entry.type === HUMAN_UNLOCK_ENTRY_TYPE),
+		false,
+	);
+
+	await harness.fire("agent_end", { type: "agent_end", messages: [answer] });
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(
+		await harness.endDecisionMessage(assistant([text("ordinary response")])),
+		undefined,
+	);
+});
+
+test("uncorrelated quarantine releases before an unrelated run", async () => {
+	const fence = createFenceHarness();
+	const harness = createHarness({ processDomain: fence.domain });
+	await startIdle(harness);
+	await harness.openDecision({ start: false });
+	await Promise.resolve();
+	await Promise.resolve();
+	fence.invalidateNextInternalBusy();
+
+	// agent_start invalidates during the provisional interval, before the exact
+	// decision custom input can correlate the quarantine to this run.
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: {
+			role: "user",
+			content: [text("ordinary user work")],
+			timestamp: Date.now(),
+		},
+	});
+	const ordinary = assistant([text("ordinary response")]);
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: ordinary,
+	});
+	assert.equal(await harness.endDecisionMessage(ordinary), undefined);
 });
 
 test("stale fenced valid continue does not consume retry or exhaust", async () => {
