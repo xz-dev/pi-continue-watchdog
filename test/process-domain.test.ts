@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type {
+	CycleCounterSnapshot,
 	DomainFence,
 	DomainSnapshot,
 	ProcessDomain,
@@ -32,6 +33,7 @@ class FakeDomain implements ProcessDomain {
 	closeCount = 0;
 	current = snapshot(1n);
 	listeners = new Set<(value: DomainSnapshot) => void>();
+	counterValues = new Map<string, CycleCounterSnapshot>();
 
 	snapshot(): DomainSnapshot {
 		return this.current;
@@ -55,6 +57,60 @@ class FakeDomain implements ProcessDomain {
 	async publish(): Promise<void> {}
 	subscribeSignals(): () => void {
 		return () => {};
+	}
+	private counter(name: string): CycleCounterSnapshot {
+		return (
+			this.counterValues.get(name) ?? {
+				name,
+				value: 0n,
+				paused: false,
+				generation: 1n,
+				ownerParticipantId: "owner",
+			}
+		);
+	}
+	async claimCycleCounter(name: string): Promise<CycleCounterSnapshot> {
+		const current = this.counter(name);
+		const next = {
+			...current,
+			generation:
+				current.ownerParticipantId === null
+					? current.generation + 1n
+					: current.generation,
+			ownerParticipantId: "owner",
+		};
+		this.counterValues.set(name, next);
+		return next;
+	}
+	async getCycleCounter(name: string): Promise<CycleCounterSnapshot> {
+		return this.counter(name);
+	}
+	subscribeCycleCounter(): () => void {
+		return () => {};
+	}
+	async incrementCycleCounter(
+		name: string,
+		delta = 1n,
+	): Promise<CycleCounterSnapshot> {
+		const current = this.counter(name);
+		const next = current.paused
+			? current
+			: { ...current, value: current.value + delta };
+		this.counterValues.set(name, next);
+		return next;
+	}
+	async resetCycleCounter(name: string): Promise<CycleCounterSnapshot> {
+		const next = { ...this.counter(name), value: 0n };
+		this.counterValues.set(name, next);
+		return next;
+	}
+	async setCycleCounterPaused(
+		name: string,
+		paused: boolean,
+	): Promise<CycleCounterSnapshot> {
+		const next = { ...this.counter(name), paused };
+		this.counterValues.set(name, next);
+		return next;
 	}
 	async confirm(fence: DomainFence): Promise<boolean> {
 		return (
@@ -86,7 +142,7 @@ test("one coordinator opens one participant and aggregates attachments", async (
 		pid: 100,
 		open: async () => {
 			opens += 1;
-			return { domain, created: true };
+			return { domain, created: true, hosted: true };
 		},
 	});
 	const first = {};
@@ -114,7 +170,7 @@ test("final root detach resets topology and clears its marker", async () => {
 	const coordinator = createProcessDomainCoordinator({
 		env,
 		pid: 100,
-		open: async () => ({ domain, created: true }),
+		open: async () => ({ domain, created: true, hosted: true }),
 	});
 	const attachment = {};
 	await coordinator.attach(attachment, { initialBusy: false, onFatal() {} });
@@ -135,6 +191,7 @@ test("reattach after final root detach creates a fresh root", async () => {
 		open: async () => ({
 			domain: domains[opens++] as FakeDomain,
 			created: true,
+			hosted: true,
 		}),
 	});
 	const first = {};
@@ -174,6 +231,7 @@ test("concurrent final detach and attach wait for teardown then open a fresh roo
 		open: async () => ({
 			domain: domains[opens++] as FakeDomain,
 			created: true,
+			hosted: true,
 		}),
 	});
 	const first = {};
@@ -207,7 +265,7 @@ test("final observer detach preserves the inherited foreign marker", async () =>
 	const coordinator = createProcessDomainCoordinator({
 		env,
 		pid: 200,
-		open: async () => ({ domain, created: false }),
+		open: async () => ({ domain, created: false, hosted: false }),
 	});
 	const attachment = {};
 	await coordinator.attach(attachment, { initialBusy: false, onFatal() {} });
@@ -224,7 +282,7 @@ test("final root detach preserves a replaced foreign marker", async () => {
 	const coordinator = createProcessDomainCoordinator({
 		env,
 		pid: 100,
-		open: async () => ({ domain, created: true }),
+		open: async () => ({ domain, created: true, hosted: true }),
 	});
 	const attachment = {};
 	await coordinator.attach(attachment, { initialBusy: false, onFatal() {} });
@@ -243,7 +301,7 @@ test("a predeclared domain without a marker is observer-only", async () => {
 	const coordinator = createProcessDomainCoordinator({
 		env,
 		pid: 200,
-		open: async () => ({ domain, created: false }),
+		open: async () => ({ domain, created: false, hosted: false }),
 	});
 	await coordinator.attach({}, { initialBusy: false, onFatal() {} });
 	assert.equal(coordinator.isRootProcess, false);
@@ -255,7 +313,7 @@ test("a different inherited pid is observer-only", async () => {
 	const coordinator = createProcessDomainCoordinator({
 		env: declaredEnv("100"),
 		pid: 200,
-		open: async () => ({ domain, created: false }),
+		open: async () => ({ domain, created: false, hosted: false }),
 	});
 	await coordinator.attach({}, { initialBusy: false, onFatal() {} });
 	assert.equal(coordinator.isRootProcess, false);
@@ -327,9 +385,9 @@ test("failed initial attach rolls back and a later attachment opens fresh", asyn
 				opens += 1;
 				if (opens === 1) {
 					if (failure === "open") throw new Error("transient open failure");
-					return { domain: failedDomain, created: true };
+					return { domain: failedDomain, created: true, hosted: true };
 				}
-				return { domain, created: true };
+				return { domain, created: true, hosted: true };
 			},
 		});
 		await assert.rejects(
@@ -386,6 +444,7 @@ test("final root detach recovers from a rejected write and reopens fresh", async
 		open: async () => ({
 			domain: domains[opens++] as FakeDomain,
 			created: true,
+			hosted: true,
 		}),
 	});
 	const first = {};
@@ -417,7 +476,7 @@ test("final detach does not hide a close failure", async () => {
 	const coordinator = createProcessDomainCoordinator({
 		env: {},
 		pid: 100,
-		open: async () => ({ domain, created: true }),
+		open: async () => ({ domain, created: true, hosted: true }),
 	});
 	const attachment = {};
 	await coordinator.attach(attachment, { initialBusy: false, onFatal() {} });
@@ -441,7 +500,7 @@ test("a rejected runtime write does not poison later coordinator writes", async 
 	const coordinator = createProcessDomainCoordinator({
 		env: declaredEnv(),
 		pid: 100,
-		open: async () => ({ domain, created: false }),
+		open: async () => ({ domain, created: false, hosted: false }),
 	});
 	const attachment = {};
 	await coordinator.attach(attachment, { initialBusy: false, onFatal() {} });
@@ -456,7 +515,7 @@ test("subscriptions and fence confirmation use the broker view", async () => {
 	const coordinator = createProcessDomainCoordinator({
 		env: declaredEnv(),
 		pid: 100,
-		open: async () => ({ domain, created: false }),
+		open: async () => ({ domain, created: false, hosted: false }),
 	});
 	const seen: bigint[] = [];
 	const sources: Array<"local" | "domain"> = [];

@@ -345,14 +345,15 @@ export function extractTrailingWatchdogXml(
 	fullNonThinkingAssistantText: string,
 ): string | null {
 	const trimmed = fullNonThinkingAssistantText.trim();
-	if (!trimmed.endsWith("</watchdog>")) return null;
+	const lowered = trimmed.toLowerCase();
+	if (!lowered.endsWith("</watchdog>")) return null;
 
-	const startIndex = trimmed.lastIndexOf("<watchdog>");
+	const startIndex = lowered.lastIndexOf("<watchdog>");
 	if (startIndex === -1) return null;
-	if (trimmed.indexOf("<watchdog>") !== startIndex) return null;
+	if (lowered.indexOf("<watchdog>") !== startIndex) return null;
 
-	const closeIndex = trimmed.indexOf("</watchdog>");
-	if (closeIndex !== trimmed.lastIndexOf("</watchdog>")) return null;
+	const closeIndex = lowered.indexOf("</watchdog>");
+	if (closeIndex !== lowered.lastIndexOf("</watchdog>")) return null;
 
 	return trimmed.slice(startIndex);
 }
@@ -370,9 +371,9 @@ export function parseWatchdogDecisionXml(
 	const document = extractTrailingWatchdogXml(raw);
 	if (document === null) return { ok: false };
 
-	// Reject attribute-bearing roots such as `<watchdog id="x">...` even though
-	// lastIndexOf("<watchdog>") can land on their prefix.
-	if (!document.startsWith("<watchdog>")) return { ok: false };
+	// Reject attribute-bearing roots such as `<watchdog id="x">...`.
+	const lowered = document.toLowerCase();
+	if (!lowered.startsWith("<watchdog>")) return { ok: false };
 	let index = "<watchdog>".length;
 
 	const seenRequired = new Set<string>();
@@ -382,7 +383,7 @@ export function parseWatchdogDecisionXml(
 
 	while (true) {
 		index = skipWhitespace(document, index);
-		if (document.startsWith("</watchdog>", index)) {
+		if (lowered.startsWith("</watchdog>", index)) {
 			index += "</watchdog>".length;
 			// Extraction already requires the document to end at this close tag.
 			if (index !== document.length || functionName === undefined) {
@@ -417,22 +418,27 @@ export function parseWatchdogDecisionXml(
 		if (text === null) return { ok: false };
 		index = text.next;
 		const close = `</${openName.name}>`;
-		if (!document.startsWith(close, index)) return { ok: false };
+		if (
+			document.slice(index, index + close.length).toLowerCase() !==
+			close.toLowerCase()
+		)
+			return { ok: false };
 		index += close.length;
+		const normalizedName = openName.name.toLowerCase();
 
 		if (
-			openName.name !== "function" &&
-			openName.name !== "reason_type" &&
-			openName.name !== "reason_content"
+			normalizedName !== "function" &&
+			normalizedName !== "reason_type" &&
+			normalizedName !== "reason_content"
 		) {
 			// Extra simple text elements are intentionally ignored.
 			continue;
 		}
-		if (seenRequired.has(openName.name)) return { ok: false };
-		seenRequired.add(openName.name);
+		if (seenRequired.has(normalizedName)) return { ok: false };
+		seenRequired.add(normalizedName);
 
-		if (openName.name === "function") functionName = text.text.trim();
-		else if (openName.name === "reason_type") reasonType = text.text;
+		if (normalizedName === "function") functionName = text.text.trim();
+		else if (normalizedName === "reason_type") reasonType = text.text;
 		else reasonContent = text.text;
 	}
 }
@@ -442,7 +448,7 @@ function validateParsedFields(
 	reasonTypes: readonly string[],
 	continueReasonTypes: readonly string[],
 ): DecisionValidation {
-	if (fields.functionName === "continue_watchdog") {
+	if (fields.functionName.trim().toLowerCase() === "continue_watchdog") {
 		if (fields.reasonType === undefined || fields.reasonContent === undefined) {
 			return { valid: false, error: MISSING_CONTINUE_FIELDS_ERROR };
 		}
@@ -468,7 +474,7 @@ function validateParsedFields(
 			},
 		};
 	}
-	if (fields.functionName !== "unlock_continue_watchdog") {
+	if (fields.functionName.trim().toLowerCase() !== "unlock_continue_watchdog") {
 		return { valid: false, error: INVALID_DECISION_XML_ERROR };
 	}
 	if (fields.reasonType === undefined || fields.reasonContent === undefined) {

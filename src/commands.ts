@@ -1,10 +1,17 @@
 import type {
+	CustomEntry,
 	EntryRenderer,
 	ExtensionAPI,
 	ExtensionCommandContext,
 	Theme,
 } from "@earendil-works/pi-coding-agent";
-import { Box, Text, visibleWidth } from "@earendil-works/pi-tui";
+import {
+	Box,
+	Text,
+	type TUI,
+	truncateToWidth,
+	visibleWidth,
+} from "@earendil-works/pi-tui";
 
 import type { ControllerEffect, LockDecisionController } from "./controller.js";
 import type { HubMainClaim } from "./hub.js";
@@ -17,6 +24,8 @@ import type {
 export const LOCK_CONTINUE_WATCHDOG_COMMAND = "lock-continue-watchdog";
 export const UNLOCK_CONTINUE_WATCHDOG_COMMAND = "unlock-continue-watchdog";
 export const STATUS_CONTINUE_WATCHDOG_COMMAND = "status-continue-watchdog";
+export const CONTINUE_TIMELINE_COMMAND = "continue-timeline";
+export const MANUAL_LOCK_ENTRY_TYPE = "pi-continue-watchdog:manual-lock";
 
 export const LOCK_COMMAND_DESCRIPTION = "Lock the continue watchdog.";
 export const UNLOCK_COMMAND_DESCRIPTION =
@@ -27,6 +36,10 @@ export const STATUS_COMMAND_DESCRIPTION =
 /** Persisted TUI-only entry for every accepted automatic continue. */
 export const CONTINUE_ENTRY_TYPE = "pi-continue-watchdog:continue";
 export const CONTINUE_ENTRY_TEXT = "Continue watchdog continued";
+
+export interface ManualLockEntry {
+	readonly timestamp: string;
+}
 
 export interface ContinueEntry {
 	readonly reasonType: string;
@@ -296,6 +309,111 @@ export function normaliseHumanUnlockReason(args: string): string | undefined {
 	return characters.slice(0, 500).join("");
 }
 
+const TIMELINE_TYPES = new Set([
+	MANUAL_LOCK_ENTRY_TYPE,
+	CONTINUE_ENTRY_TYPE,
+	HUMAN_UNLOCK_ENTRY_TYPE,
+	WATCHDOG_STATUS_ENTRY_TYPE,
+]);
+
+function timelineLine(entry: CustomEntry<unknown>): string | null {
+	if (!TIMELINE_TYPES.has(entry.customType)) return null;
+	const data = entry.data as Record<string, unknown> | undefined;
+	if (entry.customType === MANUAL_LOCK_ENTRY_TYPE)
+		return `manual lock · ${String(data?.timestamp ?? entry.timestamp)}`;
+	if (entry.customType === WATCHDOG_STATUS_ENTRY_TYPE)
+		return `${String(data?.kind ?? "status")} · ${String(data?.message ?? "")}`;
+	if (entry.customType === CONTINUE_ENTRY_TYPE)
+		return `continue · ${String(data?.reasonType ?? "")}${data?.reason ? ` · ${String(data.reason)}` : ""}`;
+	if (entry.customType === HUMAN_UNLOCK_ENTRY_TYPE)
+		return `${data?.reasonType ? "AI unlock" : "human unlock"} · ${String(data?.reason ?? "")}`;
+	if (data?.kind === "decision-failed")
+		return `decision-failed · ${String(data.message ?? "")}`;
+	return null;
+}
+
+export function formatContinueTimeline(
+	branch: readonly { readonly type: string }[],
+): string {
+	const entries = branch
+		.filter((entry): entry is CustomEntry<unknown> => entry.type === "custom")
+		.map(timelineLine)
+		.filter((line): line is string => line !== null)
+		.slice(-100);
+	const text =
+		entries.length === 0
+			? "No key continue-watchdog events on the current branch."
+			: entries.join("\n");
+	return Array.from(text).length <= 16_384
+		? text
+		: `${Array.from(text).slice(0, 16_381).join("")}...`;
+}
+
+class TimelineComponent {
+	private offset = 0;
+	private readonly lines: string[];
+	constructor(
+		private readonly tui: TUI,
+		private readonly theme: Theme,
+		private readonly done: () => void,
+		text: string,
+	) {
+		this.lines = text.split("\n");
+	}
+	handleInput(data: string): void {
+		if (data === "q" || data === "\u001b" || data === "\u0003") {
+			this.done();
+			return;
+		}
+		if (data === "\u001b[A" || data === "k")
+			this.offset = Math.max(0, this.offset - 1);
+		else if (data === "\u001b[B" || data === "j")
+			this.offset = Math.min(
+				Math.max(0, this.lines.length - 20),
+				this.offset + 1,
+			);
+		else if (data === "\u001b[5~") this.offset = Math.max(0, this.offset - 20);
+		else if (data === "\u001b[6~")
+			this.offset = Math.min(
+				Math.max(0, this.lines.length - 20),
+				this.offset + 20,
+			);
+		else return;
+		this.tui.requestRender();
+	}
+	render(width: number): string[] {
+		const inner = Math.max(1, width - 2);
+		return [
+			this.theme.fg("border", "─".repeat(inner)),
+			this.theme.fg(
+				"accent",
+				truncateToWidth(
+					"Continue timeline · ↑↓/jk scroll · q/Esc close",
+					inner,
+				),
+			),
+			...this.lines
+				.slice(this.offset, this.offset + 20)
+				.map((line) => truncateToWidth(line, inner)),
+			this.theme.fg("border", "─".repeat(inner)),
+		];
+	}
+	invalidate(): void {}
+}
+
+export async function showContinueTimeline(
+	ctx: ExtensionCommandContext,
+): Promise<void> {
+	const text = formatContinueTimeline(ctx.sessionManager.getBranch());
+	if (ctx.mode !== "tui") {
+		ctx.ui.notify(text);
+		return;
+	}
+	await ctx.ui.custom<void>(
+		(tui, theme, _keys, done) => new TimelineComponent(tui, theme, done, text),
+	);
+}
+
 function notificationFor(
 	effect: Extract<ControllerEffect, { kind: "notify" }>,
 ): string {
@@ -330,6 +448,12 @@ async function applyControllerEffects(
 
 		await runtime.applyEffect(effect, ctx);
 	}
+}
+
+function appendManualLockEntry(pi: ExtensionAPI): void {
+	pi.appendEntry<ManualLockEntry>(MANUAL_LOCK_ENTRY_TYPE, {
+		timestamp: new Date().toISOString(),
+	});
 }
 
 function currentControllerClaim(runtime: MainCommandRuntime): {
@@ -396,10 +520,12 @@ export function formatWatchdogTriggerStatus(
 }
 
 async function handleLock(
+	pi: ExtensionAPI,
 	runtime: MainCommandRuntime,
 	ctx: ExtensionCommandContext,
 ): Promise<void> {
 	await runtime.restartLockCycle(ctx, { notifyLocked: true });
+	if (runtime.isCurrentMain()) appendManualLockEntry(pi);
 }
 
 function handleStatus(
@@ -464,9 +590,22 @@ export function createMainCommands(
 		HUMAN_UNLOCK_ENTRY_TYPE,
 		createHumanUnlockEntryRenderer(),
 	);
+	pi.registerEntryRenderer<ManualLockEntry>(
+		MANUAL_LOCK_ENTRY_TYPE,
+		(entry, _options, theme) =>
+			createStaticTextComponent(
+				`Continue watchdog manual lock · ${entry.data?.timestamp ?? ""}`,
+				theme,
+			),
+	);
 	pi.registerCommand(LOCK_CONTINUE_WATCHDOG_COMMAND, {
 		description: LOCK_COMMAND_DESCRIPTION,
-		handler: async (_args, ctx) => handleLock(runtime, ctx),
+		handler: async (_args, ctx) => handleLock(pi, runtime, ctx),
+	});
+	pi.registerCommand(CONTINUE_TIMELINE_COMMAND, {
+		description:
+			"Show key continue-watchdog events on the current session branch",
+		handler: async (_args, ctx) => showContinueTimeline(ctx),
 	});
 	pi.registerCommand(UNLOCK_CONTINUE_WATCHDOG_COMMAND, {
 		description: UNLOCK_COMMAND_DESCRIPTION,
