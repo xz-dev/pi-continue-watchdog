@@ -16,6 +16,7 @@ import {
 	createHumanUnlockEntryRenderer,
 	createMainCommands,
 	createWatchdogStatusEntryRenderer,
+	formatContinueTimeline,
 	formatUnlockEntryText,
 	formatWatchdogTriggerStatus,
 	HUMAN_UNLOCK_ENTRY_TYPE,
@@ -201,6 +202,7 @@ test("Slice 4 RED: registers the exact human command names, descriptions, and TU
 		[...harness.commands.keys()],
 		[
 			LOCK_CONTINUE_WATCHDOG_COMMAND,
+			"continue-timeline",
 			UNLOCK_CONTINUE_WATCHDOG_COMMAND,
 			STATUS_CONTINUE_WATCHDOG_COMMAND,
 		],
@@ -377,7 +379,12 @@ test("Examples 2-3 RED: same-state human lock/unlock are unconditional and notif
 		"Continue watchdog unlocked",
 	]);
 	assert.equal(harness.controller.snapshot.locked, false);
-	assert.deepEqual(harness.entries, []);
+	assert.equal(
+		harness.entries.filter(
+			(entry) => entry.customType === "pi-continue-watchdog:manual-lock",
+		).length,
+		2,
+	);
 });
 
 test("Examples 2-3 RED: command transitions reset exhausted or decision-failed state and dispatch every pending effect before notification", async () => {
@@ -604,6 +611,59 @@ test("Example 7: AI typed unlock entry renders TYPE · reason; human stays untyp
 	assert.ok(!formatUnlockEntryText("Waiting for input").includes(" · · "));
 });
 
+test("continue timeline includes the five default key event kinds from the branch", () => {
+	const entry = (
+		customType: string,
+		data: unknown,
+		timestamp = "2026-01-01",
+	) => ({
+		type: "custom",
+		customType,
+		data,
+		timestamp,
+	});
+	assert.equal(
+		formatContinueTimeline([
+			entry("pi-continue-watchdog:manual-lock", { timestamp: "manual-time" }),
+			entry("pi-continue-watchdog:continue", {
+				reasonType: "WORK_REMAINS",
+				reason: "finish it",
+			}),
+			entry("pi-continue-watchdog:unlock", {
+				reasonType: "DONE",
+				reason: "complete",
+			}),
+			entry("pi-continue-watchdog:unlock", { reason: "human stop" }),
+			entry("pi-continue-watchdog:status", {
+				kind: "decision-failed",
+				message: "invalid XML",
+			}),
+		]),
+		[
+			"manual lock · manual-time",
+			"continue · WORK_REMAINS · finish it",
+			"AI unlock · complete",
+			"human unlock · human stop",
+			"decision-failed · invalid XML",
+		].join("\n"),
+	);
+});
+
+test("continue timeline fallback is Unicode bounded", () => {
+	const text = formatContinueTimeline(
+		Array.from({ length: 100 }, (_, index) => ({
+			type: "custom",
+			customType: "pi-continue-watchdog:continue",
+			data: {
+				reasonType: "WORK_REMAINS",
+				reason: `😀${index}${"x".repeat(500)}`,
+			},
+			timestamp: "2026-01-01",
+		})),
+	);
+	assert.ok(Array.from(text).length <= 16_384);
+});
+
 test("Slice 4 RED: stale or demoted command handlers are inert", async () => {
 	const harness = createHarness();
 	await harness.invoke(LOCK_CONTINUE_WATCHDOG_COMMAND);
@@ -615,6 +675,11 @@ test("Slice 4 RED: stale or demoted command handlers are inert", async () => {
 
 	assert.deepEqual(harness.controller.snapshot, before);
 	assert.deepEqual(harness.notifications, ["Continue watchdog locked"]);
-	assert.deepEqual(harness.entries, []);
+	assert.equal(
+		harness.entries.filter(
+			(entry) => entry.customType === "pi-continue-watchdog:manual-lock",
+		).length,
+		1,
+	);
 	assert.deepEqual(harness.effects, []);
 });

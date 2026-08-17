@@ -109,6 +109,28 @@ test("validator accepts one trailing continue XML block after narration and igno
 	);
 });
 
+test("watchdog XML root, fields, and function are case-insensitive", () => {
+	assert.deepEqual(
+		validateDecisionResponse(
+			response([
+				text(
+					"<WaTcHdOg><FuNcTiOn>CoNtInUe_WaTcHdOg</FuNcTiOn><ReAsOn_TyPe>work_remains</ReAsOn_TyPe><ReAsOn_CoNtEnT>still working</ReAsOn_CoNtEnT></wAtChDoG>",
+				),
+			]),
+			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
+		),
+		{
+			valid: true,
+			decision: {
+				kind: "continue",
+				reasonType: "WORK_REMAINS",
+				reason: "still working",
+			},
+		},
+	);
+});
+
 test("validator rejects multiple watchdog blocks anywhere in one response", () => {
 	for (const value of [
 		`${continueXml()}\n${continueXml()}`,
