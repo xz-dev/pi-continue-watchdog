@@ -474,14 +474,14 @@ The folder fails closed in those cases to avoid deleting genuine user conversati
 same-process watchdog attachments
   -> local hub (main election) + exact attachment activity
   -> one watchdog-owned coordinator / one pi-extension-utils transport node
-  -> root-created ZeroMQ bootstrap + per-node ROUTER endpoints
+  -> root-created loopback TCP listener + one framed connection per peer
   <- inherited child/nested Pi observer nodes
 ```
 
 `pi-extension-utils` supplies authenticated transport, peer status, directed/broadcast JSON data, and Pi lifecycle facts. It does not own watchdog counters or decisions. The watchdog coordinator reduces local attachments plus remote activity into immutable certain/all-idle snapshots and `{domainEpoch, activityGeneration}` fences. The root captures a fence for each aggregate grace/decision and confirms it before automatic effects. Root's artificial watchdog decision run is suppressed only for that exact local attachment; any other local or remote work invalidates the decision. Stale automated exchanges are folded by the shared inquiry protocol.
 
-The root is the only endpoint creator and decision authority. ZeroMQ wildcard binding selects IPC from `zeromq.capability.ipc`, falling back to loopback TCP only when IPC is unavailable. Each authenticated node gets a dedicated ROUTER endpoint so heartbeat disconnect maps to one exact peer. `PI_CONTINUE_WATCHDOG_ROOT_PID` marks creator topology; the inherited `PI_EXTENSION_UTILS_PROCESS_DOMAIN` declaration carries the bootstrap endpoint and capability. Final root detach closes the transport and clears only declarations it still owns.
+The root is the only endpoint creator and decision authority. It binds one ephemeral loopback TCP listener; each authenticated node owns one framed connection, so disconnect maps to one exact peer. `PI_CONTINUE_WATCHDOG_ROOT_PID` marks creator topology; the inherited `PI_EXTENSION_UTILS_PROCESS_DOMAIN` declaration carries the listener endpoint and capability. Final root detach closes the transport and clears only declarations it still owns.
 
-Initial declaration/authentication/transport failures are terminal and sanitized (exit 78). TUI/RPC request Pi's public graceful shutdown with a bounded nonzero fallback; print/json use the bounded fallback because public shutdown is a no-op there. Runtime heartbeat disconnect makes coordinator certainty false and blocks automatic effects until that peer reconnects and sends fresh activity. The extension never prints capabilities, HMAC proofs, raw declarations, or endpoint details.
+Initial declaration/authentication/transport failures are terminal and sanitized (exit 78). TUI/RPC request Pi's public graceful shutdown with a bounded nonzero fallback; print/json use the bounded fallback because public shutdown is a no-op there. Application ping/pong liveness makes coordinator certainty false for a disconnected or frozen peer and blocks automatic effects until it reconnects, completes a fresh HMAC handshake, and sends fresh activity. The extension never prints capabilities, HMAC proofs, raw declarations, or endpoint details.
 
 Coverage begins when an inherited watchdog completes `session_start` and reports activity. Stripped environments and children without watchdog are not observable. Coverage starts only after activity registration; no earlier guarantee is claimed.

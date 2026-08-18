@@ -826,6 +826,6 @@ Pi packages 本身是受信任、拥有完整本机权限的代码，因此 regi
 
 The earlier same-process-only conclusion is superseded for watchdog-loaded inherited Pi processes by the reviewed `pi-extension-utils` transport.
 
-The shipped design uses one process-wide watchdog coordinator and one authenticated transport node per process. The utility package provides ZeroMQ endpoints, peer liveness, directed/broadcast data, and lifecycle facts; the watchdog owns local/remote busy reduction, certainty, generations, confirmation fences, and decision state. Only the root process owns decisions. A heartbeat-disconnected participant remains conservatively blocking until it reconnects and sends fresh activity.
+The shipped design uses one process-wide watchdog coordinator and one authenticated transport node per process. The utility package provides a framed loopback TCP listener/connection topology, application ping/pong liveness, directed/broadcast data, and lifecycle facts; the watchdog owns local/remote busy reduction, certainty, generations, confirmation fences, and decision state. Only the root process owns decisions. A disconnected or frozen participant remains conservatively blocking until it reconnects through a fresh HMAC handshake and sends fresh activity.
 
 Guarantee boundaries remain explicit: observation begins after inherited watchdog `session_start` and activity registration. Stripped/replaced environment declarations and children that do not load watchdog cannot be observed; no pre-registration guarantee is claimed.
