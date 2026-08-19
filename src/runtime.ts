@@ -9,6 +9,11 @@ import {
 	type MessageEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import {
+	createInquiryRuntime,
+	type InquiryAttemptHandle,
+	type InquiryFoldMessage,
+} from "pi-extension-utils/pi-inquiry";
 
 import {
 	type ActivityGeneration,
@@ -26,7 +31,7 @@ import { BUILT_IN_CONFIG, type ContinueWatchdogConfig } from "./config.js";
 import { type LoadedConfig, loadRuntimeConfig } from "./config-loader.js";
 import {
 	createDecisionFoldMessage,
-	createDecisionPromptMessage,
+	DECISION_INQUIRY_NAMESPACE,
 	findDecisionAssistantEntryId,
 	findPreemptedDecisionAssistantEntryIds,
 	INQUIRY_MARKER_ENTRY_TYPE,
@@ -125,6 +130,7 @@ interface ActiveDecision {
 	readonly claim: HubMainClaim;
 	readonly protocol: DecisionProtocolSession;
 	readonly domainFence: DomainFence;
+	inquiry: InquiryAttemptHandle;
 	aggregateGeneration: ActivityGeneration;
 	invalidated: boolean;
 	/** True while a public fire-and-forget dispatch awaits matching lifecycle. */
@@ -154,6 +160,7 @@ interface UninterruptibleMessageEndAPI {
 		event: "message_end",
 		handler: (
 			event: MessageEndEvent,
+			ctx: ExtensionContext,
 		) => { readonly message: MessageEndEvent["message"] } | undefined,
 		options: { readonly uninterruptible: true },
 	): void;
@@ -190,7 +197,6 @@ export type WatchdogTriggerBlocker =
 	| "unlocked"
 	| "exhausted"
 	| "decision-failed"
-	| "domain-uncertain"
 	| "observable-agent-busy"
 	| "local-agent-busy"
 	| "pending-messages"
@@ -248,9 +254,12 @@ export interface DecisionRuntime {
 		},
 	): void;
 	reconcileIdle(): void;
-	handleMessageStart(event: { readonly message: unknown }): Promise<void>;
+	handleMessageStart(
+		event: { readonly message: unknown },
+		ctx?: ExtensionContext,
+	): Promise<void>;
 	registerLifecycle(): void;
-	shutdown(): Promise<void>;
+	shutdown(ctx?: ExtensionContext): Promise<void>;
 }
 
 function terminalAssistant(messages: readonly unknown[]): unknown | undefined {
@@ -330,8 +339,6 @@ export function createDecisionRuntime(
 	let domainAttached = false;
 	let domainReady = options.processDomain === undefined;
 	let domainFatal = false;
-	/** The current busy run was confirmed as an internal watchdog decision. */
-	let domainInternalDecision = false;
 	let ownedClaim: HubMainClaim | null = null;
 	let sessionContext: ExtensionContext | null = null;
 	let configLoad: Promise<void> | null = null;
@@ -340,9 +347,6 @@ export function createDecisionRuntime(
 	let localActivityGeneration = 0;
 	/** Binary AI lifecycle state: agent_start = busy, true agent_settled = idle. */
 	let localAiBusy = true;
-	let observedPendingMessages = false;
-	/** Bumps when a deferred settled-phase callback is scheduled; only the latest acts. */
-	let settledCallbackGeneration = 0;
 	let stopped = false;
 	let activeDecision: ActiveDecision | null = null;
 	let selfDecisionRun: SelfDecisionRun = { kind: "none" };
@@ -364,6 +368,8 @@ export function createDecisionRuntime(
 		readonly cycleId: number;
 	} | null = null;
 	let pendingFinalization: PendingFinalization | null = null;
+	/** Retried until Pi accepts the exact correlated remove-fold. */
+	let pendingInquiryCleanup: InquiryFoldMessage | null = null;
 	/** Retained only for AI decision unlock until the next all-idle settle. */
 	let pendingAiUnlock: {
 		readonly reasonType: string;
@@ -374,6 +380,8 @@ export function createDecisionRuntime(
 	let activeStatus: WatchdogStatusEntry | null = null;
 	let statusTui: { requestRender(): void } | null = null;
 	let statusWidgetRegistered = false;
+	/** Distinguishes this runtime's synchronous hub report from child reports. */
+	let publishingOwnHubObservation = false;
 
 	const isRootProcess = (): boolean =>
 		domainReady &&
@@ -388,13 +396,9 @@ export function createDecisionRuntime(
 	const owns = (claim: HubMainClaim): boolean =>
 		!stopped && isRootProcess() && options.hub.isCurrentMain(claim);
 
-	const domainIdle = (): boolean => {
-		if (options.processDomain === undefined) {
-			return options.hub.snapshot.allObservableIdle;
-		}
-		const snapshot = options.processDomain.snapshot;
-		return snapshot.certain && snapshot.allIdle;
-	};
+	const domainIdle = (): boolean =>
+		options.processDomain?.snapshot.allIdle ??
+		options.hub.snapshot.allObservableIdle;
 
 	const isCurrentMain = (): boolean => {
 		const claim = getMainClaim();
@@ -507,15 +511,51 @@ export function createDecisionRuntime(
 		message: "Continue watchdog checking",
 	});
 
+	const retainInquiryCleanup = (
+		active: ActiveDecision,
+		watchdogOutcome?: "invalidated" | "preempted",
+	): InquiryFoldMessage | null => {
+		const fold = active.inquiry.cancel();
+		if (fold === null) return null;
+		pendingInquiryCleanup =
+			watchdogOutcome === undefined
+				? fold
+				: {
+						...fold,
+						details: {
+							...fold.details,
+							watchdogOutcome,
+						} as InquiryFoldMessage["details"],
+					};
+		return pendingInquiryCleanup;
+	};
+
+	const retryInquiryCleanup = (): void => {
+		const cleanup = pendingInquiryCleanup;
+		if (cleanup === null) return;
+		try {
+			options.pi.sendMessage(cleanup, {
+				triggerTurn: false,
+				deliverAs: "steer",
+			});
+			if (pendingInquiryCleanup === cleanup) pendingInquiryCleanup = null;
+		} catch {
+			// The same idempotent remove-fold is retried at terminal public events.
+		}
+	};
+
 	/**
 	 * Invalidate runtime-local decision state after a controller transition.
 	 * Does not change controller lock/cycle accounting.
 	 */
 	const clearOperationalPendingWork = (): void => {
 		localActivityGeneration += 1;
+		if (activeDecision !== null) {
+			retainInquiryCleanup(activeDecision);
+			retryInquiryCleanup();
+		}
 		activeDecision = null;
 		selfDecisionRun = { kind: "none" };
-		domainInternalDecision = false;
 		suppressDecisionAbort = false;
 		capturedDecisionResponse = null;
 		decisionAssistantToSplice = null;
@@ -543,7 +583,6 @@ export function createDecisionRuntime(
 		if (active !== null) invalidateActiveDecision(true);
 		domainFatal = true;
 		domainReady = false;
-		domainInternalDecision = false;
 		clearOperationalPendingWork();
 		if (quarantine) {
 			// The trigger turn already started. Abort it and retain both tool blocking
@@ -588,7 +627,7 @@ export function createDecisionRuntime(
 		}
 	};
 
-	/** Binary local AI state; tool/output/provider-wait subphases stay busy. */
+	/** Last live public Pi activity observation for this attachment. */
 	const localIdle = (): boolean => !localAiBusy;
 	/** Public queued-message signal present in every supported upstream Pi. */
 	const hasPendingMessages = (): boolean => {
@@ -668,7 +707,6 @@ export function createDecisionRuntime(
 	let qualifyReady = (_generation: ActivityGeneration): void => {};
 	const createGraceCoordinator = () =>
 		createActivityGraceCoordinator({
-			graceSeconds: config.idleDelaySeconds,
 			clock: {
 				setTimeout: (callback, delayMs) => clock.setTimeout(callback, delayMs),
 				clearTimeout: (handle) => clock.clearTimeout(handle),
@@ -684,9 +722,25 @@ export function createDecisionRuntime(
 	 * no continue/invalid retry, append no error card, and recover after the next
 	 * genuine agent_settled.
 	 */
-	const deferDecisionOnBusy = (active: ActiveDecision): void => {
+	const deferDecisionOnBusy = (
+		active: ActiveDecision,
+		cleanupOutcome?: "preempted",
+		deferCleanupSend = false,
+	): void => {
 		if (active.invalidated) return;
+		if (
+			cleanupOutcome === undefined &&
+			(active.submitted || selfRunFor(active))
+		) {
+			quarantinedDecision = {
+				exchangeId: active.exchangeId,
+				cycleId: active.protocol.currentCycleId,
+				inputObserved: active.submitted,
+			};
+		}
 		active.invalidated = true;
+		retainInquiryCleanup(active, cleanupOutcome);
+		if (!deferCleanupSend) retryInquiryCleanup();
 		const controller = options.controllerHolder.controller;
 		capturedDecisionResponse = null;
 		pendingFinalization = null;
@@ -702,7 +756,6 @@ export function createDecisionRuntime(
 		}
 		activeDecision = null;
 		selfDecisionRun = { kind: "none" };
-		domainInternalDecision = false;
 		localActivityGeneration += 1;
 		observeAggregate();
 		// suppressDecisionAbort is owned by the user-takeover input hook and is
@@ -767,17 +820,12 @@ export function createDecisionRuntime(
 			throw error;
 		}
 		try {
-			options.pi.sendMessage(
-				createDecisionPromptMessage({
-					exchangeId: active.exchangeId,
-					cycleId,
-					decisionPrompt,
-				}),
-				{
-					triggerTurn: true,
-					deliverAs: "steer",
-				},
-			);
+			const prompt = active.inquiry.prompt(decisionPrompt);
+			if (!active.inquiry.markSent()) return false;
+			options.pi.sendMessage(prompt, {
+				triggerTurn: true,
+				deliverAs: "steer",
+			});
 			if (hasPendingMessages() || !activeGenerationCurrent(active)) {
 				deferDecisionOnBusy(active);
 				return false;
@@ -816,11 +864,22 @@ export function createDecisionRuntime(
 			domainEpoch: "local",
 			activityGeneration: 0n,
 		};
+		const exchangeId = createExchangeId();
+		const protocol = createDecisionProtocolSession({
+			controller,
+			decisionId,
+			decisionPrompt,
+			reasonTypes: config.reasonTypes,
+			continueReasonTypes: config.continueReasonTypes,
+		});
 		const active: ActiveDecision = {
 			decisionId,
-			exchangeId: createExchangeId(),
+			exchangeId,
 			claim,
 			domainFence,
+			inquiry: createInquiryRuntime(DECISION_INQUIRY_NAMESPACE, {
+				inquiryId: exchangeId,
+			}).attempt(protocol.currentCycleId),
 			aggregateGeneration: readyGeneration ??
 				graceCoordinator.snapshot.generation ?? {
 					domainEpoch: domainFence.domainEpoch,
@@ -831,13 +890,7 @@ export function createDecisionRuntime(
 			invalidated: false,
 			dispatchPending: false,
 			submitted: false,
-			protocol: createDecisionProtocolSession({
-				controller,
-				decisionId,
-				decisionPrompt,
-				reasonTypes: config.reasonTypes,
-				continueReasonTypes: config.continueReasonTypes,
-			}),
+			protocol,
 		};
 		activeDecision = active;
 		try {
@@ -969,8 +1022,6 @@ export function createDecisionRuntime(
 			blocker = "decision-open";
 		else if (pendingMessages) blocker = "pending-messages";
 		else if (!localIdle()) blocker = "local-agent-busy";
-		else if (domain !== undefined && !domain.certain)
-			blocker = "domain-uncertain";
 		else if (!externalHubIdle() || domain?.allIdle === false)
 			blocker = "observable-agent-busy";
 
@@ -1010,10 +1061,6 @@ export function createDecisionRuntime(
 			!controller.snapshot.decisionFailed &&
 			!controller.snapshot.decisionOpen;
 		const pendingMessages = hasPendingMessages();
-		if (pendingMessages !== observedPendingMessages) {
-			observedPendingMessages = pendingMessages;
-			localActivityGeneration += 1;
-		}
 		const allIdle =
 			!stopped &&
 			configReady &&
@@ -1021,13 +1068,14 @@ export function createDecisionRuntime(
 			owns(claim) &&
 			(domain === undefined
 				? options.hub.snapshot.allObservableIdle
-				: domain.certain && domain.allIdle) &&
+				: domain.allIdle) &&
 			externalHubIdle() &&
 			localIdle() &&
 			!pendingMessages &&
 			controllerEligible &&
 			activeDecision === null &&
 			pendingFinalization === null &&
+			pendingInquiryCleanup === null &&
 			selfDecisionRun.kind === "none";
 		return {
 			allIdle,
@@ -1052,6 +1100,9 @@ export function createDecisionRuntime(
 
 	qualifyReady = (generation): void => {
 		void (async () => {
+			// Timer expiry performs a fresh official Pi query before any decision logic.
+			const ctx = sessionContext;
+			if (ctx === null || !ctx.isIdle()) return;
 			const before = aggregateInput();
 			if (
 				!before.allIdle ||
@@ -1061,7 +1112,6 @@ export function createDecisionRuntime(
 					generation,
 				)
 			) {
-				observeAggregate();
 				return;
 			}
 			if (options.processDomain !== undefined) {
@@ -1083,11 +1133,10 @@ export function createDecisionRuntime(
 						return;
 					}
 					graceCoordinator.invalidate();
-					observeAggregate();
 					return;
 				}
 			}
-			observeAggregate();
+			if (!ctx.isIdle()) return;
 			const after = aggregateInput();
 			if (
 				!after.allIdle ||
@@ -1194,7 +1243,7 @@ export function createDecisionRuntime(
 		if (envelope === null || !allIdleForClaim(claim)) return;
 		if (options.processDomain !== undefined) {
 			const snapshot = options.processDomain.snapshot;
-			if (!snapshot.certain || !snapshot.allIdle) return;
+			if (!snapshot.allIdle) return;
 			try {
 				if (!(await options.processDomain.confirm(snapshot.fence))) return;
 			} catch {
@@ -1219,7 +1268,6 @@ export function createDecisionRuntime(
 	const dropControl = (): void => {
 		// Ownership has already been invalidated by the hub before cleanup starts.
 		// Safe to call again after re-entrant demotion — every step is idempotent.
-		settledCallbackGeneration += 1;
 		options.controllerHolder.controller?.unlock();
 		clearOperationalPendingWork();
 		options.controllerHolder.controller = null;
@@ -1328,9 +1376,10 @@ export function createDecisionRuntime(
 
 	const unsubscribe = options.hub.subscribe(() => {
 		if (stopped) return;
-		const ownDecisionOnly =
-			selfDecisionRun.kind !== "none" && options.hub.snapshot.busyCount <= 1;
-		if (!ownDecisionOnly) localActivityGeneration += 1;
+		if (!publishingOwnHubObservation) {
+			localActivityGeneration += 1;
+			invalidateActiveDecision(true);
+		}
 		syncHubState();
 	});
 
@@ -1341,7 +1390,7 @@ export function createDecisionRuntime(
 		const snapshot = options.processDomain?.snapshot;
 		if (
 			!force &&
-			snapshot?.certain &&
+			snapshot !== undefined &&
 			snapshot.fence.domainEpoch === active.domainFence.domainEpoch &&
 			snapshot.fence.activityGeneration ===
 				active.domainFence.activityGeneration
@@ -1361,6 +1410,7 @@ export function createDecisionRuntime(
 			};
 		}
 		active.invalidated = true;
+		const fold = retainInquiryCleanup(active, "invalidated");
 		localActivityGeneration += 1;
 		selfDecisionRun = { kind: "none" };
 		capturedDecisionResponse = null;
@@ -1374,30 +1424,13 @@ export function createDecisionRuntime(
 				claim: active.claim,
 			},
 		);
-		try {
-			options.pi.sendMessage(
-				createDecisionFoldMessage({
-					exchangeId: active.exchangeId,
-					cycleId: active.protocol.currentCycleId,
-					outcome: "invalidated",
-				}),
-				{ triggerTurn: false, deliverAs: "steer" },
-			);
-		} catch {
-			// Context folding is best effort; no external watchdog outcome is emitted.
-		}
+		if (fold !== null) retryInquiryCleanup();
 		observeAggregate();
 	}
 
 	const unsubscribeDomain = options.processDomain?.subscribe(
 		(_snapshot, source) => {
-			if (stopped || !domainReady) return;
-			if (domainInternalDecision && source === "local") {
-				// The current participant intentionally reports its own watchdog decision
-				// as broker-idle. Foreign domain updates still invalidate the decision.
-				syncHubState();
-				return;
-			}
+			if (stopped || !domainReady || source === "local") return;
 			invalidateActiveDecision();
 			syncHubState();
 		},
@@ -1544,6 +1577,10 @@ export function createDecisionRuntime(
 				deferDecisionOnBusy(active);
 				return false;
 			}
+			active.inquiry.complete();
+			active.inquiry = createInquiryRuntime(DECISION_INQUIRY_NAMESPACE, {
+				inquiryId: active.exchangeId,
+			}).attempt(active.protocol.currentCycleId);
 			try {
 				if (
 					!sendDecisionPrompt(
@@ -1625,8 +1662,10 @@ export function createDecisionRuntime(
 					}),
 					{ triggerTurn: false, deliverAs: "steer" },
 				);
+				active.inquiry.complete();
 			} catch {
-				// Fold is best effort; decision-failed state remains authoritative.
+				retainInquiryCleanup(active);
+				retryInquiryCleanup();
 			}
 			if (stopIfStale(claim)) return false;
 			try {
@@ -1726,8 +1765,14 @@ export function createDecisionRuntime(
 					}),
 					{ triggerTurn: true, deliverAs: "steer" },
 				);
+				active.inquiry.complete({
+					customType: "pi-continue-watchdog:continuation",
+					content: config.continuePrompt,
+				});
 			} catch {
 				if (!allIdleForClaim(claim)) return deferAcceptedContinue();
+				retainInquiryCleanup(active);
+				retryInquiryCleanup();
 				silentlyAbandonDecision();
 				return false;
 			}
@@ -1770,6 +1815,7 @@ export function createDecisionRuntime(
 				}),
 				{ triggerTurn: false, deliverAs: "steer" },
 			);
+			active.inquiry.complete();
 			if (stopIfStale(claim)) return false;
 			try {
 				options.pi.appendEntry<HumanUnlockEntry>(HUMAN_UNLOCK_ENTRY_TYPE, {
@@ -1781,6 +1827,8 @@ export function createDecisionRuntime(
 			}
 			stopIfStale(claim);
 		} catch {
+			retainInquiryCleanup(active);
+			retryInquiryCleanup();
 			// The controller is already unlocked and must not be re-armed.
 			stopIfStale(claim);
 		}
@@ -1816,7 +1864,16 @@ export function createDecisionRuntime(
 		};
 	};
 
-	const handleDecisionMessageEnd = (event: MessageEndEvent) => {
+	const handleDecisionMessageEnd = (
+		event: MessageEndEvent,
+		ctx?: ExtensionContext,
+	) => {
+		if (ctx !== undefined) {
+			retryInquiryCleanup();
+			observeLiveState(ctx, {
+				preserveGeneration: selfDecisionRun.kind !== "none",
+			});
+		}
 		if (quarantinedDecision !== null && event.message.role === "assistant") {
 			return {
 				message: neutralizeDecisionAssistant(
@@ -1873,7 +1930,12 @@ export function createDecisionRuntime(
 			};
 		}
 		const cycleId = active.protocol.currentCycleId;
-		const response = normalizeAssistantDecisionResponse(event.message);
+		const captured = active.inquiry.capture(event.message);
+		if (captured === null) return undefined;
+		const response = normalizeAssistantDecisionResponse({
+			...event.message,
+			content: [{ type: "text", text: captured }],
+		});
 		capturedDecisionResponse = { active, cycleId, response };
 		// The current prompt's run is over; until the next prompt (re-ask,
 		// continue, or fold) is actually sent, an unrelated run must not be
@@ -1921,10 +1983,7 @@ export function createDecisionRuntime(
 		}
 
 		return {
-			message: {
-				...event.message,
-				content: [],
-			},
+			message: active.inquiry.neutralize(event.message),
 		};
 	};
 
@@ -1981,9 +2040,10 @@ export function createDecisionRuntime(
 		);
 	};
 
-	const handleMessageStart = async (event: {
-		readonly message: unknown;
-	}): Promise<void> => {
+	const handleMessageStart = async (
+		event: { readonly message: unknown },
+		ctx?: ExtensionContext,
+	): Promise<void> => {
 		const message = event.message as {
 			readonly role?: unknown;
 			readonly customType?: unknown;
@@ -1992,6 +2052,14 @@ export function createDecisionRuntime(
 				readonly attempt?: unknown;
 			};
 		};
+		const current = activeDecision;
+		if (ctx !== undefined) {
+			observeLiveState(ctx, {
+				preserveGeneration:
+					current?.inquiry.matchesPrompt(message) === true ||
+					(current !== null && selfRunFor(current)),
+			});
+		}
 		if (quarantinedDecision !== null) {
 			// Once the exact custom input has correlated this quarantine to a Pi run,
 			// retain it across every assistant/tool-result message until agent_settled.
@@ -2008,19 +2076,17 @@ export function createDecisionRuntime(
 			return;
 		}
 		const active = activeDecision;
+		if (active === null || active.invalidated || !owns(active.claim)) return;
+		const isCurrentDecision = active.inquiry.matchesPrompt(message);
 		if (
-			active === null ||
-			active.invalidated ||
-			!active.dispatchPending ||
-			!owns(active.claim)
+			active.submitted &&
+			!isCurrentDecision &&
+			(message.role === "user" || message.role === "custom")
 		) {
+			deferDecisionOnBusy(active);
 			return;
 		}
-		const isCurrentDecision =
-			message.role === "custom" &&
-			message.customType === "pi-continue-watchdog:inquiry" &&
-			message.details?.inquiryId === active.exchangeId &&
-			message.details?.attempt === active.protocol.currentCycleId;
+		if (!active.dispatchPending) return;
 		if (!isCurrentDecision) {
 			deferDecisionOnBusy(active);
 			return;
@@ -2032,35 +2098,37 @@ export function createDecisionRuntime(
 			exchangeId: active.exchangeId,
 			cycleId: active.protocol.currentCycleId,
 		};
-		domainInternalDecision = true;
 		observeAggregate();
-		if (
-			domainReady &&
-			!domainFatal &&
-			options.processDomain !== undefined &&
-			!(await domainWrite(
-				() =>
-					options.processDomain?.setInternalDecision(
-						options.attachmentInstance,
-						true,
-					) ?? Promise.resolve(),
-			))
-		) {
-			return;
+	};
+
+	const observeLiveState = (
+		ctx = sessionContext,
+		observationOptions?: { readonly preserveGeneration?: boolean },
+	): boolean => {
+		if (ctx === null || stopped) return false;
+		retryInquiryCleanup();
+		const idle = ctx.isIdle();
+		localAiBusy = !idle;
+		if (!observationOptions?.preserveGeneration) localActivityGeneration += 1;
+		if (attachment !== null) {
+			publishingOwnHubObservation = true;
+			try {
+				if (idle) options.hub.markIdle(attachment);
+				else options.hub.markBusy(attachment);
+			} finally {
+				publishingOwnHubObservation = false;
+			}
+		} else {
+			observeAggregate();
 		}
-		if (
-			options.processDomain !== undefined &&
-			(activeDecision !== active || active.invalidated || !owns(active.claim))
-		) {
-			domainInternalDecision = false;
-			await domainWrite(
+		if (domainReady && !domainFatal && options.processDomain !== undefined) {
+			void domainWrite(
 				() =>
-					options.processDomain?.setInternalDecision(
-						options.attachmentInstance,
-						false,
-					) ?? Promise.resolve(),
+					options.processDomain?.reportIdle(options.attachmentInstance, idle) ??
+					Promise.resolve(),
 			);
 		}
+		return idle;
 	};
 
 	const registerLifecycle = (): void => {
@@ -2086,7 +2154,7 @@ export function createDecisionRuntime(
 				};
 				try {
 					await options.processDomain.attach(options.attachmentInstance, {
-						initialBusy: localAiBusy,
+						getIdle: () => sessionContext?.isIdle() ?? false,
 						onFatal: (error) => {
 							if (exitForInitialDomainFailure(error)) {
 								disableDomain();
@@ -2119,8 +2187,7 @@ export function createDecisionRuntime(
 			if (!stopped && ctx.isIdle()) recoverPreemptedDecisionAssistants(ctx);
 		});
 
-		options.pi.on("agent_start", async () => {
-			localAiBusy = true;
+		options.pi.on("agent_start", async (_event, ctx) => {
 			const claim = getMainClaim();
 			const controller = currentController(claim);
 			// A run that starts before the watchdog decision was actually submitted is
@@ -2150,9 +2217,8 @@ export function createDecisionRuntime(
 				};
 			} else {
 				selfDecisionRun = { kind: "none" };
-				localActivityGeneration += 1;
 			}
-			domainInternalDecision = provisionalInternal;
+			observeLiveState(ctx, { preserveGeneration: provisionalInternal });
 			if (claim !== null && controller !== null) {
 				const transition = controller.ensureLocked();
 				if (transition.applied) {
@@ -2165,16 +2231,6 @@ export function createDecisionRuntime(
 				}
 				// Already locked: preserve cycle/decision; do not clear active work.
 			}
-			if (attachment !== null) options.hub.markBusy(attachment);
-			if (domainReady && !domainFatal && options.processDomain !== undefined) {
-				await domainWrite(
-					() =>
-						options.processDomain?.markBusy(options.attachmentInstance, {
-							internalDecision: provisionalInternal,
-						}) ?? Promise.resolve(),
-				);
-			}
-			observeAggregate();
 		});
 
 		// A real user input (interactive or RPC) that arrives while a submitted
@@ -2182,48 +2238,34 @@ export function createDecisionRuntime(
 		// message queued when we return `continue`; do not re-send it. Abort only
 		// the watchdog decision, neutralize its aborted assistant, and persist a
 		// foldable preempted marker. Extension-injected messages never preempt.
-		options.pi.on("input", (event) => {
+		options.pi.on("input", (event, ctx) => {
 			const active = activeDecision;
 			if (event.source !== "interactive" && event.source !== "rpc") {
+				observeLiveState(ctx);
 				return;
 			}
-			localActivityGeneration += 1;
 			selfDecisionRun = { kind: "none" };
-			observeAggregate();
+			observeLiveState(ctx);
 			if (
 				active === null ||
 				active.invalidated ||
 				!active.submitted ||
 				!owns(active.claim)
 			) {
-				return;
+				return { action: "continue" };
 			}
 			suppressDecisionAbort = true;
-			const exchangeId = active.exchangeId;
-			const cycleId = active.protocol.currentCycleId;
-			decisionAssistantToSplice = { exchangeId, cycleId };
-			deferDecisionOnBusy(active);
-			// Abort first: stock interactive Pi clears its steering/follow-up queues
-			// while restoring queued text to the editor. Queueing the fold marker before
-			// that host abort hook would lose the marker and retain decision context.
+			decisionAssistantToSplice = {
+				exchangeId: active.exchangeId,
+				cycleId: active.protocol.currentCycleId,
+			};
+			deferDecisionOnBusy(active, "preempted", true);
 			try {
-				sessionContext?.abort();
+				ctx.abort();
 			} catch {
-				// Abort is best effort; the decision was already deferred so the next
-				// settle will not misattribute this run.
+				// The handle is already terminal even when host abort fails.
 			}
-			try {
-				options.pi.sendMessage(
-					createDecisionFoldMessage({
-						exchangeId,
-						cycleId,
-						outcome: "preempted",
-					}),
-					{ triggerTurn: false, deliverAs: "steer" },
-				);
-			} catch {
-				// Fold is best effort; the already-queued user input still runs.
-			}
+			retryInquiryCleanup();
 			return { action: "continue" };
 		});
 
@@ -2234,11 +2276,19 @@ export function createDecisionRuntime(
 				uninterruptible: true,
 			},
 		);
-		options.pi.on("agent_end", handleAgentEnd);
+		options.pi.on("agent_end", (event, ctx) => {
+			observeLiveState(ctx, {
+				preserveGeneration: selfDecisionRun.kind !== "none",
+			});
+			handleAgentEnd(event);
+		});
 
 		// While a decision is open, block ordinary tools before execution. The
 		// agent loop continues so the final assistant XML can still be validated.
-		options.pi.on("tool_call", (_event) => {
+		options.pi.on("tool_call", (_event, ctx) => {
+			observeLiveState(ctx, {
+				preserveGeneration: selfDecisionRun.kind !== "none",
+			});
 			if (quarantinedDecision !== null) {
 				return {
 					block: true,
@@ -2260,106 +2310,47 @@ export function createDecisionRuntime(
 		});
 
 		options.pi.on("agent_settled", async (_event, ctx: ExtensionContext) => {
-			// Only a true Pi settled boundary changes the binary AI state to idle.
-			// A later nested agent_start changes it back to busy before any wake acts.
-			if (stopped || !ctx.isIdle()) return;
-			localAiBusy = false;
+			retryInquiryCleanup();
+			const preserveGeneration = selfDecisionRun.kind !== "none";
+			if (stopped || !observeLiveState(ctx, { preserveGeneration })) return;
 
 			if (quarantinedDecision !== null) {
 				quarantinedDecision = null;
 				suppressDecisionAbort = false;
 			}
 			const spliceBeforeNextTurn = decisionAssistantToSplice;
-			if (selfDecisionRun.kind === "none") localActivityGeneration += 1;
-			if (attachment !== null) options.hub.markIdle(attachment);
 			if (selfDecisionRun.kind === "provisional") {
 				const pending = activeDecision;
 				selfDecisionRun = { kind: "none" };
-				localActivityGeneration += 1;
 				if (pending !== null) deferDecisionOnBusy(pending);
-			}
-			domainInternalDecision = false;
-			if (domainReady && !domainFatal && options.processDomain !== undefined) {
-				await domainWrite(
-					() =>
-						options.processDomain?.markIdle(options.attachmentInstance) ??
-						Promise.resolve(),
-				);
 			}
 			if (!isCurrentMain() || options.controllerHolder.controller === null)
 				return;
 
-			// Pi marks the session idle before emitting agent_settled. Defer the
-			// wake check until every settled handler has returned so a later handler
-			// can start a run without racing an eager triggerTurn from this handler.
-			// Capture per-run and per-settle identity: a later agent_start or a newer
-			// true-idle settle must leave this callback inert even if ctx is idle again.
-			const settledClaim = getMainClaim();
 			if (
 				spliceBeforeNextTurn !== null &&
 				ctx.isIdle() &&
-				localIdle() &&
 				pendingFinalization === null &&
 				decisionAssistantToSplice === spliceBeforeNextTurn
 			) {
 				spliceDecisionAssistant(ctx);
 			}
-			const settledLifecycleGeneration = lifecycleGeneration;
-			const settledAggregateGeneration = graceCoordinator.snapshot.generation;
-			const settledToken = ++settledCallbackGeneration;
-			const handle = clock.setTimeout(async () => {
-				// Later agent_start, a newer settle, session rebind, demotion, or nested
-				// busy cancels this wake so no-result is not double-counted. Child busy
-				// alone must not block delivery; publish still waits for aggregate idle.
-				if (
-					stopped ||
-					settledLifecycleGeneration !== lifecycleGeneration ||
-					!sameActivityGeneration(
-						settledAggregateGeneration,
-						graceCoordinator.snapshot.generation ?? {
-							domainEpoch: "stale",
-							activityGeneration: -1n,
-							ownershipGeneration: -1,
-							localActivityGeneration: -1,
-						},
-					) ||
-					settledToken !== settledCallbackGeneration ||
-					settledClaim === null ||
-					!options.hub.isCurrentMain(settledClaim) ||
-					!localIdle()
-				) {
-					return;
-				}
 
-				const active = activeDecision;
-				if (
-					active?.dispatchPending &&
-					!active.submitted &&
-					!active.invalidated
-				) {
-					// Public sendMessage is fire-and-forget. If no matching agent_start ever
-					// confirmed dispatch, a later settle belongs to other Pi work and must
-					// not be converted into a malformed decision response.
-					deferDecisionOnBusy(active);
-				} else {
-					// A confirmed decision run that settled without agent_end is malformed.
-					finalizeActiveDecision("missing");
-				}
-				const continued = await deliverPending(ctx);
-				// Continue/re-ask dispatch begins another run before this callback regains
-				// control. Keep its assistant pending until the next true idle boundary.
-				if (!continued && ctx.isIdle()) spliceDecisionAssistant(ctx);
-				// Explicit reconcile even when hub markIdle was a no-op edge.
-				reconcileIdle();
-				// Valid continue remains intermediate; wait for the next real idle epoch.
-				if (!continued) await maybePublishUserReady();
-			}, 0);
-			handle.unref?.();
+			const active = activeDecision;
+			if (active?.dispatchPending && !active.submitted && !active.invalidated) {
+				deferDecisionOnBusy(active);
+			} else {
+				finalizeActiveDecision("missing");
+			}
+			const continued = await deliverPending(ctx);
+			if (!continued && ctx.isIdle()) spliceDecisionAssistant(ctx);
+			if (!continued) await maybePublishUserReady();
 		});
 	};
 
-	const shutdown = async (): Promise<void> => {
+	const shutdown = async (ctx = sessionContext ?? undefined): Promise<void> => {
 		if (stopped) return;
+		const detachedIdle = ctx?.isIdle() ?? true;
 		stopped = true;
 		lifecycleGeneration += 1;
 		localActivityGeneration += 1;
@@ -2376,7 +2367,10 @@ export function createDecisionRuntime(
 		if (domainAttached && options.processDomain !== undefined) {
 			domainAttached = false;
 			try {
-				await options.processDomain.detach(options.attachmentInstance);
+				await options.processDomain.detach(
+					options.attachmentInstance,
+					detachedIdle,
+				);
 			} catch {
 				// Runtime coordination is already disabled and local teardown is complete.
 			}

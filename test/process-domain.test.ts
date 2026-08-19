@@ -13,18 +13,16 @@ import {
 	WATCHDOG_ROOT_PID_ENV,
 } from "../src/process-domain.js";
 
+const ACTIVITY_CHANNEL = "pi-continue-watchdog.activity.v2";
+
 class FakeNode implements ProcessDomainNode {
-	readonly nodeId: string;
-	readonly transport = "ipc" as const;
-	readonly endpoint = "ipc://temporary";
+	readonly transport = "tcp-loopback" as const;
+	readonly endpoint = "tcp://127.0.0.1:1234";
 	readonly declaration;
 	readonly sent: Array<{ targetId: string; channel: string; value: unknown }> =
 		[];
-	readonly broadcasts: Array<{ channel: string; value: unknown }> = [];
 	closeCount = 0;
 	sendError: Error | null = null;
-	sendBarrier: Promise<void> | null = null;
-	onSubscribe: ((channel: string) => void) | null = null;
 	private readonly channelListeners = new Map<
 		string,
 		Set<(message: ProcessDomainDataMessage) => void>
@@ -39,9 +37,8 @@ class FakeNode implements ProcessDomainNode {
 
 	constructor(
 		readonly role: "host" | "client",
-		nodeId: string = role,
+		readonly nodeId: string = role,
 	) {
-		this.nodeId = nodeId;
 		this.declaration = {
 			version: 1 as const,
 			domainId: "domain",
@@ -57,28 +54,20 @@ class FakeNode implements ProcessDomainNode {
 
 	async send(targetId: string, channel: string, value: unknown): Promise<void> {
 		this.sent.push({ targetId, channel, value });
-		if (this.sendBarrier !== null) await this.sendBarrier;
 		if (this.sendError !== null) throw this.sendError;
 	}
 
-	async broadcast(channel: string, value: unknown): Promise<void> {
-		this.broadcasts.push({ channel, value });
-	}
-
+	async broadcast(): Promise<void> {}
 	async reportLifecycle(): Promise<void> {}
 
 	subscribe(
 		channel: string,
 		listener: (message: ProcessDomainDataMessage) => void,
 	): () => void {
-		let listeners = this.channelListeners.get(channel);
-		if (listeners === undefined) {
-			listeners = new Set();
-			this.channelListeners.set(channel, listeners);
-		}
+		const listeners = this.channelListeners.get(channel) ?? new Set();
 		listeners.add(listener);
-		this.onSubscribe?.(channel);
-		return () => listeners?.delete(listener);
+		this.channelListeners.set(channel, listeners);
+		return () => listeners.delete(listener);
 	}
 
 	subscribeEvents(listener: (event: ProcessDomainEvent) => void): () => void {
@@ -90,16 +79,16 @@ class FakeNode implements ProcessDomainNode {
 		this.closeCount += 1;
 	}
 
-	emitChannel(channel: string, value: unknown, senderId = "child"): void {
+	emitChannel(value: unknown, senderId = "child"): void {
 		const message: ProcessDomainDataMessage = {
 			id: "message",
-			channel,
+			channel: ACTIVITY_CHANNEL,
 			value,
 			senderId,
 			targetId: this.nodeId,
 			receivedAt: Date.now(),
 		};
-		for (const listener of this.channelListeners.get(channel) ?? []) {
+		for (const listener of this.channelListeners.get(ACTIVITY_CHANNEL) ?? []) {
 			listener(message);
 		}
 	}
@@ -108,7 +97,7 @@ class FakeNode implements ProcessDomainNode {
 		const peer = {
 			nodeId,
 			status,
-			metadata: { activity: "idle" },
+			metadata: {},
 			connectedAt: Date.now(),
 			...(status === "offline" ? { disconnectedAt: Date.now() } : {}),
 		} as const;
@@ -124,343 +113,136 @@ async function flush(): Promise<void> {
 	await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
-test("host aggregates local attachments and owns immutable idle generations", async () => {
+test("host keeps a deduplicated busy-child set and every report replaces the fence", async () => {
 	const node = new FakeNode("host");
 	const env: NodeJS.ProcessEnv = {};
-	let opens = 0;
 	const coordinator = createProcessDomainCoordinator({
 		env,
 		pid: 100,
-		open: async () => {
-			opens += 1;
-			return node;
-		},
+		open: async () => node,
 	});
-	const first = {};
-	const second = {};
-	await coordinator.attach(first, { initialBusy: false, onFatal() {} });
-	await coordinator.attach(second, { initialBusy: false, onFatal() {} });
+	const instance = {};
+	await coordinator.attach(instance, { getIdle: () => true, onFatal() {} });
 
-	assert.equal(opens, 1);
-	assert.equal(coordinator.isRootProcess, true);
 	assert.equal(env[WATCHDOG_ROOT_PID_ENV], "100");
-	assert.equal(coordinator.snapshot.participants, 1);
 	assert.equal(coordinator.snapshot.allIdle, true);
-	const idleFence = coordinator.snapshot.fence;
-	assert.equal(coordinator.confirm(idleFence), true);
+	const initial = coordinator.snapshot.fence;
 
-	await coordinator.markBusy(first);
+	node.emitPeer("child", "online");
+	assert.deepEqual(coordinator.snapshot.fence, initial, "connect is neutral");
+
+	node.emitChannel({ agentId: "child", idle: true });
+	const firstIdle = coordinator.snapshot.fence;
+	assert.notDeepEqual(firstIdle, initial);
+	assert.equal(coordinator.snapshot.allIdle, true);
+
+	node.emitChannel({ agentId: "child", idle: true });
+	const repeatedIdle = coordinator.snapshot.fence;
+	assert.notDeepEqual(repeatedIdle, firstIdle);
+	assert.equal(coordinator.confirm(firstIdle), false);
+	assert.equal(coordinator.confirm(repeatedIdle), true);
+
+	node.emitChannel({ agentId: "child", idle: false });
 	assert.equal(coordinator.snapshot.busyParticipants, 1);
 	assert.equal(coordinator.snapshot.allIdle, false);
-	assert.equal(coordinator.confirm(idleFence), false);
+	node.emitChannel({ agentId: "child", idle: false });
+	assert.equal(
+		coordinator.snapshot.busyParticipants,
+		1,
+		"busy IDs deduplicate",
+	);
 
-	await coordinator.markBusy(second, { internalDecision: true });
-	await coordinator.markIdle(first);
+	node.emitPeer("child", "offline");
+	assert.equal(coordinator.snapshot.busyParticipants, 0);
 	assert.equal(coordinator.snapshot.allIdle, true);
 
-	await coordinator.detach(first);
-	assert.equal(node.closeCount, 0);
-	await coordinator.detach(second);
+	await coordinator.detach(instance, true);
 	assert.equal(node.closeCount, 1);
 	assert.equal(env[WATCHDOG_ROOT_PID_ENV], undefined);
-	assert.equal(coordinator.isRootProcess, false);
 });
 
-test("host reduces versioned remote activity into watchdog state", async () => {
+test("host rejects malformed or spoofed business payloads", async () => {
 	const node = new FakeNode("host");
 	const coordinator = createProcessDomainCoordinator({
 		env: {},
 		open: async () => node,
 	});
-	const seen: bigint[] = [];
-	coordinator.subscribe((snapshot) => seen.push(snapshot.activityGeneration));
-	await coordinator.attach({}, { initialBusy: false, onFatal() {} });
-
+	await coordinator.attach({}, { getIdle: () => true, onFatal() {} });
 	node.emitPeer("child", "online");
-	await flush();
-	assert.equal(coordinator.snapshot.participants, 2);
-	assert.equal(coordinator.snapshot.certain, false);
-	assert.equal(coordinator.snapshot.allIdle, false);
-	node.emitChannel("pi-continue-watchdog.activity.v1", {
-		state: "idle",
-		revision: "1",
-	});
-	await flush();
-	assert.equal(coordinator.snapshot.certain, true);
-	assert.equal(coordinator.snapshot.allIdle, true);
+	const before = coordinator.snapshot.fence;
 
-	node.emitChannel("pi-continue-watchdog.activity.v1", {
-		state: "busy",
-		revision: "2",
-	});
-	await flush();
-	assert.equal(coordinator.snapshot.busyParticipants, 1);
-	node.emitChannel("pi-continue-watchdog.activity.v1", {
-		state: "idle",
-		revision: "1",
-	});
-	await flush();
-	assert.equal(coordinator.snapshot.busyParticipants, 1);
-	node.emitChannel("pi-continue-watchdog.activity.v1", {
-		state: "idle",
-		revision: "3",
-	});
-	await flush();
-	assert.equal(coordinator.snapshot.allIdle, true);
-
-	node.emitPeer("child", "offline");
-	await flush();
-	assert.equal(coordinator.snapshot.participants, 2);
-	assert.equal(coordinator.snapshot.certain, false);
-	node.emitChannel("pi-continue-watchdog.activity.v1", {
-		state: "idle",
-		revision: "4",
-	});
-	await flush();
-	assert.equal(coordinator.snapshot.certain, false);
-	node.emitPeer("child", "online");
-	await flush();
-	assert.equal(coordinator.snapshot.certain, false);
-	node.emitChannel("pi-continue-watchdog.activity.v1", {
-		state: "idle",
-		revision: "4",
-	});
-	await flush();
-	assert.equal(coordinator.snapshot.certain, true);
-	assert.equal(coordinator.snapshot.allIdle, true);
-	assert.equal(seen.length >= 5, true);
+	for (const value of [
+		{ agentId: "other", idle: false },
+		{ agentId: "child", idle: false, revision: "1" },
+		{ agentId: "child", idle: "false" },
+		{ idle: false },
+	]) {
+		node.emitChannel(value);
+	}
+	assert.deepEqual(coordinator.snapshot.fence, before);
+	assert.equal(coordinator.snapshot.busyParticipants, 0);
 });
 
-test("initial client attach reserves activity revision before snapshot subscription", async () => {
+test("client reports live state at attach, on events, and immediately after reconnect", async () => {
 	const node = new FakeNode("client", "child");
-	node.emitPeer("host", "online");
-	node.onSubscribe = (channel) => {
-		if (channel !== "pi-continue-watchdog.snapshot.v1") return;
-		node.emitChannel(
-			channel,
-			{
-				domainId: "domain",
-				domainEpoch: "domain",
-				revision: "1",
-				activityGeneration: "1",
-				participants: 2,
-				busyParticipants: 0,
-				allIdle: true,
-				certain: true,
-				activityRevisions: [],
-			},
-			"host",
-		);
-	};
 	const coordinator = createProcessDomainCoordinator({
 		env: { PI_EXTENSION_UTILS_PROCESS_DOMAIN: "declaration" },
 		open: async () => node,
 	});
-	await coordinator.attach({}, { initialBusy: false, onFatal() {} });
-	assert.equal(node.sent.length, 1);
-	assert.deepEqual(node.sent.at(-1)?.value, {
-		state: "idle",
-		revision: "1",
-	});
-	assert.equal(coordinator.snapshot.certain, false);
-	node.emitChannel(
-		"pi-continue-watchdog.snapshot.v1",
-		{
-			domainId: "domain",
-			domainEpoch: "domain",
-			revision: "2",
-			activityGeneration: "2",
-			participants: 2,
-			busyParticipants: 0,
-			allIdle: true,
-			certain: true,
-			activityRevisions: [{ nodeId: "child", revision: "1" }],
+	let idle = true;
+	let liveQueries = 0;
+	const instance = {};
+	await coordinator.attach(instance, {
+		getIdle: () => {
+			liveQueries += 1;
+			return idle;
 		},
-		"host",
-	);
-	assert.equal(coordinator.snapshot.certain, true);
-	const second = {};
-	await coordinator.attach(second, { initialBusy: false, onFatal() {} });
-	assert.equal(node.sent.length, 2);
-	assert.deepEqual(node.sent.at(-1)?.value, {
-		state: "idle",
-		revision: "2",
+		onFatal() {},
 	});
-	await coordinator.detach(second);
-	assert.equal(node.sent.length, 3);
-	assert.deepEqual(node.sent.at(-1)?.value, {
-		state: "idle",
-		revision: "3",
-	});
-});
-
-test("client requires host snapshots to acknowledge its current activity revision", async () => {
-	const node = new FakeNode("client", "child");
-	const coordinator = createProcessDomainCoordinator({
-		env: { PI_EXTENSION_UTILS_PROCESS_DOMAIN: "declaration" },
-		open: async () => node,
-	});
-	const attachment = {};
-	await coordinator.attach(attachment, { initialBusy: false, onFatal() {} });
-	assert.equal(coordinator.isRootProcess, false);
 	assert.deepEqual(node.sent.at(-1), {
 		targetId: "host",
-		channel: "pi-continue-watchdog.activity.v1",
-		value: { state: "idle", revision: "1" },
+		channel: ACTIVITY_CHANNEL,
+		value: { agentId: "child", idle: true },
 	});
 
-	node.emitPeer("host", "online");
-	await flush();
-	assert.deepEqual(node.sent.at(-1)?.value, {
-		state: "idle",
-		revision: "2",
-	});
-	node.emitChannel(
-		"pi-continue-watchdog.snapshot.v1",
-		{
-			domainId: "domain",
-			domainEpoch: "domain",
-			revision: "4",
-			activityGeneration: "3",
-			participants: 2,
-			busyParticipants: 0,
-			allIdle: true,
-			certain: true,
-			activityRevisions: [{ nodeId: "child", revision: "2" }],
-		},
-		"host",
-	);
-	assert.equal(coordinator.snapshot.allIdle, true);
-	assert.equal(coordinator.snapshot.activityGeneration, 3n);
-	node.emitChannel(
-		"pi-continue-watchdog.snapshot.v1",
-		{
-			domainId: "domain",
-			domainEpoch: "domain",
-			revision: "3",
-			activityGeneration: "2",
-			participants: 2,
-			busyParticipants: 1,
-			allIdle: false,
-			certain: true,
-			activityRevisions: [{ nodeId: "child", revision: "2" }],
-		},
-		"host",
-	);
-	assert.equal(coordinator.snapshot.activityGeneration, 3n);
-	assert.equal(coordinator.snapshot.allIdle, true);
+	idle = false;
+	await coordinator.reportIdle(instance, false);
+	assert.deepEqual(node.sent.at(-1)?.value, { agentId: "child", idle: false });
 
-	node.emitPeer("host", "offline");
-	assert.equal(coordinator.snapshot.certain, false);
-	assert.equal(coordinator.snapshot.activityGeneration, 4n);
-	const sendsBeforeReconnect = node.sent.length;
-	let releaseReconnect: (() => void) | undefined;
-	node.sendBarrier = new Promise<void>((resolve) => {
-		releaseReconnect = resolve;
-	});
-	node.emitPeer("host", "online");
-	node.emitChannel(
-		"pi-continue-watchdog.snapshot.v1",
-		{
-			domainId: "domain",
-			domainEpoch: "domain",
-			revision: "5",
-			activityGeneration: "5",
-			participants: 2,
-			busyParticipants: 0,
-			allIdle: true,
-			certain: true,
-			activityRevisions: [{ nodeId: "child", revision: "2" }],
-		},
-		"host",
-	);
-	assert.equal(coordinator.snapshot.certain, false);
-	releaseReconnect?.();
-	node.sendBarrier = null;
-	await flush();
-	assert.equal(node.sent.length, sendsBeforeReconnect + 1);
+	const second = {};
+	await coordinator.attach(second, { getIdle: () => true, onFatal() {} });
 	assert.deepEqual(node.sent.at(-1)?.value, {
-		state: "idle",
-		revision: "3",
+		agentId: "child",
+		idle: false,
 	});
-	node.emitChannel(
-		"pi-continue-watchdog.snapshot.v1",
-		{
-			domainId: "domain",
-			domainEpoch: "domain",
-			revision: "6",
-			activityGeneration: "6",
-			participants: 2,
-			busyParticipants: 0,
-			allIdle: true,
-			certain: true,
-			activityRevisions: [{ nodeId: "child", revision: "3" }],
-		},
-		"host",
-	);
-	assert.equal(coordinator.snapshot.certain, true);
+	await coordinator.detach(second, true);
 
-	node.sendError = new Error("host temporarily offline");
-	const busyWrite = coordinator.markBusy(attachment);
-	assert.equal(coordinator.snapshot.certain, false);
-	await assert.rejects(busyWrite, /temporarily offline/);
-	assert.equal(coordinator.snapshot.certain, false);
-	node.sendError = null;
+	const queriesBeforeReconnect = liveQueries;
+	idle = true;
 	node.emitPeer("host", "online");
 	await flush();
-	assert.deepEqual(node.sent.at(-1)?.value, {
-		state: "busy",
-		revision: "5",
-	});
-	await coordinator.detach(attachment);
+	assert.equal(liveQueries, queriesBeforeReconnect + 1);
+	assert.deepEqual(node.sent.at(-1)?.value, { agentId: "child", idle: true });
+
+	await coordinator.detach(instance, true);
 	assert.equal(node.closeCount, 1);
 });
 
-test("queued client writes bind each revision to its activity state", async () => {
+test("transient client write failures do not create a business uncertain state", async () => {
 	const node = new FakeNode("client", "child");
 	const coordinator = createProcessDomainCoordinator({
 		env: { PI_EXTENSION_UTILS_PROCESS_DOMAIN: "declaration" },
 		open: async () => node,
 	});
-	const attachment = {};
-	await coordinator.attach(attachment, { initialBusy: false, onFatal() {} });
+	const instance = {};
+	await coordinator.attach(instance, { getIdle: () => true, onFatal() {} });
+	node.sendError = new Error("host offline");
+	await assert.rejects(coordinator.reportIdle(instance, false), /host offline/);
+	node.sendError = null;
 	node.emitPeer("host", "online");
 	await flush();
-	node.emitChannel(
-		"pi-continue-watchdog.snapshot.v1",
-		{
-			domainId: "domain",
-			domainEpoch: "domain",
-			revision: "1",
-			activityGeneration: "1",
-			participants: 2,
-			busyParticipants: 0,
-			allIdle: true,
-			certain: true,
-			activityRevisions: [{ nodeId: "child", revision: "2" }],
-		},
-		"host",
-	);
-	assert.equal(coordinator.snapshot.certain, true);
-
-	let releaseBusy: (() => void) | undefined;
-	node.sendBarrier = new Promise<void>((resolve) => {
-		releaseBusy = resolve;
-	});
-	const busy = coordinator.markBusy(attachment);
-	const idle = coordinator.markIdle(attachment);
-	assert.equal(coordinator.snapshot.certain, false);
-	releaseBusy?.();
-	node.sendBarrier = null;
-	await Promise.all([busy, idle]);
-	assert.deepEqual(
-		node.sent.slice(-2).map((entry) => entry.value),
-		[
-			{ state: "busy", revision: "3" },
-			{ state: "idle", revision: "4" },
-		],
-	);
-	await coordinator.detach(attachment);
+	assert.deepEqual(node.sent.at(-1)?.value, { agentId: "child", idle: true });
+	await coordinator.detach(instance, true);
 });
 
 test("failed open rolls back and a later attachment can retry", async () => {
@@ -479,7 +261,7 @@ test("failed open rolls back and a later attachment can retry", async () => {
 		coordinator.attach(
 			{},
 			{
-				initialBusy: false,
+				getIdle: () => true,
 				onFatal(error) {
 					fatalCount += 1;
 					assert.equal(error instanceof ProcessDomainFatalError, true);
@@ -492,7 +274,7 @@ test("failed open rolls back and a later attachment can retry", async () => {
 	assert.equal(coordinator.snapshot.domainId, "pending");
 
 	const second = {};
-	await coordinator.attach(second, { initialBusy: false, onFatal() {} });
+	await coordinator.attach(second, { getIdle: () => true, onFatal() {} });
 	assert.equal(opens, 2);
-	await coordinator.detach(second);
+	await coordinator.detach(second, true);
 });

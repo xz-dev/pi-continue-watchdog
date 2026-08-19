@@ -824,8 +824,8 @@ Pi packages 本身是受信任、拥有完整本机权限的代码，因此 regi
 
 ## 16. Supersession: implemented authenticated transport architecture
 
-The earlier same-process-only conclusion is superseded for watchdog-loaded inherited Pi processes by the reviewed `pi-extension-utils` transport.
+This research report is historical and does not define the shipped activity contract. The authoritative implementation/model is `docs/programming-thinking/official-pi-idle-inquiry.idea.lean` plus `docs/behavior-contract.md`.
 
-The shipped design uses one process-wide watchdog coordinator and one authenticated transport node per process. The utility package provides a framed loopback TCP listener/connection topology, application ping/pong liveness, directed/broadcast data, and lifecycle facts; the watchdog owns local/remote busy reduction, certainty, generations, confirmation fences, and decision state. Only the root process owns decisions. A disconnected or frozen participant remains conservatively blocking until it reconnects through a fresh HMAC handshake and sends fresh activity.
+The shipped design uses one process-wide watchdog coordinator and one authenticated transport node per process. The utility package provides framed loopback TCP transport, application heartbeat liveness, directed data, and fixed 1-second client reconnect. The watchdog owns only live activity reduction and fences: cross-process business data is exactly `{agentId, idle}`; the root deduplicates busy child IDs, treats disconnect as idle, treats connect as neutral, and replaces the fixed 10-second fence on every accepted report including equal reports. Children query public `ctx.isIdle()` immediately after reconnect. There is no certainty/unknown business state and no periodic activity polling.
 
 Guarantee boundaries remain explicit: observation begins after inherited watchdog `session_start` and activity registration. Stripped/replaced environment declarations and children that do not load watchdog cannot be observed; no pre-registration guarantee is claimed.

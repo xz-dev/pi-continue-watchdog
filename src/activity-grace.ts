@@ -21,16 +21,17 @@ export interface ActivityGraceSnapshot {
 
 export interface ActivityGraceCoordinator {
 	readonly snapshot: ActivityGraceSnapshot;
+	/** Every call replaces the previous candidate, including equal observations. */
 	update(input: {
 		readonly allIdle: boolean;
 		readonly generation: ActivityGeneration;
 	}): void;
-	/** Block the current generation until a different generation is observed. */
 	invalidate(): void;
 	dispose(): void;
 }
 
-const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+/** Product invariant: every automatic inquiry waits one complete fixed fence. */
+export const INQUIRY_FENCE_MS = 10_000;
 
 const nodeClock: ActivityGraceClock = {
 	setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
@@ -39,21 +40,7 @@ const nodeClock: ActivityGraceClock = {
 	now: () => Date.now(),
 };
 
-function sameGeneration(
-	left: ActivityGeneration | null,
-	right: ActivityGeneration,
-): boolean {
-	return (
-		left !== null &&
-		left.domainEpoch === right.domainEpoch &&
-		left.activityGeneration === right.activityGeneration &&
-		left.ownershipGeneration === right.ownershipGeneration &&
-		left.localActivityGeneration === right.localActivityGeneration
-	);
-}
-
 export function createActivityGraceCoordinator(options: {
-	readonly graceSeconds: number;
 	readonly clock?: ActivityGraceClock;
 	readonly onReady: (generation: ActivityGeneration) => void;
 }): ActivityGraceCoordinator {
@@ -63,44 +50,11 @@ export function createActivityGraceCoordinator(options: {
 	let deadlineMs: number | null = null;
 	let timer: ActivityGraceTimerHandle | null = null;
 	let token = 0;
-	let scheduleToken = 0;
 	let disposed = false;
 
 	const clearTimer = (): void => {
-		scheduleToken += 1;
 		if (timer !== null) clock.clearTimeout(timer);
 		timer = null;
-	};
-
-	const schedule = (capturedToken: number): void => {
-		if (disposed || phase !== "grace" || deadlineMs === null) return;
-		const delayMs = Math.min(
-			Math.max(0, deadlineMs - clock.now()),
-			MAX_TIMER_DELAY_MS,
-		);
-		const capturedScheduleToken = ++scheduleToken;
-		const handle = clock.setTimeout(() => {
-			if (
-				disposed ||
-				capturedToken !== token ||
-				capturedScheduleToken !== scheduleToken
-			) {
-				return;
-			}
-			timer = null;
-			if (deadlineMs !== null && clock.now() < deadlineMs) {
-				schedule(capturedToken);
-				return;
-			}
-			if (phase !== "grace" || generation === null) return;
-			phase = "ready";
-			deadlineMs = null;
-			options.onReady(generation);
-		}, delayMs);
-		timer = handle;
-		if ("unref" in handle && typeof handle.unref === "function") {
-			handle.unref();
-		}
 	};
 
 	return {
@@ -109,16 +63,7 @@ export function createActivityGraceCoordinator(options: {
 		},
 		update(input): void {
 			if (disposed) return;
-			if (sameGeneration(generation, input.generation)) {
-				if (input.allIdle || phase === "blocked") return;
-				token += 1;
-				clearTimer();
-				phase = "blocked";
-				deadlineMs = null;
-				return;
-			}
-
-			token += 1;
+			const capturedToken = ++token;
 			clearTimer();
 			generation = input.generation;
 			if (!input.allIdle) {
@@ -128,11 +73,25 @@ export function createActivityGraceCoordinator(options: {
 			}
 
 			phase = "grace";
-			deadlineMs = Math.min(
-				clock.now() + options.graceSeconds * 1000,
-				Number.MAX_VALUE,
-			);
-			schedule(token);
+			deadlineMs = clock.now() + INQUIRY_FENCE_MS;
+			const handle = clock.setTimeout(() => {
+				if (
+					disposed ||
+					capturedToken !== token ||
+					phase !== "grace" ||
+					generation !== input.generation
+				) {
+					return;
+				}
+				timer = null;
+				phase = "ready";
+				deadlineMs = null;
+				options.onReady(input.generation);
+			}, INQUIRY_FENCE_MS);
+			timer = handle;
+			if ("unref" in handle && typeof handle.unref === "function") {
+				handle.unref();
+			}
 		},
 		invalidate(): void {
 			if (disposed) return;

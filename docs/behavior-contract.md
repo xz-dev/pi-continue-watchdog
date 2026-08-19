@@ -34,11 +34,11 @@ Any acceptance text, test name, README, or implementation that still requires pe
 
 | | |
 |---|---|
-| **Actor** | A human driving Pi with a main (root) agent that may open same-process child/subagent sessions |
+| **Actor** | A human driving Pi with a root main agent and watchdog-loaded same-process or authenticated child Pi sessions |
 | **Need** | After all observable agents go idle, ask main—without changing ordinary tools—whether work should continue or unlock, without polluting later LLM context and without the human retyping “continue” |
 | **Value** | Reduces stalled sessions after subagents finish; makes unlock intentional and reason-visible while preserving the ordinary prompt/tool cache prefix |
-| **In scope (v1)** | Runtime lock; auto-lock on actual main user work; manual lock/unlock (optional reason); automatic unlock when the main run is actually aborted as Pi reports; trailing XML decisions; typed AI unlock reasons; decision validation + 3 re-asks; tool-call blocking during decisions; context folding + compact continue prompt; one fixed grace per authoritative aggregate all-idle generation; config; packaging/CI/publication |
-| **Out of scope (v1)** | Durable lock across reload/new/resume/restart; cross-process child coverage; depending on pi-subagents or any other plugin; replacing Pi footer; wall-clock or loop-count watchdogs (those belong to pi-watchdog); direct idle continuation without a decision stage |
+| **In scope (v1)** | Runtime lock; auto-lock on actual main user work; manual lock/unlock (optional reason); automatic unlock when the main run is actually aborted as Pi reports; trailing XML decisions; typed AI unlock reasons; decision validation + 3 re-asks; tool-call blocking during decisions; context folding + compact continue prompt; one fixed grace per authoritative aggregate all-idle generation; authenticated cross-process child activity, neutral connect/disconnect-as-idle, fixed 1-second reconnect with fresh live reports; config; packaging/CI/publication |
+| **Out of scope (v1)** | Durable lock across reload/new/resume/restart; sessions that did not load the watchdog; depending on pi-subagents or any other plugin; replacing Pi footer; wall-clock or loop-count watchdogs (those belong to pi-watchdog); direct idle continuation without a decision stage |
 
 ---
 
@@ -94,17 +94,17 @@ Continue until user assistance is required.
 
 ## Scope and classification rules
 
-1. **“All agents idle”** means every **same-process, extension-loaded, observable** session known to this plugin’s process-local hub is idle. Isolated, out-of-process, or non-extension children may be absent; document this as **observable coverage**, never “all agents in the universe.”
-2. **Main/root election** (process-local, no other plugin):
+1. **“All agents idle”** means every extension-loaded attachment in the process-local hub and every authenticated watchdog-loaded child Pi process that has joined the inherited process domain is idle. Sessions that did not load the watchdog or did not inherit the declaration may be absent; document this as **observable coverage**, never “all agents in the universe.”
+2. **Main/root election** (root-process local, no other plugin):
    - UI-bound session wins main when present.
    - Pure headless: first-bound attachment is documented best-effort main; later attachments are treated as non-main.
 3. **Only main** may enter the decision window. Ordinary tools stay advertised, but every tool call from an active main decision is blocked before execution so the model can finish with XML. Non-main attachments remain observer-only.
-4. **Zero external-plugin dependencies.** Use only Pi public extension APIs plus this plugin’s own hub.
+4. **Zero external-plugin dependencies.** Use only Pi public extension APIs plus this plugin’s own same-process hub and authenticated process-domain coordinator.
 5. **Lock state is runtime-only** for the current process/session attachment lifecycle. Not written to disk. Not restored on reload/new/resume/restart/shutdown.
 6. **Universal main-run coverage.** Every current-main `agent_start` ensures the watchdog is locked. If already locked, the existing cycle is preserved; watchdog decision and continuation turns do not reset themselves. If unlocked, the start silently begins a fresh lock cycle.
 7. **Abort unlock.** When the current main run is **actually aborted as Pi reports** (the same outcome the TUI shows as aborted), unlock reasonlessly and immediately. Ordinary natural settle does **not** unlock. Never inspect or infer why a child stopped. Implementation may inspect Pi’s public session history to detect the main aborted outcome; the detection mechanism is replaceable as long as this behavior holds.
 8. **Stop-reason-independent idle recovery.** For any non-aborted main stop—including normal completion, Provider/model failure, extension runtime failure, or auto-compaction failure—the plugin uses only Pi's true idle lifecycle. It does not match error strings or special-case compaction.
-9. **Binary AI activity.** Each observable attachment is only `busy` or `idle`: `agent_start` assigns busy, and a true `agent_settled` assigns idle. Tool execution, model output, and waiting for Provider output are all part of the same busy interval and never become separate watchdog states.
+9. **Live public AI activity.** Every relevant Pi event queries live `ctx.isIdle()`. Event labels never assign or imply busy/idle. Pi's public value covers active runs, automatic retries, auto-compaction retries, and queued continuations.
 
 ---
 
@@ -112,7 +112,7 @@ Continue until user assistance is required.
 
 | Key | Default | Notes |
 |---|---|---|
-| `idleDelaySeconds` | `10` | Base delay in seconds; any finite number `>= 0`. Zero schedules an asynchronous 0 ms decision and fractions are allowed. |
+| `idleDelaySeconds` | `10` | Deprecated compatibility key. It remains accepted/preserved, but runtime ignores it; every automatic inquiry fence is exactly 10 seconds. |
 | `maxRetries` | `10` | Maximum **valid continue** decisions per lock cycle (not invalid re-asks); safe integer in `[1, 10]` |
 | `decisionPrompt` | exact default above | Automated custom-role body; explicitly identifies extension automation and says it is not a user message/request; nonblank and at most 16,384 Unicode code points |
 | `continuePrompt` | exact default above | Compact fold-in after valid continue; nonblank and at most 16,384 Unicode code points |
@@ -127,11 +127,7 @@ Continue until user assistance is required.
 
 Trusted-project fields override global field-by-field (`builtins < global < trusted project`). Invalid high-precedence values must not erase valid lower-precedence values; emit bounded diagnostics. Missing files are silent. Configured prompt limits count Unicode code points without truncation: exactly 16,384 is valid and longer values are invalid.
 
-**Grace rule:** each new authoritative aggregate all-idle activity generation
-waits one fixed `idleDelaySeconds` grace. A valid continue advances only the
-`maxRetries` attempt count; it does not lengthen the next grace. With a zero
-value, every new eligible idle generation still schedules asynchronously at
-0 ms.
+**Fence rule:** every candidate automatic inquiry cancels/replaces the previous event-loop timer and waits a full fixed 10 seconds. Every relevant event and every child report replaces it, including repeated equal idle reports. A valid continue advances only `maxRetries`; it cannot change the fence duration.
 
 **Non-configurable:** invalid decision re-ask budget is fixed at **3** attempts (not a config key).
 
@@ -147,7 +143,7 @@ Per main ownership generation / lock cycle, at least:
 | `attempt` | Next automatic decision cycle index after idle (0 after reset; advances only on **valid continue**) |
 | `exhausted` | `locked` and `maxRetries` valid continues already consumed; no new grace until reset |
 | `decisionFailed` | After 3 invalid decision attempts; locked remains true; no new grace until reset |
-| aggregate grace | One fixed grace for the current authoritative all-idle activity generation |
+| inquiry fence | One replaceable fixed 10-second timer; stale identities are inert |
 | decision window | Automated XML decision prompt in flight / re-ask; ordinary tools stay stable but calls are blocked |
 
 **Unconditional assignment:** manual lock/unlock **never** no-op on same-state. They always assign the target state. A direct manual unlock emits its corresponding TUI output; a manual lock emits only its final lock notification. The silent prerequisite unlock of a fresh lock cycle never emits unlock output. No “already locked/unlocked” short-circuit may skip either transition.
@@ -193,8 +189,8 @@ Unlock first makes `locked=false`, then invalidates the current aggregate grace 
 
 ### Entry
 
-**Given** main is locked, not exhausted, not decision-failed, and every observable same-process session is idle
-**When** that authoritative aggregate all-idle generation remains unchanged for one fixed `idleDelaySeconds` grace
+**Given** main is locked, not exhausted, not decision-failed, every same-process attachment is idle, and the authenticated root busy-child set is empty
+**When** the latest eligible observation's fixed 10-second fence expires and every wake-time guard still passes
 **Then** the plugin:
 
 1. Keeps ordinary active tools and the system-prompt tool list unchanged.
@@ -389,8 +385,8 @@ Ordinary natural idle settle never counts as abort.
 
 ### Example 5 — Locked + authoritative aggregate idle → fixed-grace **decision entry**
 
-**Given** main is locked, not exhausted, not decision-failed, and every observable same-process session is idle
-**When** one authoritative aggregate all-idle generation remains unchanged for `idleDelaySeconds`
+**Given** main is locked, not exhausted, not decision-failed, every observable attachment is idle, and the root busy-child set is empty
+**When** the latest eligible observation's fixed 10-second fence expires and every wake-time guard still passes
 **Then**
 
 - exactly one decision window is opened for that attempt (not a direct continue custom message)
@@ -472,7 +468,7 @@ With defaults, every eligible all-idle generation waits **10s**.
 **When** all observable sessions are idle again
 **Then** the **full** delay for the **same** current attempt restarts from zero
 
-At each `agent_settled`, only Pi's live `ctx.isIdle()` truth may close that attachment's binary busy interval. Every true-idle settle explicitly reconciles aggregate idle even when the hub already considered the attachment idle. `ctx.isIdle()` is not polled between lifecycle boundaries to invent tool/output/wait sub-states. A false-idle outer settle caused by an earlier extension starting a nested turn must not arm; the later true settle must arm normally.
+At every relevant event, only that event's live public `ctx.isIdle()` query may update attachment state. Equal observations still replace the timer. There is no periodic polling; the only query without a new event is the mandatory wake-time recheck. A false-idle settle caused by a nested turn must not arm; a later live-idle event may arm normally.
 
 Stale timer callbacks (wrong generation/epoch/ownership) must not open a decision window or wake main.
 
@@ -542,8 +538,8 @@ Only AI decision unlock retains a publication intent carrying **both** matched `
 ### Example 13 — Trusted config overrides with safe fallback
 
 **Given** global and/or trusted-project `pi-continue-watchdog.json`
-**When** valid `idleDelaySeconds`, `maxRetries`, `decisionPrompt`, `continuePrompt`, `reasonTypes`, and/or `continueReasonTypes` are provided
-**Then** effective config uses field-level override (trusted project over global over defaults)
+**When** valid `maxRetries`, `decisionPrompt`, `continuePrompt`, `reasonTypes`, and/or `continueReasonTypes` are provided
+**Then** effective config uses field-level override (trusted project over global over defaults). The deprecated `idleDelaySeconds` key may be parsed/preserved for compatibility but never changes the fixed 10-second runtime fence.
 **And** each valid reason-type list independently replaces its built-in default rather than extending it
 
 **When** values are missing, unreadable, or invalid
@@ -573,7 +569,7 @@ Pi may load this extension through independent `DefaultResourceLoader` instances
 - every such attachment is visible in **one** realm-wide process domain (not one hub per module evaluation / ResourceLoader)
 - main election spans the whole domain and still follows the existing pure-headless policy: UI-bound wins when present; with no UI-bound attachment, first-bound remains best-effort main and later non-UI attachments do not steal
 - only the current main may open a decision inquiry; non-main children never expose or originate inquiry
-- intermediate settles while any observable attachment remains busy arm **no** main inquiry; only after the final busy attachment settles (and the configured idle delay elapses with every observable attachment still idle) may the current main open **exactly one** inquiry
+- intermediate settles while any observable attachment remains busy arm **no** main inquiry; only after the final busy attachment settles and the fixed 10-second fence expires with every observable attachment still idle may the current main open **exactly one** inquiry
 
 **Minimal multi-attachment idle shape:**
 
@@ -581,10 +577,10 @@ Pi may load this extension through independent `DefaultResourceLoader` instances
 **When** the root settles, then the first child settles
 **Then** the root opens **no** decision inquiry and neither child opens an inquiry
 
-**When** the final child settles and the idle delay elapses with every observable attachment still idle
+**When** the final child settles and the fixed 10-second fence expires with every observable attachment still idle
 **Then** the root opens **exactly one** decision inquiry and children still open none
 
-Isolated, out-of-process, or non-extension children remain outside coverage. This example does **not** change pure-headless election or require another plugin.
+This example covers same-realm module-evaluation sharing only. Authenticated watchdog-loaded child processes are covered by the authoritative process-domain acceptance below; children that do not load the watchdog or do not inherit the declaration remain outside observable coverage. This example does **not** change pure-headless election or require another plugin.
 
 ---
 
@@ -607,7 +603,7 @@ These are product constraints, not optional polish. Implementation details are r
 | Invariant | Requirement |
 |---|---|
 | No tool cancellation | Decision entry / continue delivery must not abort in-flight tools already running when idle is detected |
-| No false “all agents” claims | Docs and diagnostics say **observable** same-process coverage |
+| No false “all agents” claims | Docs and diagnostics say **observable** same-process plus authenticated watchdog child-process coverage |
 | Generation-safe timers | Timer callbacks must not fire after unlock/demote/ownership change |
 | Command demotion safety | If main demotes, stale command handlers must be inert |
 | Notify channel | Lock/unlock/decision-failed notifies are TUI user-only; not injected as user-role conversation turns |
@@ -648,10 +644,11 @@ For each example above, implementation slices must leave evidence that can be re
 1. A Pi with no `PI_EXTENSION_UTILS_PROCESS_DOMAIN` declaration creates the root transport during awaited `session_start`, records its PID in `PI_CONTINUE_WATCHDOG_ROOT_PID`, and is the sole decision owner while that domain is open.
 2. A child Pi inheriting the declaration connects as an observer. It reports its watchdog-owned busy/idle state but never loads root watchdog config, locks, inquires, continues, unlocks, or publishes `user-ready`.
 3. Same-realm watchdog attachments aggregate into one transport node. Local hub election chooses the root-process main attachment. Final root detach closes the transport and clears only the declaration/root marker values it still owns.
-4. `pi-extension-utils` owns only authenticated framed loopback TCP transport, peer status, directed/broadcast data, application liveness, and Pi lifecycle facts. This watchdog owns participant activity, certainty, revisions, activity generations, fences, grace, retries, and decision queues.
-5. A remote busy participant invalidates the root aggregate generation. Busy then idle begins a fresh complete grace and fence. Repeated identical facts may advance publication revision but never activity generation.
-6. Activity-generation or epoch change during a decision invalidates the response without consuming a retry. It cannot continue, unlock, exhaust, decision-fail, persist a continue status, or publish `user-ready`; the exchange folds as `invalidated`.
-7. Every automatic outcome is committed only while the root claim remains current and a certain/all-idle watchdog fence confirms. Manual commands and immediate main-abort unlock retain their explicit semantics. Root main abort unlocks regardless of child activity; child abort only changes child activity.
-8. Initial malformed declarations, wrong capabilities, unavailable transport, incompatible protocol, and unsafe endpoints fail closed with sanitized output and status 78. Runtime heartbeat disconnect makes the watchdog uncertain/fail-closed without terminating Pi. No capability, HMAC proof, raw declaration, or endpoint is rendered.
-9. An offline authenticated peer remains part of the watchdog's conservative participant set. Root certainty is restored only after that peer reconnects and sends fresh activity; monitor reconnection alone cannot reuse stale busy/idle metadata.
-10. Coverage begins after an inherited child loads watchdog, completes `session_start`, and reports activity. Deliberately stripped/replaced declarations and children without watchdog are outside the observable guarantee. Coverage starts only after activity registration; no earlier guarantee or decision-root takeover after root-process exit is claimed.
+4. `pi-extension-utils` owns authenticated framed loopback TCP transport, peer status, heartbeat liveness, and fixed 1-second reconnect retries. Watchdog business payload contains exactly `agentId` and `idle`; authenticated sender identity must match `agentId`.
+5. Root maintains a deduplicated busy-child ID set. `idle:false` adds; `idle:true` and disconnect delete. Connection alone is neutral. Every accepted report and disconnect creates a new fence even when the resulting state is unchanged.
+6. Every relevant child lifecycle event queries that child's live `ctx.isIdle()` before reporting. After reconnect the child immediately queries and reports live state; stale state is never replayed.
+7. Fence/epoch change during a decision cancels its shared inquiry handle without consuming retry accounting. The result cannot continue, unlock, exhaust, decision-fail, persist continue evidence, or publish `user-ready`; the retryable remove-fold cleans its exchange.
+8. Every automatic outcome commits only while the root claim remains current, the latest root fence confirms, the busy-child set is empty, pending messages are absent, and a fresh main `ctx.isIdle()` is true. Manual commands and immediate main-abort unlock retain their explicit semantics.
+9. Initial malformed declarations, wrong capabilities, unavailable transport, incompatible protocol, and unsafe endpoints fail closed with sanitized output and status 78. Runtime heartbeat disconnect counts the child idle while transport reconnects; it never creates a business-level uncertain state. No capability, proof, raw declaration, or endpoint is rendered.
+10. Coverage begins after an inherited child loads watchdog, completes `session_start`, and reports activity. Deliberately stripped/replaced declarations and children without watchdog remain outside observable coverage.
+11. User input or renewed external activity terminally cancels the current shared attempt. Interactive/RPC input calls public `ctx.abort()` and returns `{action:"continue"}` so Pi delivers the original input exactly once. Uninterruptible `message_end` neutralizes the exact correlated assistant, and failed remove-fold sends are retried idempotently until accepted.

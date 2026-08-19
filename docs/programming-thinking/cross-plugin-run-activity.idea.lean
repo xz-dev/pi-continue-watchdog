@@ -1,5 +1,13 @@
 import Std
 
+/-
+Historical/local run-classification submodel. The authoritative activity,
+disconnect, replaceable fixed-ten-second fence, and inquiry-cancellation model is
+`official-pi-idle-inquiry.idea.lean`. Production now queries live public
+`ctx.isIdle()` at every relevant event and does not infer activity from event
+labels or introduce a business-level uncertain state.
+-/
+
 set_option autoImplicit false
 
 namespace CrossPluginRunActivity

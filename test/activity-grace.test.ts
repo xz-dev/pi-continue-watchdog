@@ -6,13 +6,13 @@ import {
 	type ActivityGraceClock,
 	type ActivityGraceTimerHandle,
 	createActivityGraceCoordinator,
+	INQUIRY_FENCE_MS,
 } from "../src/activity-grace.js";
 
 interface TimerRecord {
 	readonly callback: () => void;
 	readonly delayMs: number;
 	cleared: boolean;
-	unrefCount: number;
 }
 
 class FakeClock implements ActivityGraceClock {
@@ -20,12 +20,7 @@ class FakeClock implements ActivityGraceClock {
 	private currentTimeMs = 0;
 
 	setTimeout(callback: () => void, delayMs: number): TimerRecord {
-		const record: TimerRecord = {
-			callback,
-			delayMs,
-			cleared: false,
-			unrefCount: 0,
-		};
+		const record = { callback, delayMs, cleared: false };
 		this.records.push(record);
 		return record;
 	}
@@ -38,16 +33,8 @@ class FakeClock implements ActivityGraceClock {
 		return this.currentTimeMs;
 	}
 
-	advanceWithoutFiring(delayMs: number): void {
+	advance(delayMs: number): void {
 		this.currentTimeMs += delayMs;
-	}
-
-	fire(index: number): void {
-		const record = this.records[index];
-		assert.ok(record, `expected timer ${index}`);
-		if (record.cleared) return;
-		this.currentTimeMs += record.delayMs;
-		record.callback();
 	}
 }
 
@@ -60,53 +47,55 @@ function generation(value: number): ActivityGeneration {
 	};
 }
 
-test("one aggregate all-idle generation gets one fixed grace", () => {
+test("an idle observation waits exactly one fixed ten-second fence", () => {
 	const clock = new FakeClock();
 	const ready: ActivityGeneration[] = [];
 	const coordinator = createActivityGraceCoordinator({
-		graceSeconds: 10,
 		clock,
 		onReady: (value) => ready.push(value),
 	});
+	const observed = generation(1);
 
-	coordinator.update({ allIdle: true, generation: generation(1) });
-	coordinator.update({ allIdle: true, generation: generation(1) });
-
+	coordinator.update({ allIdle: true, generation: observed });
 	assert.equal(coordinator.snapshot.phase, "grace");
-	assert.equal(coordinator.snapshot.deadlineMs, 10_000);
-	assert.equal(clock.records.length, 1);
-	assert.equal(clock.records[0]?.delayMs, 10_000);
+	assert.equal(coordinator.snapshot.deadlineMs, INQUIRY_FENCE_MS);
+	assert.equal(clock.records[0]?.delayMs, INQUIRY_FENCE_MS);
 
-	clock.fire(0);
+	clock.advance(INQUIRY_FENCE_MS - 1);
+	assert.deepEqual(ready, []);
+	clock.advance(1);
+	clock.records[0]?.callback();
+	assert.deepEqual(ready, [observed]);
 	assert.equal(coordinator.snapshot.phase, "ready");
-	assert.deepEqual(ready, [generation(1)]);
-
-	coordinator.update({ allIdle: true, generation: generation(1) });
-	assert.equal(clock.records.length, 1);
-	assert.deepEqual(ready, [generation(1)]);
 });
 
-test("reobserving one generation does not alter the fixed grace deadline", () => {
-	const clock = new FakeClock();
-	const coordinator = createActivityGraceCoordinator({
-		graceSeconds: 10,
-		clock,
-		onReady: () => {},
-	});
-
-	coordinator.update({ allIdle: true, generation: generation(1) });
-	clock.advanceWithoutFiring(4_000);
-	coordinator.update({ allIdle: true, generation: generation(1) });
-
-	assert.equal(coordinator.snapshot.deadlineMs, 10_000);
-	assert.equal(clock.records.length, 1);
-});
-
-test("activity invalidates the old grace callback and a new idle generation gets a full grace", () => {
+test("repeated equal idle reports replace and restart the full fence", () => {
 	const clock = new FakeClock();
 	const ready: ActivityGeneration[] = [];
 	const coordinator = createActivityGraceCoordinator({
-		graceSeconds: 10,
+		clock,
+		onReady: (value) => ready.push(value),
+	});
+	const observed = generation(1);
+
+	coordinator.update({ allIdle: true, generation: observed });
+	clock.advance(9_000);
+	coordinator.update({ allIdle: true, generation: observed });
+
+	assert.equal(clock.records[0]?.cleared, true);
+	assert.equal(clock.records[1]?.delayMs, INQUIRY_FENCE_MS);
+	assert.equal(coordinator.snapshot.deadlineMs, 19_000);
+	clock.records[0]?.callback();
+	assert.deepEqual(ready, []);
+	clock.advance(INQUIRY_FENCE_MS);
+	clock.records[1]?.callback();
+	assert.deepEqual(ready, [observed]);
+});
+
+test("busy observations cancel the candidate and stale callbacks are inert", () => {
+	const clock = new FakeClock();
+	const ready: ActivityGeneration[] = [];
+	const coordinator = createActivityGraceCoordinator({
 		clock,
 		onReady: (value) => ready.push(value),
 	});
@@ -115,159 +104,50 @@ test("activity invalidates the old grace callback and a new idle generation gets
 	coordinator.update({ allIdle: false, generation: generation(2) });
 	assert.equal(coordinator.snapshot.phase, "blocked");
 	assert.equal(clock.records[0]?.cleared, true);
-
-	// A callback already queued by the host must still be strictly inert.
 	clock.records[0]?.callback();
 	assert.deepEqual(ready, []);
-
-	coordinator.update({ allIdle: true, generation: generation(3) });
-	assert.equal(coordinator.snapshot.phase, "grace");
-	assert.equal(clock.records[1]?.delayMs, 10_000);
-
-	clock.fire(1);
-	assert.deepEqual(ready, [generation(3)]);
 });
 
-test("a changed all-idle generation replaces grace and stales the old callback", () => {
+test("invalidate and dispose make captured callbacks inert", () => {
 	const clock = new FakeClock();
 	const ready: ActivityGeneration[] = [];
 	const coordinator = createActivityGraceCoordinator({
-		graceSeconds: 10,
-		clock,
-		onReady: (value) => ready.push(value),
-	});
-
-	coordinator.update({ allIdle: true, generation: generation(1) });
-	clock.advanceWithoutFiring(3_000);
-	coordinator.update({ allIdle: true, generation: generation(2) });
-
-	assert.equal(clock.records[0]?.cleared, true);
-	assert.equal(clock.records[1]?.delayMs, 10_000);
-	assert.equal(coordinator.snapshot.deadlineMs, 13_000);
-
-	clock.records[0]?.callback();
-	assert.deepEqual(ready, []);
-	clock.fire(1);
-	assert.deepEqual(ready, [generation(2)]);
-});
-
-test("one generation cannot rearm after becoming blocked", () => {
-	const clock = new FakeClock();
-	const ready: ActivityGeneration[] = [];
-	const coordinator = createActivityGraceCoordinator({
-		graceSeconds: 10,
-		clock,
-		onReady: (value) => ready.push(value),
-	});
-
-	coordinator.update({ allIdle: true, generation: generation(1) });
-	clock.fire(0);
-	assert.deepEqual(ready, [generation(1)]);
-
-	coordinator.update({ allIdle: false, generation: generation(1) });
-	coordinator.update({ allIdle: true, generation: generation(1) });
-	assert.equal(coordinator.snapshot.phase, "blocked");
-	assert.equal(clock.records.length, 1);
-	assert.deepEqual(ready, [generation(1)]);
-
-	coordinator.update({ allIdle: true, generation: generation(2) });
-	assert.equal(coordinator.snapshot.phase, "grace");
-	assert.equal(clock.records.length, 2);
-});
-
-test("wall-clock deadline is preserved when a long timer is chunked", () => {
-	const clock = new FakeClock();
-	const ready: ActivityGeneration[] = [];
-	const coordinator = createActivityGraceCoordinator({
-		graceSeconds: 3_000_000,
-		clock,
-		onReady: (value) => ready.push(value),
-	});
-
-	coordinator.update({ allIdle: true, generation: generation(1) });
-	assert.equal(clock.records[0]?.delayMs, 2 ** 31 - 1);
-	clock.fire(0);
-
-	assert.equal(coordinator.snapshot.phase, "grace");
-	assert.equal(clock.records[1]?.delayMs, 3_000_000_000 - (2 ** 31 - 1));
-	clock.fire(1);
-	assert.deepEqual(ready, [generation(1)]);
-});
-
-test("timer safety does not depend on unique handles", () => {
-	const callbacks: Array<() => void> = [];
-	const sharedHandle = {};
-	let now = 0;
-	const clock: ActivityGraceClock = {
-		setTimeout(callback) {
-			callbacks.push(callback);
-			return sharedHandle;
-		},
-		clearTimeout() {},
-		now: () => now,
-	};
-	const ready: ActivityGeneration[] = [];
-	const coordinator = createActivityGraceCoordinator({
-		graceSeconds: 10,
-		clock,
-		onReady: (value) => ready.push(value),
-	});
-
-	coordinator.update({ allIdle: true, generation: generation(1) });
-	coordinator.update({ allIdle: false, generation: generation(2) });
-	coordinator.update({ allIdle: true, generation: generation(3) });
-	now = 10_000;
-
-	callbacks[0]?.();
-	assert.deepEqual(ready, []);
-	callbacks[1]?.();
-	assert.deepEqual(ready, [generation(3)]);
-});
-
-test("explicit invalidation consumes the generation until activity changes", () => {
-	const clock = new FakeClock();
-	const ready: ActivityGeneration[] = [];
-	const coordinator = createActivityGraceCoordinator({
-		graceSeconds: 10,
 		clock,
 		onReady: (value) => ready.push(value),
 	});
 
 	coordinator.update({ allIdle: true, generation: generation(1) });
 	coordinator.invalidate();
-	assert.equal(coordinator.snapshot.phase, "blocked");
-	assert.deepEqual(coordinator.snapshot.generation, generation(1));
-	assert.equal(clock.records[0]?.cleared, true);
-
-	coordinator.update({ allIdle: true, generation: generation(1) });
-	assert.equal(coordinator.snapshot.phase, "blocked");
-	assert.equal(clock.records.length, 1);
 	clock.records[0]?.callback();
 	assert.deepEqual(ready, []);
 
 	coordinator.update({ allIdle: true, generation: generation(2) });
-	assert.equal(coordinator.snapshot.phase, "grace");
-	assert.equal(clock.records[1]?.delayMs, 10_000);
-	clock.fire(1);
-	assert.deepEqual(ready, [generation(2)]);
+	coordinator.dispose();
+	clock.records[1]?.callback();
+	assert.deepEqual(ready, []);
+	assert.equal(coordinator.snapshot.phase, "blocked");
 });
 
-test("dispose makes every previously captured callback inert", () => {
-	const clock = new FakeClock();
+test("timer identity safety does not depend on unique host handles", () => {
+	const callbacks: Array<() => void> = [];
+	const sharedHandle = {};
 	const ready: ActivityGeneration[] = [];
 	const coordinator = createActivityGraceCoordinator({
-		graceSeconds: 10,
-		clock,
+		clock: {
+			setTimeout(callback) {
+				callbacks.push(callback);
+				return sharedHandle;
+			},
+			clearTimeout() {},
+			now: () => 0,
+		},
 		onReady: (value) => ready.push(value),
 	});
 
 	coordinator.update({ allIdle: true, generation: generation(1) });
-	coordinator.dispose();
-	assert.equal(coordinator.snapshot.phase, "blocked");
-	assert.equal(clock.records[0]?.cleared, true);
-
-	clock.records[0]?.callback();
 	coordinator.update({ allIdle: true, generation: generation(2) });
+	callbacks[0]?.();
 	assert.deepEqual(ready, []);
-	assert.equal(clock.records.length, 1);
+	callbacks[1]?.();
+	assert.deepEqual(ready, [generation(2)]);
 });

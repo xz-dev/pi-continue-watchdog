@@ -4,7 +4,8 @@
  * Invalid higher-precedence values do not erase valid lower-precedence values.
  *
  * Validation:
- * - idleDelaySeconds is any finite number >= 0; zero schedules a 0 ms timer.
+ * - idleDelaySeconds remains accepted for configuration compatibility only;
+ *   automatic inquiries always use the fixed ten-second runtime fence.
  * - maxRetries remains a safe integer in [1, 10].
  * - reasonTypes and continueReasonTypes are nonempty arrays of trim-nonblank strings;
  *   valid lists replace.
@@ -34,7 +35,7 @@ export const DEFAULT_CONTINUE_REASON_TYPES: readonly string[] = Object.freeze([
 /** Maximum prompt size, measured in Unicode code points, accepted from config. */
 export const MAX_PROMPT_CHARACTERS = 16_384;
 
-/** Minimum accepted idleDelaySeconds (inclusive). */
+/** Minimum accepted deprecated idleDelaySeconds compatibility value. */
 export const MIN_IDLE_DELAY_SECONDS = 0;
 
 /** Minimum accepted maxRetries (inclusive). */
@@ -47,6 +48,7 @@ export const MIN_RETRIES = 1;
 export const MAX_RETRIES = 10;
 
 export interface ContinueWatchdogConfig {
+	/** @deprecated Accepted and preserved, but the inquiry fence is fixed at 10s. */
 	idleDelaySeconds: number;
 	maxRetries: number;
 	decisionPrompt: string;

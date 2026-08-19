@@ -160,7 +160,7 @@ async function makePackedFixture(
 	assert.deepEqual(installedManifest.pi?.extensions, ["./src/extension.ts"]);
 	assert.equal(
 		installedManifest.dependencies?.["pi-extension-utils"],
-		"git+https://github.com/xz-dev/pi-extension-utils.git#a9043f0efef765789c221c1193373a8405792f1f",
+		"git+https://github.com/xz-dev/pi-extension-utils.git#c0a453bcfdbda08b769ef2508c09686b071737ad",
 	);
 	const utilsPackage = join(installRoot, "node_modules", "pi-extension-utils");
 	const utilsManifest = JSON.parse(
@@ -547,12 +547,12 @@ function createRpcUiContext(): ExtensionUIContext {
 }
 
 test("packed stock Pi shares aggregate idle and root control across independent ResourceLoaders", {
-	timeout: 35_000,
+	timeout: 50_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t, {
 		includeWatchdog: false,
 		withProbeOutput: true,
-		watchdogConfig: { idleDelaySeconds: 0.25 },
+		watchdogConfig: { idleDelaySeconds: 10 },
 	});
 	assert.ok(fixture.probeOut);
 	const packedWatchdogPath = join(fixture.packageDir, "src", "extension.ts");
@@ -672,7 +672,7 @@ test("packed stock Pi shares aggregate idle and root control across independent 
 	await childB.session.abort();
 	await childBPrompt;
 	await waitForSessionIdle(childB.session, 3_000, "child-b abort");
-	await waitFor(() => requests.length === 4, 5_000, "aggregate-idle decision");
+	await waitFor(() => requests.length === 4, 15_000, "aggregate-idle decision");
 	await waitForSessionIdle(root.session, 3_000, "root unlock decision");
 
 	const decisionRequests = requests.filter((request) =>
@@ -737,10 +737,10 @@ test("packed stock Pi shares aggregate idle and root control across independent 
 });
 
 test("packed artifact asks after threshold compaction settles", {
-	timeout: 35_000,
+	timeout: 50_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t, {
-		watchdogConfig: { idleDelaySeconds: 0.5 },
+		watchdogConfig: { idleDelaySeconds: 10 },
 		piSettings: {
 			compaction: { reserveTokens: 16, keepRecentTokens: 1 },
 			retry: { enabled: false },
@@ -782,7 +782,7 @@ test("packed artifact asks after threshold compaction settles", {
 
 	const promptStartedAt = Date.now();
 	await session.prompt("A normal turn must settle after threshold compaction.");
-	const decisionDeadline = promptStartedAt + 20_000;
+	const decisionDeadline = promptStartedAt + 30_000;
 	const waitWithinDeadline = async (
 		condition: () => boolean,
 		phase: string,
@@ -1016,10 +1016,10 @@ test("packed source artifact waits a real 10 seconds, decides continue, and fold
 });
 
 test("packed stock Pi retries a decision connection error and accepts the successful unlock", {
-	timeout: 30_000,
+	timeout: 45_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t, {
-		watchdogConfig: { idleDelaySeconds: 0 },
+		watchdogConfig: { idleDelaySeconds: 10 },
 	});
 	const { baseUrl, requests } = await startMockServer(t, [
 		{ kind: "stop" },
@@ -1036,7 +1036,7 @@ test("packed stock Pi retries a decision connection error and accepts the succes
 	await session.prompt("Complete the task, then let the watchdog decide.");
 	await waitFor(
 		() => requests.length === 3,
-		10_000,
+		20_000,
 		"retried watchdog decision provider request",
 	);
 	await waitForSessionIdle(session, 10_000, "retried watchdog unlock");
@@ -1080,7 +1080,7 @@ test("packed stock Pi retries a decision connection error and accepts the succes
 });
 
 test("packed command unlock and canonical programmatic abort prevent a decision turn", {
-	timeout: 20_000,
+	timeout: 40_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t);
 	let markStreamStarted: (() => void) | undefined;
@@ -1105,7 +1105,7 @@ test("packed command unlock and canonical programmatic abort prevent a decision 
 
 	await session.prompt("/lock-continue-watchdog");
 	await session.prompt("/unlock-continue-watchdog waiting for user");
-	await new Promise((resolvePromise) => setTimeout(resolvePromise, 3_300));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 10_300));
 	assert.equal(requests.length, 0);
 	const entries = session.sessionManager.getEntries();
 	assert.equal(
@@ -1129,16 +1129,16 @@ test("packed command unlock and canonical programmatic abort prevent a decision 
 		);
 	assert.equal(branchAssistants.length, 1);
 	assert.equal(branchAssistants[0]?.stopReason, "aborted");
-	await new Promise((resolvePromise) => setTimeout(resolvePromise, 3_300));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 10_300));
 	assert.equal(requests.length, 1);
 });
 
 test("packed interactive and RPC input preempt a streaming decision once", {
-	timeout: 30_000,
+	timeout: 70_000,
 }, async (t) => {
 	for (const source of ["interactive", "rpc"] as const) {
 		const fixture = await makePackedFixture(t, {
-			watchdogConfig: { idleDelaySeconds: 0.1 },
+			watchdogConfig: { idleDelaySeconds: 10 },
 		});
 		let markDecisionStarted: (() => void) | undefined;
 		const decisionStarted = new Promise<void>((resolveStarted) => {
@@ -1178,7 +1178,7 @@ test("packed interactive and RPC input preempt a streaming decision once", {
 		await session.prompt("Open a decision that user input will preempt.");
 		await waitFor(
 			() => requests.length === 2,
-			8_000,
+			18_000,
 			`${source} decision stream`,
 		);
 		await decisionStarted;
@@ -1265,12 +1265,12 @@ test("packed interactive and RPC input preempt a streaming decision once", {
 });
 
 test("packed neutral probe receives typed continue and AI unlock hooks", {
-	timeout: 45_000,
+	timeout: 70_000,
 }, async (t) => {
 	// Continue path: probe receives the accepted typed continue exactly once.
 	const continueFixture = await makePackedFixture(t, {
 		withSemanticProbe: true,
-		watchdogConfig: { idleDelaySeconds: 1 },
+		watchdogConfig: { idleDelaySeconds: 10 },
 	});
 	assert.ok(continueFixture.probeOut);
 	const continueServer = await startMockServer(t, [
@@ -1289,7 +1289,7 @@ test("packed neutral probe receives typed continue and AI unlock hooks", {
 	);
 	await waitFor(
 		() => continueServer.requests.length === 3,
-		8_000,
+		18_000,
 		"continued provider turn with probe",
 	);
 	await waitForSessionIdle(
@@ -1315,7 +1315,7 @@ test("packed neutral probe receives typed continue and AI unlock hooks", {
 	// AI unlock path: probe receives exactly one AI_UNLOCK envelope with reason.
 	const unlockFixture = await makePackedFixture(t, {
 		withSemanticProbe: true,
-		watchdogConfig: { idleDelaySeconds: 1 },
+		watchdogConfig: { idleDelaySeconds: 10 },
 	});
 	assert.ok(unlockFixture.probeOut);
 	const unlockServer = await startMockServer(t, [
@@ -1331,7 +1331,7 @@ test("packed neutral probe receives typed continue and AI unlock hooks", {
 	await unlockSession.session.prompt("Unlock after the decision check.");
 	await waitFor(
 		() => unlockServer.requests.length === 2,
-		8_000,
+		18_000,
 		"unlock decision request",
 	);
 	await waitForSessionIdle(unlockSession.session, 3_000, "probe unlock path");
@@ -1356,10 +1356,10 @@ test("packed neutral probe receives typed continue and AI unlock hooks", {
 });
 
 test("packed invalid decisions reask three times and leave Pi idle", {
-	timeout: 20_000,
+	timeout: 35_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t, {
-		watchdogConfig: { idleDelaySeconds: 0.1 },
+		watchdogConfig: { idleDelaySeconds: 10 },
 	});
 	const { baseUrl, requests } = await startMockServer(t, [
 		{ kind: "stop", text: "ordinary work complete" },
@@ -1371,7 +1371,7 @@ test("packed invalid decisions reask three times and leave Pi idle", {
 	t.after(() => shutdownSession(session));
 
 	await session.prompt("Exercise the bounded invalid decision path.");
-	await waitFor(() => requests.length === 4, 8_000, "three invalid decisions");
+	await waitFor(() => requests.length === 4, 18_000, "three invalid decisions");
 	await waitForSessionIdle(session, 3_000, "decision-failed path");
 
 	const branch = session.sessionManager.getBranch();
@@ -1393,10 +1393,10 @@ test("packed invalid decisions reask three times and leave Pi idle", {
 });
 
 test("packed persisted session resumes without watchdog decision context or working hang", {
-	timeout: 30_000,
+	timeout: 45_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t, {
-		watchdogConfig: { idleDelaySeconds: 0.1 },
+		watchdogConfig: { idleDelaySeconds: 10 },
 	});
 	const { baseUrl, requests } = await startMockServer(t, [
 		{ kind: "stop", text: "ordinary work complete" },
@@ -1415,7 +1415,7 @@ test("packed persisted session resumes without watchdog decision context or work
 	);
 	await waitFor(
 		() => requests.length === 2,
-		6_000,
+		18_000,
 		"persisted unlock decision",
 	);
 	await waitForSessionIdle(first.session, 3_000, "persisted unlock decision");
@@ -1458,7 +1458,7 @@ test("packed custom reasonTypes replace defaults and match mixed-case input", {
 	const fixture = await makePackedFixture(t, {
 		withSemanticProbe: true,
 		watchdogConfig: {
-			idleDelaySeconds: 1,
+			idleDelaySeconds: 10,
 			reasonTypes: ["Need Review", "shipped"],
 		},
 	});
@@ -1475,7 +1475,7 @@ test("packed custom reasonTypes replace defaults and match mixed-case input", {
 	t.after(() => shutdownSession(session));
 
 	await session.prompt("Unlock with a custom mixed-case reason type.");
-	await waitFor(() => requests.length === 2, 8_000, "unlock decision request");
+	await waitFor(() => requests.length === 2, 18_000, "unlock decision request");
 	await waitForSessionIdle(session, 3_000, "custom reason unlock path");
 
 	// The decision prompt advertises only the effective custom list while ordinary

@@ -183,21 +183,10 @@ function idleDomainSnapshot(generation = 1n): DomainSnapshot {
 	return {
 		domainId: "domain",
 		domainEpoch: "epoch",
-		revision: generation,
 		activityGeneration: generation,
-		participants: 1,
 		busyParticipants: 0,
 		allIdle: true,
-		certain: true,
 		fence: { domainEpoch: "epoch", activityGeneration: generation },
-	};
-}
-
-function uncertainDomainSnapshot(generation: bigint): DomainSnapshot {
-	return {
-		...idleDomainSnapshot(generation),
-		allIdle: false,
-		certain: false,
 	};
 }
 
@@ -206,52 +195,27 @@ interface PendingConfirm {
 	resolve(value: boolean): void;
 }
 
-function createFenceHarness(options?: {
-	readonly reject?: "markBusy" | "markIdle" | "setInternalDecision";
-}) {
+function createFenceHarness(options?: { readonly rejectReport?: boolean }) {
 	let snapshot = idleDomainSnapshot();
-	let reject = options?.reject;
+	let rejectReport = options?.rejectReport === true;
 	let confirmResult = true;
 	let deferred = false;
-	let invalidateDuringInternalBusy = false;
 	const pendingConfirms: PendingConfirm[] = [];
-	const internalDecisionMarks: boolean[] = [];
-	const operationCalls: string[] = [];
+	const reportedIdle: boolean[] = [];
 	const listeners = new Set<
 		(value: DomainSnapshot, source: "local" | "domain") => void
 	>();
-	const rejectOnce = (operation: typeof reject): void => {
-		operationCalls.push(String(operation));
-		if (reject !== operation) return;
-		reject = undefined;
-		snapshot = uncertainDomainSnapshot(snapshot.activityGeneration + 1n);
-		for (const listener of listeners) listener(snapshot, "domain");
-		throw new Error(`${operation} failed`);
-	};
 	const domain: ProcessDomainCoordinator = {
 		get snapshot() {
 			return snapshot;
 		},
 		isRootProcess: true,
 		async attach() {},
-		async markBusy(_instance, markOptions) {
-			rejectOnce("markBusy");
-			internalDecisionMarks.push(markOptions?.internalDecision ?? false);
-			if (
-				invalidateDuringInternalBusy &&
-				markOptions?.internalDecision === true
-			) {
-				invalidateDuringInternalBusy = false;
-				snapshot = idleDomainSnapshot(snapshot.activityGeneration + 1n);
-				for (const listener of listeners) listener(snapshot, "domain");
-			}
-		},
-		async markIdle() {
-			rejectOnce("markIdle");
-		},
-		async setInternalDecision(_instance, internal) {
-			rejectOnce("setInternalDecision");
-			internalDecisionMarks.push(internal);
+		async reportIdle(_instance, idle) {
+			reportedIdle.push(idle);
+			if (!rejectReport) return;
+			rejectReport = false;
+			throw new Error("reportIdle failed");
 		},
 		confirm(fence: DomainFence) {
 			if (deferred) {
@@ -269,8 +233,7 @@ function createFenceHarness(options?: {
 	};
 	return {
 		domain,
-		internalDecisionMarks,
-		operationCalls,
+		reportedIdle,
 		failConfirm(): void {
 			confirmResult = false;
 		},
@@ -297,9 +260,6 @@ function createFenceHarness(options?: {
 		recover(): void {
 			snapshot = idleDomainSnapshot(snapshot.activityGeneration + 1n);
 			for (const listener of listeners) listener(snapshot, "domain");
-		},
-		invalidateNextInternalBusy(): void {
-			invalidateDuringInternalBusy = true;
 		},
 	};
 }
@@ -507,7 +467,10 @@ function createHarness(options?: {
 	harness.runtime = runtime;
 	harness.fire = async (name, event) => {
 		if (name === "message_start") {
-			await runtime.handleMessageStart(event as { readonly message: unknown });
+			await runtime.handleMessageStart(
+				event as { readonly message: unknown },
+				ctx,
+			);
 		}
 		for (const handler of handlers.get(name) ?? []) {
 			await handler(event as never, ctx);
@@ -666,22 +629,9 @@ function lifecycleDomain(options?: {
 	};
 }
 
-/**
- * Fire agent_settled and the deferred 0ms settled-phase wake scheduled last by
- * the production handler. Capture before/after so idle-timer arming (which may
- * also be 0ms when idleDelaySeconds=0) is not mistaken for the wake callback.
- */
+/** agent_settled itself is the authoritative finalization boundary. */
 async function settleOnly(harness: Harness): Promise<void> {
-	const before = harness.clock.records.length;
 	await harness.fire("agent_settled", { type: "agent_settled" });
-	const after = harness.clock.records.length;
-	assert.ok(
-		after > before,
-		"true-idle agent_settled must schedule a deferred settled-phase callback",
-	);
-	const deferred = after - 1;
-	assert.equal(harness.clock.records[deferred]?.delayMs, 0);
-	harness.clock.fire(deferred);
 	await Promise.resolve();
 	await Promise.resolve();
 }
@@ -707,10 +657,11 @@ test("idle arms one unref timer and opens one visible decision-only window", asy
 	});
 	harness.runtime.reconcileIdle();
 
-	assert.equal(harness.clock.records.length, 1);
-	assert.equal(harness.clock.records[0]?.delayMs, 3000);
-	assert.equal(harness.clock.records[0]?.unrefCount, 1);
-	harness.clock.fire(0);
+	assert.equal(harness.clock.records.length, 2);
+	assert.equal(harness.clock.records[0]?.cleared, true);
+	assert.equal(harness.clock.records[1]?.delayMs, 10_000);
+	assert.equal(harness.clock.records[1]?.unrefCount, 1);
+	harness.clock.fire(1);
 
 	assert.equal(harness.sent[0]?.message.customType, DECISION_MESSAGE_TYPE);
 	assert.equal(harness.sent[0]?.message.display, false);
@@ -732,10 +683,10 @@ test("trigger status reports real runtime grace and finalization state without m
 	const waiting = harness.runtime.getTriggerStatus();
 	assert.equal(waiting.blocker, null);
 	assert.equal(waiting.gracePhase, "grace");
-	assert.equal(waiting.graceRemainingMs, 3000);
+	assert.equal(waiting.graceRemainingMs, 10_000);
 	assert.equal(waiting.observableBusyCount, 0);
 
-	harness.clock.fire(0);
+	harness.clock.fire(harness.clock.records.length - 1);
 	await harness.startDecision();
 	await harness.fire("agent_end", {
 		type: "agent_end",
@@ -796,49 +747,21 @@ test("maximum configured decision prompt still opens and re-asks with generated 
 	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
 });
 
-test("zero idle delay schedules an asynchronous immediate decision", async () => {
-	const harness = createHarness({ config: { idleDelaySeconds: 0 } });
-	await startIdle(harness);
-	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
-		suppressNotify: true,
-	});
-	harness.runtime.reconcileIdle();
+test("legacy idle delay config cannot alter the fixed ten-second fence", async () => {
+	for (const idleDelaySeconds of [0, 0.5, Number.MAX_VALUE]) {
+		const harness = createHarness({ config: { idleDelaySeconds } });
+		await startIdle(harness);
+		harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+			suppressNotify: true,
+		});
+		harness.runtime.reconcileIdle();
 
-	assert.equal(harness.clock.records.length, 1);
-	assert.equal(harness.clock.records[0]?.delayMs, 0);
-	assert.equal(harness.sent.length, 0);
-	harness.clock.fire(0);
-	assert.equal(harness.sent[0]?.message.customType, DECISION_MESSAGE_TYPE);
-});
-
-test("fractional idle delay is scheduled in milliseconds", async () => {
-	const harness = createHarness({ config: { idleDelaySeconds: 0.5 } });
-	await startIdle(harness);
-	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
-		suppressNotify: true,
-	});
-	harness.runtime.reconcileIdle();
-
-	assert.equal(harness.clock.records[0]?.delayMs, 500);
-});
-
-test("delays beyond one Node timer are scheduled in bounded chunks", async () => {
-	const maximumTimerDelayMs = 2 ** 31 - 1;
-	const harness = createHarness({
-		config: { idleDelaySeconds: (maximumTimerDelayMs + 1000) / 1000 },
-	});
-	await startIdle(harness);
-	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
-		suppressNotify: true,
-	});
-	harness.runtime.reconcileIdle();
-
-	assert.equal(harness.clock.records[0]?.delayMs, maximumTimerDelayMs);
-	harness.clock.fire(0);
-	assert.equal(harness.sent.length, 0);
-	assert.equal(harness.clock.records[1]?.delayMs, 1000);
-	harness.clock.fire(1);
-	assert.equal(harness.sent[0]?.message.customType, DECISION_MESSAGE_TYPE);
+		const timer = harness.clock.records.at(-1);
+		assert.equal(timer?.delayMs, 10_000);
+		assert.equal(harness.sent.length, 0);
+		timer?.callback();
+		assert.equal(harness.sent[0]?.message.customType, DECISION_MESSAGE_TYPE);
+	}
 });
 
 test("busy activity cancels the current chunk of a long delay", async () => {
@@ -868,26 +791,6 @@ test("busy activity cancels the current chunk of a long delay", async () => {
 	assert.equal(harness.sent.length, 0);
 });
 
-test("the largest finite delay starts with one bounded timer chunk", async () => {
-	const maximumTimerDelayMs = 2 ** 31 - 1;
-	const harness = createHarness({
-		config: { idleDelaySeconds: Number.MAX_VALUE },
-	});
-	await startIdle(harness);
-	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
-		suppressNotify: true,
-	});
-	harness.runtime.reconcileIdle();
-
-	assert.equal(harness.clock.records.length, 1);
-	assert.equal(harness.clock.records[0]?.delayMs, maximumTimerDelayMs);
-	assert.equal(harness.sent.length, 0);
-	harness.clock.fire(0);
-	assert.equal(harness.sent.length, 0);
-	assert.equal(harness.clock.records[1]?.delayMs, maximumTimerDelayMs);
-	assert.equal(harness.clock.records.length, 2);
-});
-
 test("observable child busy cancels and full idle restarts the same delay", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
@@ -909,7 +812,7 @@ test("observable child busy cancels and full idle restarts the same delay", asyn
 	assert.equal(activeTimer.cleared, true);
 	harness.hub.markIdle(child);
 	assert.equal(harness.clock.records.length, timersAfterBind + 1);
-	assert.equal(harness.clock.records.at(-1)?.delayMs, 3000);
+	assert.equal(harness.clock.records.at(-1)?.delayMs, 10_000);
 });
 
 test("agent_end finalizes while streaming but settled alone dispatches continue", async () => {
@@ -928,6 +831,12 @@ test("agent_end finalizes while streaming but settled alone dispatches continue"
 	const turnsBefore = harness.triggeredTurns;
 
 	await harness.startDecision();
+	// Stock Pi emits assistant message_start inside the same confirmed inquiry run.
+	// It is live-observed but must not be mistaken for foreign activity.
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: harness.answerContinue(),
+	});
 	await harness.fire("agent_end", {
 		type: "agent_end",
 		messages: [harness.answerContinue()],
@@ -991,7 +900,11 @@ test("inquiry marker persistence failure prevents decision dispatch", async () =
 	await startIdle(harness);
 	await harness.openDecision({ start: false });
 
-	assert.equal(harness.sent.length, 0);
+	assert.equal(
+		harness.sent.filter((entry) => entry.options?.triggerTurn === true).length,
+		0,
+	);
+	assert.equal(harness.sent.at(-1)?.options?.triggerTurn, false);
 	assert.equal(harness.controller.snapshot.locked, false);
 	assert.equal(harness.controller.snapshot.decisionOpen, false);
 });
@@ -1607,16 +1520,26 @@ test("continued settle rearms the fixed delay once and exhausts at max", async (
 	await startIdle(harness);
 	await harness.openDecision();
 	await settleResponse(harness, harness.answerContinue());
+	// The continuation turn has its own public start/settled lifecycle.
+	const timersBeforeRearm = harness.clock.records.length;
 	harness.streaming = true;
 	await harness.fire("agent_start", { type: "agent_start" });
 	harness.streaming = false;
 	await settleOnly(harness);
-	const secondTimer = harness.clock.records.findIndex(
-		(record, index) => index > 0 && record.delayMs === 3000 && !record.cleared,
+	const secondTimer = harness.clock.records.findLastIndex(
+		(record, index) => index >= timersBeforeRearm && record.delayMs === 10_000,
 	);
 	assert.ok(secondTimer >= 0);
+	assert.equal(harness.clock.records[secondTimer]?.delayMs, 10_000);
+	assert.equal(harness.clock.records[secondTimer]?.cleared, false);
 	harness.clock.fire(secondTimer);
 	await settleResponse(harness, harness.answerContinue());
+	// The accepted continuation itself is intermediate; exhaustion is observed
+	// when that continuation turn reaches its authoritative settled boundary.
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	harness.streaming = false;
+	await settleOnly(harness);
 
 	assert.equal(harness.controller.snapshot.exhausted, true);
 	assert.equal(harness.controller.snapshot.attempt, 2);
@@ -1853,7 +1776,7 @@ test("Examples 1-2: restart lock cycle clears an open decision, then locks and n
 	await settleOnly(harness);
 	assert.equal(
 		harness.clock.records.some(
-			(record) => record.delayMs === 3000 && !record.cleared,
+			(record) => record.delayMs === 10_000 && !record.cleared,
 		),
 		true,
 	);
@@ -1888,7 +1811,7 @@ test("manual lock after pending continue clears fold and rearms base idle delay"
 
 	await harness.runtime.restartLockCycle(harness.ctx, { notifyLocked: true });
 	assert.equal(harness.controller.snapshot.attempt, 0);
-	assert.equal(harness.clock.records.at(-1)?.delayMs, 3000);
+	assert.equal(harness.clock.records.at(-1)?.delayMs, 10_000);
 });
 
 test("restart lock cycle cancels an old idle timer and reconciles one fresh base timer", async () => {
@@ -1902,7 +1825,7 @@ test("restart lock cycle cancels an old idle timer and reconciles one fresh base
 	assert.ok(first);
 	await harness.runtime.restartLockCycle(harness.ctx, { notifyLocked: true });
 	assert.equal(first.cleared, true);
-	assert.equal(harness.clock.records.at(-1)?.delayMs, 3000);
+	assert.equal(harness.clock.records.at(-1)?.delayMs, 10_000);
 });
 
 test("ordinary unlocked main agent_start silently locks; locked start preserves cycle and decision", async () => {
@@ -1918,7 +1841,7 @@ test("ordinary unlocked main agent_start silently locks; locked start preserves 
 	harness.streaming = false;
 	await settleOnly(harness);
 	const idleTimerIndex = harness.clock.records.findIndex(
-		(record) => record.delayMs === 3000 && !record.cleared,
+		(record) => record.delayMs === 10_000 && !record.cleared,
 	);
 	assert.ok(idleTimerIndex >= 0);
 	harness.clock.fire(idleTimerIndex);
@@ -1942,31 +1865,18 @@ test("false-idle settle schedules no deferred callback; later true settle reconc
 
 	harness.streaming = false;
 	await settleOnly(harness);
-	assert.equal(harness.clock.records.at(-1)?.delayMs, 3000);
+	assert.equal(harness.clock.records.at(-1)?.delayMs, 10_000);
 });
 
-test("deferred settled wake is inert after later agent_start; next true settle works", async () => {
+test("authoritative settled finalizes directly without a competing zero-delay wake", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
 	await harness.openDecision();
 	harness.streaming = false;
-	const before = harness.clock.records.length;
+	const timersBefore = harness.clock.records.length;
 	await harness.fire("agent_settled", { type: "agent_settled" });
-	const deferred = harness.clock.records.length - 1;
-	assert.ok(harness.clock.records.length > before);
 
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
-	harness.clock.fire(deferred);
-	assert.equal(
-		harness.sent.filter((entry) =>
-			entry.message.content.includes("previous decision response was invalid"),
-		).length,
-		0,
-	);
-
-	harness.streaming = false;
-	await settleOnly(harness);
+	assert.equal(harness.clock.records.length, timersBefore);
 	assert.match(
 		harness.sent.at(-1)?.message.content ?? "",
 		/previous decision response was invalid/,
@@ -1998,32 +1908,21 @@ test("stale deferred settle is inert after later start+settle even when ctx is i
 	);
 });
 
-test("duplicate true-idle settles schedule two wakes but only the latest acts", async () => {
+test("duplicate true-idle reports replace the full ten-second candidate", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
-	await harness.openDecision();
-	await harness.startDecision();
-	harness.streaming = false;
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
 	await harness.fire("agent_settled", { type: "agent_settled" });
-	const firstDeferred = harness.clock.records.length - 1;
-	await harness.fire("agent_settled", { type: "agent_settled" });
-	const secondDeferred = harness.clock.records.length - 1;
-	assert.notEqual(firstDeferred, secondDeferred);
+	const first = harness.clock.records.at(-1);
+	assert.equal(first?.delayMs, 10_000);
 
-	harness.clock.fire(firstDeferred);
-	assert.equal(
-		harness.sent.filter((entry) =>
-			entry.message.content.includes("previous decision response was invalid"),
-		).length,
-		0,
-	);
-	harness.clock.fire(secondDeferred);
-	assert.equal(
-		harness.sent.filter((entry) =>
-			entry.message.content.includes("previous decision response was invalid"),
-		).length,
-		1,
-	);
+	await harness.fire("agent_settled", { type: "agent_settled" });
+	const second = harness.clock.records.at(-1);
+	assert.notEqual(first, second);
+	assert.equal(first?.cleared, true);
+	assert.equal(second?.delayMs, 10_000);
 });
 
 test("decision settle without agent_end reasks twice then decision-fails without double count", async () => {
@@ -2070,8 +1969,8 @@ test("submitted decision invalidated by domain activity still redacts its assist
 	await harness.openDecision({ start: false });
 	await Promise.resolve();
 	await Promise.resolve();
-	fence.invalidateNextInternalBusy();
 	await harness.startDecision();
+	fence.advanceFence();
 
 	assert.equal(harness.controller.snapshot.locked, true);
 	assert.equal(harness.controller.snapshot.decisionOpen, false);
@@ -2121,9 +2020,9 @@ test("uncorrelated quarantine releases before an unrelated run", async () => {
 	await harness.openDecision({ start: false });
 	await Promise.resolve();
 	await Promise.resolve();
-	fence.invalidateNextInternalBusy();
+	fence.advanceFence();
 
-	// agent_start invalidates during the provisional interval, before the exact
+	// agent_start observes the stale provisional interval before exact correlation.
 	// decision custom input can correlate the quarantine to this run.
 	harness.streaming = true;
 	await harness.fire("agent_start", { type: "agent_start" });
@@ -2162,15 +2061,14 @@ test("stale fenced valid continue does not consume retry or exhaust", async () =
 	assert.equal(harness.controller.snapshot.attempt, 0);
 	assert.equal(harness.controller.snapshot.exhausted, false);
 	assert.equal(harness.controller.snapshot.decisionOpen, false);
-	assert.equal(
-		harness.sent.filter(
-			(entry) => entry.message.customType === DECISION_FOLD_MESSAGE_TYPE,
-		).length,
-		0,
+	const staleFolds = harness.sent.filter(
+		(entry) => entry.message.customType === DECISION_FOLD_MESSAGE_TYPE,
 	);
+	assert.equal(staleFolds.length, 1);
+	assert.equal(staleFolds[0]?.options?.triggerTurn, false);
 });
 
-test("domain uncertainty before unlock delivery defers the typed unlock", async () => {
+test("domain busy fence before unlock delivery defers the typed unlock", async () => {
 	const fence = createFenceHarness();
 	const harness = createHarness({ processDomain: fence.domain });
 	await startIdle(harness);
@@ -2232,7 +2130,7 @@ test("stale fenced third invalid response preserves counts and permits retry", a
 
 	// A later idle epoch remains eligible for a fresh decision attempt.
 	harness.runtime.reconcileIdle();
-	assert.equal(harness.clock.records.at(-1)?.delayMs, 3000);
+	assert.equal(harness.clock.records.at(-1)?.delayMs, 10_000);
 });
 
 test("pending valid continue keeps reconcile inert until fold delivery", async () => {
@@ -2259,10 +2157,62 @@ test("pending valid continue keeps reconcile inert until fold delivery", async (
 	);
 	assert.equal(
 		harness.clock.records.some(
-			(record) => record.delayMs === 3000 && !record.cleared,
+			(record) => record.delayMs === 10_000 && !record.cleared,
 		),
 		true,
 	);
+});
+
+test("foreign message activity cancels and neutralizes a submitted inquiry", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	await harness.openDecision();
+	await harness.startDecision();
+
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: {
+			role: "user",
+			content: [text("foreign work")],
+			timestamp: Date.now(),
+		},
+	});
+	const replacement = (await harness.endDecisionMessage(
+		harness.answerContinue(),
+	)) as DecisionMessageReplacement;
+
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.deepEqual(replacement.message.content, []);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.sent.at(-1)?.options?.triggerTurn, false);
+});
+
+test("same-process child activity cancels a submitted inquiry immediately", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	const child = harness.hub.bind({
+		instance: createHubAttachmentInstance(),
+		sessionId: "active-child",
+		hasUI: false,
+		initialBusy: false,
+	}).attachment;
+	await harness.openDecision();
+	await harness.startDecision();
+	const foldsBefore = harness.sent.filter(
+		(entry) => entry.message.customType === DECISION_FOLD_MESSAGE_TYPE,
+	).length;
+
+	harness.hub.markBusy(child);
+
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(
+		harness.sent.filter(
+			(entry) => entry.message.customType === DECISION_FOLD_MESSAGE_TYPE,
+		).length,
+		foldsBefore + 1,
+	);
+	assert.equal(harness.sent.at(-1)?.options?.triggerTurn, false);
 });
 
 test("child completion only makes aggregate idle; exactly one inquiry comes from main", async () => {
@@ -2334,19 +2284,18 @@ test("child completion only makes aggregate idle; exactly one inquiry comes from
 	});
 
 	await main.emit("agent_settled");
-	assert.equal(clock.records[0]?.delayMs, 0);
-	clock.fire(0);
+	assert.equal(clock.records.length, 0);
 	assert.deepEqual(sentBy, []);
 
 	await firstChild.emit("agent_settled");
-	assert.equal(clock.records.length, 1);
+	assert.equal(clock.records.length, 0);
 	assert.deepEqual(sentBy, []);
 
 	await lastChild.emit("agent_settled");
-	assert.equal(clock.records[1]?.delayMs, 3000);
-	assert.equal(clock.records.length, 2);
+	assert.equal(clock.records[0]?.delayMs, 10_000);
+	assert.equal(clock.records.length, 1);
 	assert.deepEqual(sentBy, []);
-	clock.fire(1);
+	clock.fire(0);
 	assert.deepEqual(sentBy, ["main"]);
 });
 
@@ -2499,13 +2448,13 @@ test("effective config loads before binding is reconciled and shutdown blocks la
 		suppressNotify: true,
 	});
 	runtime.reconcileIdle();
-	assert.equal(clock.records.at(-1)?.delayMs, 4000);
+	assert.equal(clock.records.at(-1)?.delayMs, 10_000);
 
 	runtime.shutdown();
 	assert.equal(holder.controller, null);
 });
 
-test("local AI state changes only at agent lifecycle boundaries", async () => {
+test("timer expiry rechecks live Pi state even without an earlier activity event", async () => {
 	let liveIdle = true;
 	const harness = createHarness({ isIdle: () => liveIdle });
 	await startIdle(harness);
@@ -2516,13 +2465,12 @@ test("local AI state changes only at agent lifecycle boundaries", async () => {
 	const timer = harness.clock.records.at(-1);
 	assert.ok(timer);
 
-	// Pi lifecycle owns the binary AI state. Host subphase detail changing without
-	// agent_start must not invent a second busy/idle transition.
+	// The wake-time public query is authoritative even if no event arrived first.
 	liveIdle = false;
 	harness.clock.fire(harness.clock.records.length - 1);
 
-	assert.equal(harness.sent.length, 1);
-	assert.equal(harness.sent[0]?.message.customType, DECISION_MESSAGE_TYPE);
+	assert.equal(harness.sent.length, 0);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
 });
 
 test("agent_start before idle timer callback defers; next true settle rearms", async () => {
@@ -2534,7 +2482,7 @@ test("agent_start before idle timer callback defers; next true settle rearms", a
 	harness.runtime.reconcileIdle();
 	const timer = harness.clock.records.at(-1);
 	assert.ok(timer);
-	assert.equal(timer.delayMs, 3000);
+	assert.equal(timer.delayMs, 10_000);
 
 	// One binary lifecycle edge covers tool execution, model output, and waiting.
 	harness.streaming = true;
@@ -2553,9 +2501,9 @@ test("agent_start before idle timer callback defers; next true settle rearms", a
 	assert.equal(harness.sent.length, 0);
 	const rearmed = [...harness.clock.records]
 		.reverse()
-		.find((record) => record.delayMs === 3000 && !record.cleared);
+		.find((record) => record.delayMs === 10_000 && !record.cleared);
 	assert.ok(rearmed);
-	assert.equal(rearmed.delayMs, 3000);
+	assert.equal(rearmed.delayMs, 10_000);
 	assert.equal(rearmed.cleared, false);
 
 	// Let the freshly re-armed watchdog dispatch before supplying its response.
@@ -2579,7 +2527,7 @@ test("observed pending input invalidates grace and clearing starts a fresh full 
 	});
 	harness.runtime.reconcileIdle();
 	const firstGrace = harness.clock.records.length - 1;
-	assert.equal(harness.clock.records[firstGrace]?.delayMs, 3000);
+	assert.equal(harness.clock.records[firstGrace]?.delayMs, 10_000);
 
 	harness.pendingMessages = true;
 	harness.runtime.reconcileIdle();
@@ -2589,7 +2537,7 @@ test("observed pending input invalidates grace and clearing starts a fresh full 
 	harness.runtime.reconcileIdle();
 	const secondGrace = harness.clock.records.length - 1;
 	assert.notEqual(secondGrace, firstGrace);
-	assert.equal(harness.clock.records[secondGrace]?.delayMs, 3000);
+	assert.equal(harness.clock.records[secondGrace]?.delayMs, 10_000);
 	harness.clock.records[firstGrace]?.callback();
 	assert.equal(harness.sent.length, 0);
 
@@ -2615,7 +2563,7 @@ test("pending input appearing at grace expiry blocks dispatch until a fresh full
 	harness.runtime.reconcileIdle();
 	const secondGrace = harness.clock.records.length - 1;
 	assert.notEqual(secondGrace, firstGrace);
-	assert.equal(harness.clock.records[secondGrace]?.delayMs, 3000);
+	assert.equal(harness.clock.records[secondGrace]?.delayMs, 10_000);
 });
 
 test("rejected grace-expiry fence starts no decision and waits for a fresh generation", async () => {
@@ -2644,7 +2592,7 @@ test("rejected grace-expiry fence starts no decision and waits for a fresh gener
 	fence.advanceFence();
 	const rearmed = [...harness.clock.records]
 		.reverse()
-		.find((record) => record.delayMs === 3000 && !record.cleared);
+		.find((record) => record.delayMs === 10_000 && !record.cleared);
 	assert.ok(rearmed);
 });
 
@@ -2664,7 +2612,7 @@ test("stale rejected grace qualification leaves the newer generation deadline un
 	const newerTimer = harness.clock.records.at(-1);
 	const timersBeforeStaleRejection = harness.clock.records.length;
 	assert.ok(newerTimer);
-	assert.equal(newerTimer.delayMs, 3000);
+	assert.equal(newerTimer.delayMs, 10_000);
 	assert.equal(newerTimer.cleared, false);
 
 	fence.resolvePendingConfirm(false);
@@ -2699,7 +2647,7 @@ test("domain generation change during grace qualification makes the old callback
 	assert.equal(harness.controller.snapshot.attempt, 0);
 	const rearmed = [...harness.clock.records]
 		.reverse()
-		.find((record) => record.delayMs === 3000 && !record.cleared);
+		.find((record) => record.delayMs === 10_000 && !record.cleared);
 	assert.ok(rearmed);
 });
 
@@ -2750,9 +2698,9 @@ test("local Pi busy during deferred initial fence confirm defers without consumi
 	assert.equal(harness.sent.length, 0);
 	const rearmed = [...harness.clock.records]
 		.reverse()
-		.find((record) => record.delayMs === 3000 && !record.cleared);
+		.find((record) => record.delayMs === 10_000 && !record.cleared);
 	assert.ok(rearmed);
-	assert.equal(rearmed.delayMs, 3000);
+	assert.equal(rearmed.delayMs, 10_000);
 });
 
 test("timer confirm busy race clears intent and waits for the next full idle delay", async () => {
@@ -2782,7 +2730,7 @@ test("timer confirm busy race clears intent and waits for the next full idle del
 	await settleOnly(harness);
 	const rearmed = [...harness.clock.records]
 		.reverse()
-		.find((record) => record.delayMs === 3000 && !record.cleared);
+		.find((record) => record.delayMs === 10_000 && !record.cleared);
 	assert.ok(rearmed);
 	assert.equal(harness.controller.snapshot.attempt, 0);
 });
@@ -2801,8 +2749,8 @@ test("provisional decision during confirm is not marked internal when an unrelat
 
 	harness.streaming = true;
 	await harness.fire("agent_start", { type: "agent_start" });
-	// The unrelated run must not be branded an internal watchdog decision.
-	assert.deepEqual(fence.internalDecisionMarks, [false]);
+	// Cross-process business data is only the live idle boolean.
+	assert.equal(fence.reportedIdle.at(-1), false);
 
 	fence.resolvePendingConfirm(true);
 	await Promise.resolve();
@@ -2822,7 +2770,7 @@ test("pending decision agent_start is provisionally internal until message corre
 
 	harness.streaming = true;
 	await harness.fire("agent_start", { type: "agent_start" });
-	assert.deepEqual(fence.internalDecisionMarks, [true]);
+	assert.equal(fence.reportedIdle.at(-1), false);
 	assert.equal(harness.controller.snapshot.decisionOpen, true);
 
 	await harness.fire("message_start", {
@@ -2861,10 +2809,7 @@ test("re-ask delivery that races local busy does not consume another attempt", a
 		messages: [harness.answerInvalid()],
 	});
 	harness.streaming = false;
-	await harness.fire("agent_settled", { type: "agent_settled" });
-	const deferredSettle = harness.clock.records.length - 1;
-	assert.equal(harness.clock.records[deferredSettle]?.delayMs, 0);
-	harness.clock.fire(deferredSettle);
+	const settling = harness.fire("agent_settled", { type: "agent_settled" });
 	await Promise.resolve();
 	await Promise.resolve();
 	assert.equal(fence.pendingConfirmCount(), 1);
@@ -2873,14 +2818,17 @@ test("re-ask delivery that races local busy does not consume another attempt", a
 	harness.streaming = true;
 	await harness.fire("agent_start", { type: "agent_start" });
 	fence.resolvePendingConfirm(true);
-	await Promise.resolve();
-	await Promise.resolve();
+	await settling;
 
 	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
 	assert.equal(harness.controller.snapshot.decisionFailed, false);
 	assert.equal(harness.controller.snapshot.locked, true);
 	assert.equal(harness.controller.snapshot.decisionOpen, false);
-	assert.equal(harness.sent.length, sentBefore);
+	assert.equal(harness.sent.length, sentBefore + 1);
+	assert.deepEqual(harness.sent.at(-1)?.options, {
+		triggerTurn: false,
+		deliverAs: "steer",
+	});
 	assert.equal(
 		harness.sent.filter((entry) =>
 			entry.message.content.includes("previous decision response was invalid"),
@@ -2897,9 +2845,9 @@ test("re-ask delivery that races local busy does not consume another attempt", a
 	await settleOnly(harness);
 	const rearmed = [...harness.clock.records]
 		.reverse()
-		.find((record) => record.delayMs === 3000 && !record.cleared);
+		.find((record) => record.delayMs === 10_000 && !record.cleared);
 	assert.ok(rearmed);
-	assert.equal(rearmed.delayMs, 3000);
+	assert.equal(rearmed.delayMs, 10_000);
 	assert.equal(harness.controller.snapshot.decisionOpen, false);
 	assert.equal(harness.controller.snapshot.locked, true);
 });
@@ -2918,9 +2866,9 @@ test("accepted continue busy races roll back retry and defer without unlocking",
 		messages: [duringConfirm.answerContinue()],
 	});
 	duringConfirm.streaming = false;
-	await duringConfirm.fire("agent_settled", { type: "agent_settled" });
-	const deferred = duringConfirm.clock.records.length - 1;
-	duringConfirm.clock.fire(deferred);
+	const settling = duringConfirm.fire("agent_settled", {
+		type: "agent_settled",
+	});
 	await Promise.resolve();
 	await Promise.resolve();
 	// deliverPending first performs the common finalization fence, then the
@@ -2932,8 +2880,7 @@ test("accepted continue busy races roll back retry and defer without unlocking",
 	assert.equal(fence.pendingConfirmCount(), 1);
 	await duringConfirm.startUnrelatedRun();
 	fence.resolvePendingConfirm(true);
-	await Promise.resolve();
-	await Promise.resolve();
+	await settling;
 	assert.equal(duringConfirm.controller.snapshot.attempt, 0);
 	assert.equal(duringConfirm.controller.snapshot.locked, true);
 	assert.equal(duringConfirm.triggeredTurns, 1);
@@ -3068,6 +3015,61 @@ test("real user input silently preempts a submitted decision and extension input
 	assert.equal(extension.controller.snapshot.decisionOpen, true);
 });
 
+test("preemption retries a failed cleanup fold and leaves no model context residue", async () => {
+	let cleanupAttempts = 0;
+	const harness = createHarness({
+		onSend(message) {
+			if (message.customType !== DECISION_FOLD_MESSAGE_TYPE) return undefined;
+			cleanupAttempts += 1;
+			return cleanupAttempts === 1
+				? new Error("cleanup unavailable")
+				: undefined;
+		},
+	});
+	await startIdle(harness);
+	await harness.openDecision();
+	await harness.startDecision();
+
+	assert.deepEqual(await harness.fireInput("interactive", "take over once"), {
+		action: "continue",
+	});
+	assert.equal(cleanupAttempts, 1);
+	assert.equal(harness.aborts, 1);
+	assert.equal(
+		harness.sent.some((entry) => entry.message.content === "take over once"),
+		false,
+	);
+
+	const neutralized = (await harness.endDecisionMessage(
+		assistant([text("private partial XML")], "aborted"),
+	)) as DecisionMessageReplacement;
+	assert.equal(cleanupAttempts, 2);
+	const cleanup = harness.sent.at(-1);
+	assert.equal(cleanup?.message.customType, DECISION_FOLD_MESSAGE_TYPE);
+	assert.equal(cleanup?.options?.triggerTurn, false);
+
+	const prompt = harness.sent.find(
+		(entry) => entry.message.customType === DECISION_MESSAGE_TYPE,
+	);
+	assert.ok(prompt);
+	const providerContext = foldDecisionContext([
+		{
+			role: "custom",
+			...prompt.message,
+			content: [{ type: "text", text: prompt.message.content }],
+			timestamp: 1,
+		},
+		{
+			role: "custom",
+			...cleanup?.message,
+			content: [{ type: "text", text: cleanup?.message.content ?? "" }],
+			timestamp: 2,
+		},
+		{ ...neutralized.message, timestamp: 3 },
+	]);
+	assert.deepEqual(providerContext, []);
+});
+
 test("preempted decision cleanup stays idempotent after another handler tags the assistant", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
@@ -3114,13 +3116,14 @@ test("provider retry agent_start preserves a confirmed internal decision classif
 	await Promise.resolve();
 	await Promise.resolve();
 	await harness.startDecision();
-	const confirmedMarks = [...fence.internalDecisionMarks];
-	assert.equal(confirmedMarks.at(-1), true);
+	const reportsBeforeRetry = fence.reportedIdle.length;
+	assert.equal(fence.reportedIdle.at(-1), false);
 	assert.equal(harness.controller.snapshot.decisionOpen, true);
 
 	await harness.fire("agent_start", { type: "agent_start" });
 
-	assert.deepEqual(fence.internalDecisionMarks, [...confirmedMarks, true]);
+	assert.equal(fence.reportedIdle.length, reportsBeforeRetry + 1);
+	assert.equal(fence.reportedIdle.at(-1), false);
 	assert.equal(harness.controller.snapshot.decisionOpen, true);
 });
 
@@ -3209,7 +3212,14 @@ test("send-time busy TOCTOU defers silently; idle send failure still fail-closed
 	assert.ok(timer);
 	busy.clock.fire(busy.clock.records.length - 1);
 
-	assert.equal(busy.sent.length, 0);
+	assert.equal(
+		busy.sent.filter((entry) => entry.options?.triggerTurn === true).length,
+		0,
+	);
+	assert.deepEqual(busy.sent.at(-1)?.options, {
+		triggerTurn: false,
+		deliverAs: "steer",
+	});
 	assert.equal(busy.controller.snapshot.decisionOpen, false);
 	assert.equal(busy.controller.snapshot.invalidDecisionAttempts, 0);
 	assert.equal(busy.controller.snapshot.locked, true);
@@ -3243,80 +3253,18 @@ test("send-time busy TOCTOU defers silently; idle send failure still fail-closed
 	);
 });
 
-test("runtime process-domain write rejection stays fail-closed and recovers", async () => {
-	for (const operation of [
-		"markBusy",
-		"markIdle",
-		"setInternalDecision",
-	] as const) {
-		const fence = createFenceHarness({ reject: operation });
-		const harness = createHarness({ processDomain: fence.domain });
-		await startIdle(harness);
+test("runtime live-state report rejection fails closed without domain uncertainty", async () => {
+	const fence = createFenceHarness({ rejectReport: true });
+	const harness = createHarness({ processDomain: fence.domain });
+	await startIdle(harness);
 
-		if (operation === "markBusy") {
-			harness.streaming = true;
-			await harness.fire("agent_start", { type: "agent_start" });
-			assert.equal(fence.domain.snapshot.certain, false);
-			fence.recover();
-			harness.streaming = false;
-			await harness.fire("agent_settled", { type: "agent_settled" });
-			assert.deepEqual(fence.operationCalls, ["markBusy", "markIdle"]);
-		} else if (operation === "markIdle") {
-			harness.streaming = true;
-			await harness.fire("agent_start", { type: "agent_start" });
-			harness.streaming = false;
-			await harness.fire("agent_settled", { type: "agent_settled" });
-			assert.equal(fence.domain.snapshot.certain, false);
-			fence.recover();
-			assert.deepEqual(fence.operationCalls, ["markBusy", "markIdle"]);
-		} else {
-			await harness.openDecision({ start: false });
-			await Promise.resolve();
-			await Promise.resolve();
-			assert.equal(harness.sent.length, 1);
-			await harness.startDecision();
-			assert.equal(fence.domain.snapshot.certain, false);
-			assert.equal(harness.controller.snapshot.decisionOpen, false);
-			assert.equal(harness.aborts, 1);
-			assert.deepEqual(await harness.blockToolCall(), {
-				block: true,
-				reason: DECISION_TOOL_BLOCK_REASON,
-			});
-			const quarantineReplacement = (await harness.endDecisionMessage(
-				assistant([text("untrusted failed-domain output")]),
-			)) as { readonly message: { readonly content: readonly unknown[] } };
-			assert.deepEqual(quarantineReplacement.message.content, []);
-			assert.equal(
-				harness.sent.at(-1)?.message.customType,
-				DECISION_FOLD_MESSAGE_TYPE,
-			);
-			await harness.fire("agent_end", {
-				type: "agent_end",
-				messages: [assistant([], "aborted")],
-			});
-			assert.deepEqual(await harness.blockToolCall(), {
-				block: true,
-				reason: DECISION_TOOL_BLOCK_REASON,
-			});
-			harness.streaming = false;
-			await harness.fire("agent_settled", { type: "agent_settled" });
-			assert.equal(await harness.blockToolCall(), undefined);
-			fence.recover();
-			assert.deepEqual(fence.operationCalls, [
-				"markBusy",
-				"setInternalDecision",
-				"markIdle",
-			]);
-		}
-
-		const timersBeforeRecoveryReconcile = harness.clock.records.length;
-		harness.runtime.reconcileIdle();
-		assert.equal(
-			harness.clock.records.length >= timersBeforeRecoveryReconcile,
-			true,
-		);
-		assert.equal(fence.domain.snapshot.certain, true);
-	}
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(fence.domain.snapshot.allIdle, true);
+	assert.deepEqual(fence.reportedIdle, [false]);
 });
 
 for (const code of [

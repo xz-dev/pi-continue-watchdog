@@ -31,7 +31,7 @@ Reload Pi extensions or start a new session after install.
 Observable behavior only (implementation details may change):
 
 1. Whenever the **main agent starts running**, the continue watchdog ensures it is locked. If already locked, the current cycle is preserved. A real main user message starts a fresh cycle by silently performing a full unlock cleanup first—canceling timers and pending decision work—then locking again to reset old cycle accounting, without either notification.
-2. While locked, after every participant in the inherited authenticated process domain stays idle for the current delay, the extension confirms its own immutable activity fence and opens a short **decision check** on the root main—regardless of whether Pi stopped normally, after compaction, or because of a Provider/extension error.
+2. Every relevant public Pi event queries live `ctx.isIdle()`; event names never imply activity. Same-process attachments and authenticated child Pi processes contribute to one root-owned aggregate. While locked, each eligible observation replaces the previous candidate timer and waits a full fixed **10 seconds** before the extension rechecks enabled state, timer identity, root ownership, live main idle, pending messages, and the root busy-child set. Only then can it open a short **decision check**.
 3. The decision is an **automated custom message**, not a user message. It may stream in the live TUI/RPC while the check runs; when it ends, the extension clears the decision assistant from final TUI history and persisted assistant content. Ordinary active tools and the system-prompt tool list remain unchanged for prompt-cache stability. The model decides quickly from existing conversation knowledge without tools and finishes with exactly one XML block:
 
    ```xml
@@ -52,7 +52,7 @@ Observable behavior only (implementation details may change):
 4. During every decision cycle, a live colored Pi-TUI widget shows `Continue watchdog checking` and the current attempt. Each watchdog validation re-ask and non-watchdog error is also retained as a colored TUI-only event card with its exact safe parser/original error. **Continue** requires an independently allowed type and concise reason, then persists `Continue watchdog continued · <TYPE> · <reason>` before semantic notification and dispatch, so repeated automatic continuation is visible and cannot silently consume tokens; if persistence fails, it fails closed without starting another turn. The complete decision exchange folds into the compact prompt `Continue until user assistance is required.` (configurable), and ordinary work resumes without further user input.
 5. **AI unlock** requires an allowed `reason_type` and concise nonblank `reason_content` of at most 500 Unicode code points. It shows one muted persistent TUI line, `Continue watchdog unlocked · <TYPE> · <reason>`, with no duplicate transient notification, and does **not** start another work turn. Future model context drops the complete decision exchange. Human command unlock remains untyped.
 6. A decision gets up to **3 total attempts**. An invalid final XML response counts as one attempt; blocked ordinary tool calls and provisional Provider errors that Pi retries within the same run do not. Invalid raw text is not retained. After the third invalid response, the extension stays locked/failed until a new main user message or manual lock, and the failed exchange is folded out of future model context.
-7. After each valid continue, the next authoritative all-idle generation waits the same fixed delay: default **10s** each time, up to **10** valid continues per lock cycle.
+7. After each valid continue, the next eligible live-idle observation waits the same fixed **10s** fence, up to **10** valid continues per lock cycle. Repeated identical reports restart all ten seconds.
 8. An **aborted** main run unlocks immediately (reasonless). Child stop reasons are never inspected.
 
 Design note: the extension does **not** blindly continue. It asks first so completed or intentionally waiting work can unlock cleanly.
@@ -137,7 +137,7 @@ Project config is ignored when the project is untrusted. Missing files are silen
 
 | Key | Default | Range / rules |
 |---|---|---|
-| `idleDelaySeconds` | `10` | Any finite number `≥ 0`; `0` schedules a 0 ms timer and fractions are allowed |
+| `idleDelaySeconds` | `10` | **Deprecated compatibility key.** Accepted and preserved, but ignored at runtime; every automatic inquiry fence is exactly 10 seconds. |
 | `maxRetries` | `10` | Safe integer `1`–`10` (valid continues per lock cycle) |
 | `decisionPrompt` | see above | Non-blank, ≤ **16384** Unicode code points |
 | `continuePrompt` | `Continue until user assistance is required.` | Non-blank, ≤ **16384** Unicode code points |
@@ -150,9 +150,7 @@ For AI unlock and continue, the extension trims XML `reason_type`, matches it ag
 
 Invalid re-ask budget is fixed at **3** (not configurable).
 
-Every new authoritative all-idle activity generation waits one fixed
-`idleDelaySeconds` grace. Valid continues advance only the `maxRetries`
-accounting; they do not lengthen later grace periods.
+Every candidate automatic inquiry replaces the prior timer and waits one full fixed 10-second fence. Repeated events and repeated equal idle reports restart the complete delay. Valid continues advance only `maxRetries`; they do not alter the fence.
 
 
 ## Neutral semantic hooks
@@ -174,23 +172,23 @@ When the elected main attachment reaches a **terminal aggregate-idle** epoch whe
 
 - **“All agents”** means watchdog-loaded Pi sessions that inherit `PI_EXTENSION_UTILS_PROCESS_DOMAIN` from the root. Same-realm attachments aggregate into one OS-process participant; child and nested Pi processes join after their watchdog completes `session_start` and reports activity. A deliberately stripped/replaced environment or a child that does not load watchdog is outside coverage. Coverage starts only after activity registration; no earlier guarantee is claimed.
 - The root is the sole endpoint creator and watchdog decision authority. `pi-extension-utils` binds one ephemeral loopback TCP listener; each authenticated client owns one framed connection and clients only connect. `PI_CONTINUE_WATCHDOG_ROOT_PID` is topology metadata, not authentication.
-- `pi-extension-utils` supplies authenticated transport, peer status, directed/broadcast data, and Pi lifecycle facts only. This watchdog owns busy/idle reduction, participants, certainty, activity generations, fences, retries, pause/reset behavior, and decision queues. Application ping/pong liveness marks a disconnected or frozen peer uncertain/fail-closed until it reconnects, completes a fresh HMAC handshake, and sends fresh activity.
-- Initial declaration/authentication/transport failures fail closed with sanitized output and exit status 78. Runtime disconnect or transport loss disables automatic decisions without terminating Pi. Secrets, HMAC proofs, raw declarations, and endpoints are never printed.
+- Cross-process watchdog business data contains exactly `{ agentId, idle }`. The authenticated sender ID must match `agentId`. The root keeps a deduplicated `Set` of busy child IDs: `idle:false` adds, `idle:true` or disconnect deletes. Connect alone is neutral. Every accepted report and disconnect replaces the root fence, even when the resulting boolean state is unchanged.
+- `pi-extension-utils` supplies authenticated transport, peer events, heartbeat liveness, and a fixed 1-second reconnect retry. After reconnect, the child immediately queries live `ctx.isIdle()` and reports it; stale activity is never reused. Initial declaration/authentication/transport failures fail closed with sanitized output and exit status 78. Runtime disconnect counts that child idle while transport reconnects; it does not create a business-level uncertain state or terminate Pi. Secrets, HMAC proofs, raw declarations, and endpoints are never printed.
 - **Main election:** UI-bound session wins; pure headless uses first-bound attachment as best-effort main; later non-UI attachments do not steal main.
 - **Root ownership:** every extension-enabled attachment observes and reports busy/idle. Only the exact current main owns config, timers, XML decision messages, tool-call blocking, UI notifies, and `user-ready` publication. Non-main attachments are **observer-only** and do not load watchdog config or open decision windows.
-- **Framework boundary:** coordination uses only Pi public lifecycle/session APIs. There is no dependence on other plugins or path heuristics. Pi's `pi.events` bus is for semantic-hook delivery only, not for process coordination.
+- **Framework boundary:** coordination uses only Pi public extension APIs, notably live `ctx.isIdle()`, `ctx.abort()`, `ctx.hasPendingMessages()`, `input`, `agent_settled`, and uninterruptible `message_end`. There is no dependence on private Pi fields, fork-only behavior, other plugins, or path heuristics. Pi's `pi.events` bus is for semantic-hook delivery only, not process coordination.
 - **Lock state is runtime-only.** A new process/session attachment begins unlocked until its current main agent starts. Nothing is written to disk, and shutdown cancels runtime activity.
 - XML decision control is main-only; ordinary tools remain advertised but are blocked while the main decision is open.
 
 ## Context cleanliness
 
-After valid continue, valid unlock, terminal decision failure, or user preemption, future **model-bound** context drops the complete decision exchange, including the decision question, any streamed assistant/tool-result residue, re-asks, and fold marker. Continue replaces it with the compact continue prompt; unlock, failure, and preemption replace it with nothing. Canonical aborted decision pairs are also removed. A malformed or incomplete historical exchange fails closed only for its own correlation ID; it cannot disable folding for later independent exchanges.
+After valid continue, valid unlock, terminal decision failure, user preemption, or renewed external activity, future **model-bound** context drops the complete decision exchange, including the decision question, any streamed assistant/tool-result residue, re-asks, and fold marker. Continue replaces it with the compact continue prompt; other terminal/cancel paths replace it with nothing. A shared per-attempt handle owns exact correlation, first-terminal-wins, idempotent cancellation, assistant neutralization, and retryable remove-fold cleanup. Only exactly correlated neutralized aborted assistants can be removed without a fold marker.
 
 Each decision stores only a structured `pi-continue-watchdog:decision-audit` custom entry. Pi explicitly excludes plain custom entries from Agent/provider context, so the audit survives `pi -c` without becoming conversation. Valid continue and unlock audits keep the validated type and reason; invalid audits keep only the fixed validation error, never raw model text. The original XML and any aborted partial decision are not retained as assistant content. Pi's public `message_end` replacement leaves an empty assistant metadata record rather than deleting the append-only entry.
 
 ## Development
 
-The detailed accepted behavior contract is maintained in [`docs/behavior-contract.md`](docs/behavior-contract.md). For the current module design, lifecycle, XML finalization, session persistence, and provider-context isolation, see [`docs/architecture.md`](docs/architecture.md).
+The authoritative Lean process model is [`docs/programming-thinking/official-pi-idle-inquiry.idea.lean`](docs/programming-thinking/official-pi-idle-inquiry.idea.lean). The accepted behavior contract is [`docs/behavior-contract.md`](docs/behavior-contract.md); implementation structure and context isolation are in [`docs/architecture.md`](docs/architecture.md).
 
 ```bash
 npm ci

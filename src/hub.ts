@@ -176,7 +176,7 @@ class ProcessObservableAgentHub implements ObservableAgentHub {
 
 	public markBusy(attachment: HubAttachment): HubTransition {
 		const registered = this.findRegistered(attachment);
-		if (registered === undefined || registered.busy) return this.noop();
+		if (registered === undefined) return this.noop();
 
 		const wasAllObservableIdle = this.allObservableIdle();
 		registered.busy = true;
@@ -185,7 +185,7 @@ class ProcessObservableAgentHub implements ObservableAgentHub {
 
 	public markIdle(attachment: HubAttachment): HubTransition {
 		const registered = this.findRegistered(attachment);
-		if (registered === undefined || !registered.busy) return this.noop();
+		if (registered === undefined) return this.noop();
 
 		const wasAllObservableIdle = this.allObservableIdle();
 		registered.busy = false;

@@ -515,11 +515,16 @@ test("a malformed plugin record keeps later cycles with the same exchange id raw
 test("an earlier aborted decision does not prevent a later complete exchange from folding", () => {
 	const abortedExchangeId = "aborted-exchange";
 	const completeExchangeId = "complete-exchange";
-	const abortedAssistant = {
-		...assistant([], 3),
-		stopReason: "aborted",
-		errorMessage: "Operation aborted",
-	};
+	const abortedAssistant = neutralizeDecisionAssistant(
+		{
+			...assistant([], 3),
+			stopReason: "aborted",
+			errorMessage: "Operation aborted",
+		},
+		abortedExchangeId,
+		1,
+		{ stopReason: "aborted" },
+	);
 	const messages = [
 		user("before", 1),
 		decision(abortedExchangeId, 1, 2),

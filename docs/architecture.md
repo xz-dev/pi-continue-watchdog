@@ -8,7 +8,7 @@ For externally observable requirements, see [`behavior-contract.md`](behavior-co
 
 The extension has three layers:
 
-1. **Observation** — determine whether the elected main agent and every same-process observable child are idle.
+1. **Observation** — determine whether the elected root main, every same-process attachment, and every authenticated watchdog-loaded child process are idle.
 2. **State machine** — decide when to wait, inquire, continue, unlock, re-ask, exhaust, or stop after invalid responses.
 3. **Pi adapter** — connect the state machine to Pi lifecycle, session, provider-context, TUI, and semantic-hook APIs.
 
@@ -19,13 +19,13 @@ real main user message starts
 silent cleanup → fresh watchdog lock
           │
           ▼
-observe main and same-process children
+observe main, same-process attachments, and authenticated child processes
           │
           ▼
 new authoritative aggregate all-idle generation
           │
           ▼
-wait one fixed idleDelaySeconds grace
+replace timer and wait one fixed 10-second fence
           │
           ▼
 qualify the same generation and re-check ownership/auth
@@ -43,7 +43,7 @@ open one XML decision check
 | Module | Responsibility |
 |---|---|
 | `src/hub.ts` | Process-wide attachment registration, main election, and aggregate busy/idle state |
-| `src/activity-grace.ts` | One fixed grace per authoritative aggregate activity generation; stale callbacks are inert |
+| `src/activity-grace.ts` | One replaceable fixed 10-second fence; every observation replaces it and stale callbacks are inert |
 | `src/controller.ts` | Pure lock, attempt, exhaustion, failure, and decision-window accounting |
 | `src/runtime.ts` | Aggregate generation wiring, ownership/auth fencing, XML capture, audit entries, and finalization delivery |
 | `src/decision-protocol.ts` | Fixed XML prompt suffix, XML extraction, validation, and three-response re-ask protocol |
@@ -62,9 +62,7 @@ Every session attachment that loads this extension registers with one process-wi
 - whether it has UI;
 - one binary AI activity state.
 
-Local activity has only two lifecycle transitions: `agent_start` assigns busy;
-a true `agent_settled` assigns idle. Tool execution, model output, and waiting for
-Provider output remain inside that busy interval and are not separate states.
+Every relevant Pi event queries the public `ctx.isIdle()` value at that event. The runtime never derives busy or idle from an event label. This covers active runs, automatic retry, auto-compaction retry, and queued continuation as defined by Pi's public API.
 
 The election rules are:
 
@@ -81,7 +79,7 @@ Observers contribute to aggregate busy/idle truth, but only the exact current ma
 - notifications and TUI-only entries;
 - terminal `user-ready` publication.
 
-“Every agent is idle” therefore means every **same-process, extension-loaded, observable** attachment is idle. Out-of-process agents and sessions that did not load the extension are outside this domain.
+“Every agent is idle” therefore means every extension-loaded same-process attachment and every authenticated watchdog-loaded child Pi process in the inherited process domain is idle. Sessions that did not load the extension or did not inherit the authenticated declaration remain outside observable coverage.
 
 ## Lock cycle and state machine
 
@@ -119,15 +117,11 @@ An ordinary non-user `agent_start` only performs `ensureLocked()`:
 
 Unlock first assigns `locked = false`, then cancels operational timer and decision work. Ordinary unlock preserves retry/failure accounting; only a fresh lock cycle resets it.
 
-### Aggregate-generation grace
+### Replaceable inquiry fence
 
-The runtime composes broker activity, main ownership, and binary local AI
-activity into one generation. Any busy transition, pending input/spawn,
-ownership change, or domain uncertainty invalidates that generation. Each new
-authoritative all-idle generation gets exactly one fixed `idleDelaySeconds`
-grace. Valid continue decisions consume `maxRetries` only; they do not change
-the grace duration. The runtime does not poll host subphases between lifecycle
-boundaries to reinterpret tool execution, output, or Provider wait as new states.
+Every relevant live-state observation cancels and replaces the current candidate. If the newly observed state is eligible, the root starts one event-loop `setTimeout` for exactly 10,000 ms; otherwise it remains blocked. Equal old/new observations are still replacements. The callback captures an identity token so cleared or already-queued stale callbacks are inert.
+
+At expiry the root rechecks enabled/locked eligibility, exact timer generation, empty busy-child set, current ownership, pending messages, and a fresh public `ctx.isIdle()` value before any decision logic. A rejected confirm remains consumed until a later real event/report; runtime code never self-rearms by internally observing the same facts. There is no periodic polling, stale-timeout inference, or business-level uncertain state.
 
 ## Ownership and stale-work fencing
 
@@ -154,14 +148,19 @@ pi.appendEntry("pi-continue-watchdog:inquiry-marker", {
 });
 ```
 
-Only after that succeeds does it send the Pi `CustomMessage`:
+Only after that succeeds does it send the Pi `CustomMessage` through a shared per-attempt inquiry handle:
 
 ```ts
 {
-  customType: "pi-continue-watchdog:decision",
+  customType: "pi-continue-watchdog:inquiry",
   display: false,
   content: decisionPromptWithFixedXmlSuffix,
-  details: { version, exchangeId, cycleId }
+  details: {
+    version: 1,
+    namespace: "pi-continue-watchdog",
+    inquiryId: exchangeId,
+    attempt: cycleId
+  }
 },
 {
   triggerTurn: true,
@@ -169,7 +168,9 @@ Only after that succeeds does it send the Pi `CustomMessage`:
 }
 ```
 
-The marker and decision repeat the same unique exchange/cycle identity. This is a logical boundary, not a physical-adjacency contract: unrelated plugin custom entries or messages may appear between the marker, decision prompt, fold marker, and finalized assistant.
+The marker's exchange/cycle identity maps exactly to the inquiry's `inquiryId`/`attempt` correlation. The shared attempt handle owns correlation, pending/sent/completed/cancelled state, first-terminal-wins, capture, neutralization, and idempotent remove-fold cleanup. The Pi adapter owns `ctx.abort()` and original-input pass-through. A failed cleanup send retains the same fold for retry at uninterruptible `message_end` or `agent_settled`.
+
+This is a logical boundary, not a physical-adjacency contract: unrelated plugin custom entries or messages may appear between the marker, decision prompt, fold marker, and finalized assistant.
 
 `display: false` hides the question itself from normal TUI history. The decision assistant may stream in TUI/RPC while the check runs. Ordinary tools stay advertised. The prompt remains model-visible because the model must read it to decide. This package does not request `presentation: "hidden"` and does not depend on a downstream Pi hidden-run seam.
 
@@ -478,10 +479,12 @@ same-process watchdog attachments
   <- inherited child/nested Pi observer nodes
 ```
 
-`pi-extension-utils` supplies authenticated transport, peer status, directed/broadcast JSON data, and Pi lifecycle facts. It does not own watchdog counters or decisions. The watchdog coordinator reduces local attachments plus remote activity into immutable certain/all-idle snapshots and `{domainEpoch, activityGeneration}` fences. The root captures a fence for each aggregate grace/decision and confirms it before automatic effects. Root's artificial watchdog decision run is suppressed only for that exact local attachment; any other local or remote work invalidates the decision. Stale automated exchanges are folded by the shared inquiry protocol.
+`pi-extension-utils` supplies authenticated transport, peer status, heartbeat liveness, directed/broadcast JSON data, and a fixed 1-second client reconnect retry. It does not own watchdog counters or decisions. The watchdog business payload is exactly `{agentId, idle}`; authenticated `senderId` must equal `agentId`.
+
+The root maintains a deduplicated busy-child `Set`: `idle:false` adds; `idle:true` and disconnect delete. Connection alone does not change activity. Every accepted report and disconnect creates a fresh `{domainEpoch, activityGeneration}` fence, including equal reports. A child queries live `ctx.isIdle()` immediately after every reconnect and reports it. Root's own activity is checked locally through the hub and live wake-time query, not echoed through the child payload.
 
 The root is the only endpoint creator and decision authority. It binds one ephemeral loopback TCP listener; each authenticated node owns one framed connection, so disconnect maps to one exact peer. `PI_CONTINUE_WATCHDOG_ROOT_PID` marks creator topology; the inherited `PI_EXTENSION_UTILS_PROCESS_DOMAIN` declaration carries the listener endpoint and capability. Final root detach closes the transport and clears only declarations it still owns.
 
-Initial declaration/authentication/transport failures are terminal and sanitized (exit 78). TUI/RPC request Pi's public graceful shutdown with a bounded nonzero fallback; print/json use the bounded fallback because public shutdown is a no-op there. Application ping/pong liveness makes coordinator certainty false for a disconnected or frozen peer and blocks automatic effects until it reconnects, completes a fresh HMAC handshake, and sends fresh activity. The extension never prints capabilities, HMAC proofs, raw declarations, or endpoint details.
+Initial declaration/authentication/transport failures are terminal and sanitized (exit 78). TUI/RPC request Pi's public graceful shutdown with a bounded nonzero fallback; print/json use the bounded fallback because public shutdown is a no-op there. Heartbeat-detected disconnect removes that child from the busy set and therefore counts it idle while transport reconnects. Reconnection itself is activity-neutral; only the immediate fresh live report changes the set and replaces the fence. The extension never prints capabilities, HMAC proofs, raw declarations, or endpoint details.
 
 Coverage begins when an inherited watchdog completes `session_start` and reports activity. Stripped environments and children without watchdog are not observable. Coverage starts only after activity registration; no earlier guarantee is claimed.

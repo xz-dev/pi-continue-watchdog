@@ -117,13 +117,13 @@ test("all-observable-idle requires a main and zero busy attachments; detach of b
 	const busyChild = bind(state, "busy-child", false, true);
 	assert.equal(busyChild.transition.snapshot.allObservableIdle, false);
 	assert.deepEqual(effectKinds(busyChild.transition), ["becameObservableBusy"]);
-	assert.equal(state.markBusy(busyChild.attachment).applied, false);
+	assert.equal(state.markBusy(busyChild.attachment).applied, true);
 	assert.equal(state.snapshot.busyCount, 1);
 
 	const settled = state.markIdle(busyChild.attachment);
 	assert.equal(settled.snapshot.allObservableIdle, true);
 	assert.deepEqual(effectKinds(settled), ["becameAllObservableIdle"]);
-	assert.equal(state.markIdle(busyChild.attachment).applied, false);
+	assert.equal(state.markIdle(busyChild.attachment).applied, true);
 
 	const busyAgain = bind(state, "busy-again", false, true);
 	assert.equal(state.snapshot.busyCount, 1);
@@ -189,10 +189,11 @@ test("subscribe fans out applied transitions; unsubscribe is idempotent; one bad
 	assert.deepEqual(seenB, ["mainChanged", "becameAllObservableIdle"]);
 	assert.equal(throwCount, 1);
 
-	// No-op transitions must not notify.
+	// Equal live observations are applied and notify, but add no edge effect.
 	const before = seenA.length;
-	assert.equal(state.markIdle(root.attachment).applied, false);
+	assert.equal(state.markIdle(root.attachment).applied, true);
 	assert.equal(seenA.length, before);
+	assert.equal(throwCount, 2);
 
 	const child = bind(state, "child", false, true);
 	assert.deepEqual(effectKinds(child.transition), ["becameObservableBusy"]);
@@ -206,7 +207,7 @@ test("subscribe fans out applied transitions; unsubscribe is idempotent; one bad
 		"becameAllObservableIdle",
 		"becameObservableBusy",
 	]);
-	assert.equal(throwCount, 2);
+	assert.equal(throwCount, 3);
 
 	unsubscribeA();
 	unsubscribeA();

@@ -250,8 +250,10 @@ test("detaching main lazily promotes the observer, while the old main stays iner
 	child.streaming = false;
 	await child.fire("agent_settled");
 	assert.ok(
-		child.clock.records.some((record) => record.delayMs === 0),
-		"promoted observer must own settled control work",
+		child.clock.records.some(
+			(record) => record.delayMs === 10_000 && !record.cleared,
+		),
+		"promoted observer must own the fixed inquiry fence",
 	);
 
 	const oldMainTimers = main.clock.records.length;

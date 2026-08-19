@@ -1,6 +1,15 @@
 -- Core Lean support provides finite data, equality decisions, and deterministic executable summaries.
 import Std
 
+/-
+Residue/exactly-once takeover submodel. The authoritative combined lifecycle,
+busy-child set, disconnect, fixed-ten-second fence, and cancellation model is
+`official-pi-idle-inquiry.idea.lean`. Production realizes this cleanup through
+a shared terminal inquiry handle whose idempotent remove-fold is retried after
+send failure; the Pi adapter alone calls public `ctx.abort()` and passes the
+original input through exactly once.
+-/
+
 set_option autoImplicit false
 
 namespace WatchdogUserTakeover

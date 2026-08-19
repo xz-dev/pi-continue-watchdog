@@ -170,7 +170,7 @@ async function makePackedFixture(
 	assert.deepEqual(installedManifest.pi?.extensions, ["./src/extension.ts"]);
 	assert.equal(
 		installedManifest.dependencies?.["pi-extension-utils"],
-		"git+https://github.com/xz-dev/pi-extension-utils.git#a9043f0efef765789c221c1193373a8405792f1f",
+		"git+https://github.com/xz-dev/pi-extension-utils.git#c0a453bcfdbda08b769ef2508c09686b071737ad",
 	);
 	const utilsPackage = join(installRoot, "node_modules", "pi-extension-utils");
 	const utilsManifest = JSON.parse(
@@ -816,11 +816,11 @@ function createRpcUiContext(): ExtensionUIContext {
 }
 
 test("packed stock Pi coordinates busy and decision epochs across an OS child", {
-	timeout: 65_000,
+	timeout: 130_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t, {
 		withSemanticProbe: true,
-		watchdogConfig: { idleDelaySeconds: 0.2 },
+		watchdogConfig: { idleDelaySeconds: 10 },
 	});
 	assert.ok(fixture.probeOut);
 	const rootCwd = join(fixture.root, "root-process-project");
@@ -834,10 +834,7 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 	const heldDecisionRelease = new Promise<void>((resolveRelease) => {
 		releaseHeldDecision = resolveRelease;
 	});
-	let markHeldDecisionStarted: (() => void) | undefined;
-	const heldDecisionStarted = new Promise<void>((resolveStarted) => {
-		markHeldDecisionStarted = resolveStarted;
-	});
+	let heldDecisionStarted = false;
 	const { baseUrl, requests } = await startMockServer(t, [
 		{ kind: "delayed" },
 		{ kind: "stop", text: "root first epoch settled" },
@@ -846,7 +843,9 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		{ kind: "stop", text: "root fencing epoch settled" },
 		{
 			kind: "held-continue",
-			started: () => markHeldDecisionStarted?.(),
+			started: () => {
+				heldDecisionStarted = true;
+			},
 			release: heldDecisionRelease,
 		},
 		{ kind: "delayed" },
@@ -893,23 +892,31 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 	);
 	await root.session.prompt("Settle while the independent child stays busy.");
 	await waitForSessionIdle(root.session, 3_000, "root first ordinary work");
-	await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 10_300));
 	assert.equal(
 		requests.filter(isDecisionRequest).length,
 		0,
-		"root must not decide beyond its idle delay while the OS child is busy",
+		"root must not decide through a complete fixed fence while the OS child is busy",
 	);
 
-	await child.command("abort");
+	const disconnectedAt = Date.now();
+	assert.equal(child.process.kill("SIGSTOP"), true);
+	// The transport heartbeat first observes the stopped process; disconnect then
+	// removes its busy ID and starts a fresh fixed inquiry fence.
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 6_500));
 	await waitFor(
 		() => requests.filter(isDecisionRequest).length === 1,
-		5_000,
-		"first aggregate-idle root decision",
+		15_000,
+		"busy-child disconnect decision",
 	);
-	await waitForSessionIdle(root.session, 3_000, "first root decision");
+	await waitForSessionIdle(root.session, 3_000, "disconnect root decision");
 	const firstDecision = requests.find(isDecisionRequest);
 	assert.ok(firstDecision);
 	assert.equal(firstDecision.model, "root-process-model");
+	assert.ok(
+		firstDecision.receivedAt - disconnectedAt >= 9_800,
+		"disconnect must still wait a complete fixed inquiry fence",
+	);
 	assert.equal(
 		requests.filter(
 			(request) =>
@@ -917,10 +924,6 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		).length,
 		0,
 	);
-	const childAfterFirst = await child.command<ChildHarnessSnapshot>("snapshot");
-	assert.equal(childAfterFirst.isIdle, true);
-	assert.deepEqual(childAfterFirst.decisionTools, []);
-	assert.deepEqual(childAfterFirst.customEntries, []);
 
 	let probeRecords = await readProbeRecords(fixture.probeOut);
 	const hookDeadline = Date.now() + 2_000;
@@ -943,32 +946,52 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		"observer child must never publish user-ready",
 	);
 
-	const requestsBeforeHeartbeatLoss = requests.length;
-	assert.equal(child.process.kill("SIGSTOP"), true);
-	await new Promise((resolvePromise) => setTimeout(resolvePromise, 6_500));
+	assert.equal(child.process.kill("SIGCONT"), true);
+	const resumedBusy = await child.command<ChildHarnessSnapshot>("snapshot");
+	assert.equal(resumedBusy.isIdle, false);
+	assert.deepEqual(resumedBusy.decisionTools, []);
+	assert.deepEqual(resumedBusy.customEntries, []);
+	// Reconnect is connection-neutral. The fixed one-second retry publishes a
+	// newly queried live busy state, which must block a newly locked root.
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 2_500));
 	await root.session.prompt("/lock-continue-watchdog");
-	await new Promise((resolvePromise) => setTimeout(resolvePromise, 700));
+	const requestsBeforeReconnectBusyFence = requests.length;
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 10_300));
 	assert.equal(
 		requests.length,
-		requestsBeforeHeartbeatLoss,
-		"root must remain fail-closed while the idle child is heartbeat-offline",
+		requestsBeforeReconnectBusyFence,
+		"fresh live busy report after reconnect must block the root",
 	);
-	assert.equal(child.process.kill("SIGCONT"), true);
+
+	const childIdleAt = Date.now();
+	await child.command("abort");
 	await waitFor(
 		() => requests.filter(isDecisionRequest).length === 2,
-		8_000,
-		"heartbeat reconnect fresh-activity decision",
+		15_000,
+		"reconnected child live-idle decision",
 	);
-	await waitForSessionIdle(root.session, 5_000, "heartbeat recovery unlock");
-	assert.equal(
-		requests.filter(isDecisionRequest)[1]?.model,
-		"root-process-model",
+	await waitForSessionIdle(root.session, 5_000, "reconnect recovery unlock");
+	const reconnectDecision = requests.filter(isDecisionRequest)[1];
+	assert.ok(reconnectDecision);
+	assert.equal(reconnectDecision.model, "root-process-model");
+	assert.ok(
+		reconnectDecision.receivedAt - childIdleAt >= 9_800,
+		"fresh child idle report must wait a complete fixed inquiry fence",
 	);
+	const childAfterReconnect =
+		await child.command<ChildHarnessSnapshot>("snapshot");
+	assert.equal(childAfterReconnect.isIdle, true);
+	assert.deepEqual(childAfterReconnect.decisionTools, []);
+	assert.deepEqual(childAfterReconnect.customEntries, []);
 
 	await root.session.prompt(
 		"Open a decision that will be invalidated by child work.",
 	);
-	await heldDecisionStarted;
+	await waitFor(
+		() => heldDecisionStarted,
+		15_000,
+		"held root decision after the fixed fence",
+	);
 	const entriesBeforeInvalidation =
 		root.session.sessionManager.getEntries().length;
 	const hooksBeforeInvalidation = (await readProbeEnvelopes(fixture.probeOut))
@@ -1058,10 +1081,11 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		false,
 	);
 
+	const finalChildIdleAt = Date.now();
 	await child.command("abort");
 	await waitFor(
 		() => requests.filter(isDecisionRequest).length === 4,
-		5_000,
+		15_000,
 		"fresh post-invalidation decision",
 	);
 	await waitForSessionIdle(
@@ -1071,6 +1095,10 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 	);
 	const decisions = requests.filter(isDecisionRequest);
 	assert.equal(decisions.length, 4);
+	assert.ok(
+		(decisions[3]?.receivedAt ?? 0) - finalChildIdleAt >= 9_800,
+		"post-invalidation idle must wait a complete fixed inquiry fence",
+	);
 	assert.equal(
 		decisions.every((request) => request.model === "root-process-model"),
 		true,

@@ -480,7 +480,6 @@ const BLOCKER_TEXT: Readonly<Record<WatchdogTriggerBlocker, string>> = {
 	unlocked: "unlocked",
 	exhausted: "retry limit exhausted",
 	"decision-failed": "decision failed",
-	"domain-uncertain": "process domain uncertain",
 	"observable-agent-busy": "observable agent busy",
 	"local-agent-busy": "local agent busy",
 	"pending-messages": "pending messages",

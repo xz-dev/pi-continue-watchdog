@@ -132,12 +132,9 @@ function idleDomainSnapshot(): DomainSnapshot {
 	return {
 		domainId: "semantic-domain",
 		domainEpoch: "epoch",
-		revision: 1n,
 		activityGeneration: 1n,
-		participants: 1,
 		busyParticipants: 0,
 		allIdle: true,
-		certain: true,
 		fence: { domainEpoch: "epoch", activityGeneration: 1n },
 	};
 }
@@ -154,9 +151,7 @@ function deferredDomain() {
 		},
 		isRootProcess: true,
 		async attach() {},
-		async markBusy() {},
-		async markIdle() {},
-		async setInternalDecision() {},
+		async reportIdle() {},
 		confirm(_fence: DomainFence) {
 			confirmCalls += 1;
 			if (!defer) return Promise.resolve(true);
@@ -367,22 +362,9 @@ async function startIdle(harness: SemanticHarness): Promise<void> {
 	await harness.fire("session_start", { type: "session_start" });
 }
 
-/**
- * Fire agent_settled and the deferred 0ms settled-phase wake. Capture before/
- * after so any idle-timer arming (also 0ms when idleDelaySeconds=0) is not
- * mistaken for the wake callback; production schedules the wake last.
- */
+/** agent_settled itself is the authoritative finalization boundary. */
 async function settleOnly(harness: SemanticHarness): Promise<void> {
-	const before = harness.clock.records.length;
 	await harness.fire("agent_settled", { type: "agent_settled" });
-	const after = harness.clock.records.length;
-	assert.ok(
-		after > before,
-		"true-idle agent_settled must schedule a deferred settled-phase callback",
-	);
-	const deferred = after - 1;
-	assert.equal(harness.clock.records[deferred]?.delayMs, 0);
-	harness.clock.fire(deferred);
 	await Promise.resolve();
 	await Promise.resolve();
 }
@@ -584,7 +566,7 @@ test("accepted continue publishes its typed reason while unlock-free idle stays 
 	human.runtime.reconcileIdle();
 	assert.equal(
 		human.clock.records.some(
-			(record) => record.delayMs === 3000 && !record.cleared,
+			(record) => record.delayMs === 10_000 && !record.cleared,
 		),
 		true,
 	);
@@ -692,10 +674,7 @@ test("AI unlock intent is retained until publication confirmation succeeds", asy
 		messages: [harness.answerUnlock("Need approval.", "WAIT_USER")],
 	});
 	harness.streaming = false;
-	await harness.fire("agent_settled", { type: "agent_settled" });
-	const deferred = harness.clock.records.length - 1;
-	assert.equal(harness.clock.records[deferred]?.delayMs, 0);
-	harness.clock.fire(deferred);
+	const settling = harness.fire("agent_settled", { type: "agent_settled" });
 	await new Promise<void>((resolve) => setImmediate(resolve));
 	// Resolve deferred finalization confirmations while local Pi remains idle,
 	// stopping as soon as the unlock has committed. The next pending confirmation
@@ -720,7 +699,7 @@ test("AI unlock intent is retained until publication confirmation succeeds", asy
 	}).attachment;
 	harness.hub.markBusy(child);
 	fence.resolve(true);
-	await new Promise<void>((resolve) => setImmediate(resolve));
+	await settling;
 	assert.equal(harness.received.length, 0);
 
 	// That AI's later idle edge with immediate confirmation publishes once.

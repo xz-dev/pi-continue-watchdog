@@ -97,7 +97,9 @@ export function createContinueWatchdogExtension(
 		registerDecisionContextFolding(pi);
 		// Correlate a pending watchdog dispatch before real-user auto-lock can
 		// restart the cycle and discard the identity needed to downgrade a foreign run.
-		pi.on("message_start", runtime.handleMessageStart);
+		pi.on("message_start", (event, ctx) =>
+			runtime.handleMessageStart(event, ctx),
+		);
 
 		registerMainUserAutoLock(pi, {
 			isCurrentMain: runtime.isCurrentMain,
@@ -122,9 +124,9 @@ export function createContinueWatchdogExtension(
 		// Abort handlers register first; Pi awaits event handlers in registration order.
 		runtime.registerLifecycle();
 
-		pi.on("session_shutdown", async (_event, _ctx: ExtensionContext) => {
+		pi.on("session_shutdown", async (_event, ctx: ExtensionContext) => {
 			abortUnlock.clear();
-			await runtime.shutdown();
+			await runtime.shutdown(ctx);
 			fatalExit?.completeShutdown();
 		});
 	};
