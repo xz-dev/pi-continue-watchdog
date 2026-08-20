@@ -62,6 +62,7 @@ structure RunState where
   completedLoops : Nat
   decisionOutputOwned : Bool
   decisionResultMayAct : Bool
+  reflectCountingPaused : Bool
   cleanupPending : Bool
   xmlStored : Bool
   deriving DecidableEq, Repr
@@ -99,6 +100,7 @@ def initialState (decisionOutputOwned : Bool) : RunState :=
     completedLoops := 0
     decisionOutputOwned := decisionOutputOwned
     decisionResultMayAct := decisionOutputOwned
+    reflectCountingPaused := false
     cleanupPending := decisionOutputOwned
     xmlStored := false
   }
@@ -124,6 +126,12 @@ def messageStartFrom
     (marker : ActivityMarker)
     (state : RunState) : RunState :=
   messageStart marker state
+
+def pauseReflectCounting (apiPresent : Bool) (state : RunState) : RunState :=
+  if apiPresent then { state with reflectCountingPaused := true } else state
+
+def resumeReflectCounting (state : RunState) : RunState :=
+  { state with reflectCountingPaused := false }
 
 def assistantProducesOutput (state : RunState) : RunState :=
   if state.decisionOutputOwned then { state with xmlStored := true } else state
@@ -153,12 +161,14 @@ def executeDecision
     (producer : ProducerId)
     (consumer : ConsumerId)
     (marker : ActivityMarker)
-    (invalidated : Bool) : RunState :=
+    (invalidated : Bool)
+    (reflectApiPresent : Bool := true) : RunState :=
   let started := agentStart (initialState true)
   let classified := messageStartFrom producer consumer marker started
-  let answered := assistantProducesOutput classified
+  let paused := pauseReflectCounting reflectApiPresent classified
+  let answered := assistantProducesOutput paused
   let decided := if invalidated then invalidateDecision answered else answered
-  agentSettled (messageEnd (turnEnd decided))
+  resumeReflectCounting (agentSettled (messageEnd (turnEnd decided)))
 
 /-!
 ## Safety predicates
@@ -172,6 +182,7 @@ def finalSafety (state : RunState) : Prop :=
   state.phase = .final →
     state.domainBusy = false ∧
     state.activeTimeRunning = false ∧
+    state.reflectCountingPaused = false ∧
     state.xmlStored = false ∧
     state.cleanupPending = false
 
@@ -269,6 +280,16 @@ a fence cannot discard cleanup ownership, and every modeled execution reaches a
 final state with no stored XML.
 -/
 
+theorem optional_reflect_api_is_paused_only_when_present (state : RunState) :
+    (pauseReflectCounting true state).reflectCountingPaused = true ∧
+    (pauseReflectCounting false state).reflectCountingPaused =
+      state.reflectCountingPaused := by
+  simp [pauseReflectCounting]
+
+theorem terminal_resume_clears_reflect_pause (state : RunState) :
+    (resumeReflectCounting state).reflectCountingPaused = false := by
+  rfl
+
 theorem invalidation_preserves_cleanup_responsibility
     (state : RunState)
     (pending : state.cleanupPending = true) :
@@ -291,7 +312,8 @@ theorem observation_execution_is_isolated
   intro _
   cases invalidated <;>
     simp [executeDecision, initialState, agentStart, messageStartFrom,
-      messageStart, classifyActivity, assistantProducesOutput,
+      messageStart, classifyActivity, pauseReflectCounting,
+      resumeReflectCounting, assistantProducesOutput,
       invalidateDecision, turnEnd, messageEnd, agentSettled]
 
 theorem every_execution_is_final_and_clean
@@ -303,7 +325,8 @@ theorem every_execution_is_final_and_clean
   intro _
   cases marker <;> cases invalidated <;>
     simp [executeDecision, initialState, agentStart, messageStartFrom,
-      messageStart, classifyActivity, assistantProducesOutput,
+      messageStart, classifyActivity, pauseReflectCounting,
+      resumeReflectCounting, assistantProducesOutput,
       invalidateDecision, turnEnd, messageEnd, agentSettled]
 
 theorem invalidated_execution_cannot_act_or_store_xml
@@ -314,6 +337,7 @@ theorem invalidated_execution_cannot_act_or_store_xml
   cases marker <;>
     simp [invalidatedResultSafety, executeDecision, initialState, agentStart,
       messageStartFrom, messageStart, classifyActivity,
+      pauseReflectCounting, resumeReflectCounting,
       assistantProducesOutput, invalidateDecision, turnEnd, messageEnd,
       agentSettled]
 
@@ -325,7 +349,8 @@ theorem process_has_bounded_progress
     (executeDecision producer consumer marker invalidated).phase = .final := by
   cases marker <;> cases invalidated <;>
     simp [executeDecision, initialState, agentStart, messageStartFrom,
-      messageStart, classifyActivity, assistantProducesOutput,
+      messageStart, classifyActivity, pauseReflectCounting,
+      resumeReflectCounting, assistantProducesOutput,
       invalidateDecision, turnEnd, messageEnd, agentSettled]
 
 /-!
@@ -363,7 +388,7 @@ clean and uncounted, while an unknown marker is conservatively counted as work.
 -/
 
 def summary (state : RunState) : String :=
-  s!"phase={repr state.phase}; activity={repr state.activity}; busy={state.domainBusy}; active={state.activeTimeRunning}; loops={state.completedLoops}; mayAct={state.decisionResultMayAct}; xmlStored={state.xmlStored}"
+  s!"phase={repr state.phase}; activity={repr state.activity}; busy={state.domainBusy}; active={state.activeTimeRunning}; loops={state.completedLoops}; mayAct={state.decisionResultMayAct}; reflectPaused={state.reflectCountingPaused}; xmlStored={state.xmlStored}"
 
 end CrossPluginRunActivity
 
@@ -374,4 +399,4 @@ def main : IO Unit := do
   let unknown := CrossPluginRunActivity.executeDecision 23 41 .unknown false
   IO.println s!"Observation decision: {CrossPluginRunActivity.summary observation}"
   IO.println s!"Unknown marker defaults to work: {CrossPluginRunActivity.summary unknown}"
-  IO.println "Proved: producer/consumer identity is irrelevant, observation is opt-in, unknown input fails closed, and every decision terminates without stored XML."
+  IO.println "Proved: optional Reflect counting pauses for decision asks, every terminal path resumes it, observation is opt-in, and decisions terminate cleanly."
