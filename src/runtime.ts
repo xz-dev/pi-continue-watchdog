@@ -2357,8 +2357,7 @@ export function createDecisionRuntime(
 
 	const shutdown = async (ctx = sessionContext ?? undefined): Promise<void> => {
 		if (stopped) return;
-		const detachedIdle =
-			ctx === undefined ? true : probePiAgentState(ctx).idle;
+		const detachedIdle = ctx === undefined ? true : probePiAgentState(ctx).idle;
 		stopped = true;
 		lifecycleGeneration += 1;
 		localActivityGeneration += 1;
