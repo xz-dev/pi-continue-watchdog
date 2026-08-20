@@ -9,6 +9,7 @@ import {
 	type MessageEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import { probePiAgentState } from "pi-extension-utils/pi-agent-state";
 import {
 	createInquiryRuntime,
 	type InquiryAttemptHandle,
@@ -630,10 +631,10 @@ export function createDecisionRuntime(
 	/** Last live public Pi activity observation for this attachment. */
 	const localIdle = (): boolean => !localAiBusy;
 	/** Public queued-message signal present in every supported upstream Pi. */
-	const hasPendingMessages = (): boolean => {
-		const pending = sessionContext?.hasPendingMessages;
-		return typeof pending === "function" && pending.call(sessionContext);
-	};
+	const hasPendingMessages = (): boolean =>
+		sessionContext === null
+			? false
+			: probePiAgentState(sessionContext).pendingMessages;
 
 	const spliceDecisionAssistant = (ctx: ExtensionContext): void => {
 		const pending = decisionAssistantToSplice;
@@ -659,7 +660,8 @@ export function createDecisionRuntime(
 		try {
 			const spliceEntry = (options.pi as ExtensionAPI & Partial<SpliceEntryAPI>)
 				.spliceEntry;
-			if (typeof spliceEntry !== "function" || !ctx.isIdle()) return;
+			if (typeof spliceEntry !== "function" || !probePiAgentState(ctx).idle)
+				return;
 			for (const entryId of findPreemptedDecisionAssistantEntryIds(
 				ctx.sessionManager.getBranch(),
 			)) {
@@ -1102,7 +1104,7 @@ export function createDecisionRuntime(
 		void (async () => {
 			// Timer expiry performs a fresh official Pi query before any decision logic.
 			const ctx = sessionContext;
-			if (ctx === null || !ctx.isIdle()) return;
+			if (ctx === null || !probePiAgentState(ctx).idle) return;
 			const before = aggregateInput();
 			if (
 				!before.allIdle ||
@@ -1136,7 +1138,7 @@ export function createDecisionRuntime(
 					return;
 				}
 			}
-			if (!ctx.isIdle()) return;
+			if (!probePiAgentState(ctx).idle) return;
 			const after = aggregateInput();
 			if (
 				!after.allIdle ||
@@ -2107,8 +2109,8 @@ export function createDecisionRuntime(
 	): boolean => {
 		if (ctx === null || stopped) return false;
 		retryInquiryCleanup();
-		const idle = ctx.isIdle();
-		localAiBusy = !idle;
+		const { idle, busy } = probePiAgentState(ctx);
+		localAiBusy = busy;
 		if (!observationOptions?.preserveGeneration) localActivityGeneration += 1;
 		if (attachment !== null) {
 			publishingOwnHubObservation = true;
@@ -2136,7 +2138,7 @@ export function createDecisionRuntime(
 			++lifecycleGeneration;
 			localActivityGeneration += 1;
 			sessionContext = ctx;
-			localAiBusy = !ctx.isIdle();
+			localAiBusy = probePiAgentState(ctx).busy;
 			if (options.processDomain !== undefined) {
 				let initialAttachComplete = false;
 				let initialDomainExitRequested = false;
@@ -2154,7 +2156,10 @@ export function createDecisionRuntime(
 				};
 				try {
 					await options.processDomain.attach(options.attachmentInstance, {
-						getIdle: () => sessionContext?.isIdle() ?? false,
+						getIdle: () =>
+							sessionContext === null
+								? false
+								: probePiAgentState(sessionContext).idle,
 						onFatal: (error) => {
 							if (exitForInitialDomainFailure(error)) {
 								disableDomain();
@@ -2184,7 +2189,8 @@ export function createDecisionRuntime(
 			attachment = bound.attachment;
 			syncHubState();
 			await configLoad;
-			if (!stopped && ctx.isIdle()) recoverPreemptedDecisionAssistants(ctx);
+			if (!stopped && probePiAgentState(ctx).idle)
+				recoverPreemptedDecisionAssistants(ctx);
 		});
 
 		options.pi.on("agent_start", async (_event, ctx) => {
@@ -2329,7 +2335,7 @@ export function createDecisionRuntime(
 
 			if (
 				spliceBeforeNextTurn !== null &&
-				ctx.isIdle() &&
+				probePiAgentState(ctx).idle &&
 				pendingFinalization === null &&
 				decisionAssistantToSplice === spliceBeforeNextTurn
 			) {
@@ -2343,14 +2349,16 @@ export function createDecisionRuntime(
 				finalizeActiveDecision("missing");
 			}
 			const continued = await deliverPending(ctx);
-			if (!continued && ctx.isIdle()) spliceDecisionAssistant(ctx);
+			if (!continued && probePiAgentState(ctx).idle)
+				spliceDecisionAssistant(ctx);
 			if (!continued) await maybePublishUserReady();
 		});
 	};
 
 	const shutdown = async (ctx = sessionContext ?? undefined): Promise<void> => {
 		if (stopped) return;
-		const detachedIdle = ctx?.isIdle() ?? true;
+		const detachedIdle =
+			ctx === undefined ? true : probePiAgentState(ctx).idle;
 		stopped = true;
 		lifecycleGeneration += 1;
 		localActivityGeneration += 1;
