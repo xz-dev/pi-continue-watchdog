@@ -90,6 +90,46 @@ def inquiryClosed (state : RuntimeState) : Bool :=
 def automaticInquiryEligible (state : RuntimeState) : Bool :=
   state.enabled && aggregateIdle state && inquiryClosed state
 
+-- Status data projects enabled state and only currently busy observable root/child participants; layout remains one bounded row.
+inductive StatusActivity where
+  | idle
+  | running
+  deriving DecidableEq, Repr
+
+structure StatusProjection where
+  activity : StatusActivity
+  enabled : Bool
+  rootRunning : Bool
+  busyObservedSubagents : Nat
+  deriving DecidableEq, Repr
+
+structure StatusLineLayout where
+  lineCount : Nat
+  visibleColumns : Nat
+  deriving DecidableEq, Repr
+
+def statusActivity (state : RuntimeState) : StatusActivity :=
+  if aggregateIdle state then .idle else .running
+
+def projectStatus (state : RuntimeState) : StatusProjection :=
+  {
+    activity := statusActivity state
+    enabled := state.enabled
+    rootRunning := !state.mainIdle
+    busyObservedSubagents := state.busyChildren.length
+  }
+
+def statusRowVisible
+    (hasTui ownsMain controllerReady : Bool) : Bool :=
+  hasTui && ownsMain && controllerReady
+
+def layoutStatusLine
+    (availableColumns preferredColumns : Nat) : StatusLineLayout :=
+  {
+    lineCount := 1
+    visibleColumns := min availableColumns preferredColumns
+  }
+
 -- Event transitions always replace the old fence; child connect is neutral, while idle reports and disconnect remove every matching busy id.
 def replaceFence (state : RuntimeState) : RuntimeState :=
   let token := state.nextFenceToken + 1
@@ -469,7 +509,37 @@ theorem unlock_disables_and_cleans
   simp [unlock, preemptInquiryForUser, noInquiryXmlResidue,
     inquiryCannotAct]
 
--- The guarantee record gathers the whole-process boundary obligations for lifecycle observation, delayed inquiry, disconnect, and preemption.
+-- Status proofs tie activity, enablement, participant count, TUI ownership, and width to their authoritative runtime inputs.
+theorem status_activity_matches_aggregate_idle
+    (state : RuntimeState) :
+    (projectStatus state).activity = .idle ↔ aggregateIdle state = true := by
+  simp [projectStatus, statusActivity]
+
+theorem status_projection_uses_only_observed_busy_state
+    (state : RuntimeState) :
+    (projectStatus state).enabled = state.enabled ∧
+      (projectStatus state).rootRunning = !state.mainIdle ∧
+      (projectStatus state).busyObservedSubagents = state.busyChildren.length := by
+  simp [projectStatus]
+
+theorem visible_status_requires_tui_main_and_controller
+    (hasTui ownsMain controllerReady : Bool) :
+    statusRowVisible hasTui ownsMain controllerReady = true ↔
+      hasTui = true ∧ ownsMain = true ∧ controllerReady = true := by
+  simp [statusRowVisible, and_assoc]
+
+theorem status_layout_is_one_line
+    (availableColumns preferredColumns : Nat) :
+    (layoutStatusLine availableColumns preferredColumns).lineCount = 1 := by
+  rfl
+
+theorem status_layout_fits_available_width
+    (availableColumns preferredColumns : Nat) :
+    (layoutStatusLine availableColumns preferredColumns).visibleColumns ≤
+      availableColumns := by
+  exact Nat.min_le_left availableColumns preferredColumns
+
+-- The guarantee record gathers lifecycle, delayed inquiry, disconnect, preemption, and scoped bounded-status obligations.
 structure ProcessGuarantees : Prop where
   noEarlyInquiry :
     (advanceTimer 1 true 9 idleCandidate).inquiry.phase = .none
@@ -506,6 +576,20 @@ structure ProcessGuarantees : Prop where
     let delivered := deliverPendingUserMessage (preemptInquiryForUser state)
     delivered.inquiry.userMessageDeliveryCount =
       state.inquiry.userMessageDeliveryCount + 1
+  statusMatchesAggregateIdle : ∀ state,
+    (projectStatus state).activity = .idle ↔ aggregateIdle state = true
+  statusUsesObservedBusyState : ∀ state,
+    (projectStatus state).enabled = state.enabled ∧
+      (projectStatus state).rootRunning = !state.mainIdle ∧
+      (projectStatus state).busyObservedSubagents = state.busyChildren.length
+  statusVisibilityIsScoped : ∀ hasTui ownsMain controllerReady,
+    statusRowVisible hasTui ownsMain controllerReady = true ↔
+      hasTui = true ∧ ownsMain = true ∧ controllerReady = true
+  statusIsOneLine : ∀ availableColumns preferredColumns,
+    (layoutStatusLine availableColumns preferredColumns).lineCount = 1
+  statusFitsWidth : ∀ availableColumns preferredColumns,
+    (layoutStatusLine availableColumns preferredColumns).visibleColumns ≤
+      availableColumns
 
 theorem process_is_correct : ProcessGuarantees := by
   exact {
@@ -527,9 +611,14 @@ theorem process_is_correct : ProcessGuarantees := by
     userDeliveredOnce := by
       intro state
       exact (preempted_user_message_is_delivered_exactly_once state).1
+    statusMatchesAggregateIdle := status_activity_matches_aggregate_idle
+    statusUsesObservedBusyState := status_projection_uses_only_observed_busy_state
+    statusVisibilityIsScoped := visible_status_requires_tui_main_and_controller
+    statusIsOneLine := status_layout_is_one_line
+    statusFitsWidth := status_layout_fits_available_width
   }
 
--- Executable projections expose the proved ten-second and clean-preemption behavior without operational side effects.
+-- Executable projections expose proved timer, clean-preemption, and status behavior without operational side effects.
 def noInquiryXmlResidueBool (state : RuntimeState) : Bool :=
   !state.inquiry.streamingXmlVisible &&
     !state.inquiry.sessionXmlStored &&
@@ -539,11 +628,15 @@ def noInquiryXmlResidueBool (state : RuntimeState) : Bool :=
 def runtimeSummary (state : RuntimeState) : String :=
   s!"enabled={state.enabled}; mainIdle={state.mainIdle}; busyChildren={state.busyChildren}; fence={repr state.fence}; inquiry={repr state.inquiry.phase}; cleanupPending={state.inquiry.cleanupFoldPending}; xmlClean={noInquiryXmlResidueBool state}; deliveries={state.inquiry.userMessageDeliveryCount}"
 
+def statusSummary (state : RuntimeState) : String :=
+  let status := projectStatus state
+  s!"activity={repr status.activity}; enabled={status.enabled}; rootRunning={status.rootRunning}; busyObservedSubagents={status.busyObservedSubagents}"
+
 end OfficialPiIdleInquiry
 
 #print axioms OfficialPiIdleInquiry.process_is_correct
 
--- The executable summary demonstrates the ninth-second boundary, tenth-second inquiry, and clean user takeover.
+-- The executable summary demonstrates timer boundaries, clean user takeover, observed activity projection, and narrow layout.
 def main : IO Unit := do
   let candidate := OfficialPiIdleInquiry.idleCandidate
   let before := OfficialPiIdleInquiry.advanceTimer 1 true 9 candidate
@@ -551,7 +644,13 @@ def main : IO Unit := do
   let streamed := OfficialPiIdleInquiry.streamInquiryXml opened
   let preempted := OfficialPiIdleInquiry.preemptInquiryForUser streamed
   let delivered := OfficialPiIdleInquiry.deliverPendingUserMessage preempted
+  let running := OfficialPiIdleInquiry.reportChildState 7 false
+    (OfficialPiIdleInquiry.reportMainState false
+      (OfficialPiIdleInquiry.initialState true))
+  let narrow := OfficialPiIdleInquiry.layoutStatusLine 24 72
   IO.println s!"Before ten seconds: {OfficialPiIdleInquiry.runtimeSummary before}"
   IO.println s!"At ten seconds: {OfficialPiIdleInquiry.runtimeSummary opened}"
   IO.println s!"After user takeover: {OfficialPiIdleInquiry.runtimeSummary delivered}"
-  IO.println "Proved: fixed delay precedes inquiry, wake rechecks official idle, disconnect removes busy children, reconnect retries every second and reports fresh live state, and preemption is clean and exactly-once."
+  IO.println s!"Running status: {OfficialPiIdleInquiry.statusSummary running}"
+  IO.println s!"Narrow layout: lines={narrow.lineCount}; columns={narrow.visibleColumns}/24"
+  IO.println "Proved: fixed delay precedes inquiry, wake rechecks official idle, disconnect removes busy children, reconnect retries every second and reports fresh live state, preemption is clean and exactly-once, and the scoped status projection is one bounded line."

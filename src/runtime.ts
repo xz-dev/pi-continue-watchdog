@@ -8,7 +8,7 @@ import {
 	getAgentDir,
 	type MessageEndEvent,
 } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { probePiAgentState } from "pi-extension-utils/pi-agent-state";
 import {
 	createInquiryRuntime,
@@ -96,6 +96,7 @@ const nodeClock: RuntimeClock = {
 };
 
 const WATCHDOG_STATUS_WIDGET_KEY = "pi-continue-watchdog:status";
+const WATCHDOG_STATE_WIDGET_KEY = "pi-continue-watchdog:state";
 const REFLECT_WATCHDOG_API_SYMBOL = Symbol.for("pi-reflect-watchdog.api.v1");
 
 interface ReflectWatchdogApi {
@@ -397,6 +398,8 @@ export function createDecisionRuntime(
 	let activeStatus: WatchdogStatusEntry | null = null;
 	let statusTui: { requestRender(): void } | null = null;
 	let statusWidgetRegistered = false;
+	let stateStatusTui: { requestRender(): void } | null = null;
+	let stateStatusWidgetRegistered = false;
 	/** Distinguishes this runtime's synchronous hub report from child reports. */
 	let publishingOwnHubObservation = false;
 
@@ -431,6 +434,126 @@ export function createDecisionRuntime(
 		return effectiveClaim !== null && options.hub.isCurrentMain(effectiveClaim)
 			? controller
 			: null;
+	};
+
+	const stateStatusProjection = (): {
+		readonly activity: "idle" | "running";
+		readonly enabled: boolean;
+		readonly rootRunning: boolean;
+		readonly busySubagents: number;
+	} | null => {
+		const ctx = sessionContext;
+		const claim = getMainClaim();
+		const controller = currentController(claim);
+		if (
+			stopped ||
+			ctx === null ||
+			ctx.mode !== "tui" ||
+			!ctx.hasUI ||
+			claim === null ||
+			!owns(claim) ||
+			!configReady ||
+			controller === null
+		) {
+			return null;
+		}
+		const rootRunning = localAiBusy;
+		const localBusySubagents = Math.max(
+			0,
+			options.hub.snapshot.busyCount - (rootRunning ? 1 : 0),
+		);
+		const busySubagents =
+			localBusySubagents +
+			Math.max(0, options.processDomain?.snapshot.busyParticipants ?? 0);
+		return {
+			activity: rootRunning || busySubagents > 0 ? "running" : "idle",
+			enabled: controller.snapshot.locked,
+			rootRunning,
+			busySubagents,
+		};
+	};
+
+	const stateStatusActors = (
+		rootRunning: boolean,
+		busySubagents: number,
+		compact = false,
+	): string => {
+		if (compact) {
+			if (rootRunning && busySubagents > 0) return `R+${busySubagents}`;
+			if (rootRunning) return "R";
+			return busySubagents > 0 ? `S${busySubagents}` : "-";
+		}
+		const subagents = `${busySubagents} observed subagent${busySubagents === 1 ? "" : "s"}`;
+		if (rootRunning && busySubagents > 0) return `root + ${subagents}`;
+		if (rootRunning) return "root";
+		return busySubagents > 0 ? subagents : "none";
+	};
+
+	const renderStateStatus = (
+		width: number,
+		theme: ExtensionContext["ui"]["theme"],
+	): string[] => {
+		const status = stateStatusProjection();
+		if (status === null) return [];
+		const safeWidth = Math.max(1, Math.floor(width));
+		const full = `Continue Watchdog | ${status.activity} (${status.enabled ? "enabled" : "disabled"}) | ${stateStatusActors(status.rootRunning, status.busySubagents)}`;
+		const compact = `CW | ${status.activity === "running" ? "run" : "idle"}/${status.enabled ? "on" : "off"} | ${stateStatusActors(status.rootRunning, status.busySubagents, true)}`;
+		const line = visibleWidth(full) <= safeWidth ? full : compact;
+		return [truncateToWidth(theme.fg("dim", line), safeWidth)];
+	};
+
+	const clearStateStatus = (): void => {
+		const ctx = sessionContext;
+		if (
+			ctx !== null &&
+			stateStatusWidgetRegistered &&
+			typeof ctx.ui.setWidget === "function"
+		) {
+			try {
+				ctx.ui.setWidget(WATCHDOG_STATE_WIDGET_KEY, undefined);
+			} catch {
+				// A stale host may reject cleanup during shutdown or demotion.
+			}
+		}
+		stateStatusWidgetRegistered = false;
+		stateStatusTui = null;
+	};
+
+	const refreshStateStatus = (): void => {
+		const ctx = sessionContext;
+		if (
+			stateStatusProjection() === null ||
+			ctx === null ||
+			typeof ctx.ui.setWidget !== "function"
+		) {
+			clearStateStatus();
+			return;
+		}
+		if (!stateStatusWidgetRegistered) {
+			try {
+				ctx.ui.setWidget(
+					WATCHDOG_STATE_WIDGET_KEY,
+					(tui, theme) => {
+						stateStatusTui = tui;
+						return {
+							render: (width: number) => renderStateStatus(width, theme),
+							invalidate() {},
+							dispose() {
+								stateStatusTui = null;
+								stateStatusWidgetRegistered = false;
+							},
+						};
+					},
+					{ placement: "belowEditor" },
+				);
+				stateStatusWidgetRegistered = true;
+			} catch {
+				stateStatusWidgetRegistered = false;
+				stateStatusTui = null;
+			}
+			return;
+		}
+		stateStatusTui?.requestRender();
 	};
 
 	const renderLiveStatus = (
@@ -1153,6 +1276,7 @@ export function createDecisionRuntime(
 			allIdle: input.allIdle,
 			generation: input.generation,
 		});
+		refreshStateStatus();
 	};
 
 	qualifyReady = (generation): void => {

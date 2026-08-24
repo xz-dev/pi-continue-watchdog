@@ -5,6 +5,7 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 import {
 	CONTINUE_ENTRY_TYPE,
@@ -131,6 +132,7 @@ interface Harness {
 	readonly handlerOptions: Map<string, unknown[]>;
 	readonly clock: FakeClock;
 	readonly widgets: Array<{ key: string; value: unknown }>;
+	readonly widgetPlacements: Map<string, string | undefined>;
 	readonly config: ContinueWatchdogConfig;
 	readonly controller: ReturnType<typeof createLockDecisionController>;
 	readonly hub: ReturnType<typeof createObservableAgentHub>;
@@ -257,6 +259,17 @@ function createFenceHarness(options?: { readonly rejectReport?: boolean }) {
 				for (const listener of listeners) listener(snapshot, "domain");
 			}
 		},
+		setBusyParticipants(count: number, notify = true): void {
+			const generation = snapshot.activityGeneration + 1n;
+			snapshot = {
+				...idleDomainSnapshot(generation),
+				busyParticipants: count,
+				allIdle: count === 0,
+			};
+			if (notify) {
+				for (const listener of listeners) listener(snapshot, "domain");
+			}
+		},
 		recover(): void {
 			snapshot = idleDomainSnapshot(snapshot.activityGeneration + 1n);
 			for (const listener of listeners) listener(snapshot, "domain");
@@ -275,6 +288,7 @@ function createHarness(options?: {
 	readonly branchThrows?: boolean;
 	readonly appendUnrelatedAssistantBeforeFold?: boolean;
 	readonly hasUI?: boolean;
+	readonly mode?: "tui" | "rpc" | "json" | "print";
 	readonly onNotify?: (message: string) => void;
 	readonly processDomain?: ProcessDomainCoordinator;
 	readonly isIdle?: () => boolean;
@@ -312,6 +326,7 @@ function createHarness(options?: {
 	const branch: BranchEntry[] = [];
 	const spliceAttempts: string[] = [];
 	const widgets: Array<{ key: string; value: unknown }> = [];
+	const widgetPlacements = new Map<string, string | undefined>();
 	const aborts = 0;
 	let runtime: ReturnType<typeof createDecisionRuntime>;
 	let decisionStarted = false;
@@ -330,6 +345,7 @@ function createHarness(options?: {
 		branch,
 		spliceAttempts,
 		widgets,
+		widgetPlacements,
 		aborts,
 		pendingMessages: false,
 		streaming: false,
@@ -417,6 +433,7 @@ function createHarness(options?: {
 	} as unknown as ExtensionAPI;
 
 	const ctx = {
+		mode: options?.mode ?? "tui",
 		hasUI: options?.hasUI ?? true,
 		cwd: "/project",
 		isIdle: () => options?.isIdle?.() ?? !harness.streaming,
@@ -440,8 +457,14 @@ function createHarness(options?: {
 				notifications.push({ message, level });
 				options?.onNotify?.(message);
 			},
-			setWidget(key: string, value: unknown): void {
+			setWidget(
+				key: string,
+				value: unknown,
+				widgetOptions?: { readonly placement?: string },
+			): void {
 				widgets.push({ key, value });
+				if (value === undefined) widgetPlacements.delete(key);
+				else widgetPlacements.set(key, widgetOptions?.placement);
 			},
 		},
 		abort(): void {
@@ -586,6 +609,43 @@ function createHarness(options?: {
 
 async function startIdle(harness: Harness): Promise<void> {
 	await harness.fire("session_start", { type: "session_start" });
+}
+
+function mountStateStatusWidget(harness: Harness): {
+	readonly renderRequests: () => number;
+	render(width: number): string[];
+} {
+	const registration = [...harness.widgets]
+		.reverse()
+		.find(
+			(widget) =>
+				widget.key === "pi-continue-watchdog:state" &&
+				typeof widget.value === "function",
+		);
+	assert.ok(registration, "expected state status widget registration");
+	let renderRequests = 0;
+	const factory = registration.value as (
+		tui: { requestRender(): void },
+		theme: {
+			fg(color: string, text: string): string;
+			bg(color: string, text: string): string;
+		},
+	) => { render(width: number): string[] };
+	const component = factory(
+		{
+			requestRender(): void {
+				renderRequests += 1;
+			},
+		},
+		{
+			fg: (_color, text) => text,
+			bg: (_color, text) => text,
+		},
+	);
+	return {
+		renderRequests: () => renderRequests,
+		render: (width) => component.render(width),
+	};
 }
 
 function fatalSpy() {
@@ -908,6 +968,90 @@ test("observable child busy cancels and full idle restarts the same delay", asyn
 	harness.hub.markIdle(child);
 	assert.equal(harness.clock.records.length, timersAfterBind + 1);
 	assert.equal(harness.clock.records.at(-1)?.delayMs, 10_000);
+});
+
+test("TUI state row tracks enablement and currently running observable participants", async () => {
+	const fence = createFenceHarness();
+	const harness = createHarness({ processDomain: fence.domain });
+	await startIdle(harness);
+	assert.equal(
+		harness.widgetPlacements.get("pi-continue-watchdog:state"),
+		"belowEditor",
+	);
+	const widget = mountStateStatusWidget(harness);
+	assert.deepEqual(widget.render(120), [
+		"Continue Watchdog | idle (disabled) | none",
+	]);
+
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	assert.deepEqual(widget.render(120), [
+		"Continue Watchdog | idle (enabled) | none",
+	]);
+
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	assert.deepEqual(widget.render(120), [
+		"Continue Watchdog | running (enabled) | root",
+	]);
+
+	const child = harness.hub.bind({
+		instance: createHubAttachmentInstance(),
+		sessionId: "local-child",
+		hasUI: false,
+		initialBusy: true,
+	}).attachment;
+	fence.setBusyParticipants(1);
+	assert.deepEqual(widget.render(120), [
+		"Continue Watchdog | running (enabled) | root + 2 observed subagents",
+	]);
+
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.deepEqual(widget.render(120), [
+		"Continue Watchdog | running (enabled) | 2 observed subagents",
+	]);
+
+	harness.hub.markIdle(child);
+	assert.deepEqual(widget.render(120), [
+		"Continue Watchdog | running (enabled) | 1 observed subagent",
+	]);
+	fence.setBusyParticipants(0);
+	assert.deepEqual(widget.render(120), [
+		"Continue Watchdog | idle (enabled) | none",
+	]);
+	assert.deepEqual(widget.render(18), ["CW | idle/on | -"]);
+	const narrow = widget.render(14);
+	assert.equal(narrow.length, 1);
+	assert.equal(visibleWidth(narrow[0] ?? "") <= 14, true);
+	assert.equal(widget.renderRequests() > 0, true);
+
+	await harness.runtime.shutdown();
+	assert.deepEqual(harness.widgets.at(-1), {
+		key: "pi-continue-watchdog:state",
+		value: undefined,
+	});
+});
+
+test("state row is absent outside an interactive root TUI", async () => {
+	const rpc = createHarness({ mode: "rpc" });
+	await startIdle(rpc);
+	assert.equal(
+		rpc.widgets.some((widget) => widget.key === "pi-continue-watchdog:state"),
+		false,
+	);
+	await rpc.runtime.shutdown();
+
+	const headless = createHarness({ hasUI: false });
+	await startIdle(headless);
+	assert.equal(
+		headless.widgets.some(
+			(widget) => widget.key === "pi-continue-watchdog:state",
+		),
+		false,
+	);
+	await headless.runtime.shutdown();
 });
 
 test("agent_end finalizes while streaming but settled alone dispatches continue", async () => {
