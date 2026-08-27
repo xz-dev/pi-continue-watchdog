@@ -441,6 +441,7 @@ export function createDecisionRuntime(
 		readonly enabled: boolean;
 		readonly rootRunning: boolean;
 		readonly busySubagents: number;
+		readonly decision: "asking" | { readonly askInMs: number } | null;
 	} | null => {
 		const ctx = sessionContext;
 		const claim = getMainClaim();
@@ -465,11 +466,25 @@ export function createDecisionRuntime(
 		const busySubagents =
 			localBusySubagents +
 			Math.max(0, options.processDomain?.snapshot.busyParticipants ?? 0);
+		let decision: "asking" | { readonly askInMs: number } | null = null;
+		if (
+			activeDecision !== null ||
+			selfDecisionRun.kind !== "none" ||
+			pendingFinalization !== null
+		) {
+			decision = "asking";
+		} else {
+			const grace = graceCoordinator.snapshot;
+			if (grace.phase === "grace" && grace.deadlineMs !== null) {
+				decision = { askInMs: Math.max(0, grace.deadlineMs - now()) };
+			}
+		}
 		return {
 			activity: rootRunning || busySubagents > 0 ? "running" : "idle",
 			enabled: controller.snapshot.locked,
 			rootRunning,
 			busySubagents,
+			decision,
 		};
 	};
 
@@ -489,6 +504,16 @@ export function createDecisionRuntime(
 		return busySubagents > 0 ? subagents : "none";
 	};
 
+	const decisionLabel = (
+		decision: "asking" | { readonly askInMs: number } | null,
+		compact = false,
+	): string => {
+		if (decision === "asking") return "asking";
+		if (decision === null) return "";
+		const seconds = Math.ceil(decision.askInMs / 1000);
+		return compact ? `T-${seconds}s` : `asking in ${seconds}s`;
+	};
+
 	const renderStateStatus = (
 		width: number,
 		theme: ExtensionContext["ui"]["theme"],
@@ -496,8 +521,16 @@ export function createDecisionRuntime(
 		const status = stateStatusProjection();
 		if (status === null) return [];
 		const safeWidth = Math.max(1, Math.floor(width));
-		const full = `Continue Watchdog | ${status.activity} (${status.enabled ? "enabled" : "disabled"}) | ${stateStatusActors(status.rootRunning, status.busySubagents)}`;
-		const compact = `CW | ${status.activity === "running" ? "run" : "idle"}/${status.enabled ? "on" : "off"} | ${stateStatusActors(status.rootRunning, status.busySubagents, true)}`;
+		const third =
+			status.decision === null
+				? stateStatusActors(status.rootRunning, status.busySubagents)
+				: decisionLabel(status.decision);
+		const thirdCompact =
+			status.decision === null
+				? stateStatusActors(status.rootRunning, status.busySubagents, true)
+				: decisionLabel(status.decision, true);
+		const full = `Continue Watchdog | ${status.activity} (${status.enabled ? "enabled" : "disabled"}) | ${third}`;
+		const compact = `CW | ${status.activity === "running" ? "run" : "idle"}/${status.enabled ? "on" : "off"} | ${thirdCompact}`;
 		const line = visibleWidth(full) <= safeWidth ? full : compact;
 		return [truncateToWidth(theme.fg("dim", line), safeWidth)];
 	};
@@ -517,6 +550,35 @@ export function createDecisionRuntime(
 		}
 		stateStatusWidgetRegistered = false;
 		stateStatusTui = null;
+		stopStateStatusTick();
+	};
+
+	let stateStatusTick: RuntimeTimerHandle | null = null;
+	const stopStateStatusTick = (): void => {
+		if (stateStatusTick !== null) clock.clearTimeout(stateStatusTick);
+		stateStatusTick = null;
+	};
+	const stateStatusCountdownActive = (): boolean =>
+		stateStatusTui !== null && stateStatusProjection()?.decision != null;
+	const scheduleStateStatusTick = (): void => {
+		if (stateStatusTick !== null) return;
+		const handle = clock.setTimeout(function tick(): void {
+			stateStatusTick = null;
+			stateStatusTui?.requestRender();
+			if (stateStatusCountdownActive()) {
+				stateStatusTick = clock.setTimeout(tick, 1000);
+				if (
+					"unref" in stateStatusTick &&
+					typeof stateStatusTick.unref === "function"
+				) {
+					stateStatusTick.unref();
+				}
+			}
+		}, 1000);
+		stateStatusTick = handle;
+		if ("unref" in handle && typeof handle.unref === "function") {
+			handle.unref();
+		}
 	};
 
 	const refreshStateStatus = (): void => {
@@ -526,9 +588,12 @@ export function createDecisionRuntime(
 			ctx === null ||
 			typeof ctx.ui.setWidget !== "function"
 		) {
+			stopStateStatusTick();
 			clearStateStatus();
 			return;
 		}
+		if (stateStatusCountdownActive()) scheduleStateStatusTick();
+		else stopStateStatusTick();
 		if (!stateStatusWidgetRegistered) {
 			try {
 				ctx.ui.setWidget(

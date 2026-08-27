@@ -987,7 +987,7 @@ test("TUI state row tracks enablement and currently running observable participa
 		suppressNotify: true,
 	});
 	assert.deepEqual(widget.render(120), [
-		"Continue Watchdog | idle (enabled) | none",
+		"Continue Watchdog | idle (enabled) | asking in 10s",
 	]);
 
 	harness.streaming = true;
@@ -1019,9 +1019,9 @@ test("TUI state row tracks enablement and currently running observable participa
 	]);
 	fence.setBusyParticipants(0);
 	assert.deepEqual(widget.render(120), [
-		"Continue Watchdog | idle (enabled) | none",
+		"Continue Watchdog | idle (enabled) | asking in 10s",
 	]);
-	assert.deepEqual(widget.render(18), ["CW | idle/on | -"]);
+	assert.deepEqual(widget.render(20), ["CW | idle/on | T-10s"]);
 	const narrow = widget.render(14);
 	assert.equal(narrow.length, 1);
 	assert.equal(visibleWidth(narrow[0] ?? "") <= 14, true);
@@ -1032,6 +1032,41 @@ test("TUI state row tracks enablement and currently running observable participa
 		key: "pi-continue-watchdog:state",
 		value: undefined,
 	});
+});
+
+test("state row ticks the countdown and switches to asking once the decision opens", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	const widget = mountStateStatusWidget(harness);
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	assert.deepEqual(widget.render(120), [
+		"Continue Watchdog | idle (enabled) | asking in 10s",
+	]);
+
+	// Grace arms a 1s unref countdown ticker behind the fence timer.
+	const graceTimer = harness.clock.records.length - 2;
+	const tickTimer = harness.clock.records.length - 1;
+	assert.equal(harness.clock.records[graceTimer]?.delayMs, 10_000);
+	assert.equal(harness.clock.records[tickTimer]?.delayMs, 1_000);
+	assert.equal(harness.clock.records[tickTimer]?.unrefCount, 1);
+
+	harness.clock.fire(tickTimer);
+	assert.deepEqual(widget.render(120), [
+		"Continue Watchdog | idle (enabled) | asking in 9s",
+	]);
+	// The ticker re-armed another second while the countdown continues.
+	assert.equal(harness.clock.records.at(-1)?.delayMs, 1_000);
+
+	// Fence expiry opens the decision; the row switches to "asking".
+	harness.clock.fire(graceTimer);
+	await harness.startDecision();
+	assert.deepEqual(widget.render(120), [
+		"Continue Watchdog | running (enabled) | asking",
+	]);
+
+	await harness.runtime.shutdown();
 });
 
 test("state row is absent outside an interactive root TUI", async () => {
