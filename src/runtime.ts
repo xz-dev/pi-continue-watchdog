@@ -97,21 +97,6 @@ const nodeClock: RuntimeClock = {
 
 const WATCHDOG_STATUS_WIDGET_KEY = "pi-continue-watchdog:status";
 const WATCHDOG_STATE_WIDGET_KEY = "pi-continue-watchdog:state";
-const REFLECT_WATCHDOG_API_SYMBOL = Symbol.for("pi-reflect-watchdog.api.v1");
-
-interface ReflectWatchdogApi {
-	readonly paused: boolean;
-	pause(): void;
-	resume(): void;
-}
-
-function reflectWatchdogApi(): ReflectWatchdogApi | undefined {
-	return (
-		globalThis as typeof globalThis & {
-			[REFLECT_WATCHDOG_API_SYMBOL]?: ReflectWatchdogApi;
-		}
-	)[REFLECT_WATCHDOG_API_SYMBOL];
-}
 
 /** Context-excluded persisted metadata for one model decision response. */
 export const DECISION_AUDIT_ENTRY_TYPE = "pi-continue-watchdog:decision-audit";
@@ -365,7 +350,6 @@ export function createDecisionRuntime(
 	/** Binary AI lifecycle state: agent_start = busy, true agent_settled = idle. */
 	let localAiBusy = true;
 	let stopped = false;
-	let reflectCountingPaused = false;
 	let activeDecision: ActiveDecision | null = null;
 	let selfDecisionRun: SelfDecisionRun = { kind: "none" };
 	/** Suppress an aborted internal decision after user takeover or domain failure. */
@@ -749,35 +733,11 @@ export function createDecisionRuntime(
 		}
 	};
 
-	const pauseReflectCounting = (): void => {
-		const api = reflectWatchdogApi();
-		if (api === undefined || reflectCountingPaused) return;
-		try {
-			api.pause();
-			reflectCountingPaused = api.paused;
-		} catch {
-			// Optional peer failures never block Continue Watchdog.
-		}
-	};
-
-	const resumeReflectCounting = (): void => {
-		if (!reflectCountingPaused) return;
-		reflectCountingPaused = false;
-		try {
-			const api = reflectWatchdogApi();
-			api?.resume();
-			reflectCountingPaused = api?.paused ?? false;
-		} catch {
-			// Optional peer failures never block Continue Watchdog.
-		}
-	};
-
 	/**
 	 * Invalidate runtime-local decision state after a controller transition.
 	 * Does not change controller lock/cycle accounting.
 	 */
 	const clearOperationalPendingWork = (): void => {
-		resumeReflectCounting();
 		localActivityGeneration += 1;
 		if (activeDecision !== null) {
 			retainInquiryCleanup(activeDecision);
@@ -958,7 +918,6 @@ export function createDecisionRuntime(
 		deferCleanupSend = false,
 	): void => {
 		if (active.invalidated) return;
-		resumeReflectCounting();
 		if (
 			cleanupOutcome === undefined &&
 			(active.submitted || selfRunFor(active))
@@ -1005,7 +964,6 @@ export function createDecisionRuntime(
 	};
 
 	const silentlyAbandonDecision = (): void => {
-		resumeReflectCounting();
 		// Unlock first so locked=false is authoritative, then clear runtime work.
 		options.controllerHolder.controller?.unlock();
 		clearOperationalPendingWork();
@@ -1039,9 +997,7 @@ export function createDecisionRuntime(
 			return false;
 		}
 
-		pauseReflectCounting();
 		if (!allIdleForClaim(active.claim)) {
-			resumeReflectCounting();
 			if (sendOptions?.deferOnBusy !== false) deferDecisionOnBusy(active);
 			return false;
 		}
@@ -1055,13 +1011,11 @@ export function createDecisionRuntime(
 			});
 		} catch (error) {
 			active.dispatchPending = false;
-			resumeReflectCounting();
 			throw error;
 		}
 		try {
 			const prompt = active.inquiry.prompt(decisionPrompt);
 			if (!active.inquiry.markSent()) {
-				resumeReflectCounting();
 				return false;
 			}
 			options.pi.sendMessage(prompt, {
@@ -1069,14 +1023,12 @@ export function createDecisionRuntime(
 				deliverAs: "steer",
 			});
 			if (hasPendingMessages() || !activeGenerationCurrent(active)) {
-				resumeReflectCounting();
 				deferDecisionOnBusy(active);
 				return false;
 			}
 			return true;
 		} catch (error) {
 			active.dispatchPending = false;
-			resumeReflectCounting();
 			if (!allIdleForClaim(active.claim)) {
 				// Final TOCTOU: Pi or an observable child became busy. Silent defer.
 				if (sendOptions?.deferOnBusy !== false) deferDecisionOnBusy(active);
@@ -1196,7 +1148,6 @@ export function createDecisionRuntime(
 			case "restoreDecisionTools":
 				// Historical effect name: closes the decision window; no tool swap.
 				if (activeDecision?.decisionId === effect.decisionId) {
-					resumeReflectCounting();
 					activeDecision = null;
 					capturedDecisionResponse = null;
 					pendingFinalization = null;
@@ -1656,7 +1607,6 @@ export function createDecisionRuntime(
 			};
 		}
 		active.invalidated = true;
-		resumeReflectCounting();
 		const fold = retainInquiryCleanup(active, "invalidated");
 		localActivityGeneration += 1;
 		selfDecisionRun = { kind: "none" };
@@ -1880,7 +1830,6 @@ export function createDecisionRuntime(
 		if (stopIfStale(claim)) return false;
 
 		if (finalization.outcome === "decision-failed") {
-			resumeReflectCounting();
 			activeDecision = null;
 			capturedDecisionResponse = null;
 			if (finalization.cycleId === undefined) return false;
@@ -1940,7 +1889,6 @@ export function createDecisionRuntime(
 		}
 
 		if (finalization.outcome === "continue") {
-			resumeReflectCounting();
 			activeDecision = null;
 			capturedDecisionResponse = null;
 			const finalCycleId = finalization.cycleId;
@@ -2034,7 +1982,6 @@ export function createDecisionRuntime(
 			return true;
 		}
 
-		resumeReflectCounting();
 		activeDecision = null;
 		capturedDecisionResponse = null;
 		// Valid AI unlock must carry both fields; never invent empty fallbacks.
@@ -2605,7 +2552,6 @@ export function createDecisionRuntime(
 
 	const shutdown = async (ctx = sessionContext ?? undefined): Promise<void> => {
 		if (stopped) return;
-		resumeReflectCounting();
 		const detachedIdle = ctx === undefined ? true : probePiAgentState(ctx).idle;
 		stopped = true;
 		lifecycleGeneration += 1;
