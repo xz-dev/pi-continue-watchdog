@@ -2,6 +2,7 @@ import {
 	ENV_NAMES,
 	isProcessDomainOpenError,
 	openProcessDomain,
+	openSharedProcessDomain,
 	type ProcessDomainEvent,
 	type ProcessDomainNode,
 	type ProcessDomainOpenErrorCode,
@@ -129,7 +130,7 @@ function parseActivity(value: unknown, senderId: string): ActivityWire | null {
 export function createProcessDomainCoordinator(
 	options: ProcessDomainCoordinatorOptions = {},
 ): ProcessDomainCoordinator {
-	const open = options.open ?? openProcessDomain;
+	const open = options.open ?? openSharedProcessDomain;
 	const env = options.env ?? process.env;
 	const pid = options.pid ?? process.pid;
 	const attachments = new Map<DomainAttachmentInstance, AttachmentRecord>();

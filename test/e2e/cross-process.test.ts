@@ -170,7 +170,7 @@ async function makePackedFixture(
 	assert.deepEqual(installedManifest.pi?.extensions, ["./src/extension.ts"]);
 	assert.equal(
 		installedManifest.dependencies?.["pi-extension-utils"],
-		"git+https://github.com/xz-dev/pi-extension-utils.git#35eb18d7440cd77de339a111b6af86f6e63c14b4",
+		"git+https://github.com/xz-dev/pi-extension-utils.git#3670621a7af592b8cad2b4d72a9cc589f060f37e",
 	);
 	const utilsPackage = join(installRoot, "node_modules", "pi-extension-utils");
 	const utilsManifest = JSON.parse(

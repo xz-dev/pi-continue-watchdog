@@ -59,6 +59,6 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "pi-extension-utils": "git+https://github.com/xz-dev/pi-extension-utils.git#35eb18d7440cd77de339a111b6af86f6e63c14b4"
+    "pi-extension-utils": "git+https://github.com/xz-dev/pi-extension-utils.git#3670621a7af592b8cad2b4d72a9cc589f060f37e"
   }
 }
