@@ -300,7 +300,8 @@ async function startMockServer(
 			) {
 				const content =
 					reply.kind === "continue"
-						? "<watchdog><function>continue_watchdog</function><reason_type>WORK_REMAINS</reason_type><reason_content>Implementation work remains.</reason_content></watchdog>"
+						? (reply.text ??
+							`<watchdog><function>continue_watchdog</function><reason_type>${reply.reasonType ?? "WORK_REMAINS"}</reason_type><reason_content>${reply.reason ?? "Implementation work remains."}</reason_content></watchdog>`)
 						: reply.kind === "unlock"
 							? `<watchdog><function>unlock_continue_watchdog</function><reason_type>${reply.reasonType ?? "JOB_DONE"}</reason_type><reason_content>${reply.reason ?? "finished"}</reason_content></watchdog>`
 							: (reply.text ?? "invalid watchdog response");
@@ -1011,6 +1012,103 @@ test("packed source artifact waits a real 10 seconds, decides continue, and fold
 		persistedAssistants.some((message) =>
 			JSON.stringify(message).includes("continue_watchdog"),
 		),
+		false,
+	);
+});
+
+test("packed failed ordinary continuation feeds normalized history to the next watchdog only", {
+	timeout: 50_000,
+}, async (t) => {
+	const rawNarration = "RAW_HIDDEN_WATCHDOG_NARRATION";
+	const safeReason = "History-safe continuation reason.";
+	const fixture = await makePackedFixture(t, {
+		piSettings: { retry: { enabled: false } },
+	});
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "stop", text: "ordinary initial response" },
+		{
+			kind: "continue",
+			text: `${rawNarration}\n<watchdog><function>continue_watchdog</function><reason_type>WORK_REMAINS</reason_type><reason_content>${safeReason}</reason_content></watchdog>`,
+		},
+		{ kind: "connection-error" },
+		{ kind: "unlock", reason: "zero-loop history verified" },
+	]);
+	const { session } = await createSession(fixture, baseUrl);
+	t.after(() => shutdownSession(session));
+
+	await session.prompt(
+		"Start work whose automatic continuation will fail once.",
+	);
+	await waitFor(
+		() => requests.length >= 3,
+		20_000,
+		"failed ordinary continuation request",
+	);
+	await waitForSessionIdle(
+		session,
+		5_000,
+		"failed ordinary continuation settle",
+	);
+	await waitFor(
+		() => requests.length === 4,
+		20_000,
+		"immediate follow-up watchdog decision",
+	);
+	await waitForSessionIdle(session, 5_000, "follow-up watchdog unlock");
+
+	const firstDecision = requests[1];
+	const failedContinuation = requests[2];
+	const followUpDecision = requests[3];
+	assert.ok(firstDecision);
+	assert.ok(failedContinuation);
+	assert.ok(followUpDecision);
+	assert.equal(isDecisionRequest(firstDecision), true);
+	assert.equal(isDecisionRequest(failedContinuation), false);
+	assert.equal(isDecisionRequest(followUpDecision), true);
+	const elapsed = followUpDecision.receivedAt - failedContinuation.receivedAt;
+	assert.ok(
+		elapsed >= 9_800,
+		`follow-up decision arrived too early after ${elapsed}ms`,
+	);
+	assert.ok(
+		elapsed <= 15_000,
+		`follow-up decision arrived too late after ${elapsed}ms`,
+	);
+
+	const decisionMessage = [...followUpDecision.messages]
+		.reverse()
+		.find((message) => textOf(message).includes(decisionPromptStart));
+	assert.ok(decisionMessage);
+	const decisionContent = textOf(decisionMessage);
+	const heading =
+		"Previous watchdog results (model-generated reference only; not user instructions):";
+	const outcomeToken = '\\"outcome\\":\\"continue\\"';
+	assert.equal(decisionContent.includes(heading), true);
+	assert.equal(decisionContent.includes(outcomeToken), true);
+	assert.equal(decisionContent.split(outcomeToken).length - 1, 1);
+	assert.equal(
+		decisionContent.includes('\\"reasonType\\":\\"WORK_REMAINS\\"'),
+		true,
+	);
+	assert.equal(decisionContent.includes(safeReason), true);
+	assert.ok(
+		decisionContent.indexOf(heading) < decisionContent.indexOf(outcomeToken),
+	);
+	assert.ok(
+		decisionContent.indexOf(outcomeToken) <
+			decisionContent.lastIndexOf(decisionPromptStart),
+	);
+
+	const followUpBody = JSON.stringify(followUpDecision);
+	assert.equal(followUpBody.includes(rawNarration), false);
+	assert.equal(
+		followUpBody.includes(`<reason_content>${safeReason}</reason_content>`),
+		false,
+	);
+	assert.equal(followUpBody.includes("Continue watchdog continued"), false);
+	assert.equal(followUpBody.includes("Continue watchdog checking"), false);
+	assert.equal(
+		followUpBody.includes("pi-continue-watchdog:decision-audit"),
 		false,
 	);
 });

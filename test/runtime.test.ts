@@ -26,9 +26,17 @@ import {
 	foldDecisionContext,
 	INQUIRY_MARKER_ENTRY_TYPE,
 	neutralizeDecisionAssistant,
+	parseDecisionFoldDetails,
 } from "../src/context-fold.js";
 import { createLockDecisionController } from "../src/controller.js";
-import { DECISION_TOOL_BLOCK_REASON } from "../src/decision-protocol.js";
+import {
+	formatContiguousWatchdogHistory,
+	WATCHDOG_HISTORY_HEADING,
+} from "../src/decision-history.js";
+import {
+	buildDecisionPrompt,
+	DECISION_TOOL_BLOCK_REASON,
+} from "../src/decision-protocol.js";
 import {
 	createHubAttachmentInstance,
 	createObservableAgentHub,
@@ -123,8 +131,8 @@ interface BranchEntry {
 	readonly customType?: string;
 	readonly data?: unknown;
 	readonly details?: unknown;
-	readonly message?: {
-		readonly role: "assistant";
+	readonly message?: Readonly<Record<string, unknown>> & {
+		readonly role: string;
 	};
 }
 
@@ -819,6 +827,274 @@ test("maximum configured decision prompt still opens and re-asks with generated 
 	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
 });
 
+test("runtime omits an oversized valid terminal reason type without failing the check", async () => {
+	const longReasonType = "R".repeat(MAX_PROMPT_CHARACTERS + 1);
+	const harness = createHarness();
+	harness.branch.push(
+		historyFoldEntry(
+			"history-long-reason-type",
+			createDecisionFoldMessage({
+				exchangeId: "history-long-reason-type",
+				cycleId: 1,
+				outcome: "continue",
+				continuePrompt: "Continue.",
+				watchdogResult: {
+					outcome: "continue",
+					reasonType: longReasonType,
+					reason: "Still valid.",
+				},
+			}),
+		),
+	);
+	await startIdle(harness);
+	await harness.openDecision();
+
+	const prompt = harness.sent.at(-1)?.message.content ?? "";
+	assert.equal(harness.sent.at(-1)?.message.customType, DECISION_MESSAGE_TYPE);
+	assert.match(prompt, /1 older result omitted/);
+	assert.equal(prompt.includes(longReasonType), false);
+	assert.match(prompt, /exactly one <watchdog>/);
+});
+
+test("no-history decision prompt remains byte-for-byte unchanged", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	await harness.openDecision();
+
+	assert.equal(
+		harness.sent.at(-1)?.message.content,
+		buildDecisionPrompt(
+			harness.config.decisionPrompt,
+			harness.config.reasonTypes,
+			harness.config.continueReasonTypes,
+		),
+	);
+	assert.equal(
+		harness.sent.at(-1)?.message.content.includes(WATCHDOG_HISTORY_HEADING),
+		false,
+	);
+});
+
+test("decision history is prepended once and the snapshot is stable across re-asks", async () => {
+	const priorResult = {
+		outcome: "continue" as const,
+		reasonType: "WORK_REMAINS",
+		reason: "Original snapshot.",
+	};
+	const harness = createHarness();
+	harness.branch.push(
+		historyFoldEntry(
+			"history-original",
+			createDecisionFoldMessage({
+				exchangeId: "history-original",
+				cycleId: 1,
+				outcome: "continue",
+				continuePrompt: "Continue.",
+				watchdogResult: priorResult,
+			}),
+		),
+	);
+	await startIdle(harness);
+	await harness.openDecision();
+
+	const historyBlock = formatContiguousWatchdogHistory([priorResult]);
+	const firstPrompt = harness.sent.at(-1)?.message.content ?? "";
+	assert.equal(
+		firstPrompt,
+		buildDecisionPrompt(
+			`${historyBlock}\n\n${harness.config.decisionPrompt}`,
+			harness.config.reasonTypes,
+			harness.config.continueReasonTypes,
+		),
+	);
+
+	harness.branch.push(
+		historyFoldEntry(
+			"history-mutated",
+			createDecisionFoldMessage({
+				exchangeId: "history-mutated",
+				cycleId: 1,
+				outcome: "wait",
+				watchdogResult: {
+					outcome: "wait",
+					reason: "MUTATED_SNAPSHOT",
+					waitSeconds: 10,
+				},
+			}),
+		),
+	);
+	await settleResponse(harness, harness.answerInvalid());
+	const reask = harness.sent.at(-1)?.message.content ?? "";
+	assert.equal(reask.startsWith(firstPrompt), true);
+	assert.equal(reask.includes("MUTATED_SNAPSHOT"), false);
+	assert.equal(reask.split(WATCHDOG_HISTORY_HEADING).length - 1, 1);
+});
+
+test("only a successful ordinary assistant clears prior watchdog history", async () => {
+	for (const stopReason of ["stop", "error", "aborted"] as const) {
+		const harness = createHarness();
+		harness.branch.push(
+			historyFoldEntry(
+				`history-${stopReason}`,
+				createDecisionFoldMessage({
+					exchangeId: `history-${stopReason}`,
+					cycleId: 1,
+					outcome: "continue",
+					continuePrompt: "Continue.",
+					watchdogResult: {
+						outcome: "continue",
+						reasonType: "WORK_REMAINS",
+						reason: `retained-after-${stopReason}`,
+					},
+				}),
+			),
+			{
+				id: `ordinary-${stopReason}`,
+				type: "message",
+				message: { role: "assistant", stopReason },
+			},
+		);
+		await startIdle(harness);
+		await harness.openDecision();
+		const prompt = harness.sent.at(-1)?.message.content ?? "";
+		assert.equal(
+			prompt.includes(`retained-after-${stopReason}`),
+			stopReason !== "stop",
+		);
+	}
+});
+
+test("mixed history is chronological, unique, and excludes raw or presentation data", async () => {
+	const harness = createHarness();
+	const historyFolds = [
+		createDecisionFoldMessage({
+			exchangeId: "mixed-continue",
+			cycleId: 1,
+			outcome: "continue",
+			continuePrompt: "Continue.",
+			watchdogResult: {
+				outcome: "continue",
+				reasonType: "WORK_REMAINS",
+				reason: "Safe continue reason.",
+			},
+		}),
+		createDecisionFoldMessage({
+			exchangeId: "mixed-wait",
+			cycleId: 1,
+			outcome: "wait",
+			watchdogResult: {
+				outcome: "wait",
+				reason: "Safe wait reason.",
+				waitSeconds: 20,
+			},
+		}),
+		createDecisionFoldMessage({
+			exchangeId: "mixed-unlock",
+			cycleId: 1,
+			outcome: "unlock",
+			watchdogResult: {
+				outcome: "unlock",
+				reasonType: "JOB_DONE",
+				reason: "Safe unlock reason.",
+			},
+		}),
+		createDecisionFoldMessage({
+			exchangeId: "mixed-failed",
+			cycleId: 3,
+			outcome: "decision-failed",
+			watchdogResult: {
+				outcome: "decision-failed",
+				error: "Safe validation error.",
+			},
+		}),
+		createDecisionFoldMessage({
+			exchangeId: "mixed-preempted",
+			cycleId: 1,
+			outcome: "preempted",
+			watchdogResult: { outcome: "preempted" },
+		}),
+		createDecisionFoldMessage({
+			exchangeId: "mixed-invalidated",
+			cycleId: 1,
+			outcome: "invalidated",
+			watchdogResult: { outcome: "invalidated" },
+		}),
+	];
+	for (const [index, fold] of historyFolds.entries()) {
+		harness.branch.push(historyFoldEntry(`mixed-${index}`, fold));
+	}
+	const hiddenInquiry = neutralizeDecisionAssistant(
+		{
+			role: "assistant",
+			content: [{ type: "text", text: "<watchdog>RAW_XML_SECRET</watchdog>" }],
+			stopReason: "stop",
+			errorMessage: "PROVIDER_ERROR_SECRET",
+		},
+		"hidden-inquiry",
+		1,
+	);
+	harness.branch.push(
+		{
+			id: "raw-audit",
+			type: "custom",
+			customType: "pi-continue-watchdog:decision-audit",
+			data: { explanation: "RAW_EXPLANATION_SECRET" },
+		},
+		{
+			id: "raw-status",
+			type: "custom",
+			customType: "pi-continue-watchdog:status",
+			data: { message: "TUI_TEXT_SECRET" },
+		},
+		{
+			id: "hidden-inquiry-assistant",
+			type: "message",
+			message: hiddenInquiry as Readonly<Record<string, unknown>> & {
+				readonly role: string;
+			},
+		},
+		{
+			id: "failed-ordinary-assistant",
+			type: "message",
+			message: {
+				role: "assistant",
+				stopReason: "error",
+				content: [{ type: "text", text: "PARTIAL_OUTPUT_SECRET" }],
+				errorMessage: "ORDINARY_PROVIDER_ERROR_SECRET",
+			},
+		},
+	);
+
+	await startIdle(harness);
+	await harness.openDecision();
+	const prompt = harness.sent.at(-1)?.message.content ?? "";
+	let previousIndex = -1;
+	for (const outcome of [
+		"continue",
+		"wait",
+		"unlock",
+		"decision-failed",
+		"preempted",
+		"invalidated",
+	]) {
+		const token = `"outcome":"${outcome}"`;
+		const index = prompt.indexOf(token);
+		assert.ok(index > previousIndex);
+		assert.equal(prompt.split(token).length - 1, 1);
+		previousIndex = index;
+	}
+	for (const secret of [
+		"RAW_XML_SECRET",
+		"PROVIDER_ERROR_SECRET",
+		"RAW_EXPLANATION_SECRET",
+		"TUI_TEXT_SECRET",
+		"PARTIAL_OUTPUT_SECRET",
+		"ORDINARY_PROVIDER_ERROR_SECRET",
+	]) {
+		assert.equal(prompt.includes(secret), false);
+	}
+});
+
 test("legacy idle delay config cannot alter the fixed ten-second fence", async () => {
 	for (const idleDelaySeconds of [0, 0.5, Number.MAX_VALUE]) {
 		const harness = createHarness({ config: { idleDelaySeconds } });
@@ -1045,6 +1321,15 @@ test("agent_end finalizes while streaming but settled alone dispatches continue"
 		triggerTurn: true,
 		deliverAs: "steer",
 	});
+	assert.deepEqual(
+		parseDecisionFoldDetails(harness.sent.at(-1)?.message.details)
+			?.watchdogResult,
+		{
+			outcome: "continue",
+			reasonType: "WORK_REMAINS",
+			reason: "Implementation work remains.",
+		},
+	);
 	assert.equal(harness.triggeredTurns, turnsBefore + 1);
 	assert.equal(harness.controller.snapshot.attempt, 1);
 	assert.deepEqual(
@@ -1282,6 +1567,18 @@ function inquiryMarker(exchangeId: string, cycleId = 1) {
 		customType: INQUIRY_MARKER_ENTRY_TYPE,
 		data: { version: 1, exchangeId, cycleId },
 		timestamp: "2026-01-01T00:00:00.000Z",
+	};
+}
+
+function historyFoldEntry(
+	id: string,
+	message: ReturnType<typeof createDecisionFoldMessage>,
+): BranchEntry {
+	return {
+		id,
+		type: "custom_message",
+		customType: message.customType,
+		details: message.details,
 	};
 }
 
@@ -1586,6 +1883,11 @@ test("decision provider error stays provisional so the same Pi run can retry and
 			exchangeId: "exchange-1",
 			cycleId: 1,
 			outcome: "unlock",
+			watchdogResult: {
+				outcome: "unlock",
+				reasonType: "JOB_DONE",
+				reason: "All requested work is complete.",
+			},
 		}),
 		options: { triggerTurn: false, deliverAs: "steer" },
 		streaming: false,
@@ -1767,13 +2069,10 @@ test("valid wait records a deadline, consumes one retry, and asks again only at 
 		triggerTurn: false,
 		deliverAs: "steer",
 	});
-	assert.equal(
-		(
-			harness.sent.at(-1)?.message.details as
-				| { watchdogOutcome?: string }
-				| undefined
-		)?.watchdogOutcome,
-		"wait",
+	assert.deepEqual(
+		parseDecisionFoldDetails(harness.sent.at(-1)?.message.details)
+			?.watchdogResult,
+		{ outcome: "wait", reason: "Waiting for CI.", waitSeconds: 300 },
 	);
 	const waitTimer = harness.clock.records.findLastIndex(
 		(record) => record.delayMs === 300_000 && !record.cleared,
@@ -1937,6 +2236,14 @@ test("invalid decisions reask only after settle and third failure stays stopped"
 	assert.equal(
 		harness.sent.at(-1)?.message.customType,
 		DECISION_FOLD_MESSAGE_TYPE,
+	);
+	assert.deepEqual(
+		parseDecisionFoldDetails(harness.sent.at(-1)?.message.details)
+			?.watchdogResult,
+		{
+			outcome: "decision-failed",
+			error: "End the response with one valid watchdog XML decision block.",
+		},
 	);
 	assert.deepEqual(harness.notifications.at(-1), {
 		message:
@@ -2268,6 +2575,7 @@ test("submitted decision invalidated by domain activity still redacts its assist
 			exchangeId: "exchange-1",
 			cycleId: 1,
 			outcome: "invalidated",
+			watchdogResult: { outcome: "invalidated" },
 		}),
 	);
 
@@ -3252,6 +3560,7 @@ test("real user input silently preempts a submitted decision and extension input
 				exchangeId: "exchange-1",
 				cycleId: 1,
 				outcome: "preempted",
+				watchdogResult: { outcome: "preempted" },
 			}),
 			options: { triggerTurn: false, deliverAs: "steer" },
 			streaming: true,

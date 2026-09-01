@@ -48,7 +48,8 @@ open one XML decision check
 | `src/controller.ts` | Pure lock, shared continue/wait attempt, absolute wait deadline, exhaustion, failure, and decision-window accounting |
 | `src/runtime.ts` | Aggregate generation wiring, ownership/auth fencing, XML capture, audit entries, wait persistence/scheduling, and finalization delivery |
 | `src/decision-protocol.ts` | Fixed continue/wait/unlock XML prompt suffix, XML extraction, validation, and three-response re-ask protocol |
-| `src/context-fold.ts` | Correlate complete decision exchanges and remove them, or replace continue with its compact prompt, before provider requests |
+| `src/decision-history.ts` | Active-branch zero-loop scan plus bounded, deterministic normalized history formatting |
+| `src/context-fold.ts` | Correlate complete decision exchanges and remove them, or replace continue with its compact prompt, before provider requests; validate hidden terminal-result metadata |
 | `src/abort-outcome.ts` | Detect canonical main-run `stopReason: "aborted"` outcomes |
 | `src/auto-lock.ts` | Start a fresh lock cycle when a real main user message begins processing |
 | `src/commands.ts` | Human lock/unlock commands plus TUI-only continue, wait, unlock, status, and timeline rendering |
@@ -158,7 +159,7 @@ Only after that succeeds does it send the Pi `CustomMessage` through a shared pe
 {
   customType: "pi-continue-watchdog:inquiry",
   display: false,
-  content: decisionPromptWithFixedXmlSuffix,
+  content: optionalZeroLoopHistory + decisionPromptWithFixedXmlSuffix,
   details: {
     version: 1,
     namespace: "pi-continue-watchdog",
@@ -178,7 +179,7 @@ This is a logical boundary, not a physical-adjacency contract: unrelated plugin 
 
 `display: false` hides the question itself from normal TUI history. The decision assistant may stream in TUI/RPC while the check runs. Ordinary tools stay advertised. The prompt remains model-visible because the model must read it to decide. This package does not request `presentation: "hidden"` and does not depend on a downstream Pi hidden-run seam.
 
-The configurable prompt supplies decision intent. Runtime always appends a fixed suffix that:
+The configurable prompt supplies decision intent. When present, a bounded zero-loop history block is placed before that intent. Runtime always appends a fixed suffix after both that:
 
 - identifies the check as extension automation rather than a user request or decision;
 - tells the model to use existing conversation context and decide quickly;
@@ -187,6 +188,29 @@ The configurable prompt supplies decision intent. Runtime always appends a fixed
 - explicitly prohibits making decisions on the user's behalf;
 - lists the independent effective unlock and continue reason types;
 - gives canonical typed continue/unlock examples and an untyped wait example with integer seconds from 1 through 1800.
+
+### Zero-loop history derivation
+
+Every terminal inquiry fold keeps its existing `watchdogOutcome` and may also carry a validated `watchdogResult`:
+
+```ts
+{ outcome: "continue", reasonType, reason }
+{ outcome: "wait", reason, waitSeconds }
+{ outcome: "unlock", reasonType, reason }
+{ outcome: "decision-failed", error }
+{ outcome: "preempted" }
+{ outcome: "invalidated" }
+```
+
+Runtime finalization passes normalized fields directly into the fold builder. Cleanup paths for an already-sent inquiry attach `preempted` or `invalidated`; if terminal fold delivery throws, the retained idempotent cleanup fold keeps the same terminal result. Invalid validation re-asks do not emit terminal folds, so one inquiry exchange contributes at most its final result.
+
+At `openDecision`, `src/decision-history.ts` performs one pure backward pass over `sessionManager.getBranch()`. It accepts only valid `pi-continue-watchdog:inquiry-fold` details, keeps the newest terminal record per inquiry ID, and stops at the first non-inquiry assistant whose `stopReason` is exactly `stop`. Any structurally valid correlated inquiry assistant is ignored as a boundary regardless of its plugin namespace. Ordinary `error`, `aborted`, `length`, `toolUse`, `pending`, or `deferred` assistants are also ignored, as are user, tool-result, custom, compaction, and other entries. Reversing the collected suffix restores active-branch chronological order; no sibling branch or session is consulted.
+
+The formatter reconstructs each line from the validated union rather than serializing arbitrary entry data. Values use `JSON.stringify`, followed by explicit U+2028/U+2029 escaping to literal `\u2028`/`\u2029` sequences, and the fixed heading labels them as model-generated reference rather than user instructions. Legacy folds without `watchdogResult` become outcome-only lines; a present but malformed result invalidates that history entry. The history block uses the same 16,384-code-point ceiling as configured prompts. It admits complete lines from newest to oldest, then restores chronological order and adds an older-result omitted count when necessary. Budgeting runs after the additional separator escaping. It never truncates a field, configured decision intent, or parser-critical XML suffix.
+
+The runtime formats this block once when the decision opens and stores only the resulting prompt in the decision protocol session. Re-asks therefore reuse the exact same snapshot even though their own inquiry entries have since been appended. If no history exists or branch reading fails, prompt construction is byte-for-byte the previous configured-intent-plus-fixed-suffix behavior.
+
+Raw assistant text, narration, thinking, XML, partial output, provider errors, TUI strings, plain audit entries, and unrelated metadata are never inspected by the formatter and cannot be restored through this path.
 
 ## Stable tools and blocked execution
 
@@ -274,7 +298,7 @@ Decision audit data is persisted with `pi.appendEntry()` as a plain `CustomEntry
 pi-continue-watchdog:decision-audit
 ```
 
-Pi explicitly treats plain custom entries as display/state records that do not participate in context. They are saved in the session and readable by Pi or this extension after `pi -c`, but they are not projected into Agent messages and are never sent to the provider.
+Pi explicitly treats plain custom entries as display/state records that do not participate in context. They are saved in the session and readable by Pi or this extension after `pi -c`, but they are not projected into Agent messages and are never sent to the provider. The zero-loop feature does not read these audit or visible-result entries; it reads only validated normalized metadata on hidden terminal inquiry-fold messages.
 
 Audit shapes are deliberately structured and bounded:
 
@@ -338,7 +362,7 @@ The session remains append-only and still contains Pi-recognizable protocol entr
 - any streamed or finalized assistant metadata;
 - blocked tool results, if any;
 - re-asks;
-- a terminal fold marker, including `preempted` after user takeover.
+- a terminal fold marker, including `preempted` after user takeover, with a validated normalized terminal result when written by the current version.
 
 Before every provider request, `src/context-fold.ts` correlates a complete exchange by protocol version, exchange ID, and cycle IDs. Complete exchanges fold normally, and a canonical decision prompt followed by an aborted assistant is removed as a bounded plugin-owned pair. Unrelated custom messages may be interleaved inside a correlated exchange; folding preserves those entries while removing only watchdog-owned messages. An unrelated, incomplete, or malformed exchange fails closed locally for its own correlation ID; it cannot disable folding for later independent exchanges.
 
@@ -373,7 +397,7 @@ becomes:
 ordinary conversation
 ```
 
-No decision content remains in the provider request.
+No raw decision content remains in the provider request. If another watchdog check opens before a successful ordinary assistant completion, that new check may prepend only the normalized terminal summary described above.
 
 Plain audit and visible-result `CustomEntry` records require no folding because SessionManager never projects them into Agent context.
 
@@ -386,6 +410,8 @@ On normal `pi -c` recovery:
 3. the extension reloads and registers its context transform;
 4. before the next provider request, the complete terminal decision exchange is folded again;
 5. the provider receives only ordinary conversation, plus the compact continuation message for a continue outcome.
+
+A later watchdog decision opened before any successful ordinary assistant completion can reconstruct the bounded normalized zero-loop suffix from the restored active branch. This does not alter ordinary resume requests and does not replay the hidden exchange.
 
 Packed E2E creates a persistent session, triggers a decision, shuts it down, reopens the same file with `SessionManager.open()`, sends another ordinary prompt, and inspects the actual provider payload. It verifies the resumed request contains no watchdog question, XML answer, audit entry, or fold marker.
 
@@ -475,7 +501,7 @@ built-in defaults
 < trusted <cwd>/.pi/pi-continue-watchdog.json
 ```
 
-Project configuration is ignored when Pi does not trust the project. Invalid fields fall back to the next lower valid value and produce bounded diagnostics.
+Project configuration is ignored when Pi does not trust the project. Invalid fields fall back to the next lower valid value and produce bounded diagnostics. Prompt strings alone have the 16,384-code-point ceiling. Reason-type list entries are trimmed and required to be nonblank but otherwise retain the existing no-regex, no-artificial-length contract; an oversized history summary is omitted whole by the formatter budget rather than rejected during terminal persistence.
 
 Lock state, wait deadline, aggregate grace, ownership, and pending decisions are runtime-only. They are not restored across reload, new session, resume, restart, or shutdown. A later real main user message starts a fresh lock cycle.
 
@@ -487,8 +513,8 @@ Lock state, wait deadline, aggregate grace, ownership, and pending decisions are
 - a completed decision exchange is folded out of later provider context;
 - a user-preempted decision leaves no assistant/XML residue in later provider context;
 - raw invalid model text is not retained in audits;
-- audit and visible-result custom entries never enter Agent/provider context;
-- complete terminal decision exchanges are absent from later provider requests;
+- audit and visible-result custom entries never enter Agent/provider context; zero-loop decision prompts use only validated normalized terminal-fold metadata;
+- complete terminal decision exchanges are absent from later provider requests, apart from the separately reconstructed bounded normalized summary in a back-to-back watchdog prompt;
 - normal persistent-session resume re-applies folding before the next provider request;
 - decision paths return to idle within bounded E2E deadlines.
 
@@ -504,7 +530,7 @@ The folder fails closed in those cases to avoid deleting genuine user conversati
 
 ## Verification
 
-`npm run check` covers lint, type checking, unit tests, and build. Focused unit/runtime coverage includes wait XML bounds, shared attempt accounting, persistence rollback, absolute-deadline requalification after activity, unlock cleanup, stale callbacks, context folding, TUI records, and final-wait-delayed exhaustion. `npm run test:e2e` installs the packed source artifact against stock Pi and verifies:
+`npm run check` covers lint, type checking, unit tests, and build. Focused unit/runtime coverage includes wait XML bounds, shared attempt accounting, persistence rollback, absolute-deadline requalification after activity, unlock cleanup, stale callbacks, context folding, zero-loop stop-reason classification, deterministic budget overflow, stable re-ask snapshots, prompt privacy, TUI records, and final-wait-delayed exhaustion. `npm run test:e2e` installs the packed source artifact against stock Pi and verifies:
 
 - multi-loader, same-process aggregate-idle ownership;
 - threshold compaction recovery;
@@ -515,7 +541,8 @@ The folder fails closed in those cases to avoid deleting genuine user conversati
 - three invalid responses and terminal idle;
 - canonical abort behavior;
 - semantic-hook publication;
-- persistent session reopen with clean provider context;
+- persistent session reopen with clean ordinary provider context;
+- an immediate follow-up watchdog after a failed continuation receives the normalized prior result without raw hidden output or audit/TUI text;
 - bounded return from `working` to idle across covered paths.
 
 ## Authenticated process-domain layer

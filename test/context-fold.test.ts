@@ -15,6 +15,7 @@ import {
 	DECISION_PROTOCOL_VERSION,
 	foldDecisionContext,
 	neutralizeDecisionAssistant,
+	parseDecisionFoldDetails,
 	registerDecisionContextFolding,
 } from "../src/context-fold.js";
 
@@ -300,6 +301,130 @@ test("builders emit exact decision and fold custom messages", () => {
 				watchdogOutcome: "preempted",
 			},
 		},
+	);
+});
+
+test("terminal fold metadata is validated without breaking legacy folds", () => {
+	const folds = [
+		createDecisionFoldMessage({
+			exchangeId: EXCHANGE_ID,
+			cycleId: 1,
+			outcome: "continue",
+			continuePrompt: CONTINUE_PROMPT,
+			watchdogResult: {
+				outcome: "continue",
+				reasonType: "WORK_REMAINS",
+				reason: "Tests remain.",
+			},
+		}),
+		createDecisionFoldMessage({
+			exchangeId: EXCHANGE_ID,
+			cycleId: 2,
+			outcome: "wait",
+			watchdogResult: {
+				outcome: "wait",
+				reason: "Waiting for CI.",
+				waitSeconds: 300,
+			},
+		}),
+		createDecisionFoldMessage({
+			exchangeId: EXCHANGE_ID,
+			cycleId: 3,
+			outcome: "unlock",
+			watchdogResult: {
+				outcome: "unlock",
+				reasonType: "JOB_DONE",
+				reason: "Done.",
+			},
+		}),
+		createDecisionFoldMessage({
+			exchangeId: EXCHANGE_ID,
+			cycleId: 4,
+			outcome: "decision-failed",
+			watchdogResult: {
+				outcome: "decision-failed",
+				error: "Invalid XML.",
+			},
+		}),
+		createDecisionFoldMessage({
+			exchangeId: EXCHANGE_ID,
+			cycleId: 5,
+			outcome: "preempted",
+			watchdogResult: { outcome: "preempted" },
+		}),
+		createDecisionFoldMessage({
+			exchangeId: EXCHANGE_ID,
+			cycleId: 6,
+			outcome: "invalidated",
+			watchdogResult: { outcome: "invalidated" },
+		}),
+	];
+
+	assert.deepEqual(
+		folds.map((fold) => parseDecisionFoldDetails(fold.details)?.watchdogResult),
+		[
+			{
+				outcome: "continue",
+				reasonType: "WORK_REMAINS",
+				reason: "Tests remain.",
+			},
+			{ outcome: "wait", reason: "Waiting for CI.", waitSeconds: 300 },
+			{ outcome: "unlock", reasonType: "JOB_DONE", reason: "Done." },
+			{ outcome: "decision-failed", error: "Invalid XML." },
+			{ outcome: "preempted" },
+			{ outcome: "invalidated" },
+		],
+	);
+
+	const longReasonType = "R".repeat(MAX_PROMPT_CHARACTERS + 1);
+	const longReasonTypeFold = createDecisionFoldMessage({
+		exchangeId: EXCHANGE_ID,
+		cycleId: 7,
+		outcome: "continue",
+		continuePrompt: CONTINUE_PROMPT,
+		watchdogResult: {
+			outcome: "continue",
+			reasonType: longReasonType,
+			reason: "Still valid.",
+		},
+	});
+	const parsedLongReasonType = parseDecisionFoldDetails(
+		longReasonTypeFold.details,
+	)?.watchdogResult;
+	assert.ok(parsedLongReasonType?.outcome === "continue");
+	assert.equal(parsedLongReasonType.reasonType, longReasonType);
+
+	const legacy = createDecisionFoldMessage({
+		exchangeId: EXCHANGE_ID,
+		cycleId: 8,
+		outcome: "wait",
+	});
+	assert.equal(
+		parseDecisionFoldDetails(legacy.details)?.watchdogResult,
+		undefined,
+	);
+
+	const malformed = {
+		...(legacy.details as Record<string, unknown>),
+		watchdogResult: {
+			outcome: "wait",
+			reason: "Waiting.",
+			waitSeconds: 0,
+		},
+	};
+	assert.equal(parseDecisionFoldDetails(malformed), undefined);
+
+	assert.throws(() =>
+		createDecisionFoldMessage({
+			exchangeId: EXCHANGE_ID,
+			cycleId: 9,
+			outcome: "wait",
+			watchdogResult: {
+				outcome: "continue",
+				reasonType: "WORK_REMAINS",
+				reason: "Mismatch.",
+			},
+		} as never),
 	);
 });
 

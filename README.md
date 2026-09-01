@@ -43,6 +43,8 @@ Use `pi update --extensions` to update. Reload Pi extensions or start a new sess
      ```
 
    Typing a message during the check preempts it immediately; your message runs and the check is discarded.
+
+   If another decision check opens before an ordinary agent turn finishes successfully, the new check receives a bounded, chronological list of normalized prior watchdog results as **model-generated reference only**. Errored, aborted, length-limited, and intermediate tool-use attempts do not clear that list; a successful ordinary turn does. Raw hidden answers, XML, partial output, provider errors, TUI text, and audit records are never replayed. If the list is too large, the oldest complete summaries are omitted and their count is reported.
 4. **Continue.** The decision folds into the compact prompt `Continue until user assistance is required.` and work resumes without user input. Every accepted continue is recorded in TUI history (`Continue watchdog continued · <TYPE> · <reason>`) so repeated continuations stay visible.
 5. **Wait.** Has no reason type. It requires a reason and an integer `wait_seconds` from 1 to 1800 (no clamping — invalid values are rejected). It consumes one shared attempt, keeps the lock, folds the exchange to nothing, and suppresses further checks until the deadline passes. If the agent stays active, the wait is not restarted. Unlock or a new user message cancels it.
 6. **Unlock.** Records one muted TUI line (`Continue watchdog unlocked · <TYPE> · <reason>`) and stops automatic continuation. No extra work turn is started.
@@ -87,7 +89,7 @@ Built-in type meanings:
 - Continue: `WORK_REMAINS` — actionable work remains; `VERIFYING` — verification in progress.
 - Passive waiting for external automation is expressed with `wait_watchdog`, not a continue type.
 
-Reason types are trimmed and matched case-insensitively against their configured lists. Reason content is trimmed, must be nonblank, and may contain at most 500 Unicode characters. Human `/unlock-continue-watchdog` stays untyped.
+Reason types are trimmed and matched case-insensitively against their configured lists. Configured list entries must be nonblank but have no identifier regex or artificial per-entry length limit. Reason content is trimmed, must be nonblank, and may contain at most 500 Unicode characters. Human `/unlock-continue-watchdog` stays untyped.
 
 ## Notifications for other extensions
 
@@ -102,7 +104,7 @@ Delivery is best-effort; no consumer is required or waited for.
 
 - Coverage means all Pi processes that loaded this extension and inherited the root's process domain. Sessions that strip their environment or don't load the watchdog are outside coverage.
 - Only the elected main session decides; other attachments only observe. A UI-bound session wins main; otherwise the first-bound attachment is the best-effort main.
-- Lock and wait state is runtime-only: it is not restored after a process restart, and a fresh process starts unlocked. Decision outcomes are recorded as persistent session/TUI audit entries for visibility, but they never re-enter model context.
+- Lock and wait state is runtime-only: it is not restored after a process restart, and a fresh process starts unlocked. Decision outcomes are recorded as persistent session/TUI audit entries for visibility. Those audit entries remain excluded from Agent/provider context; only bounded normalized prior results may be added explicitly to a later back-to-back watchdog decision prompt.
 - Decision XML control is main-only; ordinary tools are blocked only while a decision is open.
 - No external network connections are opened. Cross-process coordination uses an authenticated loopback transport local to this machine; all model traffic goes through the session's normal Pi provider.
 
@@ -118,4 +120,4 @@ npm run test:e2e   # packed install + stock Pi E2E
 
 ## Privacy
 
-The extension opens no external network connections. Cross-process coordination uses authenticated loopback sockets on this machine only; decision and continuation turns use the session's normal Pi model provider, and waits start no additional model turn.
+The extension opens no external network connections. Cross-process coordination uses authenticated loopback sockets on this machine only; decision and continuation turns use the session's normal Pi model provider, and waits start no additional model turn. Back-to-back decision history is limited to normalized terminal fields labeled as model-generated reference data; raw hidden model output, XML, provider errors, TUI text, and audit records are not restored.

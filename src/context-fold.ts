@@ -10,7 +10,8 @@ import {
 	neutralizeInquiryAssistant,
 } from "pi-extension-utils/pi-inquiry";
 
-import { isValidPrompt } from "./config.js";
+import { hasAtMostUnicodeCodePoints, isValidPrompt } from "./config.js";
+import { MAX_WAIT_SECONDS } from "./decision-protocol.js";
 
 export const DECISION_INQUIRY_NAMESPACE = "pi-continue-watchdog";
 export const DECISION_PROTOCOL_VERSION = INQUIRY_PROTOCOL_VERSION;
@@ -30,9 +31,33 @@ export type DecisionFoldOutcome =
 	| "invalidated"
 	| "preempted";
 
+export type DecisionTerminalResult =
+	| {
+			readonly outcome: "continue";
+			readonly reasonType: string;
+			readonly reason: string;
+	  }
+	| {
+			readonly outcome: "wait";
+			readonly reason: string;
+			readonly waitSeconds: number;
+	  }
+	| {
+			readonly outcome: "unlock";
+			readonly reasonType: string;
+			readonly reason: string;
+	  }
+	| {
+			readonly outcome: "decision-failed";
+			readonly error: string;
+	  }
+	| { readonly outcome: "invalidated" }
+	| { readonly outcome: "preempted" };
+
 export interface DecisionFoldDetails extends InquiryCorrelation {
 	readonly outcome: "remove" | "replace";
 	readonly watchdogOutcome: DecisionFoldOutcome;
+	readonly watchdogResult?: DecisionTerminalResult;
 	readonly replacement?: {
 		readonly customType: string;
 		readonly content: string;
@@ -46,18 +71,55 @@ export interface DecisionPromptMessageInput {
 	readonly decisionPrompt: string;
 }
 
+type DecisionFoldMessageBase = {
+	readonly exchangeId: string;
+	readonly cycleId: number;
+};
+
 export type DecisionFoldMessageInput =
-	| {
-			readonly exchangeId: string;
-			readonly cycleId: number;
-			readonly outcome: Exclude<DecisionFoldOutcome, "continue">;
-	  }
-	| {
-			readonly exchangeId: string;
-			readonly cycleId: number;
+	| (DecisionFoldMessageBase & {
 			readonly outcome: "continue";
 			readonly continuePrompt: string;
-	  };
+			readonly watchdogResult?: Extract<
+				DecisionTerminalResult,
+				{ readonly outcome: "continue" }
+			>;
+	  })
+	| (DecisionFoldMessageBase & {
+			readonly outcome: "wait";
+			readonly watchdogResult?: Extract<
+				DecisionTerminalResult,
+				{ readonly outcome: "wait" }
+			>;
+	  })
+	| (DecisionFoldMessageBase & {
+			readonly outcome: "unlock";
+			readonly watchdogResult?: Extract<
+				DecisionTerminalResult,
+				{ readonly outcome: "unlock" }
+			>;
+	  })
+	| (DecisionFoldMessageBase & {
+			readonly outcome: "decision-failed";
+			readonly watchdogResult?: Extract<
+				DecisionTerminalResult,
+				{ readonly outcome: "decision-failed" }
+			>;
+	  })
+	| (DecisionFoldMessageBase & {
+			readonly outcome: "invalidated";
+			readonly watchdogResult?: Extract<
+				DecisionTerminalResult,
+				{ readonly outcome: "invalidated" }
+			>;
+	  })
+	| (DecisionFoldMessageBase & {
+			readonly outcome: "preempted";
+			readonly watchdogResult?: Extract<
+				DecisionTerminalResult,
+				{ readonly outcome: "preempted" }
+			>;
+	  });
 
 export interface DecisionCustomMessage {
 	readonly customType: string;
@@ -83,22 +145,90 @@ function validCycleId(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
-function decisionDetails(input: unknown): DecisionMessageDetails | undefined {
+function validInquiryNamespace(value: unknown): value is string {
+	return typeof value === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(value);
+}
+
+const MAX_RESULT_TEXT_CODE_POINTS = 500;
+
+function validNormalizedReasonType(value: unknown): value is string {
+	return (
+		typeof value === "string" && value.length > 0 && value === value.trim()
+	);
+}
+
+function validNormalizedText(value: unknown, maximum: number): value is string {
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		value === value.trim() &&
+		hasAtMostUnicodeCodePoints(value, maximum)
+	);
+}
+
+function parseDecisionTerminalResult(
+	input: unknown,
+	expectedOutcome: DecisionFoldOutcome,
+): DecisionTerminalResult | undefined {
+	if (!isObject(input) || input.outcome !== expectedOutcome) return undefined;
+	switch (expectedOutcome) {
+		case "continue":
+		case "unlock":
+			return validNormalizedReasonType(input.reasonType) &&
+				validNormalizedText(input.reason, MAX_RESULT_TEXT_CODE_POINTS)
+				? {
+						outcome: expectedOutcome,
+						reasonType: input.reasonType,
+						reason: input.reason,
+					}
+				: undefined;
+		case "wait":
+			return validNormalizedText(input.reason, MAX_RESULT_TEXT_CODE_POINTS) &&
+				typeof input.waitSeconds === "number" &&
+				Number.isSafeInteger(input.waitSeconds) &&
+				input.waitSeconds >= 1 &&
+				input.waitSeconds <= MAX_WAIT_SECONDS
+				? {
+						outcome: "wait",
+						reason: input.reason,
+						waitSeconds: input.waitSeconds,
+					}
+				: undefined;
+		case "decision-failed":
+			return validNormalizedText(input.error, MAX_RESULT_TEXT_CODE_POINTS)
+				? { outcome: "decision-failed", error: input.error }
+				: undefined;
+		case "invalidated":
+		case "preempted":
+			return Object.keys(input).length === 1
+				? { outcome: expectedOutcome }
+				: undefined;
+	}
+}
+
+function inquiryDetails(input: unknown): InquiryCorrelation | undefined {
 	if (!isObject(input)) return undefined;
 	if (
-		input.version !== DECISION_PROTOCOL_VERSION ||
-		input.namespace !== DECISION_INQUIRY_NAMESPACE ||
+		input.version !== INQUIRY_PROTOCOL_VERSION ||
+		!validInquiryNamespace(input.namespace) ||
 		!validExchangeId(input.inquiryId) ||
 		!validCycleId(input.attempt)
 	) {
 		return undefined;
 	}
 	return {
-		version: DECISION_PROTOCOL_VERSION,
-		namespace: DECISION_INQUIRY_NAMESPACE,
+		version: INQUIRY_PROTOCOL_VERSION,
+		namespace: input.namespace,
 		inquiryId: input.inquiryId,
 		attempt: input.attempt,
 	};
+}
+
+function decisionDetails(input: unknown): DecisionMessageDetails | undefined {
+	const correlation = inquiryDetails(input);
+	return correlation?.namespace === DECISION_INQUIRY_NAMESPACE
+		? correlation
+		: undefined;
 }
 
 function markerDetails(
@@ -114,7 +244,9 @@ function markerDetails(
 	return { exchangeId: input.exchangeId, cycleId: input.cycleId };
 }
 
-function foldDetails(input: unknown): DecisionFoldDetails | undefined {
+export function parseDecisionFoldDetails(
+	input: unknown,
+): DecisionFoldDetails | undefined {
 	const correlation = decisionDetails(input);
 	if (correlation === undefined || !isObject(input)) return undefined;
 	const watchdogOutcome = input.watchdogOutcome;
@@ -130,10 +262,17 @@ function foldDetails(input: unknown): DecisionFoldDetails | undefined {
 	}
 	if (input.outcome !== "remove" && input.outcome !== "replace")
 		return undefined;
+	const hasWatchdogResult = Object.hasOwn(input, "watchdogResult");
+	const watchdogResult = parseDecisionTerminalResult(
+		input.watchdogResult,
+		watchdogOutcome,
+	);
+	if (hasWatchdogResult && watchdogResult === undefined) return undefined;
 	return {
 		...correlation,
 		outcome: input.outcome,
 		watchdogOutcome,
+		...(watchdogResult === undefined ? {} : { watchdogResult }),
 		...(isObject(input.replacement)
 			? {
 					replacement: {
@@ -146,6 +285,15 @@ function foldDetails(input: unknown): DecisionFoldDetails | undefined {
 				}
 			: {}),
 	};
+}
+
+export function isCorrelatedInquiryAssistantMessage(input: unknown): boolean {
+	return (
+		isObject(input) &&
+		input.role === "assistant" &&
+		isObject(input.details) &&
+		inquiryDetails(input.details.piInquiry) !== undefined
+	);
 }
 
 function entryCorrelation(
@@ -230,7 +378,7 @@ export function findDecisionAssistantEntryId(
 			}
 			if (entry.customType === DECISION_FOLD_MESSAGE_TYPE) {
 				if (!decisionSeen || foldSeen) return null;
-				const fold = foldDetails(entry.details);
+				const fold = parseDecisionFoldDetails(entry.details);
 				if (
 					fold?.inquiryId !== exchangeId ||
 					fold.attempt !== cycleId ||
@@ -292,10 +440,15 @@ export function createDecisionPromptMessage(
 export function createDecisionFoldMessage(
 	input: DecisionFoldMessageInput,
 ): DecisionCustomMessage {
+	const watchdogResult =
+		input.watchdogResult === undefined
+			? undefined
+			: parseDecisionTerminalResult(input.watchdogResult, input.outcome);
 	if (
 		!validExchangeId(input.exchangeId) ||
 		!validCycleId(input.cycleId) ||
-		(input.outcome === "continue" && !isValidPrompt(input.continuePrompt))
+		(input.outcome === "continue" && !isValidPrompt(input.continuePrompt)) ||
+		(input.watchdogResult !== undefined && watchdogResult === undefined)
 	) {
 		throw new TypeError("invalid decision fold message input");
 	}
@@ -319,6 +472,7 @@ export function createDecisionFoldMessage(
 		details: {
 			...message.details,
 			watchdogOutcome: input.outcome,
+			...(watchdogResult === undefined ? {} : { watchdogResult }),
 		},
 	};
 }
