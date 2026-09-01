@@ -24,6 +24,7 @@ export interface DecisionMessageDetails extends InquiryCorrelation {}
 
 export type DecisionFoldOutcome =
 	| "continue"
+	| "wait"
 	| "unlock"
 	| "decision-failed"
 	| "invalidated"
@@ -119,6 +120,7 @@ function foldDetails(input: unknown): DecisionFoldDetails | undefined {
 	const watchdogOutcome = input.watchdogOutcome;
 	if (
 		watchdogOutcome !== "continue" &&
+		watchdogOutcome !== "wait" &&
 		watchdogOutcome !== "unlock" &&
 		watchdogOutcome !== "decision-failed" &&
 		watchdogOutcome !== "invalidated" &&

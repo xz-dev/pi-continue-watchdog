@@ -1,203 +1,121 @@
 # pi-continue-watchdog
 
-Pi extension that notices when every watchdog-loaded Pi process in an inherited authenticated process domain is idle and asks the root AI to continue or intentionally unlock, so work does not stop without explanation.
+Pi extension that keeps your agent working. When all agent sessions go idle, it briefly asks the main agent whether to **continue**, **wait**, or **unlock** — so work never stops silently without a reason.
 
-**Status:** live source package. This project has no versioned releases; users track the latest `master` commit.
+**Status:** live source package, tracks latest `master`. No versioned releases.
 
 **License:** [BSD-3-Clause](./LICENSE)
 
 ## Requirements
 
 - Node.js `>= 22.19`
-- Current Pi with the public extension `sendMessage` / lifecycle APIs. This watchdog does not require a downstream hidden-presentation seam.
-- Uses the exact reviewed Git-pinned `pi-extension-utils` transport/XML/inquiry library; no dependency on a subagent plugin
+- Current Pi with public extension APIs
 
 ## Install
-
-Source entry: `pi.extensions` → `./src/extension.ts`.
 
 ```bash
 pi install git:github.com/xz-dev/pi-continue-watchdog
 ```
 
-This unpinned Git source intentionally tracks the latest repository state. Use `pi update --extensions` to update installed Pi packages. The project does not publish npm versions, tags, or GitHub Releases.
-
-The tracked root `.npmrc` sets `allow-git=root`. npm 12 otherwise rejects the exact Git-pinned `pi-extension-utils` dependency when Pi installs this cloned Git package. The `root` policy admits only the dependency declared directly by this reviewed package; it does not broadly allow transitive Git dependencies. The utility transport is pure TypeScript over `node:net` and has no native install scripts.
-
-Reload Pi extensions or start a new session after install.
+Use `pi update --extensions` to update. Reload Pi extensions or start a new session after install.
 
 ## How it works
 
-Observable behavior only (implementation details may change):
+1. **Auto-lock.** When the main agent starts running, the watchdog arms itself. Each new user message starts a fresh cycle.
+2. **Idle detection.** The watchdog watches the main session plus all child Pi processes it spawned. When everything appears idle, it waits a fixed **10 seconds** to make sure nothing new starts, then opens a short **decision check**.
+3. **The decision check** is an automated question to the main agent — not a user message. It may briefly stream in the TUI; when it ends, the exchange is removed from both TUI history and future model context, so conversations stay clean. The agent answers from existing context (no tool calls) with exactly one XML block:
+   - **Continue** — work remains, keep going:
 
-1. Whenever the **main agent starts running**, the continue watchdog ensures it is locked. If already locked, the current cycle is preserved. A real main user message starts a fresh cycle by silently performing a full unlock cleanup first—canceling timers and pending decision work—then locking again to reset old cycle accounting, without either notification.
-2. Every relevant public Pi event queries live `ctx.isIdle()`; event names never imply activity. Same-process attachments and authenticated child Pi processes contribute to one root-owned aggregate. While locked, each eligible observation replaces the previous candidate timer and waits a full fixed **10 seconds** before the extension rechecks enabled state, timer identity, root ownership, live main idle, pending messages, and the root busy-child set. Only then can it open a short **decision check**.
-3. The decision is an **automated custom message**, not a user message. If `pi-reflect-watchdog` exposes its optional `Symbol.for("pi-reflect-watchdog.api.v1")` API, Continue pauses Reflect counting immediately before each decision ask and resumes it on every terminal success, failure, preemption, demotion, or shutdown path; without that API, behavior is unchanged. It may stream in the live TUI/RPC while the check runs; when it ends, the extension clears the decision assistant from final TUI history and persisted assistant content. Ordinary active tools and the system-prompt tool list remain unchanged for prompt-cache stability. The model decides quickly from existing conversation knowledge without tools and finishes with exactly one XML block:
+     ```xml
+     <watchdog><function>continue_watchdog</function><reason_type>WORK_REMAINS</reason_type><reason_content>Implementation work remains.</reason_content></watchdog>
+     ```
 
-   ```xml
-   <watchdog><function>continue_watchdog</function><reason_type>WORK_REMAINS</reason_type><reason_content>Implementation work remains.</reason_content></watchdog>
-   ```
+   - **Wait** — external automation (CI, subagent, timer) hasn't finished; pause without a work turn:
 
-   or:
+     ```xml
+     <watchdog><function>wait_watchdog</function><reason_content>Waiting for CI.</reason_content><wait_seconds>300</wait_seconds></watchdog>
+     ```
 
-   ```xml
-   <watchdog>
-     <function>unlock_continue_watchdog</function>
-     <reason_type>JOB_DONE</reason_type>
-     <reason_content>All requested work is complete.</reason_content>
-   </watchdog>
-   ```
+   - **Unlock** — work is done or blocked; hand control back to the user:
 
-   It may explain first or output only XML, but after trimming the sole `</watchdog>` must be the end of the response. Multiple watchdog blocks are invalid. If it tries an ordinary tool during the decision, the extension blocks execution and reminds it to answer from existing context with XML. Interactive or RPC user input during the check preempts it: the original user message runs exactly once, the aborted decision assistant is cleared, and no `Operation aborted` or `Continue watchdog unlocked` notice is shown. Future model context then drops the preempted exchange.
-4. During every decision cycle, a live colored Pi-TUI widget shows `Continue watchdog checking` and the current attempt. Each watchdog validation re-ask and non-watchdog error is also retained as a colored TUI-only event card with its exact safe parser/original error. **Continue** requires an independently allowed type and concise reason, then persists `Continue watchdog continued · <TYPE> · <reason>` before semantic notification and dispatch, so repeated automatic continuation is visible and cannot silently consume tokens; if persistence fails, it fails closed without starting another turn. The complete decision exchange folds into the compact prompt `Continue until user assistance is required.` (configurable), and ordinary work resumes without further user input.
-5. **AI unlock** requires an allowed `reason_type` and concise nonblank `reason_content` of at most 500 Unicode code points. It shows one muted persistent TUI line, `Continue watchdog unlocked · <TYPE> · <reason>`, with no duplicate transient notification, and does **not** start another work turn. Future model context drops the complete decision exchange. Human command unlock remains untyped.
-6. A decision gets up to **3 total attempts**. An invalid final XML response counts as one attempt; blocked ordinary tool calls and provisional Provider errors that Pi retries within the same run do not. Invalid raw text is not retained. After the third invalid response, the extension stays locked/failed until a new main user message or manual lock, and the failed exchange is folded out of future model context.
-7. After each valid continue, the next eligible live-idle observation waits the same fixed **10s** fence, up to **10** valid continues per lock cycle. Repeated identical reports restart all ten seconds.
-8. An **aborted** main run unlocks immediately (reasonless). Child stop reasons are never inspected.
+     ```xml
+     <watchdog><function>unlock_continue_watchdog</function><reason_type>JOB_DONE</reason_type><reason_content>All requested work is complete.</reason_content></watchdog>
+     ```
 
-Design note: the extension does **not** blindly continue. It asks first so completed or intentionally waiting work can unlock cleanly.
+   Typing a message during the check preempts it immediately; your message runs and the check is discarded.
+4. **Continue.** The decision folds into the compact prompt `Continue until user assistance is required.` and work resumes without user input. Every accepted continue is recorded in TUI history (`Continue watchdog continued · <TYPE> · <reason>`) so repeated continuations stay visible.
+5. **Wait.** Has no reason type. It requires a reason and an integer `wait_seconds` from 1 to 1800 (no clamping — invalid values are rejected). It consumes one shared attempt, keeps the lock, folds the exchange to nothing, and suppresses further checks until the deadline passes. If the agent stays active, the wait is not restarted. Unlock or a new user message cancels it.
+6. **Unlock.** Records one muted TUI line (`Continue watchdog unlocked · <TYPE> · <reason>`) and stops automatic continuation. No extra work turn is started.
+7. **Limits.** Invalid XML gets re-asked up to **3 attempts**, then the watchdog stops asking until a new user message or manual lock. Each lock cycle allows up to **10** valid continue/wait outcomes. If the final outcome is a wait, the stop signal fires only after that wait fully expires.
+
+The extension never blindly continues: it asks first, so finished work can unlock cleanly and external automation can be awaited without a wasted turn.
 
 ## Commands
 
 | Command | Effect |
 |---|---|
-| `/lock-continue-watchdog` | Silently perform full unlock cleanup first, then start a fresh lock cycle and emit exactly one TUI notification: `Continue watchdog locked` |
-| `/unlock-continue-watchdog [reason]` | Set unlocked and cancel pending checks while preserving cycle counters/failure state. Blank reason: notify `Continue watchdog unlocked`; nonblank reason: persist one muted `Continue watchdog unlocked · <reason>` entry |
-| `/status-continue-watchdog` | Show current main/lock/attempt state, trigger blocker, grace phase, and observable busy counts without changing watchdog state |
-
-Same-state commands still assign (no silent no-op). A manual lock always runs the complete unlock-cleanup → fresh-lock sequence even when already unlocked or locked, suppresses prerequisite unlock output, and emits only `Continue watchdog locked`. A direct manual unlock still emits its normal output. Only fresh lock semantics reset the cycle; a real main user message applies the same full sequence with both notifications suppressed. Ordinary main `agent_start` without a new user message remains ensure-lock behavior and preserves an already locked cycle.
-
-Human unlock reason is optional: trimmed and truncated to 500 Unicode characters; multiline allowed. Nonblank reasons also appear as a TUI-only history entry (not model context).
-
-## XML decisions (main decision window only)
-
-Canonical continue output:
-
-```xml
-<watchdog>
-  <function>continue_watchdog</function>
-  <reason_type>WORK_REMAINS</reason_type>
-  <reason_content>Implementation work remains.</reason_content>
-</watchdog>
-```
-
-Canonical unlock output:
-
-```xml
-<watchdog>
-  <function>unlock_continue_watchdog</function>
-  <reason_type>JOB_DONE</reason_type>
-  <reason_content>All requested work is complete.</reason_content>
-</watchdog>
-```
-
-The final non-thinking assistant text is trimmed, must end in `</watchdog>`, and must contain exactly one watchdog block. The extension extracts from that sole `<watchdog>` opening tag to the end and parses it. Unlock requires an allowed type and a concise nonblank reason of at most 500 Unicode code points. Thinking is ignored. Ordinary tools remain active for prompt-prefix stability but are blocked before execution while this decision is open.
-
-Default decision intent (configurable):
-
-```text
-This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. It does not represent any decision by the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one.
-```
-
-The extension always appends fixed XML instructions and the effective configured reason types. These instructions require exactly one watchdog block at the response end and never advertise compatibility-only tolerance for surplus XML keys.
-
-Default continue prompt (configurable):
-
-```text
-Continue until user assistance is required.
-```
-
-Decision-failed TUI warning:
-
-```text
-Continue watchdog decision failed after 3 attempts: <last error>
-```
+| `/lock-continue-watchdog` | Start a fresh lock cycle (notifies `Continue watchdog locked`) |
+| `/unlock-continue-watchdog [reason]` | Unlock now; optional reason is kept in TUI history |
+| `/status-continue-watchdog` | Show current lock/attempt state and why the next check would (not) fire |
 
 ## Configuration
 
-Precedence: **built-in defaults < global < trusted project**.
-
-| Path | When |
-|---|---|
-| `$PI_CODING_AGENT_DIR/pi-continue-watchdog.json` | Global (default agent dir `~/.pi/agent`) |
-| `<cwd>/.pi/pi-continue-watchdog.json` | Only when the project is **trusted** by Pi |
-
-Project config is ignored when the project is untrusted. Missing files are silent. Invalid fields fall back to the next lower valid value and emit a short diagnostic; they do not wipe other valid fields.
+Precedence: **built-in defaults < global < trusted project**. Files: `~/.pi/agent/pi-continue-watchdog.json` (global) or `<project>/.pi/pi-continue-watchdog.json` (trusted projects only). Invalid fields fall back to lower-precedence values and print a short diagnostic.
 
 ```json
 {
-  "idleDelaySeconds": 10,
   "maxRetries": 10,
-  "decisionPrompt": "This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. It does not represent any decision by the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one.",
+  "decisionPrompt": "…default shown below…",
   "continuePrompt": "Continue until user assistance is required.",
   "reasonTypes": ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
-  "continueReasonTypes": ["WORK_REMAINS", "VERIFYING", "WAIT_AUTOMATION"]
+  "continueReasonTypes": ["WORK_REMAINS", "VERIFYING"]
 }
 ```
 
-| Key | Default | Range / rules |
+| Key | Default | Rules |
 |---|---|---|
-| `idleDelaySeconds` | `10` | **Deprecated compatibility key.** Accepted and preserved, but ignored at runtime; every automatic inquiry fence is exactly 10 seconds. |
-| `maxRetries` | `10` | Safe integer `1`–`10` (valid continues per lock cycle) |
-| `decisionPrompt` | see above | Non-blank, ≤ **16384** Unicode code points |
-| `continuePrompt` | `Continue until user assistance is required.` | Non-blank, ≤ **16384** Unicode code points |
-| `reasonTypes` | `["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"]` | Allowed unlock types. Nonempty array of trim-nonblank strings; a valid list **replaces** the defaults. |
-| `continueReasonTypes` | `["WORK_REMAINS", "VERIFYING", "WAIT_AUTOMATION"]` | Independently allowed continue types with the same replace semantics. |
+| `maxRetries` | `10` | Integer `1`–`10`; valid continue/wait outcomes per lock cycle |
+| `decisionPrompt` | see below | Non-blank, ≤ 16384 Unicode code points |
+| `continuePrompt` | `Continue until user assistance is required.` | Non-blank, ≤ 16384 Unicode code points |
+| `reasonTypes` | `["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"]` | Allowed unlock types; a valid list replaces defaults |
+| `continueReasonTypes` | `["WORK_REMAINS", "VERIFYING"]` | Allowed continue types; same replace semantics |
+| `idleDelaySeconds` | `10` | **Deprecated**, accepted but ignored; the idle fence is fixed at 10 seconds |
 
-Default meanings: `JOB_DONE` means all requested work is complete; `WAIT_USER` means progress genuinely requires user input or a user decision; `JOB_BLOCKED` means the job cannot continue for another concrete reason.
+Built-in type meanings:
 
-For AI unlock and continue, the extension trims XML `reason_type`, matches it against the corresponding independent effective list case-insensitively, and emits the **matched configured value uppercased**. It trims `reason_content` but does not truncate it: blank or over-500-code-point AI reasons are invalid and use the decision re-ask protocol. Both effective allowed lists and the explicit prohibition on making decisions for the user are included in the fixed prompt suffix. Human `/unlock-continue-watchdog [reason]` remains untyped and keeps its separate truncating behavior.
+- Unlock: `JOB_DONE` — all work complete; `WAIT_USER` — user input/decision needed; `JOB_BLOCKED` — cannot proceed for another concrete reason.
+- Continue: `WORK_REMAINS` — actionable work remains; `VERIFYING` — verification in progress.
+- Passive waiting for external automation is expressed with `wait_watchdog`, not a continue type.
 
-Invalid re-ask budget is fixed at **3** (not configurable).
+Reason types are trimmed and matched case-insensitively against their configured lists. Reason content is trimmed, must be nonblank, and may contain at most 500 Unicode characters. Human `/unlock-continue-watchdog` stays untyped.
 
-Every candidate automatic inquiry replaces the prior timer and waits one full fixed 10-second fence. Repeated events and repeated equal idle reports restart the complete delay. Valid continues advance only `maxRetries`; they do not alter the fence.
+## Notifications for other extensions
 
+On Pi's public event bus (`pi:semantic-hook:v1`), the watchdog publishes:
 
-## Neutral semantic hooks
+- `watchdog-continued` — after each durably recorded continue (`REASON_TYPE`, `REASON`).
+- `user-ready` — once when a terminal idle state is reached: AI unlock (`AI_UNLOCK`), budget exhausted (`EXHAUSTED`), or three invalid decisions (`DECISION_FAILED`).
 
-After a valid continue is durably recorded, the elected main publishes a fresh `watchdog-continued` envelope on `pi:semantic-hook:v1` with `{ "REASON_TYPE": "<matched TYPE>", "REASON": "<validated reason>" }`. The persisted TUI entry is written first; listener failure is best-effort and never prevents the subsequent continuation turn. The producer has no pi-notify dependency.
+Delivery is best-effort; no consumer is required or waited for.
 
-When the elected main attachment reaches a **terminal aggregate-idle** epoch where this extension will not start another automatic decision or continue run, it publishes one fresh plain-data envelope on Pi's public bus:
+## Scope and limits
 
-- Channel: `pi:semantic-hook:v1`
-- Envelope name: `user-ready`
-- Values by stop kind:
-  - AI decision unlock: `{ "STOP_KIND": "AI_UNLOCK", "REASON_TYPE": "<matched TYPE>", "REASON": "<validated reason>" }`
-  - Max valid continues exhausted: `{ "STOP_KIND": "EXHAUSTED" }`
-  - Third invalid decision: `{ "STOP_KIND": "DECISION_FAILED" }`
-
-`user-ready` publication is at most once per such terminal idle epoch. It does **not** publish for human `/unlock-continue-watchdog`, abort unlock, valid continue, intermediate decision states, or ordinary unlocked idle. The producer does not import, identify, require, or wait for any consumer (including pi-notify). Delivery is best-effort current-listener-only with no ack, retry, or replay.
-
-## Scope and limitations
-
-- **“All agents”** means watchdog-loaded Pi sessions that inherit `PI_EXTENSION_UTILS_PROCESS_DOMAIN` from the root. Same-realm attachments aggregate into one OS-process participant; child and nested Pi processes join after their watchdog completes `session_start` and reports activity. A deliberately stripped/replaced environment or a child that does not load watchdog is outside coverage. Coverage starts only after activity registration; no earlier guarantee is claimed.
-- The root is the sole endpoint creator and watchdog decision authority. `pi-extension-utils` binds one ephemeral loopback TCP listener; each authenticated client owns one framed connection and clients only connect. `PI_CONTINUE_WATCHDOG_ROOT_PID` is topology metadata, not authentication.
-- Cross-process watchdog business data contains exactly `{ agentId, idle }`. The authenticated sender ID must match `agentId`. The root keeps a deduplicated `Set` of busy child IDs: `idle:false` adds, `idle:true` or disconnect deletes. Connect alone is neutral. Every accepted report and disconnect replaces the root fence, even when the resulting boolean state is unchanged.
-- `pi-extension-utils` supplies authenticated transport, peer events, heartbeat liveness, and a fixed 1-second reconnect retry. After reconnect, the child immediately queries live `ctx.isIdle()` and reports it; stale activity is never reused. Initial declaration/authentication/transport failures fail closed with sanitized output and exit status 78. Runtime disconnect counts that child idle while transport reconnects; it does not create a business-level uncertain state or terminate Pi. Secrets, HMAC proofs, raw declarations, and endpoints are never printed.
-- **Main election:** UI-bound session wins; pure headless uses first-bound attachment as best-effort main; later non-UI attachments do not steal main.
-- **Root ownership:** every extension-enabled attachment observes and reports busy/idle. Only the exact current main owns config, timers, XML decision messages, tool-call blocking, UI notifies, and `user-ready` publication. Non-main attachments are **observer-only** and do not load watchdog config or open decision windows.
-- **Framework boundary:** coordination uses only Pi public extension APIs, notably live `ctx.isIdle()`, and one optional same-realm Reflect Watchdog Symbol API for decision-time counter suppression. Continue has no package dependency on Reflect and feature detection is a no-op when Reflect is absent. `ctx.abort()`, `ctx.hasPendingMessages()`, `input`, `agent_settled`, and uninterruptible `message_end`. There is no dependence on private Pi fields, fork-only behavior, other plugins, or path heuristics. Pi's `pi.events` bus is for semantic-hook delivery only, not process coordination.
-- **Lock state is runtime-only.** A new process/session attachment begins unlocked until its current main agent starts. Nothing is written to disk, and shutdown cancels runtime activity.
-- XML decision control is main-only; ordinary tools remain advertised but are blocked while the main decision is open.
-
-## Context cleanliness
-
-After valid continue, valid unlock, terminal decision failure, user preemption, or renewed external activity, future **model-bound** context drops the complete decision exchange, including the decision question, any streamed assistant/tool-result residue, re-asks, and fold marker. Continue replaces it with the compact continue prompt; other terminal/cancel paths replace it with nothing. A shared per-attempt handle owns exact correlation, first-terminal-wins, idempotent cancellation, assistant neutralization, and retryable remove-fold cleanup. Only exactly correlated neutralized aborted assistants can be removed without a fold marker.
-
-Each decision stores only a structured `pi-continue-watchdog:decision-audit` custom entry. Pi explicitly excludes plain custom entries from Agent/provider context, so the audit survives `pi -c` without becoming conversation. Valid continue and unlock audits keep the validated type and reason; invalid audits keep only the fixed validation error, never raw model text. The original XML and any aborted partial decision are not retained as assistant content. Pi's public `message_end` replacement leaves an empty assistant metadata record rather than deleting the append-only entry.
+- Coverage means all Pi processes that loaded this extension and inherited the root's process domain. Sessions that strip their environment or don't load the watchdog are outside coverage.
+- Only the elected main session decides; other attachments only observe. A UI-bound session wins main; otherwise the first-bound attachment is the best-effort main.
+- Lock and wait state is runtime-only: it is not restored after a process restart, and a fresh process starts unlocked. Decision outcomes are recorded as persistent session/TUI audit entries for visibility, but they never re-enter model context.
+- Decision XML control is main-only; ordinary tools are blocked only while a decision is open.
+- No external network connections are opened. Cross-process coordination uses an authenticated loopback transport local to this machine; all model traffic goes through the session's normal Pi provider.
 
 ## Development
 
-The authoritative Lean process model is [`docs/programming-thinking/official-pi-idle-inquiry.idea.lean`](docs/programming-thinking/official-pi-idle-inquiry.idea.lean). The accepted behavior contract is [`docs/behavior-contract.md`](docs/behavior-contract.md); implementation structure and context isolation are in [`docs/architecture.md`](docs/architecture.md).
+Behavior contract: [`docs/behavior-contract.md`](docs/behavior-contract.md) · Architecture: [`docs/architecture.md`](docs/architecture.md)
 
 ```bash
 npm ci
 npm run check      # lint, typecheck, unit tests, build
-npm run test:e2e   # packed isolated install + stock Pi E2E (timing, multi-loader ownership, XML hiding, bounded idle, persisted resume context)
+npm run test:e2e   # packed install + stock Pi E2E
 ```
-
-CI (`.github/workflows/ci.yml`) runs `npm ci`, `npm run check`, and `npm run test:e2e` on `master` push and pull requests.
 
 ## Privacy
 
-The extension does not open its own network connections. Decision and continue turns use the normal Pi model provider path already configured for the session.
+The extension opens no external network connections. Cross-process coordination uses authenticated loopback sockets on this machine only; decision and continuation turns use the session's normal Pi model provider, and waits start no additional model turn.

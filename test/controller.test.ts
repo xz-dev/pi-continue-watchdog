@@ -19,7 +19,7 @@ function decisionId(transition: ControllerTransition): number {
 }
 
 function openDecision(state: ReturnType<typeof controller>): number {
-	return decisionId(state.beginDecision());
+	return decisionId(state.beginDecision(Number.MAX_SAFE_INTEGER));
 }
 
 function effectKinds(transition: ControllerTransition): string[] {
@@ -35,6 +35,7 @@ test("initial snapshot is unlocked with no decision window", () => {
 		invalidDecisionAttempts: 0,
 		lastInvalidDecisionError: null,
 		decisionOpen: false,
+		waitUntilMs: 0,
 	});
 });
 
@@ -59,6 +60,7 @@ test("lock and main user start reset accounting and close pending decisions", ()
 		invalidDecisionAttempts: 0,
 		lastInvalidDecisionError: null,
 		decisionOpen: false,
+		waitUntilMs: 0,
 	});
 });
 
@@ -73,7 +75,7 @@ test("ensureLocked starts once and leaves an active lock untouched", () => {
 	assert.deepEqual(repeated.effects, []);
 	assert.equal(state.snapshot.decisionOpen, true);
 	assert.equal(state.snapshot.invalidDecisionAttempts, 1);
-	assert.equal(state.beginDecision().applied, false);
+	assert.equal(state.beginDecision(Number.MAX_SAFE_INTEGER).applied, false);
 });
 
 test("unlock closes pending work while preserving visible accounting", () => {
@@ -106,7 +108,21 @@ test("valid continues consume only the retry budget and exhaust at max", () => {
 		assert.equal(state.snapshot.exhausted, attempt === 3);
 	}
 
-	assert.equal(state.beginDecision().applied, false);
+	assert.equal(state.beginDecision(Number.MAX_SAFE_INTEGER).applied, false);
+});
+
+test("valid wait consumes a retry, blocks early decisions, and unlock clears its timestamp", () => {
+	const state = controller(3);
+	state.lock();
+	const waited = state.recordValidWait(openDecision(state), 310_000);
+	assert.deepEqual(effectKinds(waited), ["restoreDecisionTools"]);
+	assert.equal(state.snapshot.attempt, 1);
+	assert.equal(state.snapshot.waitUntilMs, 310_000);
+	assert.equal(state.beginDecision(309_999).applied, false);
+	assert.equal(state.beginDecision(310_000).applied, true);
+
+	state.unlock();
+	assert.equal(state.snapshot.waitUntilMs, 0);
 });
 
 test("stale decisions cannot consume retry budget twice", () => {
@@ -154,7 +170,7 @@ test("invalid decisions re-ask twice without retry consumption, then fail closed
 	assert.equal(state.snapshot.attempt, 0);
 	assert.equal(state.snapshot.decisionFailed, true);
 	assert.equal(state.snapshot.decisionOpen, false);
-	assert.equal(state.beginDecision().applied, false);
+	assert.equal(state.beginDecision(Number.MAX_SAFE_INTEGER).applied, false);
 });
 
 test("transactional rollback restores invalid and continue accounting", () => {

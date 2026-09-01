@@ -15,6 +15,7 @@ import {
 	createContinueEntryRenderer,
 	createHumanUnlockEntryRenderer,
 	createMainCommands,
+	createWaitEntryRenderer,
 	createWatchdogStatusEntryRenderer,
 	formatContinueTimeline,
 	formatUnlockEntryText,
@@ -27,6 +28,7 @@ import {
 	STATUS_CONTINUE_WATCHDOG_COMMAND,
 	UNLOCK_COMMAND_DESCRIPTION,
 	UNLOCK_CONTINUE_WATCHDOG_COMMAND,
+	WAIT_ENTRY_TYPE,
 } from "../src/commands.js";
 import { createLockDecisionController } from "../src/controller.js";
 
@@ -170,7 +172,7 @@ function armDecision(
 	controller: ReturnType<typeof createLockDecisionController>,
 ): number {
 	const decision = controller
-		.beginDecision()
+		.beginDecision(Number.MAX_SAFE_INTEGER)
 		.effects.find((effect) => effect.kind === "openDecisionWindow");
 	assert.ok(decision, "expected a decision window");
 	return decision.decisionId;
@@ -355,6 +357,29 @@ test("accepted continue entry renders its typed reason", () => {
 	assert.deepEqual(component.render(10_000), [text]);
 	assert.deepEqual(mutedCalls, [{ color: "toolOutput", text }]);
 	assert.equal(CONTINUE_ENTRY_TYPE, "pi-continue-watchdog:continue");
+});
+
+test("accepted wait entry renders its seconds and reason", () => {
+	const component = createWaitEntryRenderer()(
+		{
+			type: "custom",
+			customType: WAIT_ENTRY_TYPE,
+			id: "wait-entry",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			data: {
+				reason: "Waiting for CI.",
+				waitSeconds: 300,
+				waitUntilMs: 310_000,
+			},
+		},
+		{} as never,
+		ENTRY_THEME as never,
+	);
+	assert.ok(component);
+	assert.deepEqual(component.render(10_000), [
+		"Continue watchdog waiting · 300s · Waiting for CI.",
+	]);
 });
 
 test("Examples 2-3 RED: same-state human lock/unlock are unconditional and notify exactly", async () => {
@@ -609,7 +634,7 @@ test("Example 7: AI typed unlock entry renders TYPE · reason; human stays untyp
 	assert.ok(!formatUnlockEntryText("Waiting for input").includes(" · · "));
 });
 
-test("continue timeline includes the five default key event kinds from the branch", () => {
+test("continue timeline includes the six default key event kinds from the branch", () => {
 	const entry = (
 		customType: string,
 		data: unknown,
@@ -627,6 +652,10 @@ test("continue timeline includes the five default key event kinds from the branc
 				reasonType: "WORK_REMAINS",
 				reason: "finish it",
 			}),
+			entry("pi-continue-watchdog:wait", {
+				waitSeconds: 300,
+				reason: "CI running",
+			}),
 			entry("pi-continue-watchdog:unlock", {
 				reasonType: "DONE",
 				reason: "complete",
@@ -640,6 +669,7 @@ test("continue timeline includes the five default key event kinds from the branc
 		[
 			"manual lock · manual-time",
 			"continue · WORK_REMAINS · finish it",
+			"wait · 300s · CI running",
 			"AI unlock · complete",
 			"human unlock · human stop",
 			"decision-failed · invalid XML",

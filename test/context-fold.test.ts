@@ -114,7 +114,12 @@ function toolResult(
 function foldMarker(options: {
 	readonly exchangeId?: string;
 	readonly cycleId?: number;
-	readonly outcome: "continue" | "unlock" | "decision-failed" | "preempted";
+	readonly outcome:
+		| "continue"
+		| "wait"
+		| "unlock"
+		| "decision-failed"
+		| "preempted";
 	readonly continuePrompt?: string;
 	readonly timestamp: number;
 }): Message {
@@ -230,6 +235,27 @@ test("builders emit exact decision and fold custom messages", () => {
 				attempt: 1,
 				outcome: "remove",
 				watchdogOutcome: "unlock",
+			},
+		},
+	);
+
+	assert.deepEqual(
+		createDecisionFoldMessage({
+			exchangeId: EXCHANGE_ID,
+			cycleId: 1,
+			outcome: "wait",
+		}),
+		{
+			customType: DECISION_FOLD_MESSAGE_TYPE,
+			content: "",
+			display: false,
+			details: {
+				version: DECISION_PROTOCOL_VERSION,
+				namespace: "pi-continue-watchdog",
+				inquiryId: EXCHANGE_ID,
+				attempt: 1,
+				outcome: "remove",
+				watchdogOutcome: "wait",
 			},
 		},
 	);

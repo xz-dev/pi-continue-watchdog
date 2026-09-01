@@ -1,6 +1,6 @@
 # Acceptance contract — pi-continue-watchdog
 
-**Status:** Accepted product contract for the **two-stage decision-flow** redesign (2026-08-01)
+**Status:** Accepted product contract for the **three-outcome decision-flow** redesign (2026-09-01)
 **Project:** public English `xz-dev/pi-continue-watchdog`
 **License:** BSD-3-Clause
 
@@ -20,11 +20,11 @@ This contract supersedes both the rejected direct-continuation design and the te
 
 | Rejected design | Current design (required) |
 |---|---|
-| Immediately continue after idle while a persistent unlock tool remains active | Ask main to decide after aggregate idle, then continue or unlock |
+| Immediately continue after idle while a persistent unlock tool remains active | Ask main to decide after aggregate idle, then continue, wait, or unlock |
 | Temporarily replace ordinary tools with two decision tools | Keep ordinary active tools and the system-prompt tool list unchanged |
 | Express the decision as a tool call/result | Express it as exactly one trailing `<watchdog>...</watchdog>` XML block |
 | Require the whole answer to be prose-free | Allow narration before XML, but require the sole XML block at the trimmed response end |
-| Leave terminal invalid exchanges unfolded | Fold valid continue, valid unlock, and decision-failed exchanges out of future model context |
+| Leave terminal invalid exchanges unfolded | Fold valid continue, valid wait, valid unlock, and decision-failed exchanges out of future model context |
 
 Any acceptance text, test name, README, or implementation that still requires persistent or temporary decision tools is stale.
 
@@ -35,9 +35,9 @@ Any acceptance text, test name, README, or implementation that still requires pe
 | | |
 |---|---|
 | **Actor** | A human driving Pi with a root main agent and watchdog-loaded same-process or authenticated child Pi sessions |
-| **Need** | After all observable agents go idle, ask main—without changing ordinary tools—whether work should continue or unlock, without polluting later LLM context and without the human retyping “continue” |
-| **Value** | Reduces stalled sessions after subagents finish; makes unlock intentional and reason-visible while preserving the ordinary prompt/tool cache prefix |
-| **In scope (v1)** | Runtime lock; auto-lock on actual main user work; manual lock/unlock (optional reason); automatic unlock when the main run is actually aborted as Pi reports; trailing XML decisions; typed AI unlock reasons; decision validation + 3 re-asks; tool-call blocking during decisions; context folding + compact continue prompt; one fixed grace per authoritative aggregate all-idle generation; authenticated cross-process child activity, neutral connect/disconnect-as-idle, fixed 1-second reconnect with fresh live reports; config; packaging/CI/publication |
+| **Need** | After all observable agents go idle, ask main—without changing ordinary tools—whether work should continue, wait for a bounded period, or unlock, without polluting later LLM context and without the human retyping “continue” |
+| **Value** | Reduces stalled sessions after subagents finish; lets the agent defer a check for external automation without starting a meaningless continuation turn; makes unlock intentional and reason-visible while preserving the ordinary prompt/tool cache prefix |
+| **In scope (v1)** | Runtime lock; auto-lock on actual main user work; manual lock/unlock (optional reason); automatic unlock when the main run is actually aborted as Pi reports; trailing XML continue/wait/unlock decisions; typed AI continue/unlock reasons; bounded wait reason and seconds; decision validation + 3 re-asks; tool-call blocking during decisions; context folding + compact continue prompt; one fixed grace per authoritative aggregate all-idle generation; authenticated cross-process child activity, neutral connect/disconnect-as-idle, fixed 1-second reconnect with fresh live reports; config; packaging/CI/publication |
 | **Out of scope (v1)** | Durable lock across reload/new/resume/restart; sessions that did not load the watchdog; depending on pi-subagents or any other plugin; replacing Pi footer; wall-clock or loop-count watchdogs (those belong to pi-watchdog); direct idle continuation without a decision stage |
 
 ---
@@ -50,12 +50,14 @@ Any acceptance text, test name, README, or implementation that still requires pe
 | Unlock command | `/unlock-continue-watchdog [reason]` | Human (TUI); reason optional; **untyped** (no `reasonType`) |
 | Status command | `/status-continue-watchdog` | Human (TUI); read-only trigger diagnosis |
 | Continue XML decision | `function=continue_watchdog` plus `reason_type` and `reason_content` | Main/root decision window only |
+| Wait XML decision | `function=wait_watchdog` plus `reason_content` and integer `wait_seconds` in `1..1800`; no `reason_type` | Main/root decision window only |
 | Unlock XML decision | `function=unlock_continue_watchdog` plus `reason_type` and `reason_content` | Main/root decision window only |
 | Default `decisionPrompt` | see exact default below | Automated semantic prefix; runtime always appends the fixed XML protocol and effective reason types |
 | Default `continuePrompt` | `Continue until user assistance is required.` | Compact model-visible replacement after valid continue fold |
 | Default `reasonTypes` | `JOB_DONE`, `WAIT_USER`, `JOB_BLOCKED` | Built-in allowed AI unlock type list; a valid configured list **replaces** this default |
-| Default `continueReasonTypes` | `WORK_REMAINS`, `VERIFYING`, `WAIT_AUTOMATION` | Independent allowed AI continue type list; a valid configured list **replaces** this default |
+| Default `continueReasonTypes` | `WORK_REMAINS`, `VERIFYING` | Independent allowed AI continue type list; a valid configured list **replaces** this default |
 | Continue TUI-only entry | `Continue watchdog continued · <TYPE> · <reason>` | Persisted before semantic publication and continuation dispatch |
+| Wait TUI-only entry | `Continue watchdog waiting · <seconds>s · <reason>` | Persisted before the absolute wait deadline is armed |
 | Continue semantic hook | `watchdog-continued` with `REASON_TYPE` and `REASON` | Neutral plain-data best-effort hook after durable continue evidence |
 | Lock TUI notify | `Continue watchdog locked` | User-only TUI notify |
 | Unlock TUI notify (no reason) | `Continue watchdog unlocked` | User-only TUI notify (human reasonless / abort) |
@@ -74,6 +76,15 @@ Correct all accidental `cointinue` spellings; public names use `continue` only.
 | `WAIT_USER` | User input, approval, or action is required |
 | `JOB_BLOCKED` | Work remains unfinished and cannot proceed for a non-`WAIT_USER` blocker |
 
+### Built-in default `continueReasonTypes` meanings
+
+| Type | Meaning |
+|---|---|
+| `WORK_REMAINS` | Actionable requested work remains |
+| `VERIFYING` | Verification work is actively being performed |
+
+Passive external-automation delay is represented only by untyped `wait_watchdog`; it is not a continue reason type.
+
 Configured type lists may use ordinary nonblank UTF-8 text. Trust sane user config; do **not** impose identifier-format regexes, artificial length/count caps, or collision hardening beyond the validation rules below.
 
 ### Exact default `decisionPrompt`
@@ -82,7 +93,7 @@ Configured type lists may use ordinary nonblank UTF-8 text. Trust sane user conf
 This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. It does not represent any decision by the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one.
 ```
 
-At runtime the extension always appends a fixed protocol suffix. It says to use existing conversation context, **not make decisions on the user's behalf**, not call tools, output exactly one watchdog XML block at the end, never output multiple watchdog blocks, and use the corresponding independent effective reason type list. It includes canonical typed continue and unlock XML examples. Parser compatibility with surplus XML keys is intentionally not advertised to the model.
+At runtime the extension always appends a fixed protocol suffix. It says to use existing conversation context, **not make decisions on the user's behalf**, not call tools, output exactly one watchdog XML block at the end, never output multiple watchdog blocks, and use the corresponding independent effective reason type list. It includes canonical typed continue and unlock examples plus an untyped wait example. Parser compatibility with surplus XML keys is intentionally not advertised to the model.
 
 ### Exact default `continuePrompt`
 
@@ -113,11 +124,11 @@ Continue until user assistance is required.
 | Key | Default | Notes |
 |---|---|---|
 | `idleDelaySeconds` | `10` | Deprecated compatibility key. It remains accepted/preserved, but runtime ignores it; every automatic inquiry fence is exactly 10 seconds. |
-| `maxRetries` | `10` | Maximum **valid continue** decisions per lock cycle (not invalid re-asks); safe integer in `[1, 10]` |
+| `maxRetries` | `10` | Maximum **valid continue or wait** outcomes per lock cycle (not invalid re-asks); safe integer in `[1, 10]` |
 | `decisionPrompt` | exact default above | Automated custom-role body; explicitly identifies extension automation and says it is not a user message/request; nonblank and at most 16,384 Unicode code points |
 | `continuePrompt` | exact default above | Compact fold-in after valid continue; nonblank and at most 16,384 Unicode code points |
 | `reasonTypes` | `["JOB_DONE","WAIT_USER","JOB_BLOCKED"]` | Allowed AI unlock types. A valid configured list **replaces** the default. |
-| `continueReasonTypes` | `["WORK_REMAINS","VERIFYING","WAIT_AUTOMATION"]` | Independently allowed AI continue types. Same nonempty trim-nonblank validation and replace semantics as `reasonTypes`. |
+| `continueReasonTypes` | `["WORK_REMAINS","VERIFYING"]` | Independently allowed AI continue types. Same nonempty trim-nonblank validation and replace semantics as `reasonTypes`. |
 
 **Config locations and precedence** (same pattern as sibling Pi plugins):
 
@@ -127,7 +138,7 @@ Continue until user assistance is required.
 
 Trusted-project fields override global field-by-field (`builtins < global < trusted project`). Invalid high-precedence values must not erase valid lower-precedence values; emit bounded diagnostics. Missing files are silent. Configured prompt limits count Unicode code points without truncation: exactly 16,384 is valid and longer values are invalid.
 
-**Fence rule:** every candidate automatic inquiry cancels/replaces the previous event-loop timer and waits a full fixed 10 seconds. Every relevant event and every child report replaces it, including repeated equal idle reports. A valid continue advances only `maxRetries`; it cannot change the fence duration.
+**Fence rule:** every candidate automatic inquiry cancels/replaces the previous event-loop timer and waits a full fixed 10 seconds. Every relevant event and every child report replaces it, including repeated equal idle reports. Valid continue and wait outcomes each advance the shared `maxRetries` attempt. A wait additionally records an absolute not-before deadline and prevents automatic inquiry before it; it does not change the fixed fence duration used when renewed activity requires requalification.
 
 **Non-configurable:** invalid decision re-ask budget is fixed at **3** attempts (not a config key).
 
@@ -140,8 +151,9 @@ Per main ownership generation / lock cycle, at least:
 | Field / phase | Meaning |
 |---|---|
 | `locked` | Whether auto decision-after-idle is armed |
-| `attempt` | Next automatic decision cycle index after idle (0 after reset; advances only on **valid continue**) |
-| `exhausted` | `locked` and `maxRetries` valid continues already consumed; no new grace until reset |
+| `attempt` | Number of valid continue or wait outcomes consumed in the current cycle (0 after reset) |
+| `exhausted` | `locked` and `maxRetries` valid continue/wait outcomes already consumed; no new inquiry until reset, except a final wait must first reach its deadline |
+| `waitUntilMs` | Absolute not-before time for the latest valid wait; `0` when no wait is active |
 | `decisionFailed` | After 3 invalid decision attempts; locked remains true; no new grace until reset |
 | inquiry fence | One replaceable fixed 10-second timer; stale identities are inert |
 | decision window | Automated XML decision prompt in flight / re-ask; ordinary tools stay stable but calls are blocked |
@@ -154,7 +166,7 @@ Per main ownership generation / lock cycle, at least:
 2. Assign unlocked first.
 3. Cancel every timer, clean pending finalization/decision state, and clear pending AI-unlock publication intent by dispatching the normal **non-notify** unlock cleanup effects.
 4. Revalidate the same exact ownership claim after any awaited or re-entrant cleanup effect. A stale/demoted owner stops here without locking or notifying.
-5. Assign a fresh lock, resetting attempt to `0` and clearing exhaustion, decision-failed, and invalid/no-result accounting.
+5. Assign a fresh lock, resetting attempt and `waitUntilMs` to `0` and clearing exhaustion, decision-failed, and invalid/no-result accounting.
 6. Dispatch lock effects and reconcile idle.
 
 Manual `/lock-continue-watchdog` emits exactly one final `Continue watchdog locked` notification. Actual main user-role `message_start` suppresses both prerequisite-unlock and final-lock notifications. This sequence runs even when the watchdog was already unlocked or already locked; fresh lock never fakes cleanup by calling lock alone.
@@ -170,7 +182,7 @@ Manual `/lock-continue-watchdog` emits exactly one final `Continue watchdog lock
 - Valid decision-window XML with `function=unlock_continue_watchdog`, `reason_type`, and `reason_content`
 - Main run actually aborted as Pi reports (reasonless)
 
-Unlock first makes `locked=false`, then invalidates the current aggregate grace and cleans operational pending decision state while preserving attempt, exhaustion, decision-failed, and invalid/no-result counters. Only fresh lock semantics reset those fields.
+Unlock first makes `locked=false`, resets `waitUntilMs` to `0`, then invalidates the current aggregate grace and cleans operational pending decision state while preserving attempt, exhaustion, decision-failed, and invalid/no-result counters. Only fresh lock semantics reset those preserved fields.
 
 **What auto-locks without resetting an already locked cycle:**
 
@@ -181,7 +193,7 @@ Unlock first makes `locked=false`, then invalidates the current aggregate grace 
 - Merely queued main input (before processing starts)
 - Child/subagent user-role messages
 - Watchdog decision or continuation turns while the current cycle is already locked
-- Invalid or no-result decision re-asks (they do **not** consume valid-continue retries)
+- Invalid or no-result decision re-asks (they do **not** consume shared valid continue/wait attempts)
 
 ---
 
@@ -189,22 +201,23 @@ Unlock first makes `locked=false`, then invalidates the current aggregate grace 
 
 ### Entry
 
-**Given** main is locked, not exhausted, not decision-failed, every same-process attachment is idle, and the authenticated root busy-child set is empty
+**Given** main is locked, not exhausted, not decision-failed, current time is at or after `waitUntilMs`, every same-process attachment is idle, and the authenticated root busy-child set is empty
 **When** the latest eligible observation's fixed 10-second fence expires and every wake-time guard still passes
 **Then** the plugin:
 
 1. Keeps ordinary active tools and the system-prompt tool list unchanged.
-2. Persists a context-excluded `pi-continue-watchdog:inquiry-marker` with the exact protocol version, unique `exchangeId`, and `cycleId`, then sends a **custom-role** message—not a user-role message—whose body is the configured `decisionPrompt` plus a fixed XML suffix, using `{ triggerTurn: true, deliverAs: "steer" }`. If marker persistence fails, the inquiry is not dispatched. The marker is a logical correlation boundary: other plugins may interleave entries between marker, decision prompt, assistant, and fold marker without becoming watchdog-owned. Ordinary tools stay advertised. The live decision assistant may stream in TUI/RPC, but public `message_end` replacement clears its finalized or aborted content from TUI history and persistence. The suffix tells the model to use existing task context, not call tools, put exactly one watchdog block at the response end, never output multiple watchdog blocks, and use an effective allowed `reason_type` for unlock. This package does not request `presentation: "hidden"` and does not require a downstream Pi hidden-run API.
+2. Persists a context-excluded `pi-continue-watchdog:inquiry-marker` with the exact protocol version, unique `exchangeId`, and `cycleId`, then sends a **custom-role** message—not a user-role message—whose body is the configured `decisionPrompt` plus a fixed XML suffix, using `{ triggerTurn: true, deliverAs: "steer" }`. If marker persistence fails, the inquiry is not dispatched. The marker is a logical correlation boundary: other plugins may interleave entries between marker, decision prompt, assistant, and fold marker without becoming watchdog-owned. Ordinary tools stay advertised. The live decision assistant may stream in TUI/RPC, but public `message_end` replacement clears its finalized or aborted content from TUI history and persistence. The suffix tells the model to use existing task context, not call tools, put exactly one watchdog block at the response end, never output multiple watchdog blocks, use effective allowed `reason_type` values for continue/unlock, and use an untyped bounded `wait_seconds` for wait. This package does not request `presentation: "hidden"` and does not require a downstream Pi hidden-run API.
 3. Blocks every ordinary tool call before execution while the decision is active and returns a reminder to answer from existing context with XML. A blocked call does not itself consume an invalid attempt; final assistant text is authoritative.
 4. Does **not** send the rejected direct-continuation message as the idle wake path.
 
 ### Validity rules (exactly one trailing XML decision)
 
-Thinking blocks are ignored. Concatenate final assistant text and trim it. It must end with `</watchdog>`, contain exactly one `<watchdog>` and one `</watchdog>`, and parse from the sole opening tag through the suffix. Narration before the XML is allowed. More than one watchdog block is invalid. Extra simple XML keys are ignored only for parser compatibility and are not advertised in model prompts.
+Thinking blocks are ignored. Concatenate final assistant text and trim it. It must end with `</watchdog>`, contain exactly one `<watchdog>` and one `</watchdog>`, and parse from the sole opening tag through the suffix. Narration before the XML is allowed. More than one watchdog block is invalid. Unknown extra simple XML keys are ignored only for parser compatibility and are not advertised in model prompts; a recognized field that violates an outcome contract is rejected (notably, `wait_watchdog` rejects `reason_type`).
 
 | Outcome | Requirements |
 |---|---|
 | Valid **continue** | Sole block contains `function=continue_watchdog`, a `reason_type` allowed by `continueReasonTypes`, and a valid `reason_content` |
+| Valid **wait** | Sole block contains `function=wait_watchdog`, a valid `reason_content`, and integer `wait_seconds` in `1..1800`; `reason_type` must be absent |
 | Valid **unlock** | Sole block contains `function=unlock_continue_watchdog`, a `reason_type` allowed by `reasonTypes`, and a valid `reason_content` |
 
 **AI `reason_type` validation:**
@@ -215,7 +228,7 @@ Thinking blocks are ignored. Concatenate final assistant text and trim it. It mu
 - Continue and unlock use independent allowed lists; unlock types never authorize continue
 - Human `/unlock-continue-watchdog` has no typed XML field and is unchanged
 
-**AI `reason_content` validation (continue and unlock):**
+**AI `reason_content` validation (continue, wait, and unlock):**
 
 - After trim, reason must be **non-empty**
 - Length ≤ **500 Unicode characters** (count Unicode code points / characters as implemented consistently and tested)
@@ -223,7 +236,14 @@ Thinking blocks are ignored. Concatenate final assistant text and trim it. It mu
 - Empty/blank or overlong reasons are **invalid** (no truncation on the AI path)
 - Existing reason rules remain; they are independent of type matching
 
-**Invalid includes:** a completed decision response with missing/malformed XML; no or multiple watchdog blocks; non-whitespace after the closing block; unknown function; duplicate required keys; missing/blank/unknown `reason_type`; invalid `reason_content`. A provisional Provider error that Pi retries within the same run is not a completed response and does not consume an invalid attempt.
+**Wait `wait_seconds` validation:**
+
+- After trim, the field must contain decimal digits representing a safe integer in `1..1800`
+- Missing, blank, fractional, signed, zero, or out-of-range values are invalid
+- Invalid values are re-asked; they are never silently clamped
+- Wait rejects any supplied `reason_type`; it neither consults nor persists one
+
+**Invalid includes:** a completed decision response with missing/malformed XML; no or multiple watchdog blocks; non-whitespace after the closing block; unknown function; duplicate required keys; missing/blank/unknown required `reason_type`; any `reason_type` supplied to wait; invalid `reason_content`; or invalid/missing wait fields. A provisional Provider error that Pi retries within the same run is not a completed response and does not consume an invalid attempt.
 
 ### Invalid → re-ask (fixed 3)
 
@@ -232,7 +252,7 @@ On invalid decision:
 1. Immediately re-ask with another decision prompt.
 2. The next prompt includes the **exact previous error** and explains why the response was invalid.
 3. Re-asks keep ordinary tools unchanged, continue blocking tool execution, and repeat the fixed XML suffix contract.
-4. Invalid checks **do not** consume the `maxRetries` valid-continue budget.
+4. Invalid checks **do not** consume the `maxRetries` valid continue/wait budget.
 5. After the **third** invalid attempt:
    - append a terminal fold marker so the complete failed exchange leaves future model context
    - remain **locked** and enter **decision-failed** (no new grace)
@@ -266,13 +286,27 @@ On invalid decision:
 - persist that entry before publishing `watchdog-continued`, then dispatch continuation; if persistence fails, fail closed with neither hook nor automatic continuation turn
 - semantic listener absence/failure is best-effort and never gates continuation after persistence succeeds
 - The continued ordinary turn receives exactly one compact model-bound message containing `continuePrompt`; the XML decision exchange is otherwise removed from later context
-- Consumes **one** valid-continue retry (attempt advances)
+- Consumes **one** valid outcome attempt
 - The next authoritative aggregate all-idle generation uses the same fixed grace
-- After `maxRetries` valid continues, remain locked/exhausted with no timer until reset
+- After `maxRetries` combined valid continue/wait outcomes, remain locked/exhausted with no further inquiry until reset
+
+### Valid wait
+
+**When** the decision is a valid wait:
+
+- Requires a nonblank `reason_content` of at most 500 Unicode characters, integer `wait_seconds` in `1..1800`, and no `reason_type`; a supplied `reason_type` is invalid
+- Consumes **one** shared `maxRetries` attempt while keeping the watchdog locked
+- Records the absolute deadline `waitUntilMs = now + wait_seconds * 1000`
+- Appends exactly one persistent TUI-only entry, `Continue watchdog waiting · <seconds>s · <reason>`, before arming the deadline; if persistence fails, roll back the consumed attempt/deadline and stop without scheduling the wait
+- Ends the decision without starting an ordinary continuation turn
+- Folds the complete decision exchange to nothing in future model-bound context
+- Suppresses automatic inquiry while current time is before `waitUntilMs`; renewed activity cancels stale timer identities and later idle requalifies against both the absolute deadline and the normal fixed fence
+- Unlock or a fresh lock clears `waitUntilMs` to `0`; cleared/stale callbacks are inert
+- If this wait consumes the final attempt, the controller may already be exhausted, but terminal `EXHAUSTED` publication waits until the complete deadline expires
 
 ### Human `/unlock-continue-watchdog [reason]`
 
-Always assigns `locked=false` first, then cancels timers and cleans operational decision state while preserving cycle accounting—even if already unlocked. The human command remains **untyped**: no `reasonType` argument, no type matching, and no AI typed TUI format.
+Always assigns `locked=false` first, resets `waitUntilMs` to `0`, then cancels timers and cleans operational decision state while preserving cycle accounting—even if already unlocked. The human command remains **untyped**: no `reasonType` argument, no type matching, and no AI typed TUI format.
 
 | Human reason input | TUI notify | TUI-only reason entry |
 |---|---|---|
@@ -309,7 +343,7 @@ These examples are the accepted product contract. Each is externally observable 
 
 - it captures and fences the exact current-main claim
 - it first assigns unlocked and dispatches full non-notify unlock cleanup: cancel stale timer/finalization/decision work and clear pending AI-unlock publication intent
-- after revalidating the exact claim, it assigns a fresh lock; attempt resets to `0`, and exhaustion, decision-failed, and invalid/no-result counts clear
+- after revalidating the exact claim, it assigns a fresh lock; attempt and `waitUntilMs` reset to `0`, and exhaustion, decision-failed, and invalid/no-result counts clear
 - both prerequisite-unlock and fresh-lock notifications are suppressed
 - it reconciles idle after locking
 - if ownership becomes stale/demoted during prerequisite cleanup, it stops before fresh lock and emits no notification
@@ -326,7 +360,7 @@ These examples are the accepted product contract. Each is externally observable 
 - it first assigns unlocked and dispatches the normal non-notify unlock cleanup effects before any fresh-lock transition or lock effect
 - no prerequisite `Continue watchdog unlocked` notification or reason entry is emitted
 - after revalidating the same claim, it assigns a fresh lock and dispatches lock effects
-- attempts reset to `0`; exhaustion, decision-failed, and invalid/no-result accounting clear; timers and pending operational decision/finalization state are gone; normal tools are restored; pending AI-unlock publication intent is cleared
+- attempts and `waitUntilMs` reset to `0`; exhaustion, decision-failed, and invalid/no-result accounting clear; timers and pending operational decision/finalization state are gone; normal tools are restored; pending AI-unlock publication intent is cleared
 - TUI notifies exactly once: `Continue watchdog locked`
 - idle is reconciled after locking
 - already-unlocked and already-locked starting states both execute the full unlock-cleanup → lock sequence
@@ -334,11 +368,11 @@ These examples are the accepted product contract. Each is externally observable 
 
 ### Example 3 — Manual unlock with optional reason (untyped regression)
 
-**Given** main is locked or unlocked, with or without a pending aggregate grace or decision window
+**Given** main is locked or unlocked, with or without a pending aggregate grace, wait deadline, or decision window
 **When** the human runs `/unlock-continue-watchdog` with empty/blank reason
 **Then**
 
-- `locked=false` is assigned first; timers and pending operational decision work are then cancelled; attempts/failures are preserved
+- `locked=false` is assigned first and `waitUntilMs=0`; timers and pending operational decision work are then cancelled; attempts/failures are preserved
 - TUI notifies exactly: `Continue watchdog unlocked`
 - no TUI-only reason entry
 - no `reasonType` is required or displayed
@@ -360,7 +394,7 @@ These examples are the accepted product contract. Each is externally observable 
 **When** that run ends and Pi reports it as **aborted**
 **Then**
 
-- apply the same unconditional state transition as reasonless `/unlock-continue-watchdog`: assign `locked=false` first; then cancel timers/operational decision state; preserve cycle accounting and failures
+- apply the same unconditional state transition as reasonless `/unlock-continue-watchdog`: assign `locked=false` and `waitUntilMs=0` first; then cancel timers/operational decision state; preserve cycle accounting and failures
 - TUI notifies exactly `Continue watchdog unlocked`, even when already unlocked
 - no unlock reason entry is appended
 - process that aborted run once (no duplicate unlock notification for the same abort)
@@ -385,13 +419,13 @@ Ordinary natural idle settle never counts as abort.
 
 ### Example 5 — Locked + authoritative aggregate idle → fixed-grace **decision entry**
 
-**Given** main is locked, not exhausted, not decision-failed, every observable attachment is idle, and the root busy-child set is empty
+**Given** main is locked, not exhausted, not decision-failed, current time is at or after `waitUntilMs`, every observable attachment is idle, and the root busy-child set is empty
 **When** the latest eligible observation's fixed 10-second fence expires and every wake-time guard still passes
 **Then**
 
 - exactly one decision window is opened for that attempt (not a direct continue custom message)
 - ordinary active tools and the system-prompt tool list stay unchanged; attempted tool calls are blocked before execution with an XML reminder
-- a **custom-role** decision message uses configured `decisionPrompt` plus the fixed XML suffix, identifies itself as extension automation, states it is not a user message/request, explicitly forbids making decisions on the user's behalf, lists effective `reasonTypes` and `continueReasonTypes`, and is never injected with user role
+- a **custom-role** decision message uses configured `decisionPrompt` plus the fixed XML suffix, identifies itself as extension automation, states it is not a user message/request, explicitly forbids making decisions on the user's behalf, lists effective `reasonTypes` and `continueReasonTypes`, includes the bounded untyped wait form, and is never injected with user role
 - the model may narrate before XML or output only XML, but the trimmed response must end with exactly one watchdog block; multiple watchdog blocks are invalid
 - the rejected direct-continuation default
   `Continue the task. If you are intentionally waiting for the user or all tasks are complete, call unlock_continue_watchdog.`
@@ -411,9 +445,27 @@ With defaults, every eligible all-idle generation waits **10s**.
 - then one neutral `watchdog-continued` hook publishes `REASON_TYPE=VERIFYING` and `REASON=Tests still need to run.` best-effort
 - only after durable evidence does the decision turn end and ordinary work continue automatically without further user input
 - model-bound context removes the full decision exchange and inserts one compact custom message equal to configured `continuePrompt` (default `Continue until user assistance is required.`)
-- one valid-continue retry is consumed
+- one shared valid outcome attempt is consumed
 - after the continuation settles, if still locked and aggregate idle, the **next generation** waits the same fixed grace
 - if durable continue entry persistence fails, no hook or continuation is dispatched; hook listener failures alone do not gate continuation
+
+### Example 6b — Valid wait: no work turn, absolute deadline, shared retry consumption
+
+**Given** a decision window is open and the current clock is `10_000`
+**When** the main agent returns `wait_watchdog` with reason `Waiting for CI.` and `wait_seconds=300`
+**Then**
+
+- no `reason_type` is accepted, consulted, displayed, or persisted for the wait; supplying one is invalid
+- the validated wait audit records reason `Waiting for CI.` and `waitSeconds=300`
+- one muted TUI-only entry is durably appended first: `Continue watchdog waiting · 300s · Waiting for CI.`
+- no ordinary continuation turn starts
+- model-bound context removes the full decision exchange and inserts nothing
+- one shared retry is consumed, the watchdog remains locked, and the absolute deadline is `waitUntilMs=310_000`
+- no automatic inquiry starts before that deadline
+- activity during the wait cancels its current timer identity; after activity returns idle, scheduling still honors the same absolute deadline and the fixed idle fence
+- unlock or fresh lock clears the deadline, and a cleared callback cannot open a decision or publish `EXHAUSTED`
+- if the wait entry cannot be persisted, the retry/deadline commit is rolled back and no wait is scheduled
+- if this wait consumes the final retry, `EXHAUSTED` is published only after the complete wait expires
 
 ### Example 7 — Valid AI unlock: typed muted entry, fold to nothing, no further work turn
 
@@ -440,13 +492,13 @@ With defaults, every eligible all-idle generation waits **10s**.
 ### Example 8 — Invalid or no-result decision re-asks then decision-failed
 
 **Given** a decision window is open
-**When** the model responds invalidly (missing or malformed watchdog XML, multiple watchdog blocks, trailing text after the block, unknown function, missing/blank/unknown `reason_type`, empty `reason_content`, or reason > 500 Unicode characters) **or the decision turn truly settles without any verifiable response**
+**When** the model responds invalidly (missing or malformed watchdog XML, multiple watchdog blocks, trailing text after the block, unknown function, missing/blank/unknown required `reason_type`, a `reason_type` supplied to wait, empty/overlong `reason_content`, or missing/non-integer/out-of-range `wait_seconds`) **or the decision turn truly settles without any verifiable response**
 **Then**
 
 - immediately re-ask with a prompt that includes the exact previous error and explains invalidity
 - ordinary tools remain unchanged and execution stays blocked during the re-ask
 - invalid type and invalid reason both count under the same fixed three invalid attempts total
-- invalid re-asks do **not** advance the valid-continue attempt / do not count toward `maxRetries`
+- invalid re-asks **do not** advance the shared valid continue/wait attempt and do not count toward `maxRetries`
 
 **When instead** a Provider error occurs and Pi successfully retries the same decision run
 **Then** accept the successful retry response without recording an invalid decision or opening a duplicate re-ask
@@ -470,16 +522,19 @@ With defaults, every eligible all-idle generation waits **10s**.
 
 At every relevant event, only that event's live public `ctx.isIdle()` query may update attachment state. Equal observations still replace the timer. There is no periodic polling; the only query without a new event is the mandatory wake-time recheck. A false-idle settle caused by a nested turn must not arm; a later live-idle event may arm normally.
 
-Stale timer callbacks (wrong generation/epoch/ownership) must not open a decision window or wake main.
+Stale timer callbacks (wrong generation/epoch/ownership or cleared by busy/unlock/fresh-lock cleanup) must not open a decision window, wake main, or publish terminal state.
 
-### Example 10 — Exhaustion after max valid continues
+For a valid wait, renewed activity cancels the current wait-qualified grace. When all observable sessions become idle again, the replacement timer targets the later of the existing absolute `waitUntilMs` and a complete fresh 10-second fence; activity does not create a new wait duration.
 
-**Given** default `maxRetries = 10` and 10 **valid continue** decisions have already been consumed in this lock cycle
+### Example 10 — Exhaustion after max valid continue/wait outcomes
+
+**Given** default `maxRetries = 10` and 10 combined **valid continue or wait** outcomes have already been consumed in this lock cycle
 **When** main remains locked and all observable sessions become idle again
 **Then**
 
-- no further aggregate grace is scheduled
+- no further aggregate grace is scheduled after any active final-wait deadline
 - state remains **locked and exhausted**
+- when the tenth outcome is a wait, the full wait remains active and terminal `EXHAUSTED` is not published before its deadline
 - a new actual main user message start or manual `/lock-continue-watchdog` resets attempts and clears exhaustion
 - human unlock and (after a future re-arm) decision unlock still work per Examples 3 and 7
 
@@ -490,7 +545,7 @@ Stale timer callbacks (wrong generation/epoch/ownership) must not open a decisio
 **When** the terminal stop is one of:
 
 1. Valid AI decision unlock with validated `reason_type` and `reason_content`
-2. Max valid continue attempts exhausted
+2. Max valid continue/wait attempts exhausted, with any final wait deadline reached
 3. Third invalid decision becomes decision-failed
 
 **Then** the main attachment publishes exactly one fresh plain-data envelope on Pi's public bus channel `pi:semantic-hook:v1`:
@@ -511,7 +566,7 @@ or
 {"version":1,"name":"user-ready","values":{"STOP_KIND":"DECISION_FAILED"}}
 ```
 
-**And** it does **not** publish for human `/unlock-continue-watchdog` (with or without reason), canonical/manual/user abort unlock, initial ordinary unlocked idle, valid continue or intermediate decision/settled states, locked normal/pending grace, stale/demoted/reloaded ownership, or repeated settled/reconcile in the same terminal epoch.
+**And** it does **not** publish for human `/unlock-continue-watchdog` (with or without reason), canonical/manual/user abort unlock, initial ordinary unlocked idle, valid continue, a valid wait before its deadline, intermediate decision/settled states, locked normal/pending grace, stale/demoted/reloaded ownership, or repeated settled/reconcile in the same terminal epoch.
 
 Only AI decision unlock retains a publication intent carrying **both** matched `REASON_TYPE` and validated `REASON` together until the resulting authoritative aggregate-idle settle; type and reason are retained/cleared together. Other stop kinds remain unchanged and do not invent type/reason fields. Existing type matching plus reason validation/trim/length remain authority; decision-failed does not publish last error text. Absence or failure of every consumer must not change watchdog state.
 
@@ -592,7 +647,7 @@ These are product constraints, not optional polish. Implementation details are r
 |---|---|
 | Context folding is model-bound | Future model requests drop/replace the decision exchange; persisted structured audits are CustomEntry records excluded from Agent/provider context |
 | Ordinary tools remain advertised during decisions | Prompt/tool prefixes stay stable; the extension blocks execution until the final XML decision arrives |
-| Unlock ends the decision path without starting more work | Valid unlock must not start a further ordinary work turn |
+| Unlock and wait end the decision path without starting more work | Valid unlock must not start a further ordinary work turn; valid wait must remain locked and only arm its deadline |
 | Raw session is append-only | Automated prompt, assistant/tool-result metadata, and fold-marker records may remain on disk, but complete terminal exchanges are folded before provider requests; raw assistant XML and invalid answer text are not retained |
 | XML extraction is suffix-based | Narration may precede the sole watchdog block; multiple watchdog blocks or trailing non-whitespace are invalid |
 
@@ -608,8 +663,8 @@ These are product constraints, not optional polish. Implementation details are r
 | Command demotion safety | If main demotes, stale command handlers must be inert |
 | Notify channel | Lock/unlock/decision-failed notifies are TUI user-only; not injected as user-role conversation turns |
 | Abort truthfulness | Unlock on actual Pi-reported main abort only; never on ordinary natural settle |
-| No context pollution from decisions | Future model-bound context never keeps the raw decision exchange after valid unlock/continue handling |
-| No persistent unlock tool | Outside the decision window, `unlock_continue_watchdog` / `continue_watchdog` are not part of the normal always-on tool set |
+| No context pollution from decisions | Future model-bound context never keeps the raw decision exchange after valid unlock/continue/wait handling |
+| No persistent decision tool | Outside the decision window, `unlock_continue_watchdog`, `continue_watchdog`, and `wait_watchdog` are not part of the normal always-on tool set |
 | No other-plugin coupling | No imports or runtime detection of pi-subagents / pi-watchdog / pi-notify |
 
 ---
@@ -624,8 +679,8 @@ These are product constraints, not optional polish. Implementation details are r
 - Silent same-state lock/unlock (no TUI notify)
 - Inferring abort from ordinary idle settle
 - Configurable invalid re-ask budget (must stay fixed at 3)
-- Counting invalid re-asks against `maxRetries`
-- Failing to remove the active XML decision gate after unlock, continue, decision-failed, demote, or shutdown
+- Counting invalid re-asks against the shared continue/wait `maxRetries` budget
+- Failing to remove the active XML decision gate after unlock, continue, wait, decision-failed, demote, or shutdown
 
 ---
 
@@ -633,8 +688,8 @@ These are product constraints, not optional polish. Implementation details are r
 
 For each example above, implementation slices must leave evidence that can be re-run:
 
-- **Unit / component:** pure state machine (including decision-failed and attempt advancement rules), config precedence including `reasonTypes` replace semantics, XML suffix extraction and exactly-one-block validation, AI type case-insensitive match + uppercased matched configured value, reason trim/truncate/length (AI no-truncation vs human truncate), aggregate-grace cancel/restart, generation guards, and decision validity matrix
-- **Integration / E2E (stock Pi, packed install):** auto-lock on real main user message start; command lock/unlock notifies and optional untyped reason; ordinary-tool stability with XML decision prompts; at least one real fixed-grace path into a decision window; structured CustomEntry audit excluded from context; continue/unlock/three-invalid/error/abort/user-takeover paths return to idle within bounded time; persisted session resume sends no watchdog question, answer, audit, or fold marker to the provider; delayed `AI_UNLOCK` user-ready while a child is busy; exhaustion or multi-attempt accounting (real or injected clock, documented)
+- **Unit / component:** pure state machine (including decision-failed, continue/wait attempt advancement, wait deadline reset, and rollback rules), config precedence including `reasonTypes` replace semantics, XML suffix extraction and exactly-one-block validation, AI type case-insensitive match + uppercased matched configured value, wait seconds `1..1800` strict validation, reason trim/truncate/length (AI no-truncation vs human truncate), aggregate-grace cancel/restart with absolute not-before deadlines, stale timer guards, and decision validity matrix
+- **Integration / E2E (stock Pi, packed install):** auto-lock on real main user message start; command lock/unlock notifies and optional untyped reason; ordinary-tool stability with XML decision prompts; at least one real fixed-grace path into a decision window; structured CustomEntry audit excluded from context; continue/wait/unlock/three-invalid/error/abort/user-takeover paths return to idle within bounded time; wait persistence failure rolls back; unlock clears wait deadlines; persisted session resume sends no watchdog question, answer, audit, or fold marker to the provider; delayed `AI_UNLOCK` user-ready while a child is busy; final-wait-delayed exhaustion or multi-attempt accounting (real or injected clock, documented)
 - **Human accept:** product authority reviews evidence against this file; AI does not self-accept
 
 **Contract status:** this file remains the accepted **behavior** contract. Implementation history is preserved in Git.

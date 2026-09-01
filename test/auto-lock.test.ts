@@ -154,7 +154,7 @@ function decisionId(
 	controller: ReturnType<typeof createLockDecisionController>,
 ): number {
 	const decision = controller
-		.beginDecision()
+		.beginDecision(Number.MAX_SAFE_INTEGER)
 		.effects.find((effect) => effect.kind === "openDecisionWindow");
 	assert.ok(decision, "expected a decision window");
 	return decision.decisionId;
@@ -184,6 +184,7 @@ test("actual main user message_start locks without a command notification", () =
 	assert.deepEqual(harness.entryRendererTypes, [
 		"pi-continue-watchdog:status",
 		"pi-continue-watchdog:continue",
+		"pi-continue-watchdog:wait",
 		"pi-continue-watchdog:unlock",
 		"pi-continue-watchdog:manual-lock",
 	]);
@@ -200,6 +201,7 @@ test("actual main user message_start locks without a command notification", () =
 		invalidDecisionAttempts: 0,
 		lastInvalidDecisionError: null,
 		decisionOpen: false,
+		waitUntilMs: 0,
 	});
 });
 

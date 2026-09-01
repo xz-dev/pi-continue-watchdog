@@ -29,7 +29,6 @@ export const DEFAULT_REASON_TYPES: readonly string[] = Object.freeze([
 export const DEFAULT_CONTINUE_REASON_TYPES: readonly string[] = Object.freeze([
 	"WORK_REMAINS",
 	"VERIFYING",
-	"WAIT_AUTOMATION",
 ]);
 
 /** Maximum prompt size, measured in Unicode code points, accepted from config. */

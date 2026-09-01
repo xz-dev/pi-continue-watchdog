@@ -20,6 +20,14 @@ export const INVALID_CONTINUE_REASON_ERROR =
 	"continue_watchdog requires a non-empty reason_content of at most 500 Unicode characters.";
 export const MISSING_CONTINUE_FIELDS_ERROR =
 	"continue_watchdog requires reason_type and reason_content.";
+export const INVALID_WAIT_REASON_ERROR =
+	"wait_watchdog requires a non-empty reason_content of at most 500 Unicode characters.";
+export const INVALID_WAIT_SECONDS_ERROR =
+	"wait_watchdog requires an integer wait_seconds from 1 through 1800.";
+export const MISSING_WAIT_FIELDS_ERROR =
+	"wait_watchdog requires reason_content and wait_seconds.";
+export const INVALID_WAIT_REASON_TYPE_ERROR =
+	"wait_watchdog does not use reason_type; use reason_content and wait_seconds only.";
 export const INVALID_UNLOCK_REASON_TYPE_ERROR =
 	"unlock_continue_watchdog requires an allowed reason_type.";
 export const INVALID_UNLOCK_REASON_ERROR =
@@ -30,6 +38,9 @@ export const UNSUPPORTED_DECISION_CONTENT_ERROR =
 	"The decision response contains unsupported content. End with the watchdog XML decision block.";
 export const MALFORMED_DECISION_RESPONSE_ERROR =
 	"The decision response was malformed. End with the watchdog XML decision block.";
+
+export const MIN_WAIT_SECONDS = 1;
+export const MAX_WAIT_SECONDS = 30 * 60;
 
 /** Block reason returned for ordinary tool calls while a decision is open. */
 export const DECISION_TOOL_BLOCK_REASON =
@@ -76,6 +87,11 @@ export type ValidDecision =
 			readonly reason: string;
 	  }
 	| {
+			readonly kind: "wait";
+			readonly reason: string;
+			readonly waitSeconds: number;
+	  }
+	| {
 			readonly kind: "unlock";
 			readonly reasonType: string;
 			readonly reason: string;
@@ -87,6 +103,7 @@ export type DecisionValidation =
 
 export type DecisionProtocolOutcome =
 	| "continue"
+	| "wait"
 	| "unlock"
 	| "reask"
 	| "decision-failed"
@@ -100,6 +117,8 @@ export interface DecisionProtocolFinalization {
 	readonly reaskPrompt?: string;
 	readonly reasonType?: string;
 	readonly reason?: string;
+	readonly waitSeconds?: number;
+	readonly waitUntilMs?: number;
 	readonly notification?: string;
 	/** Response cycle that produced this finalization (valid and invalid outcomes). */
 	readonly cycleId?: number;
@@ -112,6 +131,12 @@ export type DecisionProtocolPlan =
 			readonly cycleId: number;
 			readonly reasonType: string;
 			readonly reason: string;
+	  }
+	| {
+			readonly outcome: "wait";
+			readonly cycleId: number;
+			readonly reason: string;
+			readonly waitSeconds: number;
 	  }
 	| {
 			readonly outcome: "unlock";
@@ -135,6 +160,8 @@ export interface DecisionProtocolSessionOptions {
 	readonly reasonTypes: readonly string[];
 	/** Effective allowed automatic-continue reason types for this decision window. */
 	readonly continueReasonTypes: readonly string[];
+	/** Clock used to convert accepted wait seconds into an absolute timestamp. */
+	readonly now?: () => number;
 }
 
 /**
@@ -205,6 +232,16 @@ export function normalizeDecisionUnlockReason(reason: unknown): string | null {
 	return trimmed;
 }
 
+export function normalizeWaitSeconds(value: unknown): number | null {
+	if (typeof value !== "string") return null;
+	const trimmed = value.trim();
+	if (!/^[1-9]\d*$/.test(trimmed)) return null;
+	const seconds = Number(trimmed);
+	return Number.isSafeInteger(seconds) && seconds <= MAX_WAIT_SECONDS
+		? seconds
+		: null;
+}
+
 /**
  * Append the parser-critical XML contract to the configurable decision intent.
  * Keeping this suffix fixed prevents a custom decisionPrompt from accidentally
@@ -222,18 +259,24 @@ export function buildDecisionPrompt(
 		{ name: "reason_type", value: continueReasonTypes[0] ?? "ALLOWED_TYPE" },
 		{ name: "reason_content", value: "concise reason" },
 	]);
+	const waitExample = buildXmlDocument("watchdog", [
+		{ name: "function", value: "wait_watchdog" },
+		{ name: "reason_content", value: "Waiting for automation." },
+		{ name: "wait_seconds", value: "300" },
+	]);
 	const unlockExample = buildXmlDocument("watchdog", [
 		{ name: "function", value: "unlock_continue_watchdog" },
 		{ name: "reason_type", value: reasonTypes[0] ?? "ALLOWED_TYPE" },
 		{ name: "reason_content", value: "concise reason" },
 	]);
-	return `${decisionPrompt}\n\nUse only the existing conversation context and decide quickly. Do not make decisions on the user's behalf. Do not call tools. You may explain your decision first, or output only XML. In either case, output exactly one <watchdog>...</watchdog> XML block at the very end of your response. After surrounding whitespace is trimmed, </watchdog> must be the final text. Do not output multiple <watchdog>...</watchdog> blocks.\n\nTo continue, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedContinueReasonTypes}. End with:\n${continueExample}\n\nTo unlock, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedReasonTypes}. End with:\n${unlockExample}`;
+	return `${decisionPrompt}\n\nUse only the existing conversation context and decide quickly. Do not make decisions on the user's behalf. Do not call tools. You may explain your decision first, or output only XML. In either case, output exactly one <watchdog>...</watchdog> XML block at the very end of your response. After surrounding whitespace is trimmed, </watchdog> must be the final text. Do not output multiple <watchdog>...</watchdog> blocks.\n\nIf you want to continue working, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedContinueReasonTypes}. End with:\n${continueExample}\n\nIf you think the work is finished or blocked and the user should take over, use unlock. reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedReasonTypes}. End with:\n${unlockExample}\n\nIf you think work should wait a period of time before continuing (for example external automation such as CI or a subagent has not finished yet), use a non-empty reason_content and an integer wait_seconds from ${MIN_WAIT_SECONDS} through ${MAX_WAIT_SECONDS}. End with:\n${waitExample}`;
 }
 
 interface ParsedWatchdogFields {
 	readonly functionName: string;
 	readonly reasonType?: string;
 	readonly reasonContent?: string;
+	readonly waitSeconds?: string;
 }
 
 export function extractTrailingWatchdogXml(
@@ -258,6 +301,7 @@ export function parseWatchdogDecisionXml(
 			functionName,
 			reasonType: parsed.value.fields.get("reason_type"),
 			reasonContent: parsed.value.fields.get("reason_content"),
+			waitSeconds: parsed.value.fields.get("wait_seconds"),
 		},
 	};
 }
@@ -290,6 +334,35 @@ function validateParsedFields(
 				kind: "continue",
 				reasonType: normalizedType,
 				reason: normalizedReason,
+			},
+		};
+	}
+	if (fields.functionName.trim().toLowerCase() === "wait_watchdog") {
+		if (
+			fields.reasonContent === undefined ||
+			fields.waitSeconds === undefined
+		) {
+			return { valid: false, error: MISSING_WAIT_FIELDS_ERROR };
+		}
+		if (fields.reasonType !== undefined) {
+			return { valid: false, error: INVALID_WAIT_REASON_TYPE_ERROR };
+		}
+		const normalizedReason = normalizeDecisionUnlockReason(
+			fields.reasonContent,
+		);
+		if (normalizedReason === null) {
+			return { valid: false, error: INVALID_WAIT_REASON_ERROR };
+		}
+		const waitSeconds = normalizeWaitSeconds(fields.waitSeconds);
+		if (waitSeconds === null) {
+			return { valid: false, error: INVALID_WAIT_SECONDS_ERROR };
+		}
+		return {
+			valid: true,
+			decision: {
+				kind: "wait",
+				reason: normalizedReason,
+				waitSeconds,
 			},
 		};
 	}
@@ -485,19 +558,28 @@ export function createDecisionProtocolSession(
 		if (!validation.valid) {
 			return { outcome: "invalid", cycleId, error: validation.error };
 		}
-		return validation.decision.kind === "continue"
-			? {
-					outcome: "continue",
-					cycleId,
-					reasonType: validation.decision.reasonType,
-					reason: validation.decision.reason,
-				}
-			: {
-					outcome: "unlock",
-					cycleId,
-					reasonType: validation.decision.reasonType,
-					reason: validation.decision.reason,
-				};
+		if (validation.decision.kind === "continue") {
+			return {
+				outcome: "continue",
+				cycleId,
+				reasonType: validation.decision.reasonType,
+				reason: validation.decision.reason,
+			};
+		}
+		if (validation.decision.kind === "wait") {
+			return {
+				outcome: "wait",
+				cycleId,
+				reason: validation.decision.reason,
+				waitSeconds: validation.decision.waitSeconds,
+			};
+		}
+		return {
+			outcome: "unlock",
+			cycleId,
+			reasonType: validation.decision.reasonType,
+			reason: validation.decision.reason,
+		};
 	};
 
 	const commitResponse = (
@@ -514,15 +596,14 @@ export function createDecisionProtocolSession(
 			return finalized;
 		}
 
-		const transition =
-			plan.outcome === "continue"
-				? options.controller.recordValidContinue(options.decisionId)
-				: options.controller.recordValidUnlock(options.decisionId);
-		if (!transition.applied) {
-			finalized = { outcome: "ignored", transition };
-			return finalized;
-		}
 		if (plan.outcome === "continue") {
+			const transition = options.controller.recordValidContinue(
+				options.decisionId,
+			);
+			if (!transition.applied) {
+				finalized = { outcome: "ignored", transition };
+				return finalized;
+			}
 			finalized = {
 				outcome: "continue",
 				transition,
@@ -530,6 +611,33 @@ export function createDecisionProtocolSession(
 				reason: plan.reason,
 				cycleId,
 			};
+			return finalized;
+		}
+		if (plan.outcome === "wait") {
+			const waitUntilMs = Math.ceil(
+				(options.now?.() ?? Date.now()) + plan.waitSeconds * 1_000,
+			);
+			const transition = options.controller.recordValidWait(
+				options.decisionId,
+				waitUntilMs,
+			);
+			if (!transition.applied) {
+				finalized = { outcome: "ignored", transition };
+				return finalized;
+			}
+			finalized = {
+				outcome: "wait",
+				transition,
+				reason: plan.reason,
+				waitSeconds: plan.waitSeconds,
+				waitUntilMs,
+				cycleId,
+			};
+			return finalized;
+		}
+		const transition = options.controller.recordValidUnlock(options.decisionId);
+		if (!transition.applied) {
+			finalized = { outcome: "ignored", transition };
 			return finalized;
 		}
 		finalized = {

@@ -62,7 +62,6 @@ test("built-in defaults match acceptance and reject the stale direct reminder", 
 	assert.deepEqual(BUILT_IN_CONFIG.continueReasonTypes, [
 		"WORK_REMAINS",
 		"VERIFYING",
-		"WAIT_AUTOMATION",
 	]);
 	assert.deepEqual(
 		DEFAULT_CONTINUE_REASON_TYPES,
@@ -167,7 +166,6 @@ test("valid continueReasonTypes replace defaults and invalid lists fall back", (
 		"Work_Remains",
 		"verifying",
 	]);
-	assert.ok(!replaced.config.continueReasonTypes.includes("WAIT_AUTOMATION"));
 
 	const fallback = mergeConfig(
 		{ continueReasonTypes: ["GlobalWork"] },

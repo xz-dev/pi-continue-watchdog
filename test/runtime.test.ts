@@ -11,6 +11,7 @@ import {
 	CONTINUE_ENTRY_TYPE,
 	HUMAN_UNLOCK_ENTRY_TYPE,
 	type HumanUnlockEntry,
+	WAIT_ENTRY_TYPE,
 } from "../src/commands.js";
 import {
 	type ContinueWatchdogConfig,
@@ -153,6 +154,7 @@ interface Harness {
 	startDecision(): Promise<void>;
 	startUnrelatedRun(message?: unknown): Promise<void>;
 	answerContinue(): unknown;
+	answerWait(waitSeconds?: number, reason?: string): unknown;
 	answerUnlock(reason?: string, reasonType?: string): unknown;
 	answerInvalid(text?: string): unknown;
 	endDecisionMessage(message: unknown): Promise<unknown>;
@@ -172,6 +174,13 @@ function continueXml(
 	reason = "Implementation work remains.",
 ): string {
 	return `<watchdog><function>continue_watchdog</function><reason_type>${reasonType}</reason_type><reason_content>${reason}</reason_content></watchdog>`;
+}
+
+function waitXml(
+	waitSeconds = 300,
+	reason = "Waiting for automation.",
+): string {
+	return `<watchdog><function>wait_watchdog</function><reason_content>${reason}</reason_content><wait_seconds>${waitSeconds}</wait_seconds></watchdog>`;
 }
 
 function unlockXml(
@@ -311,7 +320,6 @@ function createHarness(options?: {
 		continueReasonTypes: options?.config?.continueReasonTypes ?? [
 			"WORK_REMAINS",
 			"VERIFYING",
-			"WAIT_AUTOMATION",
 		],
 	};
 	const hub = createObservableAgentHub();
@@ -564,6 +572,10 @@ function createHarness(options?: {
 		await harness.fire("message_start", { type: "message_start", message });
 	};
 	harness.answerContinue = () => assistant([text(continueXml())]);
+	harness.answerWait = (
+		waitSeconds = 300,
+		reason = "Waiting for automation.",
+	) => assistant([text(waitXml(waitSeconds, reason))]);
 	harness.answerUnlock = (
 		reason = "All requested work is complete.",
 		reasonType = "JOB_DONE",
@@ -1725,6 +1737,103 @@ test("continued settle rearms the fixed delay once and exhausts at max", async (
 	assert.equal(harness.controller.snapshot.decisionOpen, false);
 });
 
+test("valid wait records a deadline, consumes one retry, and asks again only at that deadline", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	await harness.openDecision();
+	const turnsBefore = harness.triggeredTurns;
+	const sentBefore = harness.sent.length;
+
+	await settleResponse(harness, harness.answerWait(300, "Waiting for CI."));
+
+	assert.equal(harness.triggeredTurns, turnsBefore);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.attempt, 1);
+	assert.equal(harness.controller.snapshot.waitUntilMs, 310_000);
+	assert.deepEqual(
+		harness.entries.filter((entry) => entry.type === WAIT_ENTRY_TYPE),
+		[
+			{
+				type: WAIT_ENTRY_TYPE,
+				data: {
+					reason: "Waiting for CI.",
+					waitSeconds: 300,
+					waitUntilMs: 310_000,
+				},
+			},
+		],
+	);
+	assert.deepEqual(harness.sent.at(-1)?.options, {
+		triggerTurn: false,
+		deliverAs: "steer",
+	});
+	assert.equal(
+		(
+			harness.sent.at(-1)?.message.details as
+				| { watchdogOutcome?: string }
+				| undefined
+		)?.watchdogOutcome,
+		"wait",
+	);
+	const waitTimer = harness.clock.records.findLastIndex(
+		(record) => record.delayMs === 300_000 && !record.cleared,
+	);
+	assert.ok(waitTimer >= 0);
+	assert.equal(harness.sent.length, sentBefore + 1);
+
+	harness.clock.fire(waitTimer);
+	await Promise.resolve();
+	assert.equal(harness.sent.length, sentBefore + 2);
+	assert.equal(harness.sent.at(-1)?.message.customType, DECISION_MESSAGE_TYPE);
+});
+
+test("wait entry persistence failure rolls back the retry and deadline", async () => {
+	const harness = createHarness({ appendThrows: WAIT_ENTRY_TYPE });
+	await startIdle(harness);
+	await harness.openDecision();
+	const sentBefore = harness.sent.length;
+
+	await settleResponse(harness, harness.answerWait(300, "Waiting for CI."));
+
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.controller.snapshot.exhausted, false);
+	assert.equal(harness.controller.snapshot.waitUntilMs, 0);
+	assert.equal(
+		harness.entries.some((entry) => entry.type === WAIT_ENTRY_TYPE),
+		false,
+	);
+	assert.equal(
+		harness.clock.records.some(
+			(record) => record.delayMs === 300_000 && !record.cleared,
+		),
+		false,
+	);
+	assert.equal(
+		harness.sent.some(
+			(sent) =>
+				(sent.message.details as { watchdogOutcome?: string } | undefined)
+					?.watchdogOutcome === "wait",
+		),
+		false,
+	);
+	assert.equal(harness.sent.length, sentBefore);
+	assert.deepEqual(
+		harness.entries.filter((entry) => entry.type !== INQUIRY_MARKER_ENTRY_TYPE),
+		[
+			{
+				type: "pi-continue-watchdog:status",
+				data: {
+					kind: "other-error",
+					exchangeId: "exchange-1",
+					cycleId: 1,
+					message: "append failed",
+				},
+			},
+		],
+	);
+});
+
 test("valid unlock folds without a turn and leaves one compact persisted result", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
@@ -2401,7 +2510,7 @@ test("child completion only makes aggregate idle; exactly one inquiry comes from
 		decisionPrompt: "Decide now.",
 		continuePrompt: "Continue compactly.",
 		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
-		continueReasonTypes: ["WORK_REMAINS", "VERIFYING", "WAIT_AUTOMATION"],
+		continueReasonTypes: ["WORK_REMAINS", "VERIFYING"],
 	};
 	const hub = createObservableAgentHub();
 	const clock = new FakeClock();
@@ -2487,7 +2596,7 @@ test("shared hub reclaims main after UI shutdown then prefers a new UI bind", as
 		decisionPrompt: "Decide now.",
 		continuePrompt: "Continue compactly.",
 		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
-		continueReasonTypes: ["WORK_REMAINS", "VERIFYING", "WAIT_AUTOMATION"],
+		continueReasonTypes: ["WORK_REMAINS", "VERIFYING"],
 	};
 
 	function attach(sessionId: string, hasUI: boolean) {
@@ -2612,7 +2721,7 @@ test("effective config loads before binding is reconciled and shutdown blocks la
 			decisionPrompt: "Loaded decision.",
 			continuePrompt: "Loaded continue.",
 			reasonTypes: ["JOB_DONE"],
-			continueReasonTypes: ["WORK_REMAINS", "VERIFYING", "WAIT_AUTOMATION"],
+			continueReasonTypes: ["WORK_REMAINS", "VERIFYING"],
 		},
 		diagnostics: [],
 	});

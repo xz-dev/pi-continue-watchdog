@@ -34,6 +34,7 @@ qualify the same generation and re-check ownership/auth
 open one XML decision check
           │
           ├─ continue ─► fold exchange ─► compact continuation turn
+          ├─ wait ─────► fold exchange ─► absolute not-before deadline
           ├─ unlock  ──► unlock ────────► one muted result entry
           └─ invalid ──► immediate re-ask, at most three responses
 ```
@@ -43,14 +44,14 @@ open one XML decision check
 | Module | Responsibility |
 |---|---|
 | `src/hub.ts` | Process-wide attachment registration, main election, and aggregate busy/idle state |
-| `src/activity-grace.ts` | One replaceable fixed 10-second fence; every observation replaces it and stale callbacks are inert |
-| `src/controller.ts` | Pure lock, attempt, exhaustion, failure, and decision-window accounting |
-| `src/runtime.ts` | Aggregate generation wiring, ownership/auth fencing, XML capture, audit entries, and finalization delivery |
-| `src/decision-protocol.ts` | Fixed XML prompt suffix, XML extraction, validation, and three-response re-ask protocol |
-| `src/context-fold.ts` | Correlate complete decision exchanges and remove or replace them before provider requests |
+| `src/activity-grace.ts` | One replaceable fixed 10-second fence combined with an optional absolute wait not-before time; every observation replaces it and stale callbacks are inert |
+| `src/controller.ts` | Pure lock, shared continue/wait attempt, absolute wait deadline, exhaustion, failure, and decision-window accounting |
+| `src/runtime.ts` | Aggregate generation wiring, ownership/auth fencing, XML capture, audit entries, wait persistence/scheduling, and finalization delivery |
+| `src/decision-protocol.ts` | Fixed continue/wait/unlock XML prompt suffix, XML extraction, validation, and three-response re-ask protocol |
+| `src/context-fold.ts` | Correlate complete decision exchanges and remove them, or replace continue with its compact prompt, before provider requests |
 | `src/abort-outcome.ts` | Detect canonical main-run `stopReason: "aborted"` outcomes |
 | `src/auto-lock.ts` | Start a fresh lock cycle when a real main user message begins processing |
-| `src/commands.ts` | Human lock/unlock commands and TUI-only unlock-result rendering |
+| `src/commands.ts` | Human lock/unlock commands plus TUI-only continue, wait, unlock, status, and timeline rendering |
 | `src/semantic-hook.ts` | Publish terminal `user-ready` envelopes without depending on a consumer plugin |
 | `src/config-loader.ts` | Merge built-in, global, and trusted-project configuration |
 
@@ -92,6 +93,7 @@ exhausted
 decisionFailed
 invalidDecisionAttempts
 decisionOpen
+waitUntilMs
 ```
 
 ### Fresh cycle
@@ -115,13 +117,15 @@ An ordinary non-user `agent_start` only performs `ensureLocked()`:
 
 ### Unlock
 
-Unlock first assigns `locked = false`, then cancels operational timer and decision work. Ordinary unlock preserves retry/failure accounting; only a fresh lock cycle resets it.
+Unlock first assigns `locked = false` and resets `waitUntilMs = 0`, then cancels operational timer and decision work. Ordinary unlock preserves retry/failure accounting; only a fresh lock cycle resets it.
 
-### Replaceable inquiry fence
+### Replaceable inquiry fence and wait deadline
 
-Every relevant live-state observation cancels and replaces the current candidate. If the newly observed state is eligible, the root starts one event-loop `setTimeout` for exactly 10,000 ms; otherwise it remains blocked. Equal old/new observations are still replacements. The callback captures an identity token so cleared or already-queued stale callbacks are inert.
+Every relevant live-state observation cancels and replaces the current candidate. If the newly observed state is eligible, the root starts one event-loop `setTimeout` targeting the later of (a) a complete 10,000 ms idle fence from that observation and (b) the controller's absolute `waitUntilMs`. Otherwise it remains blocked. Equal old/new observations are still replacements. The callback captures an identity token so cleared or already-queued stale callbacks are inert.
 
-At expiry the root rechecks enabled/locked eligibility, exact timer generation, empty busy-child set, current ownership, pending messages, and a fresh public `ctx.isIdle()` value before any decision logic. A rejected confirm remains consumed until a later real event/report; runtime code never self-rearms by internally observing the same facts. There is no periodic polling, stale-timeout inference, or business-level uncertain state.
+At expiry the root rechecks enabled/locked eligibility, exact timer generation, empty busy-child set, current ownership, pending messages, a fresh public `ctx.isIdle()` value, and `now >= waitUntilMs` before any decision logic. A rejected confirm remains consumed until a later real event/report; runtime code never self-rearms by internally observing the same facts. There is no periodic polling, stale-timeout inference, or business-level uncertain state.
+
+A wait that consumes the final attempt sets controller exhaustion immediately but has a separate terminal deadline timer. `user-ready` remains fenced by `waitUntilMs`; only after the deadline can the exhausted idle epoch publish `EXHAUSTED`. Unlock, fresh lock, demotion, and shutdown clear this timer, and callback identity makes a queued stale callback inert.
 
 ## Ownership and stale-work fencing
 
@@ -182,7 +186,7 @@ The configurable prompt supplies decision intent. Runtime always appends a fixed
 - requires exactly one trailing `<watchdog>...</watchdog>` block;
 - explicitly prohibits making decisions on the user's behalf;
 - lists the independent effective unlock and continue reason types;
-- gives canonical typed continue and unlock examples.
+- gives canonical typed continue/unlock examples and an untyped wait example with integer seconds from 1 through 1800.
 
 ## Stable tools and blocked execution
 
@@ -199,6 +203,16 @@ A continue response ends with:
   <function>continue_watchdog</function>
   <reason_type>WORK_REMAINS</reason_type>
   <reason_content>Implementation work remains.</reason_content>
+</watchdog>
+```
+
+A wait response ends with:
+
+```xml
+<watchdog>
+  <function>wait_watchdog</function>
+  <reason_content>Waiting for automation.</reason_content>
+  <wait_seconds>300</wait_seconds>
 </watchdog>
 ```
 
@@ -224,14 +238,19 @@ The parser:
 
 Narration may precede the XML, but nothing except whitespace may follow it. Multiple watchdog blocks are invalid.
 
-For both decisions:
+Continue and unlock use typed reasons:
 
 - `reason_type` is trimmed and matched case-insensitively against the independent effective list (`continueReasonTypes` for continue, `reasonTypes` for unlock);
-- the matched configured value is emitted in uppercase;
+- the matched configured value is emitted in uppercase.
+
+All three outcomes use the same reason validation:
+
 - `reason_content` must be nonblank and at most 500 Unicode code points;
 - invalid AI reasons are rejected rather than truncated.
 
-The model receives at most three total decision responses. Invalid responses trigger immediate re-asks and do not consume the valid-continue retry budget. The third invalid response enters `decisionFailed` until a fresh cycle.
+Wait rejects any supplied `reason_type`. Its trimmed `wait_seconds` must contain decimal digits representing a safe integer from 1 through 1800; invalid values are rejected rather than clamped.
+
+The model receives at most three total decision responses. Invalid responses trigger immediate re-asks and do not consume the shared valid continue/wait attempt budget. The third invalid response enters `decisionFailed` until a fresh cycle.
 
 ## Decision streaming and user takeover
 
@@ -260,7 +279,25 @@ Pi explicitly treats plain custom entries as display/state records that do not p
 Audit shapes are deliberately structured and bounded:
 
 ```json
-{ "version": 1, "exchangeId": "…", "cycleId": 1, "outcome": "continue" }
+{
+  "version": 1,
+  "exchangeId": "…",
+  "cycleId": 1,
+  "outcome": "continue",
+  "reasonType": "VERIFYING",
+  "reason": "Tests still need to run."
+}
+```
+
+```json
+{
+  "version": 1,
+  "exchangeId": "…",
+  "cycleId": 1,
+  "outcome": "wait",
+  "reason": "Waiting for CI.",
+  "waitSeconds": 300
+}
 ```
 
 ```json
@@ -286,9 +323,10 @@ Audit shapes are deliberately structured and bounded:
 
 Invalid audits retain only the fixed validator error, never the raw invalid model text.
 
-The visible muted unlock result is also a `CustomEntry`, but has a registered renderer. Thus both audit and visible result are excluded from model context; only the latter appears in TUI history:
+The visible muted wait and unlock results are also `CustomEntry` records with registered renderers. Audit and visible-result entries are excluded from model context; the latter remain in TUI history:
 
 ```text
+Continue watchdog waiting · 300s · Waiting for CI.
 Continue watchdog unlocked · WAIT_USER · User approval is required.
 ```
 
@@ -322,7 +360,7 @@ ordinary conversation
 
 The compact continuation message triggers the next ordinary work turn.
 
-### Unlock, decision failure, and user preemption
+### Wait, unlock, decision failure, and user preemption
 
 ```text
 ordinary conversation
@@ -351,14 +389,14 @@ On normal `pi -c` recovery:
 
 Packed E2E creates a persistent session, triggers a decision, shuts it down, reopens the same file with `SessionManager.open()`, sends another ordinary prompt, and inspects the actual provider payload. It verifies the resumed request contains no watchdog question, XML answer, audit entry, or fold marker.
 
-## Continue, unlock, invalid, and abort outcomes
+## Continue, wait, unlock, invalid, and abort outcomes
 
 ### Continue
 
 - show a live colored `Continue watchdog checking` widget for the active decision cycle;
 - persist a colored TUI-only card for every validation re-ask or other error, preserving the safe parser error or original provider error content;
 - record the accepted continue;
-- increment the continue attempt;
+- increment the shared continue/wait attempt;
 - clear the live checking widget;
 - append one TUI-only `Continue watchdog continued` entry so automatic continuation and possible token-consuming loops remain visible;
 - if that entry cannot be persisted, fail closed without dispatching continuation;
@@ -366,6 +404,17 @@ Packed E2E creates a persistent session, triggers a decision, shuts it down, reo
 - fold the exchange into `continuePrompt`;
 - trigger the next ordinary turn;
 - wait one fixed grace for the next authoritative all-idle generation if still locked.
+
+### Wait
+
+- validate reason and integer seconds in `1..1800` without a reason type;
+- record the accepted wait and increment the shared attempt;
+- persist one TUI-only `Continue watchdog waiting` entry before scheduling;
+- on persistence failure, roll back the attempt/deadline and fail closed without a wait;
+- append a wait fold marker so the exchange disappears from later context;
+- start no ordinary work turn;
+- keep the lock and qualify the next inquiry against the absolute `waitUntilMs`;
+- if the wait consumed the final attempt, schedule only terminal deadline publication and do not emit `EXHAUSTED` early.
 
 ### AI unlock
 
@@ -394,11 +443,11 @@ The runtime separates finalization from delivery:
 
 - `message_end` captures and hides the response;
 - `agent_end` computes and caches the protocol finalization;
-- only after Pi reaches true idle and emits `agent_settled` does the extension deliver continue, unlock, re-ask, or failure effects.
+- only after Pi reaches true idle and emits `agent_settled` does the extension deliver continue, wait, unlock, re-ask, or failure effects.
 
 It does not start nested agent work from inside an unfinished `agent_end` run. This lets Pi clear its active-run state before the watchdog starts another turn.
 
-Packed E2E uses bounded idle assertions against both `session.isIdle` and `session.waitForIdle()` for continue, unlock, three invalid responses, abort, compaction recovery, multi-attachment coordination, and persisted resume. These checks fail if Pi remains in `working` beyond the accepted deadline.
+Packed E2E uses bounded idle assertions against both `session.isIdle` and `session.waitForIdle()` for continue, unlock, three invalid responses, abort, compaction recovery, multi-attachment coordination, and persisted resume. Focused runtime tests cover wait delivery and deadline behavior without real-time sleeps. These checks fail if Pi remains in `working` beyond the accepted deadline.
 
 ## Semantic `user-ready` publication
 
@@ -414,7 +463,7 @@ for terminal automatic idle outcomes:
 - `EXHAUSTED`;
 - `DECISION_FAILED`.
 
-The producer is unaware of any consumer plugin. Delivery is best-effort, current-listener-only, with no acknowledgement, retry, or replay.
+`EXHAUSTED` is withheld while an accepted final wait still has `waitUntilMs` in the future. The producer is unaware of any consumer plugin. Delivery is best-effort, current-listener-only, with no acknowledgement, retry, or replay.
 
 ## Configuration
 
@@ -428,7 +477,7 @@ built-in defaults
 
 Project configuration is ignored when Pi does not trust the project. Invalid fields fall back to the next lower valid value and produce bounded diagnostics.
 
-Lock state, aggregate grace, ownership, and pending decisions are runtime-only. They are not restored across reload, new session, resume, restart, or shutdown. A later real main user message starts a fresh lock cycle.
+Lock state, wait deadline, aggregate grace, ownership, and pending decisions are runtime-only. They are not restored across reload, new session, resume, restart, or shutdown. A later real main user message starts a fresh lock cycle.
 
 ## Isolation guarantees and limits
 
@@ -455,7 +504,7 @@ The folder fails closed in those cases to avoid deleting genuine user conversati
 
 ## Verification
 
-`npm run check` covers lint, type checking, unit tests, and build. `npm run test:e2e` installs the packed source artifact against stock Pi and verifies:
+`npm run check` covers lint, type checking, unit tests, and build. Focused unit/runtime coverage includes wait XML bounds, shared attempt accounting, persistence rollback, absolute-deadline requalification after activity, unlock cleanup, stale callbacks, context folding, TUI records, and final-wait-delayed exhaustion. `npm run test:e2e` installs the packed source artifact against stock Pi and verifies:
 
 - multi-loader, same-process aggregate-idle ownership;
 - threshold compaction recovery;

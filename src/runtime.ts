@@ -25,7 +25,9 @@ import {
 	type ContinueEntry,
 	HUMAN_UNLOCK_ENTRY_TYPE,
 	type HumanUnlockEntry,
+	WAIT_ENTRY_TYPE,
 	WATCHDOG_STATUS_ENTRY_TYPE,
+	type WaitEntry,
 	type WatchdogStatusEntry,
 } from "./commands.js";
 import { BUILT_IN_CONFIG, type ContinueWatchdogConfig } from "./config.js";
@@ -53,6 +55,7 @@ import {
 	type DecisionProtocolSession,
 	type DecisionResponse,
 	formatDecisionFailedNotification,
+	MAX_WAIT_SECONDS,
 	normalizeAssistantDecisionResponse,
 	validateDecisionResponse,
 } from "./decision-protocol.js";
@@ -109,6 +112,14 @@ export type DecisionAuditEntry =
 			readonly outcome: "continue";
 			readonly reasonType: string;
 			readonly reason: string;
+	  }
+	| {
+			readonly version: 1;
+			readonly exchangeId: string;
+			readonly cycleId: number;
+			readonly outcome: "wait";
+			readonly reason: string;
+			readonly waitSeconds: number;
 	  }
 	| {
 			readonly version: 1;
@@ -379,6 +390,7 @@ export function createDecisionRuntime(
 	} | null = null;
 	/** At-most-once publication guard for the current aggregate-idle epoch. */
 	let publishedForIdleEpoch = false;
+	let terminalWaitTimer: RuntimeTimerHandle | null = null;
 	let activeStatus: WatchdogStatusEntry | null = null;
 	let statusTui: { requestRender(): void } | null = null;
 	let statusWidgetRegistered = false;
@@ -418,6 +430,11 @@ export function createDecisionRuntime(
 		return effectiveClaim !== null && options.hub.isCurrentMain(effectiveClaim)
 			? controller
 			: null;
+	};
+
+	const clearTerminalWaitTimer = (): void => {
+		if (terminalWaitTimer !== null) clock.clearTimeout(terminalWaitTimer);
+		terminalWaitTimer = null;
 	};
 
 	const stateStatusProjection = (): {
@@ -739,6 +756,7 @@ export function createDecisionRuntime(
 	 */
 	const clearOperationalPendingWork = (): void => {
 		localActivityGeneration += 1;
+		clearTerminalWaitTimer();
 		if (activeDecision !== null) {
 			retainInquiryCleanup(activeDecision);
 			retryInquiryCleanup();
@@ -1067,6 +1085,7 @@ export function createDecisionRuntime(
 			decisionPrompt,
 			reasonTypes: config.reasonTypes,
 			continueReasonTypes: config.continueReasonTypes,
+			now,
 		});
 		const active: ActiveDecision = {
 			decisionId,
@@ -1243,6 +1262,7 @@ export function createDecisionRuntime(
 		readonly generation: ActivityGeneration;
 		readonly claim: HubMainClaim | null;
 		readonly fence: DomainFence;
+		readonly waitUntilMs: number;
 	} => {
 		const claim = getMainClaim();
 		const controller = currentController(claim);
@@ -1283,6 +1303,7 @@ export function createDecisionRuntime(
 			},
 			claim,
 			fence,
+			waitUntilMs: controller?.snapshot.waitUntilMs ?? 0,
 		};
 	};
 
@@ -1291,6 +1312,7 @@ export function createDecisionRuntime(
 		graceCoordinator.update({
 			allIdle: input.allIdle,
 			generation: input.generation,
+			notBeforeMs: input.waitUntilMs,
 		});
 		refreshStateStatus();
 	};
@@ -1350,7 +1372,7 @@ export function createDecisionRuntime(
 			readyGeneration = generation;
 			const controller = currentController(after.claim);
 			if (controller !== null) {
-				applyTransition(controller.beginDecision(), undefined, {
+				applyTransition(controller.beginDecision(now()), undefined, {
 					claim: after.claim,
 				});
 			}
@@ -1417,6 +1439,7 @@ export function createDecisionRuntime(
 		const claim = getMainClaim();
 		const controller = currentController(claim);
 		if (claim === null || controller === null) return;
+		if (controller.snapshot.waitUntilMs > now()) return;
 
 		let envelope = null as ReturnType<typeof createUserReadyEnvelope> | null;
 		const aiUnlockIntent = pendingAiUnlock;
@@ -1439,6 +1462,7 @@ export function createDecisionRuntime(
 
 		if (envelope === null || !allIdleForClaim(claim)) return;
 		if (options.processDomain !== undefined) {
+			const publicationGeneration = localActivityGeneration;
 			const snapshot = options.processDomain.snapshot;
 			if (!snapshot.allIdle) return;
 			try {
@@ -1448,6 +1472,36 @@ export function createDecisionRuntime(
 				return;
 			}
 			if (!allIdleForClaim(claim)) return;
+			// A lock-cycle reset (unlock or fresh lock) may have run while the
+			// cross-process confirmation was pending. Require the exact captured
+			// claim, controller, and local generation, then re-derive the terminal
+			// envelope from live state before publishing.
+			if (localActivityGeneration !== publicationGeneration) return;
+			const liveController = currentController(claim);
+			if (liveController !== controller) return;
+			if (aiUnlockIntent !== null) {
+				if (pendingAiUnlock !== aiUnlockIntent) return;
+			} else {
+				const live = liveController.snapshot;
+				if (live.waitUntilMs > now()) return;
+				let liveEnvelope: ReturnType<typeof createUserReadyEnvelope> | null =
+					null;
+				if (live.locked && live.exhausted) {
+					liveEnvelope = createUserReadyEnvelope({ STOP_KIND: "EXHAUSTED" });
+				} else if (live.locked && live.decisionFailed) {
+					liveEnvelope = createUserReadyEnvelope({
+						STOP_KIND: "DECISION_FAILED",
+					});
+				}
+				if (
+					liveEnvelope === null ||
+					liveEnvelope.values?.STOP_KIND !== envelope.values?.STOP_KIND
+				) {
+					return;
+				}
+				envelope = liveEnvelope;
+			}
+			if (publishedForIdleEpoch) return;
 		}
 		if (aiUnlockIntent !== null) {
 			if (pendingAiUnlock !== aiUnlockIntent) return;
@@ -1459,6 +1513,29 @@ export function createDecisionRuntime(
 		} catch {
 			// Listener failures are contained by Pi's bus; emission itself must
 			// never escape into controller/runtime control flow.
+		}
+	};
+
+	const scheduleTerminalWait = (waitUntilMs: number): void => {
+		clearTerminalWaitTimer();
+		const remainingMs = Math.ceil(waitUntilMs - now());
+		if (remainingMs <= 0) {
+			void maybePublishUserReady();
+			return;
+		}
+		const handle = clock.setTimeout(() => {
+			if (terminalWaitTimer !== handle) return;
+			terminalWaitTimer = null;
+			if (waitUntilMs > now()) {
+				scheduleTerminalWait(waitUntilMs);
+				return;
+			}
+			refreshStateStatus();
+			void maybePublishUserReady();
+		}, remainingMs);
+		terminalWaitTimer = handle;
+		if ("unref" in handle && typeof handle.unref === "function") {
+			handle.unref();
 		}
 	};
 
@@ -1882,9 +1959,74 @@ export function createDecisionRuntime(
 
 		if (
 			(finalization.outcome !== "continue" &&
+				finalization.outcome !== "wait" &&
 				finalization.outcome !== "unlock") ||
 			finalization.cycleId === undefined
 		) {
+			return false;
+		}
+
+		if (finalization.outcome === "wait") {
+			activeDecision = null;
+			capturedDecisionResponse = null;
+			const finalCycleId = finalization.cycleId;
+			const reason = finalization.reason;
+			const waitSeconds = finalization.waitSeconds;
+			const waitUntilMs = finalization.waitUntilMs;
+			if (
+				typeof reason !== "string" ||
+				reason.length === 0 ||
+				typeof waitSeconds !== "number" ||
+				!Number.isSafeInteger(waitSeconds) ||
+				waitSeconds < 1 ||
+				waitSeconds > MAX_WAIT_SECONDS ||
+				typeof waitUntilMs !== "number" ||
+				!Number.isSafeInteger(waitUntilMs) ||
+				waitUntilMs < 0
+			) {
+				return false;
+			}
+			if (stopIfStale(claim)) return false;
+			try {
+				options.pi.appendEntry<WaitEntry>(WAIT_ENTRY_TYPE, {
+					reason,
+					waitSeconds,
+					waitUntilMs,
+				});
+			} catch (error) {
+				options.controllerHolder.controller?.rollbackValidWait(
+					controllerBeforeCommit?.waitUntilMs ?? 0,
+				);
+				appendStatus({
+					kind: "other-error",
+					exchangeId: active.exchangeId,
+					cycleId: finalCycleId,
+					message: originalErrorMessage(error),
+				});
+				silentlyAbandonDecision();
+				return false;
+			}
+			if (stopIfStale(claim)) return false;
+			try {
+				options.pi.sendMessage(
+					createDecisionFoldMessage({
+						exchangeId: active.exchangeId,
+						cycleId: finalCycleId,
+						outcome: "wait",
+					}),
+					{ triggerTurn: false, deliverAs: "steer" },
+				);
+				active.inquiry.complete();
+			} catch {
+				retainInquiryCleanup(active);
+				retryInquiryCleanup();
+			}
+			if (stopIfStale(claim)) return false;
+			selfDecisionRun = { kind: "none" };
+			observeAggregate();
+			if (options.controllerHolder.controller?.snapshot.exhausted) {
+				scheduleTerminalWait(waitUntilMs);
+			}
 			return false;
 		}
 
@@ -2145,31 +2287,43 @@ export function createDecisionRuntime(
 			config.reasonTypes,
 			config.continueReasonTypes,
 		);
-		const audit: DecisionAuditEntry = validation.valid
-			? validation.decision.kind === "continue"
-				? {
-						version: 1,
-						exchangeId: active.exchangeId,
-						cycleId,
-						outcome: "continue",
-						reasonType: validation.decision.reasonType,
-						reason: validation.decision.reason,
-					}
-				: {
-						version: 1,
-						exchangeId: active.exchangeId,
-						cycleId,
-						outcome: "unlock",
-						reasonType: validation.decision.reasonType,
-						reason: validation.decision.reason,
-					}
-			: {
-					version: 1,
-					exchangeId: active.exchangeId,
-					cycleId,
-					outcome: "invalid",
-					error: validation.error,
-				};
+		let audit: DecisionAuditEntry;
+		if (!validation.valid) {
+			audit = {
+				version: 1,
+				exchangeId: active.exchangeId,
+				cycleId,
+				outcome: "invalid",
+				error: validation.error,
+			};
+		} else if (validation.decision.kind === "continue") {
+			audit = {
+				version: 1,
+				exchangeId: active.exchangeId,
+				cycleId,
+				outcome: "continue",
+				reasonType: validation.decision.reasonType,
+				reason: validation.decision.reason,
+			};
+		} else if (validation.decision.kind === "wait") {
+			audit = {
+				version: 1,
+				exchangeId: active.exchangeId,
+				cycleId,
+				outcome: "wait",
+				reason: validation.decision.reason,
+				waitSeconds: validation.decision.waitSeconds,
+			};
+		} else {
+			audit = {
+				version: 1,
+				exchangeId: active.exchangeId,
+				cycleId,
+				outcome: "unlock",
+				reasonType: validation.decision.reasonType,
+				reason: validation.decision.reason,
+			};
+		}
 		try {
 			options.pi.appendEntry<DecisionAuditEntry>(
 				DECISION_AUDIT_ENTRY_TYPE,

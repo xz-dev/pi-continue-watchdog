@@ -115,7 +115,7 @@ function makeController(): LockDecisionController {
 
 function decisionId(controller: LockDecisionController): number {
 	const decision = controller
-		.beginDecision()
+		.beginDecision(Number.MAX_SAFE_INTEGER)
 		.effects.find((effect) => effect.kind === "openDecisionWindow");
 	assert.ok(decision);
 	return decision.decisionId;

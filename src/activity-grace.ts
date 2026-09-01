@@ -25,6 +25,8 @@ export interface ActivityGraceCoordinator {
 	update(input: {
 		readonly allIdle: boolean;
 		readonly generation: ActivityGeneration;
+		/** Do not declare this idle candidate ready before this absolute timestamp. */
+		readonly notBeforeMs?: number;
 	}): void;
 	invalidate(): void;
 	dispose(): void;
@@ -73,7 +75,16 @@ export function createActivityGraceCoordinator(options: {
 			}
 
 			phase = "grace";
-			deadlineMs = clock.now() + INQUIRY_FENCE_MS;
+			const startedAtMs = clock.now();
+			const notBeforeMs = Number.isFinite(input.notBeforeMs)
+				? (input.notBeforeMs ?? 0)
+				: 0;
+			const targetDeadlineMs = Math.max(
+				startedAtMs + INQUIRY_FENCE_MS,
+				notBeforeMs,
+			);
+			deadlineMs = targetDeadlineMs;
+			const delayMs = Math.max(0, Math.ceil(targetDeadlineMs - startedAtMs));
 			const handle = clock.setTimeout(() => {
 				if (
 					disposed ||
@@ -87,7 +98,7 @@ export function createActivityGraceCoordinator(options: {
 				phase = "ready";
 				deadlineMs = null;
 				options.onReady(input.generation);
-			}, INQUIRY_FENCE_MS);
+			}, delayMs);
 			timer = handle;
 			if ("unref" in handle && typeof handle.unref === "function") {
 				handle.unref();

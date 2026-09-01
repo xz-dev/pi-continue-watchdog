@@ -97,6 +97,7 @@ interface SemanticHarness {
 	openDecision(): Promise<void>;
 	startDecision(): Promise<void>;
 	answerContinue(): unknown;
+	answerWait(waitSeconds?: number, reason?: string): unknown;
 	answerUnlock(reason?: string, reasonType?: string): unknown;
 	snapshotController(): {
 		locked: boolean;
@@ -119,6 +120,10 @@ function continueXml(
 	reason = "Implementation work remains.",
 ): string {
 	return `<watchdog><function>continue_watchdog</function><reason_type>${reasonType}</reason_type><reason_content>${reason}</reason_content></watchdog>`;
+}
+
+function waitXml(waitSeconds = 30, reason = "Waiting for automation."): string {
+	return `<watchdog><function>wait_watchdog</function><reason_content>${reason}</reason_content><wait_seconds>${waitSeconds}</wait_seconds></watchdog>`;
 }
 
 function unlockXml(
@@ -211,7 +216,6 @@ function createSemanticHarness(options?: {
 		continueReasonTypes: options?.config?.continueReasonTypes ?? [
 			"WORK_REMAINS",
 			"VERIFYING",
-			"WAIT_AUTOMATION",
 		],
 	};
 	const hub = createObservableAgentHub();
@@ -331,6 +335,8 @@ function createSemanticHarness(options?: {
 		startedDecisionDetails = lastDecisionMessage.details;
 	};
 	harness.answerContinue = () => assistant([text(continueXml())]);
+	harness.answerWait = (waitSeconds = 30, reason = "Waiting for automation.") =>
+		assistant([text(waitXml(waitSeconds, reason))]);
 	harness.answerUnlock = (
 		reason = "All requested work is complete.",
 		reasonType = "JOB_DONE",
@@ -534,6 +540,92 @@ test("exhausted and decisionFailed publish exact STOP_KIND envelopes once", asyn
 	assert.equal(Object.hasOwn(failed.received[0]?.values ?? {}, "ERROR"), false);
 	failed.runtime.reconcileIdle();
 	assert.equal(failed.received.length, 1);
+});
+
+test("final retry wait delays EXHAUSTED until its deadline", async () => {
+	const harness = createSemanticHarness({ config: { maxRetries: 1 } });
+	await startIdle(harness);
+	await harness.openDecision();
+	await settleResponse(harness, harness.answerWait(30, "Waiting for CI."));
+
+	assert.equal(harness.snapshotController().exhausted, true);
+	assert.equal(harness.received.length, 0);
+	const deadlineTimer = harness.clock.records.findLastIndex(
+		(record) => record.delayMs === 30_000 && !record.cleared,
+	);
+	assert.ok(deadlineTimer >= 0);
+
+	harness.clock.fire(deadlineTimer);
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.deepEqual(harness.received, [
+		{
+			version: 1,
+			name: "user-ready",
+			values: { STOP_KIND: "EXHAUSTED" },
+		},
+	]);
+});
+
+test("unlock clears a final wait deadline and makes its stale timer inert", async () => {
+	const harness = createSemanticHarness({ config: { maxRetries: 1 } });
+	await startIdle(harness);
+	await harness.openDecision();
+	await settleResponse(harness, harness.answerWait(30, "Waiting for CI."));
+
+	const deadlineTimer = harness.clock.records.findLastIndex(
+		(record) => record.delayMs === 30_000 && !record.cleared,
+	);
+	assert.ok(deadlineTimer >= 0);
+	const deadlineRecord = harness.clock.records[deadlineTimer];
+	assert.ok(deadlineRecord);
+
+	harness.runtime.applyTransition(harness.controller.unlock(), undefined, {
+		suppressNotify: true,
+	});
+	harness.runtime.clearOperationalPendingWork();
+	assert.equal(harness.controller.snapshot.waitUntilMs, 0);
+	assert.equal(deadlineRecord.cleared, true);
+
+	deadlineRecord.callback();
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.deepEqual(harness.received, []);
+});
+
+test("pending confirmation across a final-wait deadline reset publishes no EXHAUSTED", async () => {
+	const fence = deferredDomain();
+	const harness = createSemanticHarness({
+		config: { maxRetries: 1 },
+		processDomain: fence.domain,
+	});
+	await startIdle(harness);
+	fence.setDeferred(false);
+	await harness.openDecision();
+	await settleResponse(harness, harness.answerWait(30, "Waiting for CI."));
+	assert.equal(harness.controller.snapshot.exhausted, true);
+	assert.equal(harness.received.length, 0);
+
+	// Isolate the race under test: wait finalization is complete; only terminal
+	// publication confirmation is deferred.
+	fence.setDeferred(true);
+	const deadlineTimer = harness.clock.records.findLastIndex(
+		(record) => record.delayMs === 30_000 && !record.cleared,
+	);
+	assert.ok(deadlineTimer >= 0);
+	harness.clock.fire(deadlineTimer);
+	await waitForPendingConfirm(fence);
+
+	// A manual unlock resets the lock cycle while publication is pending.
+	harness.runtime.applyTransition(harness.controller.unlock(), undefined, {
+		suppressNotify: true,
+	});
+	harness.runtime.clearOperationalPendingWork();
+	assert.equal(harness.controller.snapshot.waitUntilMs, 0);
+
+	fence.resolve(true);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(harness.received, []);
 });
 
 test("continue persistence failure publishes no hook and dispatches no continuation", async () => {

@@ -18,9 +18,14 @@ import {
 	INVALID_DECISION_XML_ERROR,
 	INVALID_UNLOCK_REASON_ERROR,
 	INVALID_UNLOCK_REASON_TYPE_ERROR,
+	INVALID_WAIT_REASON_ERROR,
+	INVALID_WAIT_REASON_TYPE_ERROR,
+	INVALID_WAIT_SECONDS_ERROR,
 	MALFORMED_DECISION_RESPONSE_ERROR,
+	MAX_WAIT_SECONDS,
 	MISSING_CONTINUE_FIELDS_ERROR,
 	MISSING_UNLOCK_FIELDS_ERROR,
+	MISSING_WAIT_FIELDS_ERROR,
 	normalizeAssistantDecisionResponse,
 	UNSUPPORTED_DECISION_CONTENT_ERROR,
 	validateDecisionResponse,
@@ -46,6 +51,13 @@ function continueXml(
 	return `<watchdog><function>continue_watchdog</function><reason_type>${reasonType}</reason_type><reason_content>${reasonContent}</reason_content>${extra}</watchdog>`;
 }
 
+function waitXml(
+	waitSeconds = 300,
+	reasonContent = "Waiting for automation.",
+): string {
+	return `<watchdog><function>wait_watchdog</function><reason_content>${reasonContent}</reason_content><wait_seconds>${waitSeconds}</wait_seconds></watchdog>`;
+}
+
 function unlockXml(
 	reasonType = "JOB_DONE",
 	reasonContent = "All requested work is complete.",
@@ -60,7 +72,7 @@ function openDecision(
 	const controller = createLockDecisionController({ maxRetries: 2 });
 	controller.lock();
 	const opened = controller
-		.beginDecision()
+		.beginDecision(Number.MAX_SAFE_INTEGER)
 		.effects.find((effect) => effect.kind === "openDecisionWindow");
 	assert.ok(opened);
 	return {
@@ -71,6 +83,7 @@ function openDecision(
 			decisionPrompt: DECISION_PROMPT,
 			reasonTypes,
 			continueReasonTypes,
+			now: () => 10_000,
 		}),
 	};
 }
@@ -199,6 +212,64 @@ test("continue XML requires independently configured type and nonblank reason", 
 			CONTINUE_REASON_TYPES,
 		),
 		{ valid: false, error: INVALID_CONTINUE_REASON_ERROR },
+	);
+});
+
+test("wait XML requires a reason and integer seconds from 1 through 1800", () => {
+	assert.deepEqual(
+		validateDecisionResponse(
+			response([text(waitXml(MAX_WAIT_SECONDS, " Waiting for CI. "))]),
+			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
+		),
+		{
+			valid: true,
+			decision: {
+				kind: "wait",
+				reason: "Waiting for CI.",
+				waitSeconds: MAX_WAIT_SECONDS,
+			},
+		},
+	);
+	assert.deepEqual(
+		validateDecisionResponse(
+			response([
+				text("<watchdog><function>wait_watchdog</function></watchdog>"),
+			]),
+			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
+		),
+		{ valid: false, error: MISSING_WAIT_FIELDS_ERROR },
+	);
+	assert.deepEqual(
+		validateDecisionResponse(
+			response([text(waitXml(30, " "))]),
+			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
+		),
+		{ valid: false, error: INVALID_WAIT_REASON_ERROR },
+	);
+	for (const seconds of [0, 1801, 1.5]) {
+		assert.deepEqual(
+			validateDecisionResponse(
+				response([text(waitXml(seconds))]),
+				REASON_TYPES,
+				CONTINUE_REASON_TYPES,
+			),
+			{ valid: false, error: INVALID_WAIT_SECONDS_ERROR },
+		);
+	}
+	assert.deepEqual(
+		validateDecisionResponse(
+			response([
+				text(
+					"<watchdog><function>wait_watchdog</function><reason_type>WORK_REMAINS</reason_type><reason_content>Waiting for CI.</reason_content><wait_seconds>30</wait_seconds></watchdog>",
+				),
+			]),
+			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
+		),
+		{ valid: false, error: INVALID_WAIT_REASON_TYPE_ERROR },
 	);
 });
 
@@ -451,7 +522,16 @@ test("fixed prompt suffix requires typed reasons for both decisions", () => {
 	assert.match(prompt, /<function>continue_watchdog<\/function>/);
 	assert.match(prompt, /<reason_type>WORK_REMAINS<\/reason_type>/);
 	assert.match(prompt, /<reason_content>concise reason<\/reason_content>/);
+	assert.match(prompt, /<function>wait_watchdog<\/function>/);
+	assert.match(prompt, /<wait_seconds>300<\/wait_seconds>/);
+	assert.match(prompt, /integer wait_seconds from 1 through 1800/);
 	assert.match(prompt, /<function>unlock_continue_watchdog<\/function>/);
+	assert.match(prompt, /If you want to continue working/);
+	assert.match(prompt, /If you think the work is finished or blocked/);
+	assert.match(
+		prompt,
+		/If you think work should wait a period of time before continuing/,
+	);
 	assert.equal(/extra|ignored|unknown child/i.test(prompt), false);
 });
 
@@ -506,6 +586,26 @@ test("session finalizes valid continue without temporary decision tools", () => 
 	assert.equal(duplicate, finalized);
 	assert.equal(controller.snapshot.attempt, 1);
 	assert.equal(protocol.advanceAfterReask(protocol.currentCycleId), false);
+});
+
+test("session finalizes wait, consumes one retry, and records its absolute deadline", () => {
+	const { controller, protocol } = openDecision();
+
+	const finalized = finalizeCurrent(
+		protocol,
+		response([text(waitXml(300, "Waiting for CI."))]),
+	);
+	assert.equal(finalized.outcome, "wait");
+	assert.equal(finalized.cycleId, 1);
+	assert.equal(finalized.reason, "Waiting for CI.");
+	assert.equal(finalized.waitSeconds, 300);
+	assert.equal(finalized.waitUntilMs, 310_000);
+	assert.deepEqual(finalized.transition.effects, [
+		{ kind: "restoreDecisionTools", decisionId: 1 },
+	]);
+	assert.equal(controller.snapshot.attempt, 1);
+	assert.equal(controller.snapshot.waitUntilMs, 310_000);
+	assert.equal(controller.snapshot.decisionOpen, false);
 });
 
 test("invalid decisions re-ask without consuming a valid continue retry", () => {

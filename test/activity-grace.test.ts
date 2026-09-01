@@ -69,6 +69,63 @@ test("an idle observation waits exactly one fixed ten-second fence", () => {
 	assert.equal(coordinator.snapshot.phase, "ready");
 });
 
+test("wait deadline extends the fence without adding another fence afterward", () => {
+	const clock = new FakeClock();
+	const ready: ActivityGeneration[] = [];
+	const coordinator = createActivityGraceCoordinator({
+		clock,
+		onReady: (value) => ready.push(value),
+	});
+	const observed = generation(1);
+
+	coordinator.update({
+		allIdle: true,
+		generation: observed,
+		notBeforeMs: 300_000,
+	});
+	assert.equal(coordinator.snapshot.deadlineMs, 300_000);
+	assert.equal(clock.records[0]?.delayMs, 300_000);
+
+	clock.advance(300_000);
+	clock.records[0]?.callback();
+	assert.deepEqual(ready, [observed]);
+});
+
+test("activity during a wait cancels the stale timer and keeps the absolute deadline", () => {
+	const clock = new FakeClock();
+	const ready: ActivityGeneration[] = [];
+	const coordinator = createActivityGraceCoordinator({
+		clock,
+		onReady: (value) => ready.push(value),
+	});
+	const waitUntilMs = 300_000;
+
+	coordinator.update({
+		allIdle: true,
+		generation: generation(1),
+		notBeforeMs: waitUntilMs,
+	});
+	clock.advance(100_000);
+	coordinator.update({ allIdle: false, generation: generation(2) });
+	assert.equal(clock.records[0]?.cleared, true);
+	clock.records[0]?.callback();
+	assert.deepEqual(ready, []);
+
+	clock.advance(100_000);
+	const resumed = generation(3);
+	coordinator.update({
+		allIdle: true,
+		generation: resumed,
+		notBeforeMs: waitUntilMs,
+	});
+	assert.equal(coordinator.snapshot.deadlineMs, waitUntilMs);
+	assert.equal(clock.records[1]?.delayMs, 100_000);
+
+	clock.advance(100_000);
+	clock.records[1]?.callback();
+	assert.deepEqual(ready, [resumed]);
+});
+
 test("repeated equal idle reports replace and restart the full fence", () => {
 	const clock = new FakeClock();
 	const ready: ActivityGeneration[] = [];

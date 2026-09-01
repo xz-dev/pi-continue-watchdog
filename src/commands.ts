@@ -14,6 +14,7 @@ import {
 } from "@earendil-works/pi-tui";
 
 import type { ControllerEffect, LockDecisionController } from "./controller.js";
+import { MAX_WAIT_SECONDS } from "./decision-protocol.js";
 import type { HubMainClaim } from "./hub.js";
 import type {
 	WatchdogTriggerBlocker,
@@ -36,6 +37,7 @@ export const STATUS_COMMAND_DESCRIPTION =
 /** Persisted TUI-only entry for every accepted automatic continue. */
 export const CONTINUE_ENTRY_TYPE = "pi-continue-watchdog:continue";
 export const CONTINUE_ENTRY_TEXT = "Continue watchdog continued";
+export const WAIT_ENTRY_TYPE = "pi-continue-watchdog:wait";
 
 export interface ManualLockEntry {
 	readonly timestamp: string;
@@ -44,6 +46,12 @@ export interface ManualLockEntry {
 export interface ContinueEntry {
 	readonly reasonType: string;
 	readonly reason: string;
+}
+
+export interface WaitEntry {
+	readonly reason: string;
+	readonly waitSeconds: number;
+	readonly waitUntilMs: number;
 }
 
 /** Persistent lifecycle event rendered as a standard colored Pi-TUI box. */
@@ -285,6 +293,25 @@ export function createContinueEntryRenderer(): EntryRenderer<ContinueEntry> {
 	};
 }
 
+export function createWaitEntryRenderer(): EntryRenderer<WaitEntry> {
+	return (entry, _options, theme) => {
+		const reason = sanitizeTuiText(String(entry.data?.reason ?? ""));
+		const waitSeconds = Number(entry.data?.waitSeconds);
+		if (
+			reason.length === 0 ||
+			!Number.isSafeInteger(waitSeconds) ||
+			waitSeconds < 1 ||
+			waitSeconds > MAX_WAIT_SECONDS
+		) {
+			return undefined;
+		}
+		return createStaticTextComponent(
+			`Continue watchdog waiting · ${waitSeconds}s · ${reason}`,
+			theme,
+		);
+	};
+}
+
 export function createHumanUnlockEntryRenderer(): EntryRenderer<HumanUnlockEntry> {
 	return (entry, _options, theme) => {
 		const { reason, reasonType } = getHumanUnlockFields(entry);
@@ -312,6 +339,7 @@ export function normaliseHumanUnlockReason(args: string): string | undefined {
 const TIMELINE_TYPES = new Set([
 	MANUAL_LOCK_ENTRY_TYPE,
 	CONTINUE_ENTRY_TYPE,
+	WAIT_ENTRY_TYPE,
 	HUMAN_UNLOCK_ENTRY_TYPE,
 	WATCHDOG_STATUS_ENTRY_TYPE,
 ]);
@@ -325,6 +353,8 @@ function timelineLine(entry: CustomEntry<unknown>): string | null {
 		return `${String(data?.kind ?? "status")} · ${String(data?.message ?? "")}`;
 	if (entry.customType === CONTINUE_ENTRY_TYPE)
 		return `continue · ${String(data?.reasonType ?? "")}${data?.reason ? ` · ${String(data.reason)}` : ""}`;
+	if (entry.customType === WAIT_ENTRY_TYPE)
+		return `wait · ${String(data?.waitSeconds ?? "")}s${data?.reason ? ` · ${String(data.reason)}` : ""}`;
 	if (entry.customType === HUMAN_UNLOCK_ENTRY_TYPE)
 		return `${data?.reasonType ? "AI unlock" : "human unlock"} · ${String(data?.reason ?? "")}`;
 	if (data?.kind === "decision-failed")
@@ -584,6 +614,10 @@ export function createMainCommands(
 	pi.registerEntryRenderer<ContinueEntry>(
 		CONTINUE_ENTRY_TYPE,
 		createContinueEntryRenderer(),
+	);
+	pi.registerEntryRenderer<WaitEntry>(
+		WAIT_ENTRY_TYPE,
+		createWaitEntryRenderer(),
 	);
 	pi.registerEntryRenderer<HumanUnlockEntry>(
 		HUMAN_UNLOCK_ENTRY_TYPE,
