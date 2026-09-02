@@ -59,6 +59,7 @@ Any acceptance text, test name, README, or implementation that still requires pe
 | Continue TUI-only entry | `Continue watchdog continued · <TYPE> · <reason>` | Persisted before semantic publication and continuation dispatch |
 | Wait TUI-only entry | `Continue watchdog waiting · <seconds>s · <reason>` | Persisted before the absolute wait deadline is armed |
 | Continue semantic hook | `watchdog-continued` with `REASON_TYPE` and `REASON` | Neutral plain-data best-effort hook after durable continue evidence |
+| Wait semantic hook | `watchdog-waiting` with `REASON` and decimal `WAIT_SECONDS`; no `REASON_TYPE` | Neutral plain-data best-effort hook after durable wait evidence |
 | Lock TUI notify | `Continue watchdog locked` | User-only TUI notify |
 | Unlock TUI notify (no reason) | `Continue watchdog unlocked` | User-only TUI notify (human reasonless / abort) |
 | Human unlock TUI-only entry (with reason) | `Continue watchdog unlocked · <reason>` | Muted persistent user-only history entry; human path remains untyped |
@@ -316,11 +317,14 @@ On invalid decision:
 - Consumes **one** shared `maxRetries` attempt while keeping the watchdog locked
 - Records the absolute deadline `waitUntilMs = now + wait_seconds * 1000`
 - Appends exactly one persistent TUI-only entry, `Continue watchdog waiting · <seconds>s · <reason>`, before arming the deadline; if persistence fails, roll back the consumed attempt/deadline and stop without scheduling the wait
+- After that append succeeds and the same ownership claim remains current, publishes exactly one fresh plain-data envelope on `pi:semantic-hook:v1`: `{"version":1,"name":"watchdog-waiting","values":{"REASON":"<validated trimmed reason>","WAIT_SECONDS":"<accepted decimal seconds>"}}`
+- Revalidates ownership after publication before folding or scheduling; invalid, retried, preempted, stale, ownership-lost, persistence-failed, and rollback paths publish no waiting hook
+- Missing, throwing, or slow synchronous listeners remain optional and cannot change accepted wait state, folding, or scheduling; best-effort publication does not promise zero synchronous listener delay
 - Ends the decision without starting an ordinary continuation turn
 - Folds the complete decision exchange to nothing in future model-bound context; a later back-to-back watchdog check may receive only the normalized wait summary defined above
 - Suppresses automatic inquiry while current time is before `waitUntilMs`; renewed activity cancels stale timer identities and later idle requalifies against both the absolute deadline and the normal fixed fence
 - Unlock or a fresh lock clears `waitUntilMs` to `0`; cleared/stale callbacks are inert
-- If this wait consumes the final attempt, the controller may already be exhausted, but terminal `EXHAUSTED` publication waits until the complete deadline expires
+- If this wait consumes the final attempt, `watchdog-waiting` publishes immediately after durable acceptance, but terminal `EXHAUSTED` publication waits until the complete deadline expires
 
 ### Human `/unlock-continue-watchdog [reason]`
 
@@ -489,14 +493,17 @@ With defaults, every eligible all-idle generation waits **10s**.
 - no `reason_type` is accepted, consulted, displayed, or persisted for the wait; supplying one is invalid
 - the validated wait audit records reason `Waiting for CI.` and `waitSeconds=300`
 - one muted TUI-only entry is durably appended first: `Continue watchdog waiting · 300s · Waiting for CI.`
+- exactly one neutral `watchdog-waiting` hook then publishes `REASON=Waiting for CI.` and `WAIT_SECONDS=300`, with no `REASON_TYPE`
 - no ordinary continuation turn starts
 - model-bound context removes the full decision exchange and inserts nothing
 - one shared retry is consumed, the watchdog remains locked, and the absolute deadline is `waitUntilMs=310_000`
 - no automatic inquiry starts before that deadline
 - activity during the wait cancels its current timer identity; after activity returns idle, scheduling still honors the same absolute deadline and the fixed idle fence
 - unlock or fresh lock clears the deadline, and a cleared callback cannot open a decision or publish `EXHAUSTED`
-- if the wait entry cannot be persisted, the retry/deadline commit is rolled back and no wait is scheduled
-- if this wait consumes the final retry, `EXHAUSTED` is published only after the complete wait expires
+- if the wait entry cannot be persisted, the retry/deadline commit is rolled back, no wait is scheduled, and no waiting hook is published
+- if ownership becomes stale before or during append, no waiting hook is published; if listener publication itself demotes ownership, the one already-published hook is not repeated and later fold/scheduling stops
+- listener absence or failure does not alter the accepted wait
+- if this wait consumes the final retry, `watchdog-waiting` publishes immediately, while `EXHAUSTED` is published only after the complete wait expires
 
 ### Example 7 — Valid AI unlock: typed muted entry, fold to nothing, no further work turn
 

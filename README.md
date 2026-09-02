@@ -96,6 +96,7 @@ Reason types are trimmed and matched case-insensitively against their configured
 On Pi's public event bus (`pi:semantic-hook:v1`), the watchdog publishes:
 
 - `watchdog-continued` — after each durably recorded continue (`REASON_TYPE`, `REASON`).
+- `watchdog-waiting` — exactly once after each durably recorded wait (`REASON`, decimal `WAIT_SECONDS`); waits have no reason type.
 - `user-ready` — once when a terminal idle state is reached: AI unlock (`AI_UNLOCK`), budget exhausted (`EXHAUSTED`), or three invalid decisions (`DECISION_FAILED`).
 
 Delivery is best-effort; no consumer is required or waited for.
