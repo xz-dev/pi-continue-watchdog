@@ -45,12 +45,14 @@ interface MockReply {
 	readonly kind:
 		| "stop"
 		| "continue"
+		| "wait"
 		| "unlock"
 		| "invalid"
 		| "delayed"
 		| "connection-error";
 	readonly reasonType?: string;
 	readonly reason?: string;
+	readonly waitSeconds?: number;
 	readonly started?: () => void;
 	readonly text?: string;
 	readonly usage?: {
@@ -295,6 +297,7 @@ async function startMockServer(
 			}
 			if (
 				reply.kind === "continue" ||
+				reply.kind === "wait" ||
 				reply.kind === "unlock" ||
 				reply.kind === "invalid"
 			) {
@@ -302,9 +305,11 @@ async function startMockServer(
 					reply.kind === "continue"
 						? (reply.text ??
 							`<watchdog><function>continue_watchdog</function><reason_type>${reply.reasonType ?? "WORK_REMAINS"}</reason_type><reason_content>${reply.reason ?? "Implementation work remains."}</reason_content></watchdog>`)
-						: reply.kind === "unlock"
-							? `<watchdog><function>unlock_continue_watchdog</function><reason_type>${reply.reasonType ?? "JOB_DONE"}</reason_type><reason_content>${reply.reason ?? "finished"}</reason_content></watchdog>`
-							: (reply.text ?? "invalid watchdog response");
+						: reply.kind === "wait"
+							? `<watchdog><function>wait_watchdog</function><reason_content>${reply.reason ?? "Waiting for automation."}</reason_content><wait_seconds>${reply.waitSeconds ?? 30}</wait_seconds></watchdog>`
+							: reply.kind === "unlock"
+								? `<watchdog><function>unlock_continue_watchdog</function><reason_type>${reply.reasonType ?? "JOB_DONE"}</reason_type><reason_content>${reply.reason ?? "finished"}</reason_content></watchdog>`
+								: (reply.text ?? "invalid watchdog response");
 				sendSse(response, [
 					{
 						id,
@@ -1360,6 +1365,53 @@ test("packed interactive and RPC input preempt a streaming decision once", {
 		await shutdownSession(session);
 		sessionClosed = true;
 	}
+});
+
+test("packed neutral probe receives accepted waiting hook exactly once", {
+	timeout: 25_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t, {
+		withSemanticProbe: true,
+		watchdogConfig: { idleDelaySeconds: 10, maxRetries: 2 },
+	});
+	assert.ok(fixture.probeOut);
+	const server = await startMockServer(t, [
+		{ kind: "stop" },
+		{
+			kind: "wait",
+			reason: " Waiting for packed CI. ",
+			waitSeconds: 30,
+		},
+	]);
+	const { session } = await createSession(fixture, server.baseUrl);
+	t.after(() => shutdownSession(session));
+
+	await session.prompt("Wait for external automation after work settles.");
+	await waitFor(
+		() => server.requests.length === 2,
+		18_000,
+		"accepted wait decision request",
+	);
+	await waitForSessionIdle(session, 3_000, "accepted packed wait");
+
+	const waitEntries = session.sessionManager
+		.getBranch()
+		.filter(
+			(entry) =>
+				entry.type === "custom" &&
+				entry.customType === "pi-continue-watchdog:wait",
+		);
+	assert.equal(waitEntries.length, 1);
+	assert.deepEqual(await readProbeEnvelopes(fixture.probeOut), [
+		{
+			version: 1,
+			name: "watchdog-waiting",
+			values: {
+				REASON: "Waiting for packed CI.",
+				WAIT_SECONDS: "30",
+			},
+		},
+	]);
 });
 
 test("packed neutral probe receives typed continue and AI unlock hooks", {

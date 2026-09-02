@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import test from "node:test";
 import type {
 	ExtensionAPI,
@@ -25,11 +26,13 @@ import {
 import {
 	createUserReadyEnvelope,
 	createWatchdogContinuedEnvelope,
+	createWatchdogWaitingEnvelope,
 	emitSemanticHook,
 	SEMANTIC_HOOK_CHANNEL,
 	type SemanticHookEnvelope,
 	USER_READY_HOOK_NAME,
 	WATCHDOG_CONTINUED_HOOK_NAME,
+	WATCHDOG_WAITING_HOOK_NAME,
 } from "../src/semantic-hook.js";
 
 interface TimerRecord {
@@ -201,7 +204,13 @@ function createSemanticHarness(options?: {
 		customType: string,
 		hub: ReturnType<typeof createObservableAgentHub>,
 	) => void;
+	readonly onAppend?: (
+		type: string,
+		hub: ReturnType<typeof createObservableAgentHub>,
+	) => void;
 	readonly appendThrows?: string;
+	readonly listen?: boolean;
+	readonly eventBus?: ReturnType<typeof createEventBus>;
 }): SemanticHarness {
 	const config: ContinueWatchdogConfig = {
 		idleDelaySeconds: options?.config?.idleDelaySeconds ?? 3,
@@ -224,7 +233,7 @@ function createSemanticHarness(options?: {
 	const handlers = new Map<string, Handler[]>();
 	const clock = new FakeClock();
 	const received: SemanticHookEnvelope[] = [];
-	const bus = createEventBus();
+	const bus = options?.eventBus ?? createEventBus();
 	const notifications: Array<{ message: string; level?: string }> = [];
 	const sentTypes: string[] = [];
 	let runtime: ReturnType<typeof createDecisionRuntime>;
@@ -232,9 +241,11 @@ function createSemanticHarness(options?: {
 		null;
 	let startedDecisionDetails: unknown = null;
 
-	bus.on(SEMANTIC_HOOK_CHANNEL, (data) => {
-		received.push(data as SemanticHookEnvelope);
-	});
+	if (options?.listen !== false) {
+		bus.on(SEMANTIC_HOOK_CHANNEL, (data) => {
+			received.push(data as SemanticHookEnvelope);
+		});
+	}
 
 	const harness = {
 		handlers,
@@ -264,6 +275,7 @@ function createSemanticHarness(options?: {
 			options?.onSend?.(customType, hub);
 		},
 		appendEntry(type: string): void {
+			options?.onAppend?.(type, hub);
 			if (type === options?.appendThrows) throw new Error("append failed");
 		},
 	} as unknown as ExtensionAPI;
@@ -399,7 +411,7 @@ function assertFrozenEnvelope(envelope: SemanticHookEnvelope): void {
 	});
 }
 
-test("protocol builders emit exact terminal and continue envelopes as fresh frozen plain data", () => {
+test("protocol builders emit exact terminal, wait, and continue envelopes as fresh frozen plain data", () => {
 	const unlock = createUserReadyEnvelope({
 		STOP_KIND: "AI_UNLOCK",
 		REASON_TYPE: "JOB_DONE",
@@ -410,6 +422,14 @@ test("protocol builders emit exact terminal and continue envelopes as fresh froz
 	const continued = createWatchdogContinuedEnvelope({
 		REASON_TYPE: "VERIFYING",
 		REASON: "Tests still need to run.",
+	});
+	const waiting = createWatchdogWaitingEnvelope({
+		REASON: "Waiting for CI.",
+		WAIT_SECONDS: "30",
+	});
+	const secondWaiting = createWatchdogWaitingEnvelope({
+		REASON: "Waiting for CI.",
+		WAIT_SECONDS: "30",
 	});
 
 	assert.deepEqual(unlock, {
@@ -439,12 +459,25 @@ test("protocol builders emit exact terminal and continue envelopes as fresh froz
 			REASON: "Tests still need to run.",
 		},
 	});
+	assert.deepEqual(waiting, {
+		version: 1,
+		name: WATCHDOG_WAITING_HOOK_NAME,
+		values: {
+			REASON: "Waiting for CI.",
+			WAIT_SECONDS: "30",
+		},
+	});
+	assert.equal(Object.hasOwn(waiting.values ?? {}, "REASON_TYPE"), false);
+	assert.notEqual(waiting, secondWaiting);
+	assert.notEqual(waiting.values, secondWaiting.values);
 	assert.notEqual(unlock, exhausted);
 	assert.notEqual(exhausted, failed);
 	assertFrozenEnvelope(unlock);
 	assertFrozenEnvelope(exhausted);
 	assertFrozenEnvelope(failed);
 	assertFrozenEnvelope(continued);
+	assertFrozenEnvelope(waiting);
+	assertFrozenEnvelope(secondWaiting);
 
 	const bus = createEventBus();
 	const seen: unknown[] = [];
@@ -542,14 +575,310 @@ test("exhausted and decisionFailed publish exact STOP_KIND envelopes once", asyn
 	assert.equal(failed.received.length, 1);
 });
 
-test("final retry wait delays EXHAUSTED until its deadline", async () => {
+test("accepted wait publishes exact trimmed values once after append and before fold", async () => {
+	const order: string[] = [];
+	const harness = createSemanticHarness({
+		onAppend(type) {
+			if (type === "pi-continue-watchdog:wait") order.push("append");
+		},
+		onSend(customType) {
+			if (customType === "pi-continue-watchdog:inquiry-fold") {
+				order.push("fold");
+			}
+		},
+	});
+	harness.bus.on(SEMANTIC_HOOK_CHANNEL, (data) => {
+		if ((data as SemanticHookEnvelope).name === "watchdog-waiting") {
+			order.push("emit");
+		}
+	});
+	await startIdle(harness);
+	await harness.openDecision();
+	order.length = 0;
+	await settleResponse(
+		harness,
+		harness.answerWait(30, "  Waiting for automation.  "),
+	);
+
+	assert.deepEqual(harness.received, [
+		{
+			version: 1,
+			name: "watchdog-waiting",
+			values: {
+				REASON: "Waiting for automation.",
+				WAIT_SECONDS: "30",
+			},
+		},
+	]);
+	assert.deepEqual(order, ["append", "emit", "fold"]);
+	harness.runtime.reconcileIdle();
+	await settleOnly(harness);
+	assert.equal(harness.received.length, 1);
+});
+
+test("invalid and pre-persistence-stale waits publish no waiting hook", async () => {
+	const invalid = createSemanticHarness();
+	await startIdle(invalid);
+	await invalid.openDecision();
+	await settleResponse(invalid, invalid.answerWait(0, "Invalid duration."));
+	assert.equal(
+		invalid.received.some((envelope) => envelope.name === "watchdog-waiting"),
+		false,
+	);
+
+	const preempted = createSemanticHarness();
+	await startIdle(preempted);
+	await preempted.openDecision();
+	await preempted.fire("agent_end", {
+		type: "agent_end",
+		messages: [preempted.answerWait(30, "User preempts.")],
+	});
+	await preempted.fire("message_start", {
+		type: "message_start",
+		message: {
+			role: "user",
+			content: [{ type: "text", text: "take over" }],
+			timestamp: Date.now(),
+		},
+	});
+	preempted.streaming = false;
+	await settleOnly(preempted);
+	assert.equal(
+		preempted.received.some((envelope) => envelope.name === "watchdog-waiting"),
+		false,
+	);
+	assert.equal(preempted.snapshotController().attempt, 0);
+
+	const fence = deferredDomain();
+	fence.setDeferred(false);
+	const stale = createSemanticHarness({ processDomain: fence.domain });
+	await startIdle(stale);
+	await stale.openDecision();
+	fence.setDeferred(true);
+	await stale.fire("agent_end", {
+		type: "agent_end",
+		messages: [stale.answerWait(30, "Stale before persistence.")],
+	});
+	stale.streaming = false;
+	const settling = stale.fire("agent_settled", { type: "agent_settled" });
+	await waitForPendingConfirm(fence);
+	fence.resolve(false);
+	await settling;
+	assert.equal(
+		stale.received.some((envelope) => envelope.name === "watchdog-waiting"),
+		false,
+	);
+	assert.equal(stale.snapshotController().attempt, 0);
+});
+
+test("wait append failure and re-entrant ownership loss publish no waiting hook", async () => {
+	const failed = createSemanticHarness({
+		appendThrows: "pi-continue-watchdog:wait",
+	});
+	await startIdle(failed);
+	await failed.openDecision();
+	await settleResponse(failed, failed.answerWait(30, "Append fails."));
+	assert.equal(
+		failed.received.some((envelope) => envelope.name === "watchdog-waiting"),
+		false,
+	);
+	assert.deepEqual(failed.snapshotController(), {
+		locked: false,
+		exhausted: false,
+		decisionFailed: false,
+		attempt: 0,
+	});
+
+	let usurper:
+		| ReturnType<
+				ReturnType<typeof createObservableAgentHub>["bind"]
+		  >["attachment"]
+		| undefined;
+	const demoted = createSemanticHarness({
+		hasUI: false,
+		onAppend(type, hub) {
+			if (type !== "pi-continue-watchdog:wait") return;
+			usurper = hub.bind({
+				instance: createHubAttachmentInstance(),
+				sessionId: "wait-owner-usurper",
+				hasUI: true,
+				initialBusy: false,
+			}).attachment;
+		},
+	});
+	await startIdle(demoted);
+	await demoted.openDecision();
+	await settleResponse(demoted, demoted.answerWait(30, "Owner changes."));
+	assert.equal(demoted.runtime.isCurrentMain(), false);
+	assert.equal(
+		demoted.received.some((envelope) => envelope.name === "watchdog-waiting"),
+		false,
+	);
+	if (usurper !== undefined) demoted.hub.detach(usurper);
+});
+
+test("listener-side ownership loss is fenced after one waiting emit", async () => {
+	let usurper:
+		| ReturnType<
+				ReturnType<typeof createObservableAgentHub>["bind"]
+		  >["attachment"]
+		| undefined;
+	const harness = createSemanticHarness({ hasUI: false });
+	harness.bus.on(SEMANTIC_HOOK_CHANNEL, (data) => {
+		if ((data as SemanticHookEnvelope).name !== "watchdog-waiting") return;
+		usurper = harness.hub.bind({
+			instance: createHubAttachmentInstance(),
+			sessionId: "wait-listener-usurper",
+			hasUI: true,
+			initialBusy: false,
+		}).attachment;
+	});
+	await startIdle(harness);
+	await harness.openDecision();
+	await settleResponse(harness, harness.answerWait(30, "Listener demotes."));
+
+	assert.equal(
+		harness.received.filter((envelope) => envelope.name === "watchdog-waiting")
+			.length,
+		1,
+	);
+	assert.equal(harness.runtime.isCurrentMain(), false);
+	assert.equal(
+		harness.sentTypes.includes("pi-continue-watchdog:inquiry-fold"),
+		false,
+	);
+	if (usurper !== undefined) harness.hub.detach(usurper);
+});
+
+test("accepted wait does not depend on present or successful listeners", async () => {
+	const withoutListener = createSemanticHarness({ listen: false });
+	await startIdle(withoutListener);
+	await withoutListener.openDecision();
+	await settleResponse(
+		withoutListener,
+		withoutListener.answerWait(30, "No listener."),
+	);
+	assert.deepEqual(withoutListener.snapshotController(), {
+		locked: true,
+		exhausted: false,
+		decisionFailed: false,
+		attempt: 1,
+	});
+	assert.equal(
+		withoutListener.sentTypes.includes("pi-continue-watchdog:inquiry-fold"),
+		true,
+	);
+
+	const throwingEmitter = new EventEmitter();
+	const throwing = createSemanticHarness({
+		config: { maxRetries: 1 },
+		eventBus: {
+			emit(channel, data): void {
+				throwingEmitter.emit(channel, data);
+			},
+			on(channel, handler) {
+				throwingEmitter.on(channel, handler);
+				return () => throwingEmitter.off(channel, handler);
+			},
+			clear(): void {
+				throwingEmitter.removeAllListeners();
+			},
+		},
+	});
+	let throwingListenerReached = false;
+	throwing.bus.on(SEMANTIC_HOOK_CHANNEL, (data) => {
+		if ((data as SemanticHookEnvelope).name === "watchdog-waiting") {
+			throwingListenerReached = true;
+			throw new Error("intentional waiting consumer failure");
+		}
+	});
+	await startIdle(throwing);
+	await throwing.openDecision();
+	await settleResponse(throwing, throwing.answerWait(30, "Throwing listener."));
+	assert.equal(throwingListenerReached, true);
+	assert.deepEqual(throwing.snapshotController(), {
+		locked: true,
+		exhausted: true,
+		decisionFailed: false,
+		attempt: 1,
+	});
+	assert.deepEqual(throwing.received, [
+		{
+			version: 1,
+			name: "watchdog-waiting",
+			values: {
+				REASON: "Throwing listener.",
+				WAIT_SECONDS: "30",
+			},
+		},
+	]);
+	assert.equal(
+		throwing.sentTypes.includes("pi-continue-watchdog:inquiry-fold"),
+		true,
+	);
+	const throwingDeadlineTimer = throwing.clock.records.findLastIndex(
+		(record) => record.delayMs === 30_000 && !record.cleared,
+	);
+	assert.ok(throwingDeadlineTimer >= 0);
+	throwing.clock.fire(throwingDeadlineTimer);
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.deepEqual(throwing.received, [
+		{
+			version: 1,
+			name: "watchdog-waiting",
+			values: {
+				REASON: "Throwing listener.",
+				WAIT_SECONDS: "30",
+			},
+		},
+		{
+			version: 1,
+			name: "user-ready",
+			values: { STOP_KIND: "EXHAUSTED" },
+		},
+	]);
+
+	const slow = createSemanticHarness();
+	let slowListenerReturned = false;
+	slow.bus.on(SEMANTIC_HOOK_CHANNEL, (data) => {
+		if ((data as SemanticHookEnvelope).name !== "watchdog-waiting") return;
+		Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+		slowListenerReturned = true;
+	});
+	await startIdle(slow);
+	await slow.openDecision();
+	await settleResponse(slow, slow.answerWait(30, "Slow listener."));
+	assert.equal(slowListenerReturned, true);
+	assert.deepEqual(slow.snapshotController(), {
+		locked: true,
+		exhausted: false,
+		decisionFailed: false,
+		attempt: 1,
+	});
+	assert.equal(
+		slow.sentTypes.includes("pi-continue-watchdog:inquiry-fold"),
+		true,
+	);
+});
+
+test("final retry wait publishes waiting immediately and delays EXHAUSTED until its deadline", async () => {
 	const harness = createSemanticHarness({ config: { maxRetries: 1 } });
 	await startIdle(harness);
 	await harness.openDecision();
 	await settleResponse(harness, harness.answerWait(30, "Waiting for CI."));
 
 	assert.equal(harness.snapshotController().exhausted, true);
-	assert.equal(harness.received.length, 0);
+	assert.deepEqual(harness.received, [
+		{
+			version: 1,
+			name: "watchdog-waiting",
+			values: {
+				REASON: "Waiting for CI.",
+				WAIT_SECONDS: "30",
+			},
+		},
+	]);
 	const deadlineTimer = harness.clock.records.findLastIndex(
 		(record) => record.delayMs === 30_000 && !record.cleared,
 	);
@@ -561,10 +890,24 @@ test("final retry wait delays EXHAUSTED until its deadline", async () => {
 	assert.deepEqual(harness.received, [
 		{
 			version: 1,
+			name: "watchdog-waiting",
+			values: {
+				REASON: "Waiting for CI.",
+				WAIT_SECONDS: "30",
+			},
+		},
+		{
+			version: 1,
 			name: "user-ready",
 			values: { STOP_KIND: "EXHAUSTED" },
 		},
 	]);
+	const deadlineRecord = harness.clock.records[deadlineTimer];
+	assert.ok(deadlineRecord);
+	deadlineRecord.callback();
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(harness.received.length, 2);
 });
 
 test("unlock clears a final wait deadline and makes its stale timer inert", async () => {
@@ -590,7 +933,16 @@ test("unlock clears a final wait deadline and makes its stale timer inert", asyn
 	deadlineRecord.callback();
 	await Promise.resolve();
 	await Promise.resolve();
-	assert.deepEqual(harness.received, []);
+	assert.deepEqual(harness.received, [
+		{
+			version: 1,
+			name: "watchdog-waiting",
+			values: {
+				REASON: "Waiting for CI.",
+				WAIT_SECONDS: "30",
+			},
+		},
+	]);
 });
 
 test("pending confirmation across a final-wait deadline reset publishes no EXHAUSTED", async () => {
@@ -604,7 +956,16 @@ test("pending confirmation across a final-wait deadline reset publishes no EXHAU
 	await harness.openDecision();
 	await settleResponse(harness, harness.answerWait(30, "Waiting for CI."));
 	assert.equal(harness.controller.snapshot.exhausted, true);
-	assert.equal(harness.received.length, 0);
+	assert.deepEqual(harness.received, [
+		{
+			version: 1,
+			name: "watchdog-waiting",
+			values: {
+				REASON: "Waiting for CI.",
+				WAIT_SECONDS: "30",
+			},
+		},
+	]);
 
 	// Isolate the race under test: wait finalization is complete; only terminal
 	// publication confirmation is deferred.
@@ -625,7 +986,12 @@ test("pending confirmation across a final-wait deadline reset publishes no EXHAU
 
 	fence.resolve(true);
 	await new Promise<void>((resolve) => setImmediate(resolve));
-	assert.deepEqual(harness.received, []);
+	assert.equal(
+		harness.received.filter((envelope) => envelope.name === "user-ready")
+			.length,
+		0,
+	);
+	assert.equal(harness.received.length, 1);
 });
 
 test("continue persistence failure publishes no hook and dispatches no continuation", async () => {

@@ -79,6 +79,7 @@ import {
 import {
 	createUserReadyEnvelope,
 	createWatchdogContinuedEnvelope,
+	createWatchdogWaitingEnvelope,
 	emitSemanticHook,
 } from "./semantic-hook.js";
 
@@ -2034,6 +2035,18 @@ export function createDecisionRuntime(
 				});
 				silentlyAbandonDecision();
 				return false;
+			}
+			if (stopIfStale(claim)) return false;
+			try {
+				emitSemanticHook(
+					options.pi.events,
+					createWatchdogWaitingEnvelope({
+						REASON: reason,
+						WAIT_SECONDS: String(waitSeconds),
+					}),
+				);
+			} catch {
+				// Listener failures never gate an accepted wait.
 			}
 			const watchdogResult: DecisionTerminalResult = {
 				outcome: "wait",

@@ -11,6 +11,9 @@ export const SEMANTIC_HOOK_CHANNEL = "pi:semantic-hook:v1";
 /** Semantic name published by this producer when the watchdog will not auto-wake. */
 export const USER_READY_HOOK_NAME = "user-ready";
 
+/** Semantic name published after an accepted wait is durably recorded. */
+export const WATCHDOG_WAITING_HOOK_NAME = "watchdog-waiting";
+
 /** Semantic name published after an accepted continue is durably recorded. */
 export const WATCHDOG_CONTINUED_HOOK_NAME = "watchdog-continued";
 
@@ -30,6 +33,11 @@ export interface UserReadyValues {
 	readonly REASON_TYPE?: string;
 	/** Present only for AI decision unlock; validated trimmed reason. */
 	readonly REASON?: string;
+}
+
+export interface WatchdogWaitingValues {
+	readonly REASON: string;
+	readonly WAIT_SECONDS: string;
 }
 
 export interface WatchdogContinuedValues {
@@ -66,6 +74,20 @@ export function createUserReadyEnvelope(
 			STOP_KIND: values.STOP_KIND,
 			REASON_TYPE: values.REASON_TYPE,
 			REASON: values.REASON,
+		}),
+	});
+}
+
+/** Build a fresh plain-data accepted-wait envelope. */
+export function createWatchdogWaitingEnvelope(
+	values: WatchdogWaitingValues,
+): SemanticHookEnvelope {
+	return Object.freeze({
+		version: 1 as const,
+		name: WATCHDOG_WAITING_HOOK_NAME,
+		values: freezeValues({
+			REASON: values.REASON,
+			WAIT_SECONDS: values.WAIT_SECONDS,
 		}),
 	});
 }
