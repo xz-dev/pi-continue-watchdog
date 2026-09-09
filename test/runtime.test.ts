@@ -1935,7 +1935,8 @@ test("each invalid XML response persists a parser re-ask event and updates check
 			kind: "validation-error",
 			exchangeId: "exchange-1",
 			cycleId: 1,
-			message: "End the response with one valid watchdog XML decision block.",
+			message:
+				"Your entire response must be exactly one valid watchdog XML decision document.",
 		},
 	});
 	assert.notEqual(harness.widgets.at(-1)?.value, undefined);
@@ -1984,7 +1985,8 @@ test("decision message_end audit records invalid output without retaining raw te
 			exchangeId: "exchange-1",
 			cycleId: 1,
 			outcome: "invalid",
-			error: "End the response with one valid watchdog XML decision block.",
+			error:
+				"Your entire response must be exactly one valid watchdog XML decision document.",
 		},
 	});
 	assert.equal(
@@ -2242,12 +2244,13 @@ test("invalid decisions reask only after settle and third failure stays stopped"
 			?.watchdogResult,
 		{
 			outcome: "decision-failed",
-			error: "End the response with one valid watchdog XML decision block.",
+			error:
+				"Your entire response must be exactly one valid watchdog XML decision document.",
 		},
 	);
 	assert.deepEqual(harness.notifications.at(-1), {
 		message:
-			"Continue watchdog decision failed after 3 attempts: End the response with one valid watchdog XML decision block.",
+			"Continue watchdog decision failed after 3 attempts: Your entire response must be exactly one valid watchdog XML decision document.",
 		level: "warning",
 	});
 });
@@ -2552,7 +2555,7 @@ test("decision settle without agent_end reasks twice then decision-fails without
 	);
 	assert.deepEqual(harness.notifications.at(-1), {
 		message:
-			"Continue watchdog decision failed after 3 attempts: The decision response was malformed. End with the watchdog XML decision block.",
+			"Continue watchdog decision failed after 3 attempts: The decision response was malformed. Your entire response must be the one watchdog XML document.",
 		level: "warning",
 	});
 });

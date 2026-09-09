@@ -13,7 +13,7 @@ import type {
 export const DECISION_INVALID_ATTEMPT_LIMIT = 3;
 
 export const INVALID_DECISION_XML_ERROR =
-	"End the response with one valid watchdog XML decision block.";
+	"Your entire response must be exactly one valid watchdog XML decision document.";
 export const INVALID_CONTINUE_REASON_TYPE_ERROR =
 	"continue_watchdog requires an allowed reason_type.";
 export const INVALID_CONTINUE_REASON_ERROR =
@@ -35,16 +35,16 @@ export const INVALID_UNLOCK_REASON_ERROR =
 export const MISSING_UNLOCK_FIELDS_ERROR =
 	"unlock_continue_watchdog requires reason_type and reason_content.";
 export const UNSUPPORTED_DECISION_CONTENT_ERROR =
-	"The decision response contains unsupported content. End with the watchdog XML decision block.";
+	"The decision response contains unsupported content. Your entire response must be the one watchdog XML document.";
 export const MALFORMED_DECISION_RESPONSE_ERROR =
-	"The decision response was malformed. End with the watchdog XML decision block.";
+	"The decision response was malformed. Your entire response must be the one watchdog XML document.";
 
 export const MIN_WAIT_SECONDS = 1;
 export const MAX_WAIT_SECONDS = 30 * 60;
 
 /** Block reason returned for ordinary tool calls while a decision is open. */
 export const DECISION_TOOL_BLOCK_REASON =
-	"Do not call tools during the pi-continue-watchdog decision check. Answer from the existing conversation and end with exactly one watchdog XML decision block.";
+	"Do not call tools during the pi-continue-watchdog decision check. Answer from the existing conversation, and make your entire response exactly one watchdog XML document with nothing else.";
 
 export interface DecisionTextContent {
 	readonly type: "text";
@@ -269,7 +269,7 @@ export function buildDecisionPrompt(
 		{ name: "reason_type", value: reasonTypes[0] ?? "ALLOWED_TYPE" },
 		{ name: "reason_content", value: "concise reason" },
 	]);
-	return `${decisionPrompt}\n\nUse only the existing conversation context and decide quickly. Do not make decisions on the user's behalf. Do not call tools. You may explain your decision first, or output only XML. In either case, output exactly one <watchdog>...</watchdog> XML block at the very end of your response. After surrounding whitespace is trimmed, </watchdog> must be the final text. Do not output multiple <watchdog>...</watchdog> blocks.\n\nIf you want to continue working, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedContinueReasonTypes}. End with:\n${continueExample}\n\nIf you think the work is finished or blocked and the user should take over, use unlock. reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedReasonTypes}. End with:\n${unlockExample}\n\nIf you think work should wait a period of time before continuing (for example external automation such as CI or a subagent has not finished yet), use a non-empty reason_content and an integer wait_seconds from ${MIN_WAIT_SECONDS} through ${MAX_WAIT_SECONDS}. End with:\n${waitExample}`;
+	return `${decisionPrompt}\n\nUse only the existing conversation context and decide quickly. Do not make decisions on the user's behalf. Do not call tools. Your entire response must be exactly one <watchdog>...</watchdog> XML document, with no text before or after it; express your reasoning inside the fields, above all reason_content. Do not output multiple <watchdog>...</watchdog> blocks.\n\nIf you want to continue working, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedContinueReasonTypes}. Use:\n${continueExample}\n\nIf you think the work is finished or blocked and the user should take over, use unlock. reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedReasonTypes}. Use:\n${unlockExample}\n\nIf you think work should wait a period of time before continuing (for example external automation such as CI or a subagent has not finished yet), use a non-empty reason_content and an integer wait_seconds from ${MIN_WAIT_SECONDS} through ${MAX_WAIT_SECONDS}. Use:\n${waitExample}`;
 }
 
 interface ParsedWatchdogFields {
@@ -489,7 +489,7 @@ export function buildDecisionReaskPrompt(
 	decisionPrompt: string,
 	error: string,
 ): string {
-	return `${decisionPrompt}\n\nYour previous decision response was invalid: ${error}\nCorrect it now without calling tools. You may explain first, but the watchdog XML block must be at the very end of your response.`;
+	return `${decisionPrompt}\n\nYour previous decision response was invalid: ${error}\nCorrect it now without calling tools. Your entire response must be exactly one valid <watchdog> XML document with no text before or after it.`;
 }
 
 /** Exact user-only warning text emitted by future runtime wiring on failure. */

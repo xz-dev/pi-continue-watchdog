@@ -515,7 +515,7 @@ test("fixed prompt suffix requires typed reasons for both decisions", () => {
 	assert.match(prompt, /Do not call tools/);
 	assert.match(prompt, /existing conversation context/);
 	assert.match(prompt, /exactly one <watchdog>\.\.\.<\/watchdog>/);
-	assert.match(prompt, /very end of your response/);
+	assert.match(prompt, /very end of your response|no text before or after it/);
 	assert.match(prompt, /Do not output multiple/);
 	assert.match(prompt, /\["JOB_DONE","WAIT_USER"\]/);
 	assert.match(prompt, /\["WORK_REMAINS","VERIFYING"\]/);
@@ -553,10 +553,10 @@ test("fixed prompt suffix XML-escapes an arbitrary reason type and lists types u
 	assert.equal(prompt.includes("<reason_type>Need <Review & Approval"), false);
 });
 
-test("re-ask prompt embeds the fixed previous error and keeps the XML block last rule", () => {
+test("re-ask prompt embeds the fixed previous error and keeps the entire-response XML rule", () => {
 	assert.equal(
 		buildDecisionReaskPrompt(DECISION_PROMPT, INVALID_DECISION_XML_ERROR),
-		"Decision prompt from configuration.\n\nYour previous decision response was invalid: End the response with one valid watchdog XML decision block.\nCorrect it now without calling tools. You may explain first, but the watchdog XML block must be at the very end of your response.",
+		"Decision prompt from configuration.\n\nYour previous decision response was invalid: Your entire response must be exactly one valid watchdog XML decision document.\nCorrect it now without calling tools. Your entire response must be exactly one valid <watchdog> XML document with no text before or after it.",
 	);
 });
 
@@ -685,7 +685,7 @@ test("third invalid response decision-fails without advancing retries", () => {
 	assert.equal(third.cycleId, protocol.currentCycleId);
 	assert.equal(
 		third.notification,
-		"Continue watchdog decision failed after 3 attempts: End the response with one valid watchdog XML decision block.",
+		"Continue watchdog decision failed after 3 attempts: Your entire response must be exactly one valid watchdog XML decision document.",
 	);
 	assert.equal(DECISION_INVALID_ATTEMPT_LIMIT, 3);
 	assert.equal(
