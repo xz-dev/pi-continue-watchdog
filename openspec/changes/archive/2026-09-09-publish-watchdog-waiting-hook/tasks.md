@@ -17,5 +17,5 @@
 - [x] 3.3 Intentionally disable the new emit once and verify the acceptance test fails, then restore the candidate and rerun the focused test.
 - [x] 3.4 Obtain provisional independent review of the uncommitted working-tree candidate, resolve every finding, and rerun affected checks; explicitly record that this review is not approval of an immutable SHA.
 - [x] 3.5 After explicit user confirmation for local commits only, create separate GPG-signed Conventional functional and documentation commits and verify their signatures; do not push or integrate under this authorization.
-- [ ] 3.6 Independently review the resulting exact commit SHAs or prove tree equivalence to the provisionally reviewed candidate, resolve any finding through separately authorized follow-up commits, rerun affected checks, and retain approval tied to the final exact SHAs.
-- [ ] 3.7 After separate explicit user confirmation for push/integration, publish only the exact approved commits, fast-forward them into `master`, remove the feature branch, and confirm local/public SHAs match.
+- [x] 3.6 Independently review the resulting exact commit SHAs or prove tree equivalence to the provisionally reviewed candidate, resolve any finding through separately authorized follow-up commits, rerun affected checks, and retain approval tied to the final exact SHAs.
+- [x] 3.7 After separate explicit user confirmation for push/integration, publish only the exact approved commits, fast-forward them into `master`, remove the feature branch, and confirm local/public SHAs match.
