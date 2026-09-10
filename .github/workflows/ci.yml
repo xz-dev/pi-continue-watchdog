@@ -28,4 +28,4 @@ jobs:
           # preparation-free Git dependency must not turn that project policy
           # into a forbidden child-install CLI policy.
           NPM_CONFIG_CACHE="$install_root/npm-cache" npx --yes npm@12.0.2 install --omit=dev --no-audit --no-fund
-          node --input-type=module -e 'import("pi-process-domain").then((module) => { if (typeof module.openDomain !== "function") process.exit(1); })'
+          node --input-type=module -e 'import("pi-extension-utils/process-domain").then((module) => { if (typeof module.openProcessDomain !== "function") process.exit(1); })'
