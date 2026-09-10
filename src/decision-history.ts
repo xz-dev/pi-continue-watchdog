@@ -86,9 +86,28 @@ export function formatContiguousWatchdogHistory(
 	return buildHistoryBlock(lines.slice(start), start);
 }
 
+// A retry-recovered ordinary assistant (stopReason "stop") that immediately
+// follows a retry-errored assistant (stopReason "error") completes the SAME
+// run Pi retried; it is not a new ordinary-work boundary. Skip both and keep
+// scanning so the watchdog history chain survives a transient failure.
+function isRetryRecoveredStop(
+	entries: readonly SessionEntry[],
+	stopIndex: number,
+): boolean {
+	for (let index = stopIndex - 1; index >= 0; index -= 1) {
+		const entry = entries[index];
+		if (entry === undefined) continue;
+		if (entry.type !== "message" || entry.message.role !== "assistant")
+			return false;
+		return entry.message.stopReason === "error";
+	}
+	return false;
+}
+
 /**
  * Collect the active branch's zero-loop watchdog suffix.
- * Only a successful ordinary assistant turn ends the suffix.
+ * Only a successful ordinary assistant turn ends the suffix; a stop that
+ * merely recovers an immediately-preceding retried error does not.
  */
 export function collectContiguousWatchdogHistory(
 	entries: readonly SessionEntry[],
@@ -120,7 +139,8 @@ export function collectContiguousWatchdogHistory(
 			entry.type === "message" &&
 			entry.message.role === "assistant" &&
 			!isCorrelatedInquiryAssistantMessage(entry.message) &&
-			entry.message.stopReason === "stop"
+			entry.message.stopReason === "stop" &&
+			!isRetryRecoveredStop(entries, index)
 		) {
 			break;
 		}

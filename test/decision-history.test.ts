@@ -191,6 +191,28 @@ test("successful ordinary assistant stops the chain", () => {
 	]);
 });
 
+test("retry-recovered ordinary assistant does not stop the chain", () => {
+	const entries = [
+		fold("old", 1, { outcome: "preempted" }),
+		message(assistant("error")),
+		message(assistant("stop")),
+	];
+	assert.deepEqual(collectContiguousWatchdogHistory(entries), [
+		{ outcome: "preempted" },
+	]);
+});
+
+test("ordinary stop after a non-adjacent error still stops the chain", () => {
+	const entries = [
+		fold("old", 1, { outcome: "preempted" }),
+		message(assistant("error")),
+		message(assistant("stop")),
+		fold("new", 1, { outcome: "invalidated" }),
+		message(assistant("stop")),
+	];
+	assert.deepEqual(collectContiguousWatchdogHistory(entries), []);
+});
+
 test("unsuccessful and intermediate ordinary assistants do not stop the chain", () => {
 	for (const stopReason of [
 		"pending",

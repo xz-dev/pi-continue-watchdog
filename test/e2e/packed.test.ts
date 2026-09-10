@@ -1026,16 +1026,18 @@ test("packed failed ordinary continuation feeds normalized history to the next w
 }, async (t) => {
 	const rawNarration = "RAW_HIDDEN_WATCHDOG_NARRATION";
 	const safeReason = "History-safe continuation reason.";
-	const fixture = await makePackedFixture(t, {
-		piSettings: { retry: { enabled: false } },
-	});
+	const fixture = await makePackedFixture(t);
 	const { baseUrl, requests } = await startMockServer(t, [
 		{ kind: "stop", text: "ordinary initial response" },
 		{
 			kind: "continue",
 			text: `${rawNarration}\n<watchdog><function>continue_watchdog</function><reason_type>WORK_REMAINS</reason_type><reason_content>${safeReason}</reason_content></watchdog>`,
 		},
+		// Transient failure: stock Pi auto-retry (default maxRetries 3) recovers,
+		// so the settlement is a non-error terminal outcome and the watchdog must
+		// keep the fence + follow-up decision per the terminal-outcome gate.
 		{ kind: "connection-error" },
+		{ kind: "stop", text: "continuation recovered after transient failure" },
 		{ kind: "unlock", reason: "zero-loop history verified" },
 	]);
 	const { session } = await createSession(fixture, baseUrl);
@@ -1045,17 +1047,17 @@ test("packed failed ordinary continuation feeds normalized history to the next w
 		"Start work whose automatic continuation will fail once.",
 	);
 	await waitFor(
-		() => requests.length >= 3,
+		() => requests.length >= 4,
 		20_000,
-		"failed ordinary continuation request",
+		"retried ordinary continuation request",
 	);
 	await waitForSessionIdle(
 		session,
 		5_000,
-		"failed ordinary continuation settle",
+		"recovered ordinary continuation settle",
 	);
 	await waitFor(
-		() => requests.length === 4,
+		() => requests.length === 5,
 		20_000,
 		"immediate follow-up watchdog decision",
 	);
@@ -1063,7 +1065,7 @@ test("packed failed ordinary continuation feeds normalized history to the next w
 
 	const firstDecision = requests[1];
 	const failedContinuation = requests[2];
-	const followUpDecision = requests[3];
+	const followUpDecision = requests[4];
 	assert.ok(firstDecision);
 	assert.ok(failedContinuation);
 	assert.ok(followUpDecision);
