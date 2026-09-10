@@ -128,6 +128,7 @@ interface AbortHarness {
 	readonly notifications: string[];
 	readonly effects: ControllerEffect[];
 	readonly timeline: string[];
+	readonly entries: Array<{ customType: string; data: unknown }>;
 	readonly sessionManager: FakeSessionManager;
 	readonly attachment: HubAttachment;
 	readonly claim: HubMainClaim;
@@ -159,9 +160,15 @@ function createAbortHarness(
 	const notifications: string[] = [];
 	const effects: ControllerEffect[] = [];
 	const timeline: string[] = [];
+	const entries: Array<{ customType: string; data: unknown }> = [];
 	const sessionManager = createSessionManager(options.initialBranch ?? []);
 
-	registerMainAbortUnlock(multiOn(handlers), {
+	const pi = Object.assign(multiOn(handlers), {
+		appendEntry(customType: string, data: unknown): void {
+			entries.push({ customType, data });
+		},
+	});
+	registerMainAbortUnlock(pi, {
 		isCurrentMain() {
 			const claim = hub.mainClaimFor(bound.attachment);
 			return claim !== null && hub.isCurrentMain(claim);
@@ -192,6 +199,7 @@ function createAbortHarness(
 		notifications,
 		effects,
 		timeline,
+		entries,
 		sessionManager,
 		attachment: bound.attachment,
 		claim: bound.mainClaim,
@@ -216,12 +224,14 @@ function createAbortHarness(
 function createExtensionHarness(controller: LockDecisionController): {
 	readonly handlers: Map<string, LifecycleHandler[]>;
 	readonly notifications: string[];
+	readonly entries: Array<{ customType: string; data: unknown }>;
 	readonly sessionManager: FakeSessionManager;
 	readonly ctx: ExtensionContext;
 } {
 	const hub = createObservableAgentHub();
 	const handlers = new Map<string, LifecycleHandler[]>();
 	const notifications: string[] = [];
+	const entries: Array<{ customType: string; data: unknown }> = [];
 	const sessionManager = createSessionManager([user("u0")]);
 	let activeTools: string[] = ["bash", "read"];
 
@@ -239,8 +249,8 @@ function createExtensionHarness(controller: LockDecisionController): {
 		registerEntryRenderer() {},
 		registerCommand() {},
 		registerShortcut() {},
-		appendEntry() {
-			throw new Error("abort unlock must not append a reason entry");
+		appendEntry(customType: string, data: unknown) {
+			entries.push({ customType, data });
 		},
 	} as unknown as ExtensionAPI;
 
@@ -261,7 +271,7 @@ function createExtensionHarness(controller: LockDecisionController): {
 		},
 	} as unknown as ExtensionContext;
 
-	return { handlers, notifications, sessionManager, ctx };
+	return { handlers, notifications, entries, sessionManager, ctx };
 }
 
 test("pure: boundary capture and suffix terminal outcomes", () => {
@@ -293,14 +303,14 @@ test("pure: boundary capture and suffix terminal outcomes", () => {
 			{ getBranch: () => [assistant("a", "error")] },
 			null,
 		),
-		"non-aborted",
+		"error",
 	);
 	assert.equal(
 		inspectTerminalAssistantOutcome(
 			{ getBranch: () => [user("u0"), assistant("a", "error")] },
 			"u0",
 		),
-		"non-aborted",
+		"error",
 	);
 	assert.equal(
 		inspectTerminalAssistantOutcome({ getBranch: () => [] }, null),
@@ -408,7 +418,7 @@ test("already-unlocked abort still notifies bare text", async () => {
 	assert.deepEqual(harness.notifications, ["Continue watchdog unlocked"]);
 });
 
-test("terminal error settle stays locked without bare unlock", async () => {
+test("terminal error settle auto-unlocks with a distinct record and no decision", async () => {
 	const harness = createAbortHarness({ locked: true });
 	harness.append(user("u0"));
 	await harness.start();
@@ -421,15 +431,53 @@ test("terminal error settle stays locked without bare unlock", async () => {
 	harness.append(assistant("a1", "error"));
 	await harness.settle();
 
-	assert.equal(harness.controller.snapshot.locked, true);
-	assert.equal(harness.controller.snapshot.decisionOpen, true);
+	// Auto unlock: decision cleared, attempt accounting preserved, one
+	// distinct notification, and a human-unlock-style entry marked automatic.
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
 	assert.equal(harness.controller.snapshot.attempt, 1);
+	assert.deepEqual(harness.notifications, [
+		"Continue watchdog unlocked · run ended in error",
+	]);
+	assert.deepEqual(harness.entries, [
+		{
+			customType: "pi-continue-watchdog:unlock",
+			data: { reason: "run ended in error (automatic unlock)" },
+		},
+	]);
+	assert.deepEqual(harness.timeline, [
+		"cleanup:locked=false",
+		"restoreDecisionTools",
+		"notify:Continue watchdog unlocked · run ended in error",
+	]);
+});
+
+test("terminal error settle while unlocked stays unconditional", async () => {
+	const harness = createAbortHarness({ locked: false });
+	harness.append(user("u0"));
+	await harness.start();
+	harness.append(assistant("a1", "error"));
+	await harness.settle();
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.deepEqual(harness.notifications, [
+		"Continue watchdog unlocked · run ended in error",
+	]);
+});
+
+test("terminal error without a final error assistant falls through to the normal path", async () => {
+	const harness = createAbortHarness({ locked: true });
+	harness.append(user("u0"));
+	await harness.start();
+	// Error text inside a successful assistant is not a terminal error.
+	harness.append({
+		id: "a1",
+		type: "message",
+		message: { role: "assistant", stopReason: "stop" },
+	});
+	await harness.settle();
+	assert.equal(harness.controller.snapshot.locked, true);
 	assert.deepEqual(harness.notifications, []);
-	assert.deepEqual(
-		harness.effects.map((effect) => effect.kind),
-		[],
-	);
-	assert.deepEqual(harness.timeline, []);
+	assert.deepEqual(harness.entries, []);
 });
 
 test("non-aborted matrix and no-assistant / missing-boundary stay locked", async () => {
@@ -674,4 +722,40 @@ test("extension registers hooks, clears on shutdown, and unlocks through settle"
 	);
 	assert.equal(unlockController.snapshot.locked, false);
 	assert.deepEqual(unlock.notifications, ["Continue watchdog unlocked"]);
+	assert.deepEqual(unlock.entries, []);
+});
+
+test("extension routes a terminal error settle to auto unlock before any fence", async () => {
+	const controller = makeController();
+	controller.lock();
+	const harness = createExtensionHarness(controller);
+	await fireHandlers(
+		harness.handlers,
+		"session_start",
+		{ type: "session_start", reason: "startup" },
+		harness.ctx,
+	);
+	await fireHandlers(
+		harness.handlers,
+		"agent_start",
+		{ type: "agent_start" },
+		harness.ctx,
+	);
+	harness.sessionManager.append(assistant("a1", "error"));
+	await fireHandlers(
+		harness.handlers,
+		"agent_settled",
+		{ type: "agent_settled" },
+		harness.ctx,
+	);
+	assert.equal(controller.snapshot.locked, false);
+	assert.deepEqual(harness.notifications, [
+		"Continue watchdog unlocked · run ended in error",
+	]);
+	assert.deepEqual(harness.entries, [
+		{
+			customType: "pi-continue-watchdog:unlock",
+			data: { reason: "run ended in error (automatic unlock)" },
+		},
+	]);
 });

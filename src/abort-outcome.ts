@@ -3,6 +3,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
+import { HUMAN_UNLOCK_ENTRY_TYPE, type HumanUnlockEntry } from "./commands.js";
 import type {
 	ControllerEffect,
 	ControllerTransition,
@@ -21,6 +22,7 @@ import type { HubMainClaim } from "./hub.js";
 
 export type TerminalAssistantOutcome =
 	| "aborted"
+	| "error"
 	| "non-aborted"
 	| "none"
 	| "boundary-missing";
@@ -117,27 +119,64 @@ export function inspectTerminalAssistantOutcome(
 
 	if (terminalStopReason === undefined) return "none";
 	if (terminalStopReason === "aborted") return "aborted";
+	if (terminalStopReason === "error") return "error";
 	return "non-aborted";
 }
 
 const UNLOCKED_NOTIFICATION = "Continue watchdog unlocked";
+const ERROR_UNLOCKED_NOTIFICATION =
+	"Continue watchdog unlocked · run ended in error";
+const ERROR_AUTO_UNLOCK_REASON = "run ended in error (automatic unlock)";
 
 async function applyUnlockEffects(
 	transition: ControllerTransition,
 	runtime: MainAbortUnlockRuntime,
 	ctx: ExtensionContext,
 	claim: HubMainClaim,
+	notification: string = UNLOCKED_NOTIFICATION,
 ): Promise<void> {
 	for (const effect of transition.effects) {
 		if (!runtime.isCurrentMainClaim(claim)) return;
 		if (effect.kind === "notify") {
-			// Reasonless abort unlock always uses the exact bare notification.
+			// Automatic unlocks always use their exact fixed notification.
 			if (effect.notification === "unlocked") {
-				ctx.ui.notify(UNLOCKED_NOTIFICATION);
+				ctx.ui.notify(notification);
 			}
 			continue;
 		}
 		await runtime.applyEffect(effect, ctx);
+	}
+}
+
+/** Shared authoritative unlock → cleanup → effects → notify sequence. */
+async function performAutoUnlock(
+	pi: ExtensionAPI,
+	runtime: MainAbortUnlockRuntime,
+	ctx: ExtensionContext,
+	claim: HubMainClaim,
+	options: {
+		readonly notification: string;
+		readonly entryReason?: string;
+	},
+): Promise<void> {
+	const controller = runtime.controller;
+	if (controller === null || !runtime.isCurrentMainClaim(claim)) return;
+	// Unlock first (locked=false authoritative), then operational cleanup,
+	// restore tools, and notify last.
+	const transition = controller.unlock();
+	if (!runtime.isCurrentMainClaim(claim)) return;
+	runtime.clearOperationalPendingWork();
+	await applyUnlockEffects(
+		transition,
+		runtime,
+		ctx,
+		claim,
+		options.notification,
+	);
+	if (options.entryReason !== undefined && runtime.isCurrentMainClaim(claim)) {
+		pi.appendEntry<HumanUnlockEntry>(HUMAN_UNLOCK_ENTRY_TYPE, {
+			reason: options.entryReason,
+		});
 	}
 }
 
@@ -202,17 +241,18 @@ export function registerMainAbortUnlock(
 			ctx.sessionManager,
 			active.boundaryLeafId,
 		);
-		if (outcome !== "aborted") return;
-
-		const controller = runtime.controller;
-		if (controller === null || !runtime.isCurrentMainClaim(active.claim))
+		if (outcome === "aborted") {
+			await performAutoUnlock(pi, runtime, ctx, active.claim, {
+				notification: UNLOCKED_NOTIFICATION,
+			});
 			return;
-		// Unlock first (locked=false authoritative), then operational cleanup,
-		// restore tools, and bare notify last.
-		const transition = controller.unlock();
-		if (!runtime.isCurrentMainClaim(active.claim)) return;
-		runtime.clearOperationalPendingWork();
-		await applyUnlockEffects(transition, runtime, ctx, active.claim);
+		}
+		if (outcome === "error") {
+			await performAutoUnlock(pi, runtime, ctx, active.claim, {
+				notification: ERROR_UNLOCKED_NOTIFICATION,
+				entryReason: ERROR_AUTO_UNLOCK_REASON,
+			});
+		}
 	});
 
 	return { clear };

@@ -63,6 +63,8 @@ Any acceptance text, test name, README, or implementation that still requires pe
 | Lock TUI notify | `Continue watchdog locked` | User-only TUI notify |
 | Unlock TUI notify (no reason) | `Continue watchdog unlocked` | User-only TUI notify (human reasonless / abort) |
 | Human unlock TUI-only entry (with reason) | `Continue watchdog unlocked · <reason>` | Muted persistent user-only history entry; human path remains untyped |
+| Terminal-error auto-unlock TUI notify | `Continue watchdog unlocked · run ended in error` | User-only TUI notify; automatic when the settled main run's terminal assistant reports `stopReason: "error"` |
+| Terminal-error auto-unlock TUI-only entry | `Continue watchdog unlocked · run ended in error (automatic unlock)` | Muted persistent user-only history entry; distinguishes the automatic unlock from a manual one |
 | AI unlock TUI-only entry | `Continue watchdog unlocked · <TYPE> · <reason>` | Muted persistent user-only history entry; `<TYPE>` is the matched configured value uppercased |
 | Decision-failed TUI warning | `Continue watchdog decision failed after 3 attempts: <last error>` | User-only TUI notify/warning |
 | Main-run abort unlock | same behavior as reasonless `/unlock-continue-watchdog` | Automatic when Pi reports the main run as aborted |
@@ -115,7 +117,7 @@ Continue until user assistance is required.
 5. **Lock state is runtime-only** for the current process/session attachment lifecycle. Not written to disk. Not restored on reload/new/resume/restart/shutdown.
 6. **Universal main-run coverage.** Every current-main `agent_start` ensures the watchdog is locked. If already locked, the existing cycle is preserved; watchdog decision and continuation turns do not reset themselves. If unlocked, the start silently begins a fresh lock cycle.
 7. **Abort unlock.** When the current main run is **actually aborted as Pi reports** (the same outcome the TUI shows as aborted), unlock reasonlessly and immediately. Ordinary natural settle does **not** unlock. Never inspect or infer why a child stopped. Implementation may inspect Pi’s public session history to detect the main aborted outcome; the detection mechanism is replaceable as long as this behavior holds.
-8. **Stop-reason-independent idle recovery.** For any non-aborted main stop—including normal completion, Provider/model failure, extension runtime failure, or auto-compaction failure—the plugin uses only Pi's true idle lifecycle. It does not match error strings or special-case compaction.
+8. **Three-outcome idle recovery.** A settled non-aborted main run resolves by the terminal assistant message's `stopReason` after Pi's automatic retries are exhausted. Normal completion enters the standard inquiry fence and continue/wait/unlock decision. A terminal failure (`stopReason: "error"`) unlocks automatically with a clear notification and a record distinguishable from a manual unlock—there is no healthy trajectory to resume, and no inquiry fence or decision starts. While Pi is still retrying, the run is busy and no outcome is considered. The plugin classifies only the terminal `stopReason`; it never matches error strings or special-cases compaction. Actual user aborts keep rule 7's immediate unlock and never pass through this gate.
 9. **Live public AI activity.** Every relevant Pi event queries live `ctx.isIdle()`. Event labels never assign or imply busy/idle. Pi's public value covers active runs, automatic retries, auto-compaction retries, and queued continuations.
 
 ---
@@ -182,6 +184,7 @@ Manual `/lock-continue-watchdog` emits exactly one final `Continue watchdog lock
 - `/unlock-continue-watchdog [reason]` (human; untyped optional reason)
 - Valid decision-window XML with `function=unlock_continue_watchdog`, `reason_type`, and `reason_content`
 - Main run actually aborted as Pi reports (reasonless)
+- Main run settled with terminal `stopReason: "error"` after Pi's automatic retries are exhausted (automatic, distinct record; no inquiry fence or decision)
 
 Unlock first makes `locked=false`, resets `waitUntilMs` to `0`, then invalidates the current aggregate grace and cleans operational pending decision state while preserving attempt, exhaustion, decision-failed, and invalid/no-result counters. Only fresh lock semantics reset those preserved fields.
 

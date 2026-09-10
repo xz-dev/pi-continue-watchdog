@@ -23,6 +23,8 @@ Use `pi update --extensions` to update. Reload Pi extensions or start a new sess
 
 1. **Auto-lock.** When the main agent starts running, the watchdog arms itself. Each new user message starts a fresh cycle.
 2. **Idle detection.** The watchdog watches the main session plus all child Pi processes it spawned. When everything appears idle, it waits a fixed **10 seconds** to make sure nothing new starts, then opens a short **decision check**.
+
+   Settlement has exactly three outcomes. A **normally completed** run follows the fence and decision check above. A run that ends in a **terminal error** (`stopReason: "error"` after Pi's automatic retries are exhausted) unlocks the watchdog automatically — no fence, no decision — with `Continue watchdog unlocked · run ended in error` and a history entry marked `(automatic unlock)`; there is no healthy trajectory to resume, so control returns to you. An **aborted** run keeps the existing immediate reasonless unlock. While Pi is still retrying, the run is busy and none of this happens.
 3. **The decision check** is an automated question to the main agent — not a user message. It may briefly stream in the TUI; when it ends, the exchange is removed from both TUI history and future model context, so conversations stay clean. The agent answers from existing context (no tool calls) with exactly one XML block:
    - **Continue** — work remains, keep going:
 
