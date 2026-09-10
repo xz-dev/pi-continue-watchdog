@@ -482,3 +482,41 @@ test("ENOENT is silent while non-ENOENT throw values stay content-free", async (
 	assert.ok(!failed.diagnostics[0]?.message.includes("/home/user"));
 	assert.ok(!failed.diagnostics[0]?.message.includes("EPERM"));
 });
+
+test("unlockShortcut defaults to alt+u, accepts a key id string, and can be disabled", () => {
+	assert.equal(BUILT_IN_CONFIG.unlockShortcut, "alt+u");
+
+	const custom = validateConfig("project", { unlockShortcut: "ctrl+k" });
+	assert.equal(custom.config.unlockShortcut, "ctrl+k");
+	assert.deepEqual(custom.diagnostics, []);
+
+	const disabled = validateConfig("project", { unlockShortcut: false });
+	assert.equal(disabled.config.unlockShortcut, false);
+	assert.deepEqual(disabled.diagnostics, []);
+
+	const merged = mergeConfig({ unlockShortcut: "ctrl+u" });
+	assert.equal(merged.config.unlockShortcut, "ctrl+u");
+	const projectWins = mergeConfig(
+		{ unlockShortcut: "ctrl+u" },
+		{ unlockShortcut: false },
+	);
+	assert.equal(projectWins.config.unlockShortcut, false);
+});
+
+test("invalid unlockShortcut values fall back to the default with one bounded diagnostic", () => {
+	for (const invalid of [123, "", "   ", true, null, [], {}]) {
+		const result = validateConfig("project", { unlockShortcut: invalid });
+		assert.equal(result.config.unlockShortcut, undefined);
+		const diags = result.diagnostics.filter((d) =>
+			d.message.includes("unlockShortcut"),
+		);
+		assert.equal(diags.length, 1, JSON.stringify(invalid));
+		assert.equal(
+			diags[0]?.message,
+			"unlockShortcut must be a non-empty key id string or false",
+		);
+	}
+	// Invalid values merge as absent, preserving the built-in default.
+	const merged = mergeConfig({ unlockShortcut: 123 });
+	assert.equal(merged.config.unlockShortcut, "alt+u");
+});

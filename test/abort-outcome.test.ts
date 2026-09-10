@@ -238,6 +238,7 @@ function createExtensionHarness(controller: LockDecisionController): {
 		},
 		registerEntryRenderer() {},
 		registerCommand() {},
+		registerShortcut() {},
 		appendEntry() {
 			throw new Error("abort unlock must not append a reason entry");
 		},

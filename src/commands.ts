@@ -564,7 +564,7 @@ function handleStatus(
 	ctx.ui.notify(formatWatchdogTriggerStatus(runtime.getTriggerStatus()));
 }
 
-async function handleUnlock(
+export async function handleUnlock(
 	pi: ExtensionAPI,
 	runtime: MainCommandRuntime,
 	args: string,

@@ -90,6 +90,7 @@ function createMultiHandlerPi(options?: {
 		registerCommand(name: string): void {
 			commandNames.push(name);
 		},
+		registerShortcut(): void {},
 		appendEntry(): void {},
 	} as unknown as ExtensionAPI;
 }

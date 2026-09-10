@@ -329,6 +329,7 @@ function createHarness(options?: {
 			"WORK_REMAINS",
 			"VERIFYING",
 		],
+		unlockShortcut: options?.config?.unlockShortcut ?? "alt+u",
 	};
 	const hub = createObservableAgentHub();
 	const controller = createLockDecisionController(config);
@@ -1180,13 +1181,13 @@ test("TUI state row tracks enablement and currently running observable participa
 		suppressNotify: true,
 	});
 	assert.deepEqual(widget.render(120), [
-		"Continue Watchdog | idle (enabled) | asking in 10s",
+		"Continue Watchdog | idle (enabled · alt+u unlock) | asking in 10s",
 	]);
 
 	harness.streaming = true;
 	await harness.fire("agent_start", { type: "agent_start" });
 	assert.deepEqual(widget.render(120), [
-		"Continue Watchdog | running (enabled) | root",
+		"Continue Watchdog | running (enabled · alt+u unlock) | root",
 	]);
 
 	const child = harness.hub.bind({
@@ -1197,22 +1198,22 @@ test("TUI state row tracks enablement and currently running observable participa
 	}).attachment;
 	fence.setBusyParticipants(1);
 	assert.deepEqual(widget.render(120), [
-		"Continue Watchdog | running (enabled) | root + 2 observed subagents",
+		"Continue Watchdog | running (enabled · alt+u unlock) | root + 2 observed subagents",
 	]);
 
 	harness.streaming = false;
 	await settleOnly(harness);
 	assert.deepEqual(widget.render(120), [
-		"Continue Watchdog | running (enabled) | 2 observed subagents",
+		"Continue Watchdog | running (enabled · alt+u unlock) | 2 observed subagents",
 	]);
 
 	harness.hub.markIdle(child);
 	assert.deepEqual(widget.render(120), [
-		"Continue Watchdog | running (enabled) | 1 observed subagent",
+		"Continue Watchdog | running (enabled · alt+u unlock) | 1 observed subagent",
 	]);
 	fence.setBusyParticipants(0);
 	assert.deepEqual(widget.render(120), [
-		"Continue Watchdog | idle (enabled) | asking in 10s",
+		"Continue Watchdog | idle (enabled · alt+u unlock) | asking in 10s",
 	]);
 	assert.deepEqual(widget.render(20), ["CW | idle/on | T-10s"]);
 	const narrow = widget.render(14);
@@ -1235,7 +1236,7 @@ test("state row ticks the countdown and switches to asking once the decision ope
 		suppressNotify: true,
 	});
 	assert.deepEqual(widget.render(120), [
-		"Continue Watchdog | idle (enabled) | asking in 10s",
+		"Continue Watchdog | idle (enabled · alt+u unlock) | asking in 10s",
 	]);
 
 	// Grace arms a 1s unref countdown ticker behind the fence timer.
@@ -1247,7 +1248,7 @@ test("state row ticks the countdown and switches to asking once the decision ope
 
 	harness.clock.fire(tickTimer);
 	assert.deepEqual(widget.render(120), [
-		"Continue Watchdog | idle (enabled) | asking in 9s",
+		"Continue Watchdog | idle (enabled · alt+u unlock) | asking in 9s",
 	]);
 	// The ticker re-armed another second while the countdown continues.
 	assert.equal(harness.clock.records.at(-1)?.delayMs, 1_000);
@@ -1256,9 +1257,33 @@ test("state row ticks the countdown and switches to asking once the decision ope
 	harness.clock.fire(graceTimer);
 	await harness.startDecision();
 	assert.deepEqual(widget.render(120), [
-		"Continue Watchdog | running (enabled) | asking",
+		"Continue Watchdog | running (enabled · alt+u unlock) | asking",
 	]);
 
+	await harness.runtime.shutdown();
+});
+
+test("state row names the unlock command when the shortcut is disabled, and no hint while unlocked", async () => {
+	const harness = createHarness({ config: { unlockShortcut: false } });
+	await startIdle(harness);
+	const widget = mountStateStatusWidget(harness);
+	assert.deepEqual(widget.render(120), [
+		"Continue Watchdog | idle (disabled) | none",
+	]);
+
+	harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	assert.deepEqual(widget.render(120), [
+		"Continue Watchdog | idle (enabled · /unlock-continue-watchdog) | asking in 10s",
+	]);
+
+	harness.runtime.applyTransition(harness.controller.unlock(), undefined, {
+		suppressNotify: true,
+	});
+	assert.deepEqual(widget.render(120), [
+		"Continue Watchdog | idle (disabled) | none",
+	]);
 	await harness.runtime.shutdown();
 });
 
@@ -2822,6 +2847,7 @@ test("child completion only makes aggregate idle; exactly one inquiry comes from
 		continuePrompt: "Continue compactly.",
 		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
 		continueReasonTypes: ["WORK_REMAINS", "VERIFYING"],
+		unlockShortcut: "alt+u",
 	};
 	const hub = createObservableAgentHub();
 	const clock = new FakeClock();
@@ -2908,6 +2934,7 @@ test("shared hub reclaims main after UI shutdown then prefers a new UI bind", as
 		continuePrompt: "Continue compactly.",
 		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
 		continueReasonTypes: ["WORK_REMAINS", "VERIFYING"],
+		unlockShortcut: "alt+u",
 	};
 
 	function attach(sessionId: string, hasUI: boolean) {
@@ -3033,6 +3060,7 @@ test("effective config loads before binding is reconciled and shutdown blocks la
 			continuePrompt: "Loaded continue.",
 			reasonTypes: ["JOB_DONE"],
 			continueReasonTypes: ["WORK_REMAINS", "VERIFYING"],
+			unlockShortcut: "alt+u",
 		},
 		diagnostics: [],
 	});

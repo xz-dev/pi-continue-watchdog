@@ -208,6 +208,8 @@ export interface DecisionRuntimeOptions {
 	readonly createExchangeId?: () => string;
 	readonly loadConfig?: typeof loadRuntimeConfig;
 	readonly agentDir?: string;
+	/** Fired once per control acquisition when the effective config is committed. */
+	readonly onConfigReady?: (config: ContinueWatchdogConfig) => void;
 }
 
 export type WatchdogTriggerBlocker =
@@ -536,7 +538,12 @@ export function createDecisionRuntime(
 			status.decision === null
 				? stateStatusActors(status.rootRunning, status.busySubagents, true)
 				: decisionLabel(status.decision, true);
-		const full = `Continue Watchdog | ${status.activity} (${status.enabled ? "enabled" : "disabled"}) | ${third}`;
+		const unlockHint = status.enabled
+			? config.unlockShortcut === false
+				? " · /unlock-continue-watchdog"
+				: ` · ${config.unlockShortcut} unlock`
+			: "";
+		const full = `Continue Watchdog | ${status.activity} (${status.enabled ? "enabled" : "disabled"}${unlockHint}) | ${third}`;
 		const compact = `CW | ${status.activity === "running" ? "run" : "idle"}/${status.enabled ? "on" : "off"} | ${thirdCompact}`;
 		const line = visibleWidth(full) <= safeWidth ? full : compact;
 		return [truncateToWidth(theme.fg("dim", line), safeWidth)];
@@ -1593,6 +1600,7 @@ export function createDecisionRuntime(
 		if (options.injectedController) {
 			options.controllerHolder.controller = injectedController;
 			configReady = injectedController !== null;
+			if (configReady) options.onConfigReady?.(config);
 			syncHubState();
 			return;
 		}
@@ -1644,7 +1652,10 @@ export function createDecisionRuntime(
 					return;
 				}
 			}
-			if (owns(claim)) syncHubState();
+			if (owns(claim)) {
+				options.onConfigReady?.(config);
+				syncHubState();
+			}
 		})().finally(() => {
 			if (ownedClaim === claim) configLoad = null;
 		});

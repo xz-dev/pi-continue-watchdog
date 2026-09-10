@@ -226,6 +226,7 @@ function createSemanticHarness(options?: {
 			"WORK_REMAINS",
 			"VERIFYING",
 		],
+		unlockShortcut: options?.config?.unlockShortcut ?? "alt+u",
 	};
 	const hub = createObservableAgentHub();
 	const controller = createLockDecisionController(config);

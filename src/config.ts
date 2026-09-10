@@ -54,6 +54,8 @@ export interface ContinueWatchdogConfig {
 	continuePrompt: string;
 	reasonTypes: readonly string[];
 	continueReasonTypes: readonly string[];
+	/** Key binding for the human unlock shortcut, or false to disable it. */
+	unlockShortcut: string | false;
 }
 
 export interface ConfigDiagnostic {
@@ -78,6 +80,7 @@ export const BUILT_IN_CONFIG: Readonly<ContinueWatchdogConfig> = Object.freeze({
 	continuePrompt: DEFAULT_CONTINUE_PROMPT,
 	reasonTypes: DEFAULT_REASON_TYPES,
 	continueReasonTypes: DEFAULT_CONTINUE_REASON_TYPES,
+	unlockShortcut: "alt+u",
 });
 
 const MAX_DIAGNOSTIC_LENGTH = 240;
@@ -89,6 +92,7 @@ const KNOWN_KEYS = new Set([
 	"continuePrompt",
 	"reasonTypes",
 	"continueReasonTypes",
+	"unlockShortcut",
 ]);
 
 function diagnostic(source: string, message: string): ConfigDiagnostic {
@@ -103,6 +107,7 @@ function copyBuiltIn(): ContinueWatchdogConfig {
 		continuePrompt: BUILT_IN_CONFIG.continuePrompt,
 		reasonTypes: [...BUILT_IN_CONFIG.reasonTypes],
 		continueReasonTypes: [...BUILT_IN_CONFIG.continueReasonTypes],
+		unlockShortcut: BUILT_IN_CONFIG.unlockShortcut,
 	};
 }
 
@@ -257,6 +262,23 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 		}
 	}
 
+	if (Object.hasOwn(input, "unlockShortcut")) {
+		const shortcut = input.unlockShortcut;
+		if (
+			shortcut === false ||
+			(typeof shortcut === "string" && shortcut.trim().length > 0)
+		) {
+			config.unlockShortcut = shortcut;
+		} else {
+			diagnostics.push(
+				diagnostic(
+					source,
+					"unlockShortcut must be a non-empty key id string or false",
+				),
+			);
+		}
+	}
+
 	for (const key of Object.keys(input)) {
 		if (!KNOWN_KEYS.has(key)) {
 			diagnostics.push(diagnostic(source, "ignoring unsupported keys"));
@@ -308,6 +330,9 @@ export function mergeConfig(
 		}
 		if (partial.continueReasonTypes !== undefined) {
 			config.continueReasonTypes = [...partial.continueReasonTypes];
+		}
+		if (partial.unlockShortcut !== undefined) {
+			config.unlockShortcut = partial.unlockShortcut;
 		}
 	}
 

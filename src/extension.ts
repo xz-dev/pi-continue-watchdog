@@ -1,11 +1,17 @@
 import type {
 	ExtensionAPI,
+	ExtensionCommandContext,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import type { KeyId } from "@earendil-works/pi-tui";
 
 import { registerMainAbortUnlock } from "./abort-outcome.js";
 import { registerMainUserAutoLock } from "./auto-lock.js";
-import { createMainCommands } from "./commands.js";
+import {
+	createMainCommands,
+	handleUnlock,
+	type MainCommandRuntime,
+} from "./commands.js";
 import type { ContinueWatchdogConfig } from "./config.js";
 import type {
 	LoadedConfig,
@@ -65,6 +71,7 @@ export function createContinueWatchdogExtension(
 	};
 
 	return (pi: ExtensionAPI): void => {
+		let commandRuntime: MainCommandRuntime | null = null;
 		const runtime = createDecisionRuntime({
 			pi,
 			hub,
@@ -78,9 +85,25 @@ export function createContinueWatchdogExtension(
 			createExchangeId: options.createExchangeId,
 			loadConfig: options.loadConfig,
 			agentDir: options.agentDir,
+			onConfigReady: (config) => {
+				if (config.unlockShortcut === false) return;
+				const key = config.unlockShortcut;
+				pi.registerShortcut(key as KeyId, {
+					description: "Unlock continue watchdog (pi-continue-watchdog)",
+					handler: (shortcutCtx) => {
+						if (commandRuntime === null) return;
+						return handleUnlock(
+							pi,
+							commandRuntime,
+							"",
+							shortcutCtx as ExtensionCommandContext,
+						);
+					},
+				});
+			},
 		});
 
-		createMainCommands(pi, {
+		commandRuntime = {
 			get controller() {
 				return holder.controller;
 			},
@@ -93,7 +116,8 @@ export function createContinueWatchdogExtension(
 			clearOperationalPendingWork: () => runtime.clearOperationalPendingWork(),
 			applyEffect: runtime.applyEffect,
 			reconcileIdle: runtime.reconcileIdle,
-		});
+		};
+		createMainCommands(pi, commandRuntime);
 		registerDecisionContextFolding(pi);
 		// Correlate a pending watchdog dispatch before real-user auto-lock can
 		// restart the cycle and discard the identity needed to downgrade a foreign run.

@@ -95,6 +95,7 @@ function createAttachmentHarness(options: {
 		},
 		registerEntryRenderer(): void {},
 		registerCommand(): void {},
+		registerShortcut(): void {},
 		appendEntry(): void {},
 		sendMessage(message: unknown): void {
 			sentMessages.push(message);
@@ -138,6 +139,7 @@ const CONFIG: LoadedConfig = {
 		continuePrompt: "Continue now.",
 		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
 		continueReasonTypes: ["WORK_REMAINS", "VERIFYING"],
+		unlockShortcut: "alt+u",
 	},
 	diagnostics: [],
 };

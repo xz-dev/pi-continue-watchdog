@@ -60,6 +60,8 @@ The extension never blindly continues: it asks first, so finished work can unloc
 | `/unlock-continue-watchdog [reason]` | Unlock now; optional reason is kept in TUI history |
 | `/status-continue-watchdog` | Show current lock/attempt state and why the next check would (not) fire |
 
+A keyboard shortcut (default `alt+u`, configurable via `unlockShortcut`) performs the same unlock as `/unlock-continue-watchdog` without a reason. While the watchdog is locked, the `Continue Watchdog | …` state row names the effective gesture (for example `enabled · alt+u unlock`).
+
 ## Configuration
 
 Precedence: **built-in defaults < global < trusted project**. Files: `~/.pi/agent/pi-continue-watchdog.json` (global) or `<project>/.pi/pi-continue-watchdog.json` (trusted projects only). Invalid fields fall back to lower-precedence values and print a short diagnostic.
@@ -70,7 +72,8 @@ Precedence: **built-in defaults < global < trusted project**. Files: `~/.pi/agen
   "decisionPrompt": "…default shown below…",
   "continuePrompt": "Continue until user assistance is required.",
   "reasonTypes": ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
-  "continueReasonTypes": ["WORK_REMAINS", "VERIFYING"]
+  "continueReasonTypes": ["WORK_REMAINS", "VERIFYING"],
+  "unlockShortcut": "alt+u"
 }
 ```
 
@@ -81,6 +84,7 @@ Precedence: **built-in defaults < global < trusted project**. Files: `~/.pi/agen
 | `continuePrompt` | `Continue until user assistance is required.` | Non-blank, ≤ 16384 Unicode code points |
 | `reasonTypes` | `["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"]` | Allowed unlock types; a valid list replaces defaults |
 | `continueReasonTypes` | `["WORK_REMAINS", "VERIFYING"]` | Allowed continue types; same replace semantics |
+| `unlockShortcut` | `"alt+u"` | Key id for the unlock shortcut, or `false` to disable (the command stays available). Why not `keybindings.json`: Pi exposes no namespaced keybinding ids for extension shortcuts, so plugin config is the only user-level rebinding surface; Pi's native conflict diagnostics still apply to the registered key |
 | `idleDelaySeconds` | `10` | **Deprecated**, accepted but ignored; the idle fence is fixed at 10 seconds |
 
 Built-in type meanings:
