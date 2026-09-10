@@ -253,7 +253,7 @@ Thinking blocks are ignored. Concatenate final assistant text and trim it. It mu
 **AI `reason_content` validation (continue, wait, and unlock):**
 
 - After trim, reason must be **non-empty**
-- Length ≤ **500 Unicode characters** (count Unicode code points / characters as implemented consistently and tested)
+- Length ≤ **1000 Unicode characters** hard limit (count Unicode code points / characters as implemented consistently and tested); the decision prompt advises at most **500**, derived in code as half the hard limit
 - May technically contain newlines
 - Empty/blank or overlong reasons are **invalid** (no truncation on the AI path)
 - Existing reason rules remain; they are independent of type matching
@@ -298,7 +298,7 @@ On invalid decision:
 
 **When** the decision is a valid continue:
 
-- Requires a type allowed by `continueReasonTypes` and a nonblank reason of at most 500 Unicode characters
+- Requires a type allowed by `continueReasonTypes` and a nonblank reason of at most 1000 Unicode characters
 - The matched type and validated reason are retained in context-excluded audit data and in the hidden normalized terminal record used only by the bounded zero-loop history contract
 - The decision turn ends, and ordinary work continues automatically without further user input
 - extension `message_end` captures the provider XML for validation and replaces the finalized assistant with empty content; context folding then removes the complete prompt / assistant and tool-result metadata and replaces them with **one** compact custom message containing the configured `continuePrompt` (exact default: `Continue until user assistance is required.`)
@@ -316,7 +316,7 @@ On invalid decision:
 
 **When** the decision is a valid wait:
 
-- Requires a nonblank `reason_content` of at most 500 Unicode characters, integer `wait_seconds` in `1..1800`, and no `reason_type`; a supplied `reason_type` is invalid
+- Requires a nonblank `reason_content` of at most 1000 Unicode characters, integer `wait_seconds` in `1..1800`, and no `reason_type`; a supplied `reason_type` is invalid
 - Consumes **one** shared `maxRetries` attempt while keeping the watchdog locked
 - Records the absolute deadline `waitUntilMs = now + wait_seconds * 1000`
 - Appends exactly one persistent TUI-only entry, `Continue watchdog waiting · <seconds>s · <reason>`, before arming the deadline; if persistence fails, roll back the consumed attempt/deadline and stop without scheduling the wait

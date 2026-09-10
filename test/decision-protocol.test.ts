@@ -22,11 +22,13 @@ import {
 	INVALID_WAIT_REASON_TYPE_ERROR,
 	INVALID_WAIT_SECONDS_ERROR,
 	MALFORMED_DECISION_RESPONSE_ERROR,
+	MAX_REASON_CHARACTERS,
 	MAX_WAIT_SECONDS,
 	MISSING_CONTINUE_FIELDS_ERROR,
 	MISSING_UNLOCK_FIELDS_ERROR,
 	MISSING_WAIT_FIELDS_ERROR,
 	normalizeAssistantDecisionResponse,
+	REASON_GUIDANCE_CHARACTERS,
 	UNSUPPORTED_DECISION_CONTENT_ERROR,
 	validateDecisionResponse,
 } from "../src/decision-protocol.js";
@@ -328,12 +330,13 @@ test("unlock reason_type matches configured values case-insensitively and emits 
 });
 
 test("unlock reason_content is trimmed, counts Unicode code points, and never truncates", () => {
-	const exactly500 = "世".repeat(500);
-	const over500 = `${exactly500}界`;
+	const withinGuidanceHeadroom = "世".repeat(700);
+	const exactly1000 = "世".repeat(1000);
+	const over1000 = `${exactly1000}界`;
 
 	assert.deepEqual(
 		validateDecisionResponse(
-			response([text(unlockXml("JOB_DONE", `\n${exactly500}\n`))]),
+			response([text(unlockXml("JOB_DONE", withinGuidanceHeadroom))]),
 			REASON_TYPES,
 			CONTINUE_REASON_TYPES,
 		),
@@ -342,13 +345,28 @@ test("unlock reason_content is trimmed, counts Unicode code points, and never tr
 			decision: {
 				kind: "unlock",
 				reasonType: "JOB_DONE",
-				reason: exactly500,
+				reason: withinGuidanceHeadroom,
 			},
 		},
 	);
 	assert.deepEqual(
 		validateDecisionResponse(
-			response([text(unlockXml("JOB_DONE", over500))]),
+			response([text(unlockXml("JOB_DONE", `\n${exactly1000}\n`))]),
+			REASON_TYPES,
+			CONTINUE_REASON_TYPES,
+		),
+		{
+			valid: true,
+			decision: {
+				kind: "unlock",
+				reasonType: "JOB_DONE",
+				reason: exactly1000,
+			},
+		},
+	);
+	assert.deepEqual(
+		validateDecisionResponse(
+			response([text(unlockXml("JOB_DONE", over1000))]),
 			REASON_TYPES,
 			CONTINUE_REASON_TYPES,
 		),
@@ -517,6 +535,11 @@ test("fixed prompt suffix requires typed reasons for both decisions", () => {
 	assert.match(prompt, /exactly one <watchdog>\.\.\.<\/watchdog>/);
 	assert.match(prompt, /very end of your response|no text before or after it/);
 	assert.match(prompt, /Do not output multiple/);
+	assert.match(
+		prompt,
+		/reason_content must be non-empty and at most 500 Unicode characters/,
+	);
+	assert.equal(REASON_GUIDANCE_CHARACTERS, MAX_REASON_CHARACTERS / 2);
 	assert.match(prompt, /\["JOB_DONE","WAIT_USER"\]/);
 	assert.match(prompt, /\["WORK_REMAINS","VERIFYING"\]/);
 	assert.match(prompt, /<function>continue_watchdog<\/function>/);

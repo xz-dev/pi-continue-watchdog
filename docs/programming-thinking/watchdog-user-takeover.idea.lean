@@ -478,7 +478,7 @@ structure ContinueEvidence where
   deriving DecidableEq, Repr
 
 def validContinueReason (evidence : ContinueEvidence) : Prop :=
-  evidence.reasonLength > 0 ∧ evidence.reasonLength ≤ 500
+  evidence.reasonLength > 0 ∧ evidence.reasonLength ≤ 1000
 
 def continueEvidenceOrdered (evidence : ContinueEvidence) : Prop :=
   (evidence.hookPublished = true → evidence.tuiEntryStored = true) ∧

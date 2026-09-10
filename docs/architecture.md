@@ -269,7 +269,7 @@ Continue and unlock use typed reasons:
 
 All three outcomes use the same reason validation:
 
-- `reason_content` must be nonblank and at most 500 Unicode code points;
+- `reason_content` must be nonblank and at most 1000 Unicode code points; the decision prompt advises at most 500 (derived as half the hard limit);
 - invalid AI reasons are rejected rather than truncated.
 
 Wait rejects any supplied `reason_type`. Its trimmed `wait_seconds` must contain decimal digits representing a safe integer from 1 through 1800; invalid values are rejected rather than clamped.

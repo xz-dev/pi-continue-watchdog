@@ -12,16 +12,24 @@ import type {
 /** The fixed re-ask budget is owned by the controller, not configuration. */
 export const DECISION_INVALID_ATTEMPT_LIMIT = 3;
 
+/**
+ * Hard limit for model-provided reason_content, in Unicode code points.
+ * The prompt-stated guidance is derived as half of this value so the two
+ * can never drift apart when the constant is edited.
+ */
+export const MAX_REASON_CHARACTERS = 1000;
+
+/** Guidance limit stated in the decision prompt: always half the hard limit. */
+export const REASON_GUIDANCE_CHARACTERS = MAX_REASON_CHARACTERS / 2;
+
 export const INVALID_DECISION_XML_ERROR =
 	"Your entire response must be exactly one valid watchdog XML decision document.";
 export const INVALID_CONTINUE_REASON_TYPE_ERROR =
 	"continue_watchdog requires an allowed reason_type.";
-export const INVALID_CONTINUE_REASON_ERROR =
-	"continue_watchdog requires a non-empty reason_content of at most 500 Unicode characters.";
+export const INVALID_CONTINUE_REASON_ERROR = `continue_watchdog requires a non-empty reason_content of at most ${MAX_REASON_CHARACTERS} Unicode characters.`;
 export const MISSING_CONTINUE_FIELDS_ERROR =
 	"continue_watchdog requires reason_type and reason_content.";
-export const INVALID_WAIT_REASON_ERROR =
-	"wait_watchdog requires a non-empty reason_content of at most 500 Unicode characters.";
+export const INVALID_WAIT_REASON_ERROR = `wait_watchdog requires a non-empty reason_content of at most ${MAX_REASON_CHARACTERS} Unicode characters.`;
 export const INVALID_WAIT_SECONDS_ERROR =
 	"wait_watchdog requires an integer wait_seconds from 1 through 1800.";
 export const MISSING_WAIT_FIELDS_ERROR =
@@ -30,8 +38,7 @@ export const INVALID_WAIT_REASON_TYPE_ERROR =
 	"wait_watchdog does not use reason_type; use reason_content and wait_seconds only.";
 export const INVALID_UNLOCK_REASON_TYPE_ERROR =
 	"unlock_continue_watchdog requires an allowed reason_type.";
-export const INVALID_UNLOCK_REASON_ERROR =
-	"unlock_continue_watchdog requires a non-empty reason_content of at most 500 Unicode characters.";
+export const INVALID_UNLOCK_REASON_ERROR = `unlock_continue_watchdog requires a non-empty reason_content of at most ${MAX_REASON_CHARACTERS} Unicode characters.`;
 export const MISSING_UNLOCK_FIELDS_ERROR =
 	"unlock_continue_watchdog requires reason_type and reason_content.";
 export const UNSUPPORTED_DECISION_CONTENT_ERROR =
@@ -228,7 +235,11 @@ export function normalizeDecisionUnlockReasonType(
 export function normalizeDecisionUnlockReason(reason: unknown): string | null {
 	if (typeof reason !== "string") return null;
 	const trimmed = reason.trim();
-	if (trimmed.length === 0 || Array.from(trimmed).length > 500) return null;
+	if (
+		trimmed.length === 0 ||
+		Array.from(trimmed).length > MAX_REASON_CHARACTERS
+	)
+		return null;
 	return trimmed;
 }
 
@@ -269,7 +280,7 @@ export function buildDecisionPrompt(
 		{ name: "reason_type", value: reasonTypes[0] ?? "ALLOWED_TYPE" },
 		{ name: "reason_content", value: "concise reason" },
 	]);
-	return `${decisionPrompt}\n\nUse only the existing conversation context and decide quickly. Do not make decisions on the user's behalf. Do not call tools. Your entire response must be exactly one <watchdog>...</watchdog> XML document, with no text before or after it; express your reasoning inside the fields, above all reason_content. Do not output multiple <watchdog>...</watchdog> blocks.\n\nIf you want to continue working, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedContinueReasonTypes}. Use:\n${continueExample}\n\nIf you think the work is finished or blocked and the user should take over, use unlock. reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedReasonTypes}. Use:\n${unlockExample}\n\nIf you think work should wait a period of time before continuing (for example external automation such as CI or a subagent has not finished yet), use a non-empty reason_content and an integer wait_seconds from ${MIN_WAIT_SECONDS} through ${MAX_WAIT_SECONDS}. Use:\n${waitExample}`;
+	return `${decisionPrompt}\n\nUse only the existing conversation context and decide quickly. Do not make decisions on the user's behalf. Do not call tools. Your entire response must be exactly one <watchdog>...</watchdog> XML document, with no text before or after it; express your reasoning inside the fields, above all reason_content. reason_content must be non-empty and at most ${REASON_GUIDANCE_CHARACTERS} Unicode characters. Do not output multiple <watchdog>...</watchdog> blocks.\n\nIf you want to continue working, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedContinueReasonTypes}. Use:\n${continueExample}\n\nIf you think the work is finished or blocked and the user should take over, use unlock. reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedReasonTypes}. Use:\n${unlockExample}\n\nIf you think work should wait a period of time before continuing (for example external automation such as CI or a subagent has not finished yet), use a non-empty reason_content and an integer wait_seconds from ${MIN_WAIT_SECONDS} through ${MAX_WAIT_SECONDS}. Use:\n${waitExample}`;
 }
 
 interface ParsedWatchdogFields {

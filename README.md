@@ -95,7 +95,7 @@ Built-in type meanings:
 - Continue: `WORK_REMAINS` — actionable work remains; `VERIFYING` — verification in progress.
 - Passive waiting for external automation is expressed with `wait_watchdog`, not a continue type.
 
-Reason types are trimmed and matched case-insensitively against their configured lists. Configured list entries must be nonblank but have no identifier regex or artificial per-entry length limit. Reason content is trimmed, must be nonblank, and may contain at most 500 Unicode characters. Human `/unlock-continue-watchdog` stays untyped.
+Reason types are trimmed and matched case-insensitively against their configured lists. Configured list entries must be nonblank but have no identifier regex or artificial per-entry length limit. Reason content is trimmed, must be nonblank, and may contain at most 1000 Unicode characters; the decision prompt advises staying within 500 (half the hard limit) so minor overshoot does not trigger a re-ask. Human `/unlock-continue-watchdog` stays untyped.
 
 ## Notifications for other extensions
 
