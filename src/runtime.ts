@@ -15,6 +15,7 @@ import {
 	type InquiryAttemptHandle,
 	type InquiryFoldMessage,
 } from "pi-extension-utils/pi-inquiry";
+import { PreemptTakeover } from "pi-extension-utils/preempt-takeover";
 
 import {
 	type ActivityGeneration,
@@ -389,6 +390,14 @@ export function createDecisionRuntime(
 		readonly cycleId: number;
 	} | null = null;
 	let pendingFinalization: PendingFinalization | null = null;
+	/**
+	 * User takeover capture shared from pi-extension-utils. 0.85.1 aborts
+	 * asynchronously and drops queued steering, so the watchdog re-issues the
+	 * takeover as a fresh turn after the preempted decision settles. The
+	 * shared guard prevents the re-issued prompt from re-entering this
+	 * capture path (re-entrancy guard).
+	 */
+	const pendingTakeover = new PreemptTakeover();
 	/** Retried until Pi accepts the exact correlated remove-fold. */
 	let pendingInquiryCleanup: InquiryFoldMessage | null = null;
 	/** Retained only for AI decision unlock until the next all-idle settle. */
@@ -2672,6 +2681,11 @@ export function createDecisionRuntime(
 			}
 			selfDecisionRun = { kind: "none" };
 			observeLiveState(ctx);
+			// A re-issued takeover must pass through untouched so it becomes the
+			// fresh user turn instead of being captured again.
+			if (pendingTakeover.isReissuedTakeover(event.text)) {
+				return { action: "continue" };
+			}
 			if (
 				active === null ||
 				active.invalidated ||
@@ -2680,6 +2694,12 @@ export function createDecisionRuntime(
 			) {
 				return { action: "continue" };
 			}
+			// Swallow the raw takeover so 0.85.1's async abort cannot strand it as
+			// steering inside the hidden decision run; re-issue after settle. A
+			// second takeover before the first settles supersedes it (the newest
+			// user intent wins) rather than throwing on the shared single slot.
+			if (pendingTakeover.hasPending) pendingTakeover.clear();
+			pendingTakeover.capture(event.text);
 			suppressDecisionAbort = true;
 			decisionAssistantToSplice = {
 				exchangeId: active.exchangeId,
@@ -2692,7 +2712,7 @@ export function createDecisionRuntime(
 				// The handle is already terminal even when host abort fails.
 			}
 			retryInquiryCleanup();
-			return { action: "continue" };
+			return { action: "handled" };
 		});
 
 		(options.pi as ExtensionAPI & Partial<UninterruptibleMessageEndAPI>).on(
@@ -2772,6 +2792,14 @@ export function createDecisionRuntime(
 			if (!continued && probePiAgentState(ctx).idle)
 				spliceDecisionAssistant(ctx);
 			if (!continued) await maybePublishUserReady();
+
+			// Re-issue a captured takeover as a fresh user turn now that the
+			// preempted decision has settled. The shared guard lets this exact
+			// text through when it re-enters the input hook.
+			const takeover = pendingTakeover.takeForReissue();
+			if (takeover !== null && probePiAgentState(ctx).idle) {
+				await options.pi.sendUserMessage(takeover);
+			}
 		});
 	};
 

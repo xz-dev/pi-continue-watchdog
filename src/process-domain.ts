@@ -1,7 +1,7 @@
 import {
 	ENV_NAMES,
 	isProcessDomainOpenError,
-	openProcessDomain,
+	type openProcessDomain,
 	openSharedProcessDomain,
 	type ProcessDomainEvent,
 	type ProcessDomainNode,

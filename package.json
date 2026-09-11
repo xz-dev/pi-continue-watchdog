@@ -50,6 +50,9 @@
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
   },
+  "dependencies": {
+    "pi-extension-utils": "git+https://github.com/xz-dev/pi-extension-utils.git#210f84e"
+  },
   "devDependencies": {
     "@biomejs/biome": "^2.5.12",
     "@earendil-works/pi-coding-agent": "0.84.1",
@@ -57,8 +60,5 @@
     "@types/node": "^26.5.0",
     "tsx": "^4.23.13",
     "typescript": "^7.0.2"
-  },
-  "dependencies": {
-    "pi-extension-utils": "git+https://github.com/xz-dev/pi-extension-utils.git#3670621a7af592b8cad2b4d72a9cc589f060f37e"
   }
 }

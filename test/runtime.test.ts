@@ -146,6 +146,7 @@ interface Harness {
 	readonly controller: ReturnType<typeof createLockDecisionController>;
 	readonly hub: ReturnType<typeof createObservableAgentHub>;
 	readonly sent: SentMessage[];
+	readonly sentUserMessages: string[];
 	readonly notifications: Array<{ message: string; level?: string }>;
 	readonly entries: Array<{ type: string; data: unknown }>;
 	readonly branch: BranchEntry[];
@@ -338,6 +339,7 @@ function createHarness(options?: {
 	const handlerOptions = new Map<string, unknown[]>();
 	const clock = new FakeClock();
 	const sent: SentMessage[] = [];
+	const sentUserMessages: string[] = [];
 	const notifications: Array<{ message: string; level?: string }> = [];
 	const entries: Array<{ type: string; data: unknown }> = [];
 	const branch: BranchEntry[] = [];
@@ -357,6 +359,7 @@ function createHarness(options?: {
 		controller,
 		hub,
 		sent,
+		sentUserMessages,
 		notifications,
 		entries,
 		branch,
@@ -377,6 +380,9 @@ function createHarness(options?: {
 			const registrations = handlerOptions.get(name) ?? [];
 			registrations.push(registrationOptions);
 			handlerOptions.set(name, registrations);
+		},
+		async sendUserMessage(content: string): Promise<void> {
+			sentUserMessages.push(content);
 		},
 		sendMessage(
 			message: SentMessage["message"],
@@ -3579,7 +3585,7 @@ test("real user input silently preempts a submitted decision and extension input
 		const sentBefore = harness.sent.length;
 
 		assert.deepEqual(await harness.fireInput(source, "user takeover"), {
-			action: "continue",
+			action: "handled",
 		});
 		assert.equal(harness.aborts, 1);
 		assert.equal(harness.controller.snapshot.locked, true);
@@ -3632,6 +3638,11 @@ test("real user input silently preempts a submitted decision and extension input
 			harness.branch.some((entry) => entry.id === "assistant-4"),
 			false,
 		);
+		// The captured takeover is re-issued exactly once as a fresh user turn
+		// once the preempted decision settles and the host is idle.
+		assert.deepEqual(harness.sentUserMessages, ["user takeover"]);
+		await harness.fire("agent_settled", { type: "agent_settled" });
+		assert.deepEqual(harness.sentUserMessages, ["user takeover"]);
 	}
 
 	const extension = createHarness();
@@ -3659,7 +3670,7 @@ test("preemption retries a failed cleanup fold and leaves no model context resid
 	await harness.startDecision();
 
 	assert.deepEqual(await harness.fireInput("interactive", "take over once"), {
-		action: "continue",
+		action: "handled",
 	});
 	assert.equal(cleanupAttempts, 1);
 	assert.equal(harness.aborts, 1);
@@ -3703,7 +3714,7 @@ test("preempted decision cleanup stays idempotent after another handler tags the
 	await startIdle(harness);
 	await harness.openDecision();
 	assert.deepEqual(await harness.fireInput("interactive", "take over"), {
-		action: "continue",
+		action: "handled",
 	});
 
 	const replacement = (await harness.endDecisionMessage({
