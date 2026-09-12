@@ -849,7 +849,10 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 			release: heldDecisionRelease,
 		},
 		{ kind: "delayed" },
-		{ kind: "stop", text: "invalidated decision fold settled" },
+		// 0.84.1 consumed a model turn here for the invalidated-decision fold
+		// (a triggerTurn:false custom message became a follow-on turn). 0.85.1
+		// persists context-only custom messages without a model turn, so no
+		// request maps to this slot; the next request is the fresh decision.
 		{ kind: "unlock", reason: "fresh epoch complete" },
 	]);
 	const root = await createSession(fixture, baseUrl, {
@@ -1005,8 +1008,22 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		"second child held provider request",
 	);
 	releaseHeldDecision?.();
+	// 0.85.1 semantics: a triggerTurn:false custom fold delivered while the
+	// held decision streams is persisted as a context-only custom message at
+	// turn end instead of becoming a follow-on model turn, so settlement is
+	// observed on the session transcript rather than an extra provider request.
 	await waitFor(
-		() => requests.length === 8,
+		() =>
+			root.session.sessionManager
+				.getEntries()
+				.slice(entriesBeforeInvalidation)
+				.some(
+					(entry) =>
+						JSON.stringify(entry).includes(
+							`"customType":${JSON.stringify(DECISION_FOLD_MESSAGE_TYPE)}`,
+						) &&
+						JSON.stringify(entry).includes('"watchdogOutcome":"invalidated"'),
+				),
 		5_000,
 		"invalidated decision fold settlement",
 	);
@@ -1073,7 +1090,8 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		false,
 		"stale continue must not start a continuation turn",
 	);
-	assert.equal(isDecisionRequest(requests[7] as RequestRecord), false);
+	// With no fold turn there is no provider request after the second child
+	// request; the next request belongs to the fresh post-invalidation decision.
 	assert.equal(
 		requests
 			.slice(7)
