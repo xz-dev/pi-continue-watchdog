@@ -17,7 +17,11 @@ export const WATCHDOG_WAITING_HOOK_NAME = "watchdog-waiting";
 /** Semantic name published after an accepted continue is durably recorded. */
 export const WATCHDOG_CONTINUED_HOOK_NAME = "watchdog-continued";
 
-export type UserReadyStopKind = "AI_UNLOCK" | "EXHAUSTED" | "DECISION_FAILED";
+export type UserReadyStopKind =
+	| "AI_UNLOCK"
+	| "ERROR_UNLOCK"
+	| "EXHAUSTED"
+	| "DECISION_FAILED";
 
 export type SemanticHookValues = Readonly<Record<string, string>>;
 

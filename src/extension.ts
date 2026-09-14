@@ -140,6 +140,7 @@ export function createContinueWatchdogExtension(
 				return holder.controller;
 			},
 			clearOperationalPendingWork: () => runtime.clearOperationalPendingWork(),
+			retainErrorUnlock: runtime.retainErrorUnlock,
 			consumeDecisionAbortSuppression: () =>
 				runtime.consumeDecisionAbortSuppression(),
 			applyEffect: runtime.applyEffect,

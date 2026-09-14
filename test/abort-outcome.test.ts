@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-
 import type {
 	ExtensionAPI,
 	ExtensionContext,
 	ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
+import { createEventBus } from "@earendil-works/pi-coding-agent";
 
 import {
 	type BranchEntryView,
@@ -26,6 +26,11 @@ import {
 	type HubMainClaim,
 	type ObservableAgentHub,
 } from "../src/hub.js";
+
+import {
+	SEMANTIC_HOOK_CHANNEL,
+	type SemanticHookEnvelope,
+} from "../src/semantic-hook.js";
 
 type LifecycleHandler = (
 	event: unknown,
@@ -180,6 +185,7 @@ function createAbortHarness(
 			return hub.isCurrentMain(claim);
 		},
 		controller,
+		retainErrorUnlock() {},
 		clearOperationalPendingWork() {
 			timeline.push(
 				`cleanup:locked=${controller.snapshot.locked ? "true" : "false"}`,
@@ -222,6 +228,9 @@ function createAbortHarness(
 }
 
 function createExtensionHarness(controller: LockDecisionController): {
+	readonly hub: ObservableAgentHub;
+	readonly received: SemanticHookEnvelope[];
+	setIdle(idle: boolean): void;
 	readonly handlers: Map<string, LifecycleHandler[]>;
 	readonly notifications: string[];
 	readonly entries: Array<{ customType: string; data: unknown }>;
@@ -233,10 +242,17 @@ function createExtensionHarness(controller: LockDecisionController): {
 	const notifications: string[] = [];
 	const entries: Array<{ customType: string; data: unknown }> = [];
 	const sessionManager = createSessionManager([user("u0")]);
+	const received: SemanticHookEnvelope[] = [];
+	const events = createEventBus();
+	events.on(SEMANTIC_HOOK_CHANNEL, (data) => {
+		received.push(data as SemanticHookEnvelope);
+	});
+	let idle = true;
 	let activeTools: string[] = ["bash", "read"];
 
 	const pi = {
 		...multiOn(handlers),
+		events,
 		registerTool(tool: { readonly name: string }) {
 			activeTools.push(tool.name);
 		},
@@ -258,7 +274,7 @@ function createExtensionHarness(controller: LockDecisionController): {
 
 	const ctx = {
 		hasUI: true,
-		isIdle: () => true,
+		isIdle: () => idle,
 		sessionManager: {
 			getSessionId: () => "main",
 			getLeafId: () => sessionManager.getLeafId(),
@@ -271,7 +287,18 @@ function createExtensionHarness(controller: LockDecisionController): {
 		},
 	} as unknown as ExtensionContext;
 
-	return { handlers, notifications, entries, sessionManager, ctx };
+	return {
+		hub,
+		received,
+		setIdle(value) {
+			idle = value;
+		},
+		handlers,
+		notifications,
+		entries,
+		sessionManager,
+		ctx,
+	};
 }
 
 test("pure: boundary capture and suffix terminal outcomes", () => {
@@ -379,6 +406,7 @@ test("user-preempted decision abort does not unlock or notify", async () => {
 			return hub.isCurrentMain(claim);
 		},
 		controller,
+		retainErrorUnlock() {},
 		clearOperationalPendingWork() {
 			if (remainingSuppressions > 0) {
 				throw new Error("preempted abort must not unlock");
@@ -554,6 +582,7 @@ test("demotion/detach/reclaim and child capture stay inert", async () => {
 			return hub.isCurrentMain(claim);
 		},
 		controller,
+		retainErrorUnlock() {},
 		clearOperationalPendingWork() {
 			throw new Error("demoted settle must not clear operational work");
 		},
@@ -591,6 +620,7 @@ test("demotion/detach/reclaim and child capture stay inert", async () => {
 		getMainClaim: () => null,
 		isCurrentMainClaim: () => false,
 		controller: childController,
+		retainErrorUnlock() {},
 		clearOperationalPendingWork() {
 			throw new Error("child must not clear operational work");
 		},
@@ -723,9 +753,10 @@ test("extension registers hooks, clears on shutdown, and unlocks through settle"
 	assert.equal(unlockController.snapshot.locked, false);
 	assert.deepEqual(unlock.notifications, ["Continue watchdog unlocked"]);
 	assert.deepEqual(unlock.entries, []);
+	assert.deepEqual(unlock.received, []);
 });
 
-test("extension routes a terminal error settle to auto unlock before any fence", async () => {
+test("extension unlocks terminal error then publishes ERROR_UNLOCK once at idle", async () => {
 	const controller = makeController();
 	controller.lock();
 	const harness = createExtensionHarness(controller);
@@ -758,4 +789,65 @@ test("extension routes a terminal error settle to auto unlock before any fence",
 			data: { reason: "run ended in error (automatic unlock)" },
 		},
 	]);
+	assert.deepEqual(harness.received, [
+		{ version: 1, name: "user-ready", values: { STOP_KIND: "ERROR_UNLOCK" } },
+	]);
+	assert.equal(Object.isFrozen(harness.received[0]), true);
+	assert.equal(Object.isFrozen(harness.received[0].values), true);
+	await fireHandlers(
+		harness.handlers,
+		"agent_settled",
+		{ type: "agent_settled" },
+		harness.ctx,
+	);
+	assert.equal(harness.received.length, 1);
+});
+
+test("terminal error publication waits for observable children, then stays consumed", async () => {
+	const controller = makeController();
+	const harness = createExtensionHarness(controller);
+	await fireHandlers(harness.handlers, "session_start", {}, harness.ctx);
+	harness.setIdle(false);
+	await fireHandlers(harness.handlers, "agent_start", {}, harness.ctx);
+	const child = harness.hub.bind({
+		instance: createHubAttachmentInstance(),
+		sessionId: "busy-child",
+		hasUI: false,
+		initialBusy: true,
+	}).attachment;
+	harness.sessionManager.append(assistant("failed", "error"));
+	harness.setIdle(true);
+	await fireHandlers(harness.handlers, "agent_settled", {}, harness.ctx);
+	assert.equal(controller.snapshot.locked, false);
+	assert.deepEqual(harness.received, []);
+	harness.hub.markIdle(child);
+	assert.deepEqual(harness.received, [
+		{ version: 1, name: "user-ready", values: { STOP_KIND: "ERROR_UNLOCK" } },
+	]);
+	harness.hub.markBusy(child);
+	harness.hub.markIdle(child);
+	assert.equal(harness.received.length, 1);
+});
+
+test("Pi retry errors before settle remain silent, successful retry does not unlock", async () => {
+	const controller = makeController();
+	const harness = createExtensionHarness(controller);
+	await fireHandlers(harness.handlers, "session_start", {}, harness.ctx);
+	harness.setIdle(false);
+	await fireHandlers(harness.handlers, "agent_start", {}, harness.ctx);
+	harness.sessionManager.append(assistant("retry-error", "error"));
+	await fireHandlers(
+		harness.handlers,
+		"agent_end",
+		{ messages: [] },
+		harness.ctx,
+	);
+	assert.equal(controller.snapshot.locked, true);
+	assert.deepEqual(harness.received, []);
+	harness.sessionManager.append(assistant("retry-success", "stop"));
+	harness.setIdle(true);
+	await fireHandlers(harness.handlers, "agent_settled", {}, harness.ctx);
+	assert.equal(controller.snapshot.locked, true);
+	assert.deepEqual(harness.received, []);
+	await fireHandlers(harness.handlers, "session_shutdown", {}, harness.ctx);
 });

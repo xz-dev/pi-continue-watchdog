@@ -103,7 +103,7 @@ On Pi's public event bus (`pi:semantic-hook:v1`), the watchdog publishes:
 
 - `watchdog-continued` — after each durably recorded continue (`REASON_TYPE`, `REASON`).
 - `watchdog-waiting` — exactly once after each durably recorded wait (`REASON`, decimal `WAIT_SECONDS`); waits have no reason type.
-- `user-ready` — once when a terminal idle state is reached: AI unlock (`AI_UNLOCK`), budget exhausted (`EXHAUSTED`), or three invalid decisions (`DECISION_FAILED`).
+- `user-ready` — once when a terminal aggregate-idle state is reached: AI unlock (`AI_UNLOCK`), terminal-error automatic unlock (`ERROR_UNLOCK`), budget exhausted (`EXHAUSTED`), or three invalid decisions (`DECISION_FAILED`). Only `AI_UNLOCK` includes `REASON_TYPE` and `REASON`; `ERROR_UNLOCK` carries only `STOP_KIND`, after Pi's retries have ended and the watchdog has unlocked. Publication waits for busy children and process-domain idle confirmation. Manual unlock and user abort remain silent.
 
 Delivery is best-effort; no consumer is required or waited for.
 

@@ -1453,3 +1453,66 @@ test("async-rejecting bus consumer leaves producer and controller unchanged", as
 		attempt: 0,
 	});
 });
+
+test("ERROR_UNLOCK waits for domain confirmation and rechecks busy activity", async () => {
+	const fence = deferredDomain();
+	const harness = createSemanticHarness({ processDomain: fence.domain });
+	await startIdle(harness);
+	harness.streaming = true;
+	await harness.fire("agent_start", {});
+	const claim = harness.runtime.getMainClaim();
+	assert.ok(claim);
+	harness.controller.unlock();
+	harness.runtime.clearOperationalPendingWork();
+	harness.runtime.retainErrorUnlock(claim);
+	assert.deepEqual(harness.received, []);
+	harness.streaming = false;
+	const settling = settleOnly(harness);
+	await waitForPendingConfirm(fence);
+	assert.deepEqual(harness.received, []);
+	const child = harness.hub.bind({
+		instance: createHubAttachmentInstance(),
+		sessionId: "error-publication-child",
+		hasUI: false,
+		initialBusy: true,
+	}).attachment;
+	while (fence.hasPending()) fence.resolve(true);
+	await settling;
+	assert.deepEqual(harness.received, []);
+	fence.setDeferred(false);
+	harness.hub.markIdle(child);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(harness.received, [
+		{ version: 1, name: "user-ready", values: { STOP_KIND: "ERROR_UNLOCK" } },
+	]);
+	await settleOnly(harness);
+	assert.equal(harness.received.length, 1);
+	await harness.runtime.shutdown();
+});
+
+test("ERROR_UNLOCK confirmation cannot survive manual unlock, re-lock, or shutdown", async () => {
+	for (const transition of ["unlock", "lock", "shutdown"] as const) {
+		const fence = deferredDomain();
+		const harness = createSemanticHarness({ processDomain: fence.domain });
+		await startIdle(harness);
+		harness.streaming = true;
+		await harness.fire("agent_start", {});
+		const claim = harness.runtime.getMainClaim();
+		assert.ok(claim);
+		harness.controller.unlock();
+		harness.runtime.clearOperationalPendingWork();
+		harness.runtime.retainErrorUnlock(claim);
+		harness.streaming = false;
+		const settling = settleOnly(harness);
+		await waitForPendingConfirm(fence);
+		if (transition === "shutdown") await harness.runtime.shutdown();
+		else {
+			harness.controller[transition]();
+			harness.runtime.clearOperationalPendingWork();
+		}
+		while (fence.hasPending()) fence.resolve(true);
+		await settling;
+		assert.deepEqual(harness.received, [], transition);
+		await harness.runtime.shutdown();
+	}
+});

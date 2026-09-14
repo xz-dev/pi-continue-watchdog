@@ -588,6 +588,7 @@ For a valid wait, renewed activity cancels the current wait-qualified grace. Whe
 1. Valid AI decision unlock with validated `reason_type` and `reason_content`
 2. Max valid continue/wait attempts exhausted, with any final wait deadline reached
 3. Third invalid decision becomes decision-failed
+4. The main run settles with terminal `stopReason: "error"` after Pi's retries and the watchdog automatically unlocks
 
 **Then** the main attachment publishes exactly one fresh plain-data envelope on Pi's public bus channel `pi:semantic-hook:v1`:
 
@@ -607,9 +608,15 @@ or
 {"version":1,"name":"user-ready","values":{"STOP_KIND":"DECISION_FAILED"}}
 ```
 
+or
+
+```json
+{"version":1,"name":"user-ready","values":{"STOP_KIND":"ERROR_UNLOCK"}}
+```
+
 **And** it does **not** publish for human `/unlock-continue-watchdog` (with or without reason), canonical/manual/user abort unlock, initial ordinary unlocked idle, valid continue, a valid wait before its deadline, intermediate decision/settled states, locked normal/pending grace, stale/demoted/reloaded ownership, or repeated settled/reconcile in the same terminal epoch.
 
-Only AI decision unlock retains a publication intent carrying **both** matched `REASON_TYPE` and validated `REASON` together until the resulting authoritative aggregate-idle settle; type and reason are retained/cleared together. Other stop kinds remain unchanged and do not invent type/reason fields. Existing type matching plus reason validation/trim/length remain authority; decision-failed does not publish last error text. Absence or failure of every consumer must not change watchdog state.
+Only AI decision unlock retains a publication intent carrying **both** matched `REASON_TYPE` and validated `REASON` together until the resulting authoritative aggregate-idle settle; type and reason are retained/cleared together. Terminal-error automatic unlock retains an `ERROR_UNLOCK` intent after authoritative unlock and operational cleanup; it publishes only at aggregate idle, after process-domain confirmation when configured. Busy children delay publication; duplicate settles cannot repeat it. Manual unlock, a fresh lock cycle, stale ownership, and shutdown clear the pending intent. Pi retry errors before final settlement do not publish. Non-AI stop kinds do not invent type/reason fields. Existing type matching plus reason validation/trim/length remain authority; decision-failed does not publish last error text. Absence or failure of every consumer must not change watchdog state.
 
 **Delayed publication while a child is still busy:**
 

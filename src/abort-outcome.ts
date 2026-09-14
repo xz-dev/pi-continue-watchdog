@@ -48,6 +48,8 @@ export interface MainAbortUnlockRuntime {
 	 * later settle path cannot continue after abort unlock.
 	 */
 	clearOperationalPendingWork(): void;
+	/** Retain error unlock after cleanup; runtime publishes only at aggregate idle. */
+	retainErrorUnlock(claim: HubMainClaim): void;
 	/**
 	 * Atomically consume the marker suppressing a watchdog decision aborted by
 	 * user input. When true, the abort unlock must be suppressed entirely (no
@@ -157,6 +159,7 @@ async function performAutoUnlock(
 	options: {
 		readonly notification: string;
 		readonly entryReason?: string;
+		readonly stopKind?: "ERROR_UNLOCK";
 	},
 ): Promise<void> {
 	const controller = runtime.controller;
@@ -166,6 +169,7 @@ async function performAutoUnlock(
 	const transition = controller.unlock();
 	if (!runtime.isCurrentMainClaim(claim)) return;
 	runtime.clearOperationalPendingWork();
+	if (options.stopKind === "ERROR_UNLOCK") runtime.retainErrorUnlock(claim);
 	await applyUnlockEffects(
 		transition,
 		runtime,
@@ -251,6 +255,7 @@ export function registerMainAbortUnlock(
 			await performAutoUnlock(pi, runtime, ctx, active.claim, {
 				notification: ERROR_UNLOCKED_NOTIFICATION,
 				entryReason: ERROR_AUTO_UNLOCK_REASON,
+				stopKind: "ERROR_UNLOCK",
 			});
 		}
 	});

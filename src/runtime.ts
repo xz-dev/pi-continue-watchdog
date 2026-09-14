@@ -82,6 +82,7 @@ import {
 	createWatchdogContinuedEnvelope,
 	createWatchdogWaitingEnvelope,
 	emitSemanticHook,
+	type UserReadyValues,
 } from "./semantic-hook.js";
 
 export interface RuntimeControllerHolder {
@@ -249,6 +250,8 @@ export interface DecisionRuntime {
 	 * lock/unlock transition so a later settle cannot continue stale work.
 	 */
 	clearOperationalPendingWork(): void;
+	/** Retain terminal-error unlock intent; publication waits for aggregate idle. */
+	retainErrorUnlock(claim: HubMainClaim): void;
 	/**
 	 * Atomically consume the marker suppressing a watchdog decision aborted by
 	 * user input. Returns true once; afterwards a later unrelated abort is never
@@ -400,11 +403,8 @@ export function createDecisionRuntime(
 	const pendingTakeover = new PreemptTakeover();
 	/** Retried until Pi accepts the exact correlated remove-fold. */
 	let pendingInquiryCleanup: InquiryFoldMessage | null = null;
-	/** Retained only for AI decision unlock until the next all-idle settle. */
-	let pendingAiUnlock: {
-		readonly reasonType: string;
-		readonly reason: string;
-	} | null = null;
+	/** Retained for automatic unlock until the next all-idle settle. */
+	let pendingUnlock: UserReadyValues | null = null;
 	/** At-most-once publication guard for the current aggregate-idle epoch. */
 	let publishedForIdleEpoch = false;
 	let terminalWaitTimer: RuntimeTimerHandle | null = null;
@@ -792,8 +792,8 @@ export function createDecisionRuntime(
 		decisionAssistantToSplice = null;
 		pendingFinalization = null;
 		clearLiveStatus();
-		// Human/abort unlock must not inherit a prior AI unlock publication intent.
-		pendingAiUnlock = null;
+		// Human/abort unlock must not inherit an automatic unlock publication intent.
+		pendingUnlock = null;
 		observeAggregate();
 	};
 
@@ -1459,7 +1459,7 @@ export function createDecisionRuntime(
 
 	/**
 	 * Publish neutral `user-ready` at most once for the current all-idle epoch.
-	 * Only AI decision unlock, exhausted, and decision-failed terminal states
+	 * Only automatic unlock, exhausted, and decision-failed terminal states
 	 * produce a signal. Ordinary unlocked idle never publishes by inference.
 	 */
 	const maybePublishUserReady = async (): Promise<void> => {
@@ -1482,13 +1482,9 @@ export function createDecisionRuntime(
 		if (controller.snapshot.waitUntilMs > now()) return;
 
 		let envelope = null as ReturnType<typeof createUserReadyEnvelope> | null;
-		const aiUnlockIntent = pendingAiUnlock;
-		if (aiUnlockIntent !== null) {
-			envelope = createUserReadyEnvelope({
-				STOP_KIND: "AI_UNLOCK",
-				REASON_TYPE: aiUnlockIntent.reasonType,
-				REASON: aiUnlockIntent.reason,
-			});
+		const unlockIntent = pendingUnlock;
+		if (unlockIntent !== null) {
+			envelope = createUserReadyEnvelope(unlockIntent);
 		} else {
 			const snapshot = controller.snapshot;
 			if (snapshot.locked && snapshot.exhausted) {
@@ -1519,8 +1515,8 @@ export function createDecisionRuntime(
 			if (localActivityGeneration !== publicationGeneration) return;
 			const liveController = currentController(claim);
 			if (liveController !== controller) return;
-			if (aiUnlockIntent !== null) {
-				if (pendingAiUnlock !== aiUnlockIntent) return;
+			if (unlockIntent !== null) {
+				if (pendingUnlock !== unlockIntent) return;
 			} else {
 				const live = liveController.snapshot;
 				if (live.waitUntilMs > now()) return;
@@ -1543,9 +1539,9 @@ export function createDecisionRuntime(
 			}
 			if (publishedForIdleEpoch) return;
 		}
-		if (aiUnlockIntent !== null) {
-			if (pendingAiUnlock !== aiUnlockIntent) return;
-			pendingAiUnlock = null;
+		if (unlockIntent !== null) {
+			if (pendingUnlock !== unlockIntent) return;
+			pendingUnlock = null;
 		}
 		publishedForIdleEpoch = true;
 		try {
@@ -2218,7 +2214,11 @@ export function createDecisionRuntime(
 		// Retain AI unlock publication intent before asynchronous publication
 		// fencing. The controller is already terminally unlocked; if Pi becomes busy,
 		// the next genuine idle epoch publishes the typed intent exactly once.
-		pendingAiUnlock = { reasonType, reason };
+		pendingUnlock = {
+			STOP_KIND: "AI_UNLOCK",
+			REASON_TYPE: reasonType,
+			REASON: reason,
+		};
 		const watchdogResult: DecisionTerminalResult = {
 			outcome: "unlock",
 			reasonType,
@@ -2844,6 +2844,11 @@ export function createDecisionRuntime(
 		getMainClaim,
 		isCurrentMainClaim: (claim) => options.hub.isCurrentMain(claim),
 		clearOperationalPendingWork,
+		retainErrorUnlock(claim): void {
+			if (!owns(claim) || currentController(claim)?.snapshot.locked !== false)
+				return;
+			pendingUnlock = { STOP_KIND: "ERROR_UNLOCK" };
+		},
 		consumeDecisionAbortSuppression,
 		restartLockCycle,
 		applyEffect,
