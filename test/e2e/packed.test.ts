@@ -1570,6 +1570,82 @@ test("packed invalid decisions reask three times and leave Pi idle", {
 	);
 });
 
+test("packed approval-gated decision prompt prioritizes WAIT_USER without continuation", {
+	timeout: 30_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t);
+	const { baseUrl, requests } = await startMockServer(t, [
+		{
+			kind: "stop",
+			text: "Production deployment requires explicit user approval.",
+		},
+		{
+			kind: "unlock",
+			reasonType: "WAIT_USER",
+			reason: "Production deployment requires explicit user approval.",
+		},
+	]);
+	const { session } = await createSession(fixture, baseUrl);
+	t.after(() => shutdownSession(session));
+
+	await session.prompt(
+		"Prepare deployment, but do not deploy without approval.",
+	);
+	await waitFor(() => requests.length === 2, 18_000, "WAIT_USER decision");
+	await waitForSessionIdle(session, 3_000, "WAIT_USER unlock");
+
+	const decisionRequest = requests[1];
+	assert.ok(decisionRequest);
+	const decisionContent = textOf(decisionRequest.messages.at(-1) ?? {});
+	assert.match(
+		decisionContent,
+		/Choose the outcome using these rules in order/,
+	);
+	assert.match(
+		decisionContent,
+		/no concrete next action can proceed without additional user input, approval, confirmation, authorization, credentials, or another user action/,
+	);
+	assert.match(decisionContent, /default reason_type is WAIT_USER/);
+	assert.match(
+		decisionContent,
+		/Unfinished work alone is not sufficient reason to continue/,
+	);
+	assert.match(
+		decisionContent,
+		/at least one concrete requested and authorized next action can be performed immediately/,
+	);
+	assert.match(
+		decisionContent,
+		/reason_content must name that immediately executable action, not a user-blocked action/,
+	);
+	assert.equal(
+		requests.some((request) =>
+			request.messages.some((message) =>
+				textOf(message).includes("pi-continue-watchdog:continuation"),
+			),
+		),
+		false,
+	);
+	assert.equal(
+		requests.length,
+		2,
+		"WAIT_USER must not start a continuation turn",
+	);
+
+	const unlockEntry = session.sessionManager
+		.getBranch()
+		.find(
+			(entry) =>
+				entry.type === "custom" &&
+				entry.customType === "pi-continue-watchdog:unlock",
+		);
+	assert.ok(unlockEntry?.type === "custom");
+	assert.deepEqual(unlockEntry.data, {
+		reasonType: "WAIT_USER",
+		reason: "Production deployment requires explicit user approval.",
+	});
+});
+
 test("packed automatic continuation cannot satisfy an unresolved approval request", {
 	timeout: 40_000,
 }, async (t) => {

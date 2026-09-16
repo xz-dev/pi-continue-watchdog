@@ -136,6 +136,34 @@ def buildContinuationEnvelope
     stopAtUserBoundary := true
   }
 
+-- Decision facts formalize mutually exclusive outcome selection with the user boundary ahead of unfinished scope.
+inductive DecisionOutcome where
+  | waitUser
+  | waitExternal
+  | continueWork
+  | jobDone
+  | jobBlocked
+  deriving DecidableEq, Repr
+
+structure DecisionFacts where
+  userActionRequired : Bool
+  externalWaitRequired : Bool
+  immediateAuthorizedAction : Bool
+  allWorkComplete : Bool
+  deriving DecidableEq, Repr
+
+def selectDecisionOutcome (facts : DecisionFacts) : DecisionOutcome :=
+  if facts.userActionRequired && !facts.immediateAuthorizedAction then
+    .waitUser
+  else if facts.externalWaitRequired && !facts.immediateAuthorizedAction then
+    .waitExternal
+  else if facts.immediateAuthorizedAction then
+    .continueWork
+  else if facts.allWorkComplete then
+    .jobDone
+  else
+    .jobBlocked
+
 def statusActivity (state : RuntimeState) : StatusActivity :=
   if aggregateIdle state then .idle else .running
 
@@ -586,6 +614,46 @@ theorem continuation_preserves_reason_and_guidance
       (buildContinuationEnvelope accepted).guidance = accepted.guidance := by
   simp [buildContinuationEnvelope]
 
+-- Outcome proofs establish WAIT_USER priority, external-wait separation, immediate-action continue, and terminal unlock categories.
+theorem user_boundary_has_priority
+    (facts : DecisionFacts)
+    (userRequired : facts.userActionRequired = true)
+    (noImmediate : facts.immediateAuthorizedAction = false) :
+    selectDecisionOutcome facts = .waitUser := by
+  simp [selectDecisionOutcome, userRequired, noImmediate]
+
+theorem external_wait_is_not_user_wait
+    (facts : DecisionFacts)
+    (noUser : facts.userActionRequired = false)
+    (externalWait : facts.externalWaitRequired = true)
+    (noImmediate : facts.immediateAuthorizedAction = false) :
+    selectDecisionOutcome facts = .waitExternal := by
+  simp [selectDecisionOutcome, noUser, externalWait, noImmediate]
+
+theorem independent_authorized_action_can_continue
+    (facts : DecisionFacts)
+    (immediate : facts.immediateAuthorizedAction = true) :
+    selectDecisionOutcome facts = .continueWork := by
+  simp [selectDecisionOutcome, immediate]
+
+theorem completed_work_is_done
+    (facts : DecisionFacts)
+    (noUser : facts.userActionRequired = false)
+    (noExternalWait : facts.externalWaitRequired = false)
+    (noImmediate : facts.immediateAuthorizedAction = false)
+    (complete : facts.allWorkComplete = true) :
+    selectDecisionOutcome facts = .jobDone := by
+  simp [selectDecisionOutcome, noUser, noExternalWait, noImmediate, complete]
+
+theorem remaining_non_user_blocker_is_blocked
+    (facts : DecisionFacts)
+    (noUser : facts.userActionRequired = false)
+    (noExternalWait : facts.externalWaitRequired = false)
+    (noImmediate : facts.immediateAuthorizedAction = false)
+    (incomplete : facts.allWorkComplete = false) :
+    selectDecisionOutcome facts = .jobBlocked := by
+  simp [selectDecisionOutcome, noUser, noExternalWait, noImmediate, incomplete]
+
 -- The guarantee record gathers lifecycle, delayed inquiry, disconnect, preemption, and scoped bounded-status obligations.
 structure ProcessGuarantees : Prop where
   noEarlyInquiry :
@@ -647,6 +715,18 @@ structure ProcessGuarantees : Prop where
     (buildContinuationEnvelope accepted).reasonType = accepted.reasonType ∧
       (buildContinuationEnvelope accepted).reason = accepted.reason ∧
       (buildContinuationEnvelope accepted).guidance = accepted.guidance
+  userBoundaryFirst : ∀ facts,
+    facts.userActionRequired = true →
+      facts.immediateAuthorizedAction = false →
+      selectDecisionOutcome facts = .waitUser
+  externalWaitDistinct : ∀ facts,
+    facts.userActionRequired = false →
+      facts.externalWaitRequired = true →
+      facts.immediateAuthorizedAction = false →
+      selectDecisionOutcome facts = .waitExternal
+  independentWorkContinues : ∀ facts,
+    facts.immediateAuthorizedAction = true →
+      selectDecisionOutcome facts = .continueWork
 
 theorem process_is_correct : ProcessGuarantees := by
   exact {
@@ -676,6 +756,9 @@ theorem process_is_correct : ProcessGuarantees := by
     continuationAttributed := continuation_is_extension_authored
     continuationNotAuthorization := continuation_does_not_authorize
     continuationPreservesDecision := continuation_preserves_reason_and_guidance
+    userBoundaryFirst := user_boundary_has_priority
+    externalWaitDistinct := external_wait_is_not_user_wait
+    independentWorkContinues := independent_authorized_action_can_continue
   }
 
 -- Executable projections expose proved timer, clean-preemption, and status behavior without operational side effects.
@@ -713,10 +796,23 @@ def main : IO Unit := do
     reason := "Implementation work remains."
     guidance := "Continue until user assistance is required."
   }
+  let approvalGate := OfficialPiIdleInquiry.selectDecisionOutcome {
+    userActionRequired := true
+    externalWaitRequired := false
+    immediateAuthorizedAction := false
+    allWorkComplete := false
+  }
+  let independentWork := OfficialPiIdleInquiry.selectDecisionOutcome {
+    userActionRequired := true
+    externalWaitRequired := false
+    immediateAuthorizedAction := true
+    allWorkComplete := false
+  }
   IO.println s!"Before ten seconds: {OfficialPiIdleInquiry.runtimeSummary before}"
   IO.println s!"At ten seconds: {OfficialPiIdleInquiry.runtimeSummary opened}"
   IO.println s!"After user takeover: {OfficialPiIdleInquiry.runtimeSummary delivered}"
   IO.println s!"Running status: {OfficialPiIdleInquiry.statusSummary running}"
   IO.println s!"Narrow layout: lines={narrow.lineCount}; columns={narrow.visibleColumns}/24"
   IO.println s!"Continuation envelope: extensionAuthored={continuation.extensionAuthored}; userAuthored={continuation.userAuthored}; userAuthorization={continuation.conveysUserAuthorization}; reasonType={continuation.reasonType}; stopAtUserBoundary={continuation.stopAtUserBoundary}"
-  IO.println "Proved: fixed delay precedes inquiry, wake rechecks official idle, disconnect removes busy children, reconnect retries every second and reports fresh live state, preemption is clean and exactly-once, the scoped status projection is one bounded line, and automatic continuation is extension-authored, non-authorizing, reason-preserving, and bounded by the next user-input or approval requirement."
+  IO.println s!"Decision priority: approvalGate={repr approvalGate}; independentWork={repr independentWork}"
+  IO.println "Proved: fixed delay precedes inquiry, wake rechecks official idle, disconnect removes busy children, reconnect retries every second and reports fresh live state, preemption is clean and exactly-once, the scoped status projection is one bounded line, automatic continuation is extension-authored and non-authorizing, WAIT_USER wins when no authorized action can proceed, external waits remain distinct, and independent authorized work may continue."

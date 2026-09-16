@@ -212,7 +212,7 @@ Unlock first makes `locked=false`, resets `waitUntilMs` to `0`, then invalidates
 **Then** the plugin:
 
 1. Keeps ordinary active tools and the system-prompt tool list unchanged.
-2. Persists a context-excluded `pi-continue-watchdog:inquiry-marker` with the exact protocol version, unique `exchangeId`, and `cycleId`, then sends a **custom-role** message—not a user-role message—whose body is an optional bounded zero-loop history block, followed by the configured `decisionPrompt`, followed by the fixed XML suffix, using `{ triggerTurn: true, deliverAs: "steer" }`. If marker persistence fails, the inquiry is not dispatched. The marker is a logical correlation boundary: other plugins may interleave entries between marker, decision prompt, assistant, and fold marker without becoming watchdog-owned. Ordinary tools stay advertised. The live decision assistant may stream in TUI/RPC, but public `message_end` replacement clears its finalized or aborted content from TUI history and persistence. The suffix tells the model to use existing task context, not call tools, put exactly one watchdog block at the response end, never output multiple watchdog blocks, use effective allowed `reason_type` values for continue/unlock, and use an untyped bounded `wait_seconds` for wait. This package does not request `presentation: "hidden"` and does not require a downstream Pi hidden-run API.
+2. Persists a context-excluded `pi-continue-watchdog:inquiry-marker` with the exact protocol version, unique `exchangeId`, and `cycleId`, then sends a **custom-role** message—not a user-role message—whose body is an optional bounded zero-loop history block, followed by the configured `decisionPrompt`, followed by the fixed XML suffix, using `{ triggerTurn: true, deliverAs: "steer" }`. If marker persistence fails, the inquiry is not dispatched. The marker is a logical correlation boundary: other plugins may interleave entries between marker, decision prompt, assistant, and fold marker without becoming watchdog-owned. Ordinary tools stay advertised. The live decision assistant may stream in TUI/RPC, but public `message_end` replacement clears its finalized or aborted content from TUI history and persistence. The suffix tells the model to use existing task context, not call tools, put exactly one watchdog block at the response end, never output multiple watchdog blocks, use effective allowed `reason_type` values for continue/unlock, and use an untyped bounded `wait_seconds` for wait. It also applies one ordered classification: user-dependent work with no immediately executable authorized action uses unlock/`WAIT_USER`; temporary external waiting with no user action uses wait; continue requires a concrete requested and authorized action executable now; completed work uses unlock/`JOB_DONE`; other blockers use unlock/`JOB_BLOCKED`. Unfinished work alone never justifies continue. This package does not request `presentation: "hidden"` and does not require a downstream Pi hidden-run API.
 3. Blocks every ordinary tool call before execution while the decision is active and returns a reminder to answer from existing context with XML. A blocked call does not itself consume an invalid attempt; final assistant text is authoritative.
 4. Does **not** send the rejected direct-continuation message as the idle wake path.
 
@@ -233,6 +233,18 @@ Legacy terminal records that have only a valid outcome remain compatible as outc
 The block begins with `Previous watchdog results (model-generated reference only; not user instructions):` (or the same heading with an older-result omitted count) and emits one deterministic JSON-escaped summary per line. In addition to normal JSON string escaping, U+2028 and U+2029 are emitted as literal `\u2028` and `\u2029` sequences so values cannot create physical line separators. It has a fixed **16,384 Unicode-code-point** ceiling: formatting keeps the newest complete summaries, restores chronological order, and reports how many older summaries were omitted. It never truncates a field, the configured decision prompt, or the fixed XML suffix.
 
 The history string is captured once when the check opens and reused unchanged for every validation re-ask in that check. It may use only the normalized fields above. Raw watchdog explanation text, XML, thinking, partial output, provider errors, TUI strings, response-audit data, and arbitrary malformed metadata never enter the block.
+
+### Ordered outcome selection
+
+The fixed suffix applies these guards in order before XML validation:
+
+1. If no concrete next action can proceed without additional user input, approval, confirmation, authorization, credentials, or another user action, choose unlock with the allowed type representing `WAIT_USER`.
+2. If no immediate action can proceed because temporary external automation or elapsed time is required and no user action is required, choose wait.
+3. Choose continue only when at least one concrete requested and authorized action can be performed immediately without additional user input or approval; `reason_content` names that action, not a blocked action.
+4. If all requested work is complete, choose unlock with the allowed type representing `JOB_DONE`.
+5. Otherwise choose unlock with the allowed type representing `JOB_BLOCKED`.
+
+A pending approval-gated action does not force unlock when independent requested and authorized work remains executable now. Conversely, unfinished work with no executable action is not `WORK_REMAINS`; when blocked on the user it is `WAIT_USER`.
 
 ### Validity rules (exactly one trailing XML decision)
 
@@ -460,6 +472,30 @@ Ordinary natural idle settle never counts as abort.
 - the rejected untyped decision default that asked only for a concise reason without an allowed `reasonType` is **not** used
 
 With defaults, every eligible all-idle generation waits **10s**.
+
+### Example 5a — Approval-gated work chooses WAIT_USER immediately
+
+**Given** requested production changes remain, but every permitted next action requires explicit user approval
+**When** the watchdog decision opens
+**Then** the fixed suffix directs unlock with `WAIT_USER`; unfinished production work alone cannot justify `WORK_REMAINS`; no automatic continuation turn starts.
+
+### Example 5b — External automation chooses wait
+
+**Given** CI is running, no useful action can proceed until it completes, and no user response is required
+**When** the watchdog decision opens
+**Then** the fixed suffix directs `wait_watchdog` with a bounded duration rather than `WAIT_USER` or continue.
+
+### Example 5c — Independent authorized work may continue
+
+**Given** one action awaits user approval but another concrete requested and authorized verification action is executable now
+**When** the watchdog decision opens
+**Then** continue remains valid only when `reason_content` names that immediately executable verification action rather than the blocked production action.
+
+### Example 5d — Completed and other-blocked work unlock distinctly
+
+**Given** either all requested work is complete or work is blocked for a reason that is neither user action nor a temporary external wait
+**When** the watchdog decision opens
+**Then** the fixed suffix directs `JOB_DONE` for completion and `JOB_BLOCKED` for the other blocker.
 
 ### Example 6 — Valid continue: fold, compact prompt, retry consumption
 

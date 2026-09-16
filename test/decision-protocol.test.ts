@@ -526,7 +526,7 @@ test("Pi AssistantMessage normalization maps ordinary text/thinking/toolCall sha
 test("fixed prompt suffix requires typed reasons for both decisions", () => {
 	const prompt = buildDecisionPrompt(
 		DECISION_PROMPT,
-		["JOB_DONE", "WAIT_USER"],
+		["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
 		["WORK_REMAINS", "VERIFYING"],
 	);
 	assert.match(prompt, /Do not make decisions on the user's behalf/);
@@ -540,7 +540,7 @@ test("fixed prompt suffix requires typed reasons for both decisions", () => {
 		/reason_content must be non-empty and at most 500 Unicode characters/,
 	);
 	assert.equal(REASON_GUIDANCE_CHARACTERS, MAX_REASON_CHARACTERS / 2);
-	assert.match(prompt, /\["JOB_DONE","WAIT_USER"\]/);
+	assert.match(prompt, /\["JOB_DONE","WAIT_USER","JOB_BLOCKED"\]/);
 	assert.match(prompt, /\["WORK_REMAINS","VERIFYING"\]/);
 	assert.match(prompt, /<function>continue_watchdog<\/function>/);
 	assert.match(prompt, /<reason_type>WORK_REMAINS<\/reason_type>/);
@@ -549,12 +549,37 @@ test("fixed prompt suffix requires typed reasons for both decisions", () => {
 	assert.match(prompt, /<wait_seconds>300<\/wait_seconds>/);
 	assert.match(prompt, /integer wait_seconds from 1 through 1800/);
 	assert.match(prompt, /<function>unlock_continue_watchdog<\/function>/);
-	assert.match(prompt, /If you want to continue working/);
-	assert.match(prompt, /If you think the work is finished or blocked/);
+	assert.match(prompt, /Choose the outcome using these rules in order/);
 	assert.match(
 		prompt,
-		/If you think work should wait a period of time before continuing/,
+		/no concrete next action can proceed without additional user input, approval, confirmation, authorization, credentials, or another user action/,
 	);
+	assert.match(prompt, /default reason_type is WAIT_USER/);
+	assert.match(
+		prompt,
+		/Unfinished work alone is not sufficient reason to continue/,
+	);
+	assert.match(
+		prompt,
+		/at least one concrete requested and authorized next action can be performed immediately/,
+	);
+	assert.match(
+		prompt,
+		/reason_content must name that immediately executable action/,
+	);
+	assert.match(
+		prompt,
+		/temporary external automation or elapsed time and no user action is required/,
+	);
+	assert.match(prompt, /default reason_type is JOB_DONE/);
+	assert.match(prompt, /default reason_type is JOB_BLOCKED/);
+	assert.ok(
+		prompt.indexOf("default reason_type is WAIT_USER") <
+			prompt.indexOf("Unfinished work alone"),
+	);
+	assert.match(prompt, /If you choose continue_watchdog/);
+	assert.match(prompt, /If you choose unlock_continue_watchdog/);
+	assert.match(prompt, /If you choose wait_watchdog/);
 	assert.equal(/extra|ignored|unknown child/i.test(prompt), false);
 });
 
@@ -573,6 +598,21 @@ test("fixed prompt suffix XML-escapes an arbitrary reason type and lists types u
 		prompt,
 		/<reason_type>Work &lt;Remains &amp; Verify<\/reason_type>/,
 	);
+	assert.match(
+		prompt,
+		/choose the allowed reason_type value that represents required user action/,
+	);
+	assert.match(
+		prompt,
+		/choose the allowed reason_type value that represents completed work/,
+	);
+	assert.match(
+		prompt,
+		/choose the allowed reason_type value that represents a non-user blocker/,
+	);
+	assert.equal(prompt.includes("WAIT_USER"), false);
+	assert.equal(prompt.includes("JOB_DONE"), false);
+	assert.equal(prompt.includes("JOB_BLOCKED"), false);
 	assert.equal(prompt.includes("<reason_type>Need <Review & Approval"), false);
 });
 

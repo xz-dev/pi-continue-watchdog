@@ -265,6 +265,27 @@ export function buildDecisionPrompt(
 ): string {
 	const allowedReasonTypes = JSON.stringify(reasonTypes);
 	const allowedContinueReasonTypes = JSON.stringify(continueReasonTypes);
+	const configuredReasonType = (builtIn: string): string | null => {
+		const match = reasonTypes.find(
+			(reasonType) => reasonType.toLowerCase() === builtIn.toLowerCase(),
+		);
+		return match === undefined ? null : match.toUpperCase();
+	};
+	const waitUserType = configuredReasonType("WAIT_USER");
+	const jobDoneType = configuredReasonType("JOB_DONE");
+	const jobBlockedType = configuredReasonType("JOB_BLOCKED");
+	const waitUserGuidance =
+		waitUserType === null
+			? "choose the allowed reason_type value that represents required user action"
+			: `the default reason_type is ${waitUserType}`;
+	const jobDoneGuidance =
+		jobDoneType === null
+			? "choose the allowed reason_type value that represents completed work"
+			: `the default reason_type is ${jobDoneType}`;
+	const jobBlockedGuidance =
+		jobBlockedType === null
+			? "choose the allowed reason_type value that represents a non-user blocker"
+			: `the default reason_type is ${jobBlockedType}`;
 	const continueExample = buildXmlDocument("watchdog", [
 		{ name: "function", value: "continue_watchdog" },
 		{ name: "reason_type", value: continueReasonTypes[0] ?? "ALLOWED_TYPE" },
@@ -280,7 +301,7 @@ export function buildDecisionPrompt(
 		{ name: "reason_type", value: reasonTypes[0] ?? "ALLOWED_TYPE" },
 		{ name: "reason_content", value: "concise reason" },
 	]);
-	return `${decisionPrompt}\n\nUse only the existing conversation context and decide quickly. Do not make decisions on the user's behalf. Do not call tools. Your entire response must be exactly one <watchdog>...</watchdog> XML document, with no text before or after it; express your reasoning inside the fields, above all reason_content. reason_content must be non-empty and at most ${REASON_GUIDANCE_CHARACTERS} Unicode characters. Do not output multiple <watchdog>...</watchdog> blocks.\n\nIf you want to continue working, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedContinueReasonTypes}. Use:\n${continueExample}\n\nIf you think the work is finished or blocked and the user should take over, use unlock. reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedReasonTypes}. Use:\n${unlockExample}\n\nIf you think work should wait a period of time before continuing (for example external automation such as CI or a subagent has not finished yet), use a non-empty reason_content and an integer wait_seconds from ${MIN_WAIT_SECONDS} through ${MAX_WAIT_SECONDS}. Use:\n${waitExample}`;
+	return `${decisionPrompt}\n\nUse only the existing conversation context and decide quickly. Do not make decisions on the user's behalf. Do not call tools. Your entire response must be exactly one <watchdog>...</watchdog> XML document, with no text before or after it; express your reasoning inside the fields, above all reason_content. reason_content must be non-empty and at most ${REASON_GUIDANCE_CHARACTERS} Unicode characters. Do not output multiple <watchdog>...</watchdog> blocks.\n\nChoose the outcome using these rules in order:\n1. If no concrete next action can proceed without additional user input, approval, confirmation, authorization, credentials, or another user action, use unlock_continue_watchdog. For reason_type, ${waitUserGuidance}. Unfinished work alone is not sufficient reason to continue.\n2. If progress only requires temporary external automation or elapsed time and no user action is required, use wait_watchdog.\n3. Use continue_watchdog only if at least one concrete requested and authorized next action can be performed immediately without additional user input or approval. reason_content must name that immediately executable action, not a user-blocked action.\n4. If all requested work is complete, use unlock_continue_watchdog. For reason_type, ${jobDoneGuidance}.\n5. Otherwise, if work cannot proceed for a blocker that is neither user action nor a temporary external wait, use unlock_continue_watchdog. For reason_type, ${jobBlockedGuidance}.\n\nIf you choose continue_watchdog, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedContinueReasonTypes}. Use:\n${continueExample}\n\nIf you choose unlock_continue_watchdog, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedReasonTypes}. Use:\n${unlockExample}\n\nIf you choose wait_watchdog, use a non-empty reason_content and an integer wait_seconds from ${MIN_WAIT_SECONDS} through ${MAX_WAIT_SECONDS}. Use:\n${waitExample}`;
 }
 
 interface ParsedWatchdogFields {
