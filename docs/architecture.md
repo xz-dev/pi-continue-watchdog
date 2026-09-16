@@ -186,7 +186,8 @@ The configurable prompt supplies decision intent. When present, a bounded zero-l
 - forbids tool use;
 - requires exactly one trailing `<watchdog>...</watchdog>` block;
 - explicitly prohibits making decisions on the user's behalf;
-- defines one ordered outcome policy: user-dependent work with no immediately executable authorized action uses unlock/`WAIT_USER`; temporary external waiting with no user action uses wait; continue requires naming a concrete requested and authorized action executable now; completed work uses unlock/`JOB_DONE`; other blockers use unlock/`JOB_BLOCKED`;
+- reconciles requests with the latest ordinary answer and tool results before classification; completed, cancelled, or superseded work is not revived by stale plans or watchdog reasons;
+- presents an ASCII decision tree and completion-first rules: completed work unlocks, incomplete immediately executable authorized work continues, otherwise user-dependent work unlocks, external automation waits, and other blockers unlock;
 - states that unfinished work alone is not sufficient reason to continue and that a pending user-gated action does not block continue when independent requested and authorized work remains immediately executable;
 - lists the independent effective unlock and continue reason types;
 - gives canonical typed continue/unlock examples and an untyped wait example with integer seconds from 1 through 1800.
@@ -225,14 +226,16 @@ Tool availability in the request does not imply execution is allowed. While a ma
 Before choosing an XML shape, the model applies the fixed suffix's ordered guards:
 
 ```text
-no immediately executable action + user input/approval needed -> unlock (WAIT_USER)
-no immediately executable action + temporary external wait   -> wait
-concrete requested and authorized action executable now       -> continue
-all requested work complete                                   -> unlock (JOB_DONE)
-other blocker                                                 -> unlock (JOB_BLOCKED)
+Compare requests with actual delivery
+|
++-- Complete --> unlock (JOB_DONE)
++-- Incomplete, authorized action executable now --> continue
++-- No executable action, needs user --> unlock (WAIT_USER)
++-- No executable action, waiting for automation --> wait
++-- Other blocker --> unlock (JOB_BLOCKED)
 ```
 
-These are prompt-level decision semantics, not runtime heuristics. Parser acceptance, configured reason lists, and field validation remain unchanged.
+These are prompt-level decision semantics, not runtime heuristics. The fixed suffix requires checking the latest ordinary answer before claiming it is missing, while retaining genuine unfinished earlier work. A final response/stop marker alone does not imply completion. The tree substitutes semantic descriptions when configured reason lists omit built-in names. Parser acceptance, configured reason lists, and field validation remain unchanged. Packed mocked-provider coverage checks that a delivered answer precedes this check in the actual request; it cannot prove that a real model will always classify correctly.
 
 A continue response ends with:
 

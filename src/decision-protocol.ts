@@ -301,7 +301,35 @@ export function buildDecisionPrompt(
 		{ name: "reason_type", value: reasonTypes[0] ?? "ALLOWED_TYPE" },
 		{ name: "reason_content", value: "concise reason" },
 	]);
-	return `${decisionPrompt}\n\nUse only the existing conversation context and decide quickly. Do not make decisions on the user's behalf. Do not call tools. Your entire response must be exactly one <watchdog>...</watchdog> XML document, with no text before or after it; express your reasoning inside the fields, above all reason_content. reason_content must be non-empty and at most ${REASON_GUIDANCE_CHARACTERS} Unicode characters. Do not output multiple <watchdog>...</watchdog> blocks.\n\nChoose the outcome using these rules in order:\n1. If no concrete next action can proceed without additional user input, approval, confirmation, authorization, credentials, or another user action, use unlock_continue_watchdog. For reason_type, ${waitUserGuidance}. Unfinished work alone is not sufficient reason to continue.\n2. If progress only requires temporary external automation or elapsed time and no user action is required, use wait_watchdog.\n3. Use continue_watchdog only if at least one concrete requested and authorized next action can be performed immediately without additional user input or approval. reason_content must name that immediately executable action, not a user-blocked action.\n4. If all requested work is complete, use unlock_continue_watchdog. For reason_type, ${jobDoneGuidance}.\n5. Otherwise, if work cannot proceed for a blocker that is neither user action nor a temporary external wait, use unlock_continue_watchdog. For reason_type, ${jobBlockedGuidance}.\n\nIf you choose continue_watchdog, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedContinueReasonTypes}. Use:\n${continueExample}\n\nIf you choose unlock_continue_watchdog, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedReasonTypes}. Use:\n${unlockExample}\n\nIf you choose wait_watchdog, use a non-empty reason_content and an integer wait_seconds from ${MIN_WAIT_SECONDS} through ${MAX_WAIT_SECONDS}. Use:\n${waitExample}`;
+	return `${decisionPrompt}
+
+Use only the existing conversation context and decide quickly. Do not make decisions on the user's behalf. Do not call tools. Your entire response must be exactly one <watchdog>...</watchdog> XML document, with no text before or after it; express your reasoning inside the fields, above all reason_content. reason_content must be non-empty and at most ${REASON_GUIDANCE_CHARACTERS} Unicode characters. Do not output multiple <watchdog>...</watchdog> blocks.
+
+First reconcile the user's outstanding requests with the latest ordinary assistant response and relevant tool results. Exclude work already delivered, cancelled, or superseded; preserve genuinely unfinished earlier requests. Earlier plans and watchdog reasons are not proof that work remains. A final response or stop marker alone is not proof of completion: compare actual deliverables with the requests. Before claiming that the user has not been answered, check whether the latest ordinary assistant response already answers the question. For continue, identify the specific missing deliverable and an authorized next action; do not repeat an already-delivered answer or invent optional follow-up work.
+
+Compare requests with actual delivery
+|
++-- Complete --> unlock (${jobDoneType ?? "allowed completion type"})
++-- Incomplete, authorized action executable now --> continue
++-- No executable action, needs user --> unlock (${waitUserType ?? "allowed user-action type"})
++-- No executable action, waiting for automation --> wait
++-- Other blocker --> unlock (${jobBlockedType ?? "allowed blocker type"})
+
+Choose the outcome using these rules in order:
+1. If all requested work is complete, use unlock_continue_watchdog. For reason_type, ${jobDoneGuidance}.
+2. Use continue_watchdog only if at least one concrete requested and authorized next action can be performed immediately for a still-incomplete deliverable without additional user input or approval. reason_content must name that immediately executable action, not a user-blocked action. Unfinished work alone is not sufficient reason to continue.
+3. If no concrete next action can proceed without additional user input, approval, confirmation, authorization, credentials, or another user action, use unlock_continue_watchdog. For reason_type, ${waitUserGuidance}.
+4. If no authorized action can be performed now and progress only requires temporary external automation or elapsed time and no user action is required, use wait_watchdog.
+5. Otherwise, if work cannot proceed for a blocker that is neither user action nor a temporary external wait, use unlock_continue_watchdog. For reason_type, ${jobBlockedGuidance}.
+
+If you choose continue_watchdog, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedContinueReasonTypes}. Use:
+${continueExample}
+
+If you choose unlock_continue_watchdog, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedReasonTypes}. Use:
+${unlockExample}
+
+If you choose wait_watchdog, use a non-empty reason_content and an integer wait_seconds from ${MIN_WAIT_SECONDS} through ${MAX_WAIT_SECONDS}. Use:
+${waitExample}`;
 }
 
 interface ParsedWatchdogFields {
@@ -521,7 +549,10 @@ export function buildDecisionReaskPrompt(
 	decisionPrompt: string,
 	error: string,
 ): string {
-	return `${decisionPrompt}\n\nYour previous decision response was invalid: ${error}\nCorrect it now without calling tools. Your entire response must be exactly one valid <watchdog> XML document with no text before or after it.`;
+	return `${decisionPrompt}
+
+Your previous decision response was invalid: ${error}
+Correct it now without calling tools. Your entire response must be exactly one valid <watchdog> XML document with no text before or after it.`;
 }
 
 /** Exact user-only warning text emitted by future runtime wiring on failure. */

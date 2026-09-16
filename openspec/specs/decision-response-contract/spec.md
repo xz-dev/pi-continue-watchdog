@@ -77,9 +77,31 @@ Model-provided `reason_content` for continue, wait, and unlock decisions SHALL b
 - **WHEN** a decision response carries a `reason_content` that is empty or whitespace-only after trimming
 - **THEN** validation rejects it with the same limit error as before
 
+### Requirement: Reconcile actual delivery before outcome selection
+
+The fixed decision prompt SHALL compare outstanding user requests with the latest ordinary assistant answer and relevant tool results before selecting an outcome. It SHALL exclude delivered, cancelled, or superseded work while retaining genuinely unfinished earlier requests. Earlier plans and watchdog reasons SHALL NOT be treated as proof of remaining work; a final response or stop marker alone SHALL NOT be treated as proof of completion. Before claiming the user has not been answered, the prompt SHALL require checking the latest delivered answer and naming a specific missing deliverable.
+
+#### Scenario: Answer already delivered
+
+- **WHEN** the latest ordinary assistant response answers the requested question but an earlier plan says the answer is pending
+- **THEN** the prompt directs the model to reconcile that plan with the delivered answer and unlock for completed work rather than repeat the answer
+
+#### Scenario: Final response reports progress only
+
+- **WHEN** an assistant response ends normally but only reports progress toward an unfinished requested deliverable
+- **THEN** the prompt does not equate normal completion with task completion
+- **AND** an authorized immediately executable action for that missing deliverable remains eligible for continue
+
+#### Scenario: Completion-first decision tree
+
+- **WHEN** the fixed suffix is rendered
+- **THEN** it includes a plain ASCII decision tree ordered as completed work, unfinished executable authorized work, user-dependent work, external wait, and other blocker
+- **AND** its prose rules use the same order
+- **AND** names absent from the effective reason-type lists are replaced by semantic descriptions, not advertised as available values
+
 ### Requirement: Outcome selection follows user-boundary priority
 
-The fixed decision prompt SHALL define an ordered outcome policy in which the need for additional user input, approval, confirmation, authorization, credentials, or another user action takes priority over the existence of unfinished work. When no concrete next action can proceed without that user action, the model SHALL select `unlock_continue_watchdog` with the configured reason type corresponding to `WAIT_USER`.
+After reconciling delivery and ruling out completed work, the fixed decision prompt SHALL define an ordered outcome policy in which the need for additional user input, approval, confirmation, authorization, credentials, or another user action takes priority over the mere existence of unfinished work. When no concrete next action can proceed without that user action, the model SHALL select `unlock_continue_watchdog` with the configured reason type corresponding to `WAIT_USER`.
 
 #### Scenario: Production action requires explicit approval
 
@@ -94,7 +116,7 @@ The fixed decision prompt SHALL define an ordered outcome policy in which the ne
 
 ### Requirement: Continue requires an immediately executable action
 
-The fixed decision prompt SHALL permit `continue_watchdog` only when at least one concrete next action can be performed immediately using existing authorization and conversation context, without additional user input or approval. Its `reason_content` SHALL identify that immediately executable action. Unfinished work by itself SHALL NOT be sufficient grounds for continue.
+The fixed decision prompt SHALL permit `continue_watchdog` only when a specific requested deliverable remains incomplete and at least one concrete next action can be performed immediately using existing authorization and conversation context, without additional user input or approval. Its `reason_content` SHALL identify that immediately executable action. Unfinished work by itself SHALL NOT be sufficient grounds for continue.
 
 #### Scenario: Unfinished work is fully blocked on the user
 

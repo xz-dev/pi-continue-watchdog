@@ -1570,6 +1570,72 @@ test("packed invalid decisions reask three times and leave Pi idle", {
 	);
 });
 
+test("packed decision request retains delivered answer and completion-first guidance", {
+	timeout: 30_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t);
+	const answer =
+		"The review creates a new agent object, inherits parent context, and receives an in-memory history snapshot; it does not read a session file.";
+	// Mock responses verify transport and finalization, not a real model's judgment.
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "stop", text: answer },
+		{
+			kind: "unlock",
+			reasonType: "JOB_DONE",
+			reason: "The requested explanation was delivered.",
+		},
+	]);
+	const { session } = await createSession(fixture, baseUrl);
+	t.after(() => shutdownSession(session));
+	await session.prompt(
+		"Explain whether review uses a fork with history or reads a session file.",
+	);
+	await waitFor(() => requests.length === 2, 18_000, "completion check");
+	await waitForSessionIdle(session, 3_000, "completed explanation unlock");
+	const request = requests[1];
+	assert.ok(request);
+	const answerIndex = request.messages.findIndex(
+		(message) =>
+			message.role === "assistant" && textOf(message).includes(answer),
+	);
+	const checkIndex = request.messages.findIndex((message) =>
+		textOf(message).includes(decisionPromptStart),
+	);
+	assert.ok(answerIndex >= 0 && checkIndex > answerIndex);
+	const prompt = textOf(request.messages[checkIndex] ?? {});
+	assert.match(
+		prompt,
+		/latest ordinary assistant response and relevant tool results/,
+	);
+	assert.match(prompt, /Earlier plans and watchdog reasons are not proof/);
+	assert.match(prompt, /Before claiming that the user has not been answered/);
+	assert.match(prompt, /A final response or stop marker alone is not proof/);
+	assert.ok(
+		prompt.indexOf("1. If all requested work is complete") <
+			prompt.indexOf("2. Use continue_watchdog only if"),
+	);
+	assert.equal(requests.length, 2);
+	const entries = session.sessionManager.getBranch();
+	assert.equal(
+		entries.some(
+			(entry) =>
+				entry.type === "custom" &&
+				entry.customType === "pi-continue-watchdog:continue",
+		),
+		false,
+	);
+	const unlock = entries.find(
+		(entry) =>
+			entry.type === "custom" &&
+			entry.customType === "pi-continue-watchdog:unlock",
+	);
+	assert.ok(unlock?.type === "custom");
+	assert.deepEqual(unlock.data, {
+		reasonType: "JOB_DONE",
+		reason: "The requested explanation was delivered.",
+	});
+});
+
 test("packed approval-gated decision prompt prioritizes WAIT_USER without continuation", {
 	timeout: 30_000,
 }, async (t) => {
