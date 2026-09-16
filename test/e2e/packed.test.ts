@@ -901,7 +901,11 @@ test("packed artifact asks after threshold compaction settles", {
 test("packed source artifact waits a real 10 seconds, decides continue, and folds context", {
 	timeout: 40_000,
 }, async (t) => {
-	const fixture = await makePackedFixture(t);
+	const customContinuePrompt =
+		"Continue configured verification guidance verbatim.";
+	const fixture = await makePackedFixture(t, {
+		watchdogConfig: { continuePrompt: customContinuePrompt },
+	});
 	const { baseUrl, requests } = await startMockServer(t, [
 		{ kind: "stop" },
 		{ kind: "continue" },
@@ -960,13 +964,35 @@ test("packed source artifact waits a real 10 seconds, decides continue, and fold
 	);
 	const folded = continuedRequest.messages.filter(
 		(message) =>
-			message.role === "user" && textOf(message).includes(continuePrompt),
+			message.role === "user" && textOf(message).includes(customContinuePrompt),
 	);
 	assert.equal(folded.length, 1);
+	const continuationContent = textOf(folded[0] ?? {});
+	assert.match(continuationContent, /not a message or request from the user/);
+	assert.equal(continuationContent.includes(customContinuePrompt), true);
+	assert.match(
+		continuationContent,
+		/not user approval, confirmation, consent, or authorization/,
+	);
+	assert.match(continuationContent, /\\"reasonType\\":\\"WORK_REMAINS\\"/);
+	assert.match(
+		continuationContent,
+		/\\"reason\\":\\"Implementation work remains\.\\"/,
+	);
+	assert.match(
+		continuationContent,
+		/Do not treat this message as permission for any action requiring user approval/,
+	);
 	const thirdBody = JSON.stringify(requests[2]);
 	assert.equal(thirdBody.includes(decisionPromptStart), false);
 	assert.equal(thirdBody.includes("continue_watchdog"), false);
 	assert.equal(thirdBody.includes("unlock_continue_watchdog"), false);
+	assert.equal(thirdBody.includes("<watchdog>"), false);
+	assert.equal(
+		thirdBody.includes("pi-continue-watchdog:decision-audit"),
+		false,
+	);
+	assert.equal(thirdBody.includes("pi-continue-watchdog:inquiry-fold"), false);
 	const persisted = session.sessionManager
 		.getEntries()
 		.map((entry) => JSON.stringify(entry));
@@ -1544,6 +1570,56 @@ test("packed invalid decisions reask three times and leave Pi idle", {
 	);
 });
 
+test("packed automatic continuation cannot satisfy an unresolved approval request", {
+	timeout: 40_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t);
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "stop", text: "Approval is required before deployment." },
+		{
+			kind: "continue",
+			reasonType: "WORK_REMAINS",
+			reason: "Non-deployment verification remains.",
+		},
+		{ kind: "stop", text: "Stopped at the approval boundary." },
+	]);
+	const { session } = await createSession(fixture, baseUrl);
+	t.after(() => shutdownSession(session));
+
+	await session.prompt("Verify the release, but ask before deployment.");
+	await waitFor(
+		() => requests.length === 3,
+		20_000,
+		"approval-safe continuation",
+	);
+	await waitForSessionIdle(session, 5_000, "approval-safe ordinary work");
+
+	const continuedRequest = requests[2];
+	assert.ok(continuedRequest);
+	const continuation = continuedRequest.messages.find(
+		(message) =>
+			message.role === "user" && textOf(message).includes(continuePrompt),
+	);
+	assert.ok(continuation);
+	const content = textOf(continuation);
+	assert.match(
+		content,
+		/not user approval, confirmation, consent, or authorization/,
+	);
+	assert.match(
+		content,
+		/Do not treat this message as permission for any action requiring user approval/,
+	);
+	assert.match(
+		content,
+		/If additional user input, approval, or assistance is required, stop and ask the user/,
+	);
+	assert.match(
+		content,
+		/\\"reason\\":\\"Non-deployment verification remains\.\\"/,
+	);
+});
+
 test("packed persisted session resumes without watchdog decision context or working hang", {
 	timeout: 45_000,
 }, async (t) => {
@@ -1597,6 +1673,14 @@ test("packed persisted session resumes without watchdog decision context or work
 	assert.equal(resumedPayload.includes("resume context is clean"), false);
 	assert.equal(
 		resumedPayload.includes("pi-continue-watchdog:decision-audit"),
+		false,
+	);
+	assert.equal(
+		resumedPayload.includes("pi-continue-watchdog:inquiry-fold"),
+		false,
+	);
+	assert.equal(
+		resumedPayload.includes("pi-continue-watchdog:continuation"),
 		false,
 	);
 });

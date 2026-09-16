@@ -51,6 +51,7 @@ export interface ContinueWatchdogConfig {
 	idleDelaySeconds: number;
 	maxRetries: number;
 	decisionPrompt: string;
+	/** Configurable guidance embedded in the fixed automated continuation envelope. */
 	continuePrompt: string;
 	reasonTypes: readonly string[];
 	continueReasonTypes: readonly string[];

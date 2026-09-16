@@ -1121,6 +1121,14 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		decisions.every((request) => request.model === "root-process-model"),
 		true,
 	);
+	// Fold markers, decision audits, and continuation envelopes are context-only
+	// transformations: they must never leak into any provider request body.
+	for (const request of requests) {
+		const body = JSON.stringify(request);
+		assert.equal(body.includes("pi-continue-watchdog:inquiry-fold"), false);
+		assert.equal(body.includes("pi-continue-watchdog:decision-audit"), false);
+		assert.equal(body.includes("pi-continue-watchdog:continuation"), false);
+	}
 	const finalChild = await child.command<ChildHarnessSnapshot>("snapshot");
 	assert.deepEqual(finalChild.decisionTools, []);
 	assert.deepEqual(finalChild.customEntries, []);

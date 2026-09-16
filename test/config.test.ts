@@ -119,6 +119,8 @@ test("global and trusted project overrides apply field-by-field", () => {
 	assert.equal(withProject.config.maxRetries, 4);
 	assert.equal(withProject.config.decisionPrompt, "Global decision");
 	assert.equal(withProject.config.continuePrompt, "Project continue");
+	// continuePrompt stays configurable guidance; runtime wraps it in fixed
+	// extension attribution and non-authorization language.
 	assert.deepEqual(withProject.config.reasonTypes, ["ProjectType", "shipped"]);
 	assert.deepEqual(withProject.config.continueReasonTypes, [
 		"ProjectWork",

@@ -18,6 +18,7 @@ import {
 	MAX_PROMPT_CHARACTERS,
 } from "../src/config.js";
 import {
+	buildAutomatedContinuationMessage,
 	createDecisionFoldMessage,
 	createDecisionPromptMessage,
 	DECISION_FOLD_MESSAGE_TYPE,
@@ -1360,6 +1361,14 @@ test("agent_end finalizes while streaming but settled alone dispatches continue"
 			reasonType: "WORK_REMAINS",
 			reason: "Implementation work remains.",
 		},
+	);
+	assert.equal(
+		harness.sent.at(-1)?.message.content,
+		buildAutomatedContinuationMessage({
+			continuePrompt: harness.config.continuePrompt,
+			reasonType: "WORK_REMAINS",
+			reason: "Implementation work remains.",
+		}),
 	);
 	assert.equal(harness.triggeredTurns, turnsBefore + 1);
 	assert.equal(harness.controller.snapshot.attempt, 1);

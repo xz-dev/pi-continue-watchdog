@@ -108,6 +108,34 @@ structure StatusLineLayout where
   visibleColumns : Nat
   deriving DecidableEq, Repr
 
+structure AcceptedContinue where
+  reasonType : String
+  reason : String
+  guidance : String
+  deriving DecidableEq, Repr
+
+structure ContinuationEnvelope where
+  extensionAuthored : Bool
+  userAuthored : Bool
+  conveysUserAuthorization : Bool
+  reasonType : String
+  reason : String
+  guidance : String
+  stopAtUserBoundary : Bool
+  deriving DecidableEq, Repr
+
+def buildContinuationEnvelope
+    (accepted : AcceptedContinue) : ContinuationEnvelope :=
+  {
+    extensionAuthored := true
+    userAuthored := false
+    conveysUserAuthorization := false
+    reasonType := accepted.reasonType
+    reason := accepted.reason
+    guidance := accepted.guidance
+    stopAtUserBoundary := true
+  }
+
 def statusActivity (state : RuntimeState) : StatusActivity :=
   if aggregateIdle state then .idle else .running
 
@@ -401,7 +429,7 @@ theorem idle_child_is_removed
     (agentId : AgentId)
     (state : RuntimeState) :
     agentId ∉ (reportChildState agentId true state).busyChildren := by
-  simp only [reportChildState, if_pos]
+  simp only [reportChildState, ite_eq_left]
   unfold replaceFence removeChild
   dsimp
   split <;> simp
@@ -539,6 +567,25 @@ theorem status_layout_fits_available_width
       availableColumns := by
   exact Nat.min_le_left availableColumns preferredColumns
 
+theorem continuation_is_extension_authored
+    (accepted : AcceptedContinue) :
+    (buildContinuationEnvelope accepted).extensionAuthored = true ∧
+      (buildContinuationEnvelope accepted).userAuthored = false := by
+  simp [buildContinuationEnvelope]
+
+theorem continuation_does_not_authorize
+    (accepted : AcceptedContinue) :
+    (buildContinuationEnvelope accepted).conveysUserAuthorization = false ∧
+      (buildContinuationEnvelope accepted).stopAtUserBoundary = true := by
+  simp [buildContinuationEnvelope]
+
+theorem continuation_preserves_reason_and_guidance
+    (accepted : AcceptedContinue) :
+    (buildContinuationEnvelope accepted).reasonType = accepted.reasonType ∧
+      (buildContinuationEnvelope accepted).reason = accepted.reason ∧
+      (buildContinuationEnvelope accepted).guidance = accepted.guidance := by
+  simp [buildContinuationEnvelope]
+
 -- The guarantee record gathers lifecycle, delayed inquiry, disconnect, preemption, and scoped bounded-status obligations.
 structure ProcessGuarantees : Prop where
   noEarlyInquiry :
@@ -590,6 +637,16 @@ structure ProcessGuarantees : Prop where
   statusFitsWidth : ∀ availableColumns preferredColumns,
     (layoutStatusLine availableColumns preferredColumns).visibleColumns ≤
       availableColumns
+  continuationAttributed : ∀ accepted,
+    (buildContinuationEnvelope accepted).extensionAuthored = true ∧
+      (buildContinuationEnvelope accepted).userAuthored = false
+  continuationNotAuthorization : ∀ accepted,
+    (buildContinuationEnvelope accepted).conveysUserAuthorization = false ∧
+      (buildContinuationEnvelope accepted).stopAtUserBoundary = true
+  continuationPreservesDecision : ∀ accepted,
+    (buildContinuationEnvelope accepted).reasonType = accepted.reasonType ∧
+      (buildContinuationEnvelope accepted).reason = accepted.reason ∧
+      (buildContinuationEnvelope accepted).guidance = accepted.guidance
 
 theorem process_is_correct : ProcessGuarantees := by
   exact {
@@ -616,6 +673,9 @@ theorem process_is_correct : ProcessGuarantees := by
     statusVisibilityIsScoped := visible_status_requires_tui_main_and_controller
     statusIsOneLine := status_layout_is_one_line
     statusFitsWidth := status_layout_fits_available_width
+    continuationAttributed := continuation_is_extension_authored
+    continuationNotAuthorization := continuation_does_not_authorize
+    continuationPreservesDecision := continuation_preserves_reason_and_guidance
   }
 
 -- Executable projections expose proved timer, clean-preemption, and status behavior without operational side effects.
@@ -648,9 +708,15 @@ def main : IO Unit := do
     (OfficialPiIdleInquiry.reportMainState false
       (OfficialPiIdleInquiry.initialState true))
   let narrow := OfficialPiIdleInquiry.layoutStatusLine 24 72
+  let continuation := OfficialPiIdleInquiry.buildContinuationEnvelope {
+    reasonType := "WORK_REMAINS"
+    reason := "Implementation work remains."
+    guidance := "Continue until user assistance is required."
+  }
   IO.println s!"Before ten seconds: {OfficialPiIdleInquiry.runtimeSummary before}"
   IO.println s!"At ten seconds: {OfficialPiIdleInquiry.runtimeSummary opened}"
   IO.println s!"After user takeover: {OfficialPiIdleInquiry.runtimeSummary delivered}"
   IO.println s!"Running status: {OfficialPiIdleInquiry.statusSummary running}"
   IO.println s!"Narrow layout: lines={narrow.lineCount}; columns={narrow.visibleColumns}/24"
-  IO.println "Proved: fixed delay precedes inquiry, wake rechecks official idle, disconnect removes busy children, reconnect retries every second and reports fresh live state, preemption is clean and exactly-once, and the scoped status projection is one bounded line."
+  IO.println s!"Continuation envelope: extensionAuthored={continuation.extensionAuthored}; userAuthored={continuation.userAuthored}; userAuthorization={continuation.conveysUserAuthorization}; reasonType={continuation.reasonType}; stopAtUserBoundary={continuation.stopAtUserBoundary}"
+  IO.println "Proved: fixed delay precedes inquiry, wake rechecks official idle, disconnect removes busy children, reconnect retries every second and reports fresh live state, preemption is clean and exactly-once, the scoped status projection is one bounded line, and automatic continuation is extension-authored, non-authorizing, reason-preserving, and bounded by the next user-input or approval requirement."

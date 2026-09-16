@@ -33,7 +33,7 @@ qualify the same generation and re-check ownership/auth
           ▼
 open one XML decision check
           │
-          ├─ continue ─► fold exchange ─► compact continuation turn
+          ├─ continue ─► fold exchange ─► attributed continuation turn
           ├─ wait ─────► fold exchange ─► absolute not-before deadline
           ├─ unlock  ──► unlock ────────► one muted result entry
           └─ invalid ──► immediate re-ask, at most three responses
@@ -49,7 +49,7 @@ open one XML decision check
 | `src/runtime.ts` | Aggregate generation wiring, ownership/auth fencing, XML capture, audit entries, wait persistence/scheduling, and finalization delivery |
 | `src/decision-protocol.ts` | Fixed continue/wait/unlock XML prompt suffix, XML extraction, validation, and three-response re-ask protocol |
 | `src/decision-history.ts` | Active-branch zero-loop scan plus bounded, deterministic normalized history formatting |
-| `src/context-fold.ts` | Correlate complete decision exchanges and remove them, or replace continue with its compact prompt, before provider requests; validate hidden terminal-result metadata |
+| `src/context-fold.ts` | Build the attributed continuation envelope, correlate complete decision exchanges, and remove or replace them before provider requests; validate hidden terminal-result metadata |
 | `src/abort-outcome.ts` | Detect canonical main-run `stopReason: "aborted"` outcomes |
 | `src/auto-lock.ts` | Start a fresh lock cycle when a real main user message begins processing |
 | `src/commands.ts` | Human lock/unlock commands plus TUI-only continue, wait, unlock, status, and timeline rendering |
@@ -379,10 +379,15 @@ becomes:
 
 ```text
 ordinary conversation
-+ configured continuePrompt
++ automated continuation envelope
+  - extension source and non-user attribution
+  - no approval / confirmation / consent / authorization
+  - JSON-serialized model-generated reasonType and reason
+  - configured continuePrompt guidance
+  - resume-only-authorized-work and stop-at-user-boundary instructions
 ```
 
-The compact continuation message triggers the next ordinary work turn.
+Pi converts the continuation custom message to a provider-facing user-role message. The fixed body therefore carries the source and authorization boundary explicitly. The configured `continuePrompt` remains verbatim guidance inside that envelope, and the envelope triggers the next ordinary work turn.
 
 ### Wait, unlock, decision failure, and user preemption
 
@@ -409,7 +414,7 @@ On normal `pi -c` recovery:
 2. plain custom entries remain readable state records but are not Agent messages;
 3. the extension reloads and registers its context transform;
 4. before the next provider request, the complete terminal decision exchange is folded again;
-5. the provider receives only ordinary conversation, plus the compact continuation message for a continue outcome.
+5. the provider receives only ordinary conversation, plus the attributed automated continuation envelope for a continue outcome.
 
 A later watchdog decision opened before any successful ordinary assistant completion can reconstruct the bounded normalized zero-loop suffix from the restored active branch. This does not alter ordinary resume requests and does not replay the hidden exchange.
 
@@ -427,7 +432,7 @@ Packed E2E creates a persistent session, triggers a decision, shuts it down, reo
 - append one TUI-only `Continue watchdog continued` entry so automatic continuation and possible token-consuming loops remain visible;
 - if that entry cannot be persisted, fail closed without dispatching continuation;
 - append the terminal fold marker;
-- fold the exchange into `continuePrompt`;
+- build the canonical automated continuation envelope from normalized type/reason and configured `continuePrompt` guidance, then fold the exchange into that envelope;
 - trigger the next ordinary turn;
 - wait one fixed grace for the next authoritative all-idle generation if still locked.
 

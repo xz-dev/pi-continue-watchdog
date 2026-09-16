@@ -83,7 +83,7 @@ Precedence: **built-in defaults < global < trusted project**. Files: `~/.pi/agen
 |---|---|---|
 | `maxRetries` | `10` | Integer `1`–`10`; valid continue/wait outcomes per lock cycle |
 | `decisionPrompt` | see below | Non-blank, ≤ 16384 Unicode code points |
-| `continuePrompt` | `Continue until user assistance is required.` | Non-blank, ≤ 16384 Unicode code points |
+| `continuePrompt` | `Continue until user assistance is required.` | Non-blank guidance, ≤ 16384 Unicode code points; embedded verbatim in a fixed extension-attributed, non-authorization continuation envelope |
 | `reasonTypes` | `["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"]` | Allowed unlock types; a valid list replaces defaults |
 | `continueReasonTypes` | `["WORK_REMAINS", "VERIFYING"]` | Allowed continue types; same replace semantics |
 | `unlockShortcut` | `"alt+u"` | Key id for the unlock shortcut, or `false` to disable (the command stays available). Why not `keybindings.json`: Pi exposes no namespaced keybinding ids for extension shortcuts, so plugin config is the only user-level rebinding surface; Pi's native conflict diagnostics still apply to the registered key |
@@ -96,6 +96,8 @@ Built-in type meanings:
 - Passive waiting for external automation is expressed with `wait_watchdog`, not a continue type.
 
 Reason types are trimmed and matched case-insensitively against their configured lists. Configured list entries must be nonblank but have no identifier regex or artificial per-entry length limit. Reason content is trimmed, must be nonblank, and may contain at most 1000 Unicode characters; the decision prompt advises staying within 500 (half the hard limit) so minor overshoot does not trigger a re-ask. Human `/unlock-continue-watchdog` stays untyped.
+
+After an accepted continue, the extension sends one hidden custom continuation message. Pi exposes custom messages to providers with user role, so the body explicitly identifies extension automation, denies that it is a user request, approval, confirmation, consent, or authorization, carries the normalized model-generated reason, preserves `continuePrompt` as guidance, and requires the agent to stop at any new user-input or approval boundary.
 
 ## Notifications for other extensions
 

@@ -53,7 +53,7 @@ Any acceptance text, test name, README, or implementation that still requires pe
 | Wait XML decision | `function=wait_watchdog` plus `reason_content` and integer `wait_seconds` in `1..1800`; no `reason_type` | Main/root decision window only |
 | Unlock XML decision | `function=unlock_continue_watchdog` plus `reason_type` and `reason_content` | Main/root decision window only |
 | Default `decisionPrompt` | see exact default below | Automated semantic prefix; runtime always appends the fixed XML protocol and effective reason types |
-| Default `continuePrompt` | `Continue until user assistance is required.` | Compact model-visible replacement after valid continue fold |
+| Default `continuePrompt` | `Continue until user assistance is required.` | Configurable guidance embedded verbatim in the fixed model-visible automated continuation envelope |
 | Default `reasonTypes` | `JOB_DONE`, `WAIT_USER`, `JOB_BLOCKED` | Built-in allowed AI unlock type list; a valid configured list **replaces** this default |
 | Default `continueReasonTypes` | `WORK_REMAINS`, `VERIFYING` | Independent allowed AI continue type list; a valid configured list **replaces** this default |
 | Continue TUI-only entry | `Continue watchdog continued · <TYPE> · <reason>` | Persisted before semantic publication and continuation dispatch |
@@ -104,6 +104,8 @@ At runtime the extension always appends a fixed protocol suffix. It says to use 
 Continue until user assistance is required.
 ```
 
+`continuePrompt` is configurable guidance, not the complete provider-bound message. After a valid continue, runtime embeds it verbatim in a fixed envelope that identifies the pi-continue-watchdog extension as the source, states that the message is not from the user and is not user approval, confirmation, consent, or authorization, includes the normalized model-generated `reasonType` and `reason` as JSON, and permits only previously requested and authorized work. The envelope tells the agent to stop and ask when additional user input, approval, or assistance is required. Pi may serialize the custom message with provider-facing user role; the body retains these source and authorization boundaries.
+
 ---
 
 ## Scope and classification rules
@@ -129,7 +131,7 @@ Continue until user assistance is required.
 | `idleDelaySeconds` | `10` | Deprecated compatibility key. It remains accepted/preserved, but runtime ignores it; every automatic inquiry fence is exactly 10 seconds. |
 | `maxRetries` | `10` | Maximum **valid continue or wait** outcomes per lock cycle (not invalid re-asks); safe integer in `[1, 10]` |
 | `decisionPrompt` | exact default above | Automated custom-role body; explicitly identifies extension automation and says it is not a user message/request; nonblank and at most 16,384 Unicode code points |
-| `continuePrompt` | exact default above | Compact fold-in after valid continue; nonblank and at most 16,384 Unicode code points |
+| `continuePrompt` | exact default above | Guidance embedded verbatim in the fixed automated continuation envelope; nonblank and at most 16,384 Unicode code points |
 | `reasonTypes` | `["JOB_DONE","WAIT_USER","JOB_BLOCKED"]` | Allowed AI unlock types. A valid configured list **replaces** the default. |
 | `continueReasonTypes` | `["WORK_REMAINS","VERIFYING"]` | Independently allowed AI continue types. Same nonempty trim-nonblank validation and replace semantics as `reasonTypes`. |
 
@@ -301,13 +303,13 @@ On invalid decision:
 - Requires a type allowed by `continueReasonTypes` and a nonblank reason of at most 1000 Unicode characters
 - The matched type and validated reason are retained in context-excluded audit data and in the hidden normalized terminal record used only by the bounded zero-loop history contract
 - The decision turn ends, and ordinary work continues automatically without further user input
-- extension `message_end` captures the provider XML for validation and replaces the finalized assistant with empty content; context folding then removes the complete prompt / assistant and tool-result metadata and replaces them with **one** compact custom message containing the configured `continuePrompt` (exact default: `Continue until user assistance is required.`)
+- extension `message_end` captures the provider XML for validation and replaces the finalized assistant with empty content; context folding then removes the complete prompt / assistant and tool-result metadata and replaces them with **one** custom message containing the fixed automated continuation envelope: extension attribution, explicit non-user/non-authorization language, JSON-serialized normalized type/reason, configured `continuePrompt` guidance, and the stop-at-user-boundary instruction
 - show a live colored TUI widget with `Continue watchdog checking` and the current decision cycle while the check is active; clear it on terminal continue, unlock, failure, abort, or cleanup
 - persist a colored TUI-only event card for each watchdog validation re-ask with its safe parser error and cycle number; persist non-watchdog failures as `Other error` with the original error content
 - append exactly one persistent TUI-only entry with exact text `Continue watchdog continued · <TYPE> · <reason>`, so repeated automatic continuation remains observable without entering model context
 - persist that entry before publishing `watchdog-continued`, then dispatch continuation; if persistence fails, fail closed with neither hook nor automatic continuation turn
 - semantic listener absence/failure is best-effort and never gates continuation after persistence succeeds
-- The continued ordinary turn receives exactly one compact model-bound message containing `continuePrompt`; the XML decision exchange is otherwise removed from later context
+- The continued ordinary turn receives exactly one model-bound automated continuation message; `continuePrompt` appears verbatim as guidance, while the fixed body states that the message is not a user request or approval and carries the normalized model-generated reason; the XML decision exchange is otherwise removed from later context
 - Consumes **one** valid outcome attempt
 - The next authoritative aggregate all-idle generation uses the same fixed grace
 - After `maxRetries` combined valid continue/wait outcomes, remain locked/exhausted with no further inquiry until reset
@@ -469,7 +471,7 @@ With defaults, every eligible all-idle generation waits **10s**.
 - one muted TUI-only entry is durably appended first: `Continue watchdog continued · VERIFYING · Tests still need to run.`
 - then one neutral `watchdog-continued` hook publishes `REASON_TYPE=VERIFYING` and `REASON=Tests still need to run.` best-effort
 - only after durable evidence does the decision turn end and ordinary work continue automatically without further user input
-- model-bound context removes the full decision exchange and inserts one compact custom message equal to configured `continuePrompt` (default `Continue until user assistance is required.`)
+- model-bound context removes the full decision exchange and inserts one automated continuation custom message containing the configured `continuePrompt` verbatim plus fixed extension attribution, normalized model-generated type/reason, and explicit non-approval/stop-at-user-boundary language
 - one shared valid outcome attempt is consumed
 - after the continuation settles, if still locked and aggregate idle, the **next generation** waits the same fixed grace
 - if durable continue entry persistence fails, no hook or continuation is dispatched; hook listener failures alone do not gate continuation

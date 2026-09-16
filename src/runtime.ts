@@ -34,6 +34,7 @@ import {
 import { BUILT_IN_CONFIG, type ContinueWatchdogConfig } from "./config.js";
 import { type LoadedConfig, loadRuntimeConfig } from "./config-loader.js";
 import {
+	buildAutomatedContinuationMessage,
 	createDecisionFoldMessage,
 	DECISION_INQUIRY_NAMESPACE,
 	type DecisionTerminalResult,
@@ -2162,6 +2163,11 @@ export function createDecisionRuntime(
 				reasonType,
 				reason,
 			};
+			const continuationMessage = buildAutomatedContinuationMessage({
+				continuePrompt: config.continuePrompt,
+				reasonType,
+				reason,
+			});
 			if (stopIfStale(claim)) return false;
 			try {
 				options.pi.sendMessage(
@@ -2169,14 +2175,14 @@ export function createDecisionRuntime(
 						exchangeId: active.exchangeId,
 						cycleId: finalCycleId,
 						outcome: "continue",
-						continuePrompt: config.continuePrompt,
+						continuePrompt: continuationMessage,
 						watchdogResult,
 					}),
 					{ triggerTurn: true, deliverAs: "steer" },
 				);
 				active.inquiry.complete({
 					customType: "pi-continue-watchdog:continuation",
-					content: config.continuePrompt,
+					content: continuationMessage,
 				});
 			} catch {
 				if (!allIdleForClaim(claim)) return deferAcceptedContinue();
