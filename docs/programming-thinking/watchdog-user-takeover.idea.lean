@@ -525,6 +525,138 @@ theorem typed_continue_is_correct : ContinueGuarantees := by
       simp [continueEvidenceOrdered, hookMissing, dispatchMissing]
   }
 
+-- Manual cancellation models watchdog ownership, transfer to genuine user work, explicit unlock, and authoritative settlement without private queue replay.
+inductive ManualRunKind where
+  | decision
+  | continuation
+  | ordinary
+  deriving DecidableEq, Repr
+
+inductive ManualOwner where
+  | watchdog
+  | user
+  deriving DecidableEq, Repr
+
+inductive ManualPhase where
+  | running
+  | cancelling
+  | settled
+  deriving DecidableEq, Repr
+
+structure ManualCancellationState where
+  runKind : ManualRunKind
+  owner : ManualOwner
+  phase : ManualPhase
+  watchdogLocked : Bool
+  abortRequested : Bool
+  visibleResidue : Bool
+  futureModelResidue : Bool
+  operationAbortedVisible : Bool
+  replacementTurnStarted : Bool
+  privateQueueReplayAttempted : Bool
+  duplicateUnlockVisible : Bool
+  deriving DecidableEq, Repr
+
+def manualRunningState (runKind : ManualRunKind) : ManualCancellationState :=
+  {
+    runKind
+    owner := if runKind == .ordinary then .user else .watchdog
+    phase := .running
+    watchdogLocked := true
+    abortRequested := false
+    visibleResidue := false
+    futureModelResidue := false
+    operationAbortedVisible := false
+    replacementTurnStarted := false
+    privateQueueReplayAttempted := false
+    duplicateUnlockVisible := false
+  }
+
+def startForeignUserWork (state : ManualCancellationState) : ManualCancellationState :=
+  if state.runKind == .continuation ∧ state.owner == .watchdog then
+    { state with runKind := .ordinary, owner := .user }
+  else
+    state
+
+def manualUnlockStep (state : ManualCancellationState) : ManualCancellationState :=
+  {
+    state with
+    phase := if state.owner == .watchdog then .cancelling else .settled
+    watchdogLocked := false
+    abortRequested := state.owner == .watchdog
+    visibleResidue := false
+    futureModelResidue := false
+    operationAbortedVisible := false
+    replacementTurnStarted := false
+    privateQueueReplayAttempted := false
+    duplicateUnlockVisible := false
+  }
+
+def manualSettleStep (state : ManualCancellationState) : ManualCancellationState :=
+  { state with phase := .settled }
+
+def runManualCancellation (runKind : ManualRunKind) : ManualCancellationState :=
+  manualSettleStep (manualUnlockStep (manualRunningState runKind))
+
+def runContinuationAfterForeignInput : ManualCancellationState :=
+  manualSettleStep
+    (manualUnlockStep (startForeignUserWork (manualRunningState .continuation)))
+
+def manualCancellationPostcondition
+    (expectedAbort : Bool)
+    (state : ManualCancellationState) : Prop :=
+  state.phase = .settled ∧
+    state.watchdogLocked = false ∧
+    state.abortRequested = expectedAbort ∧
+    state.visibleResidue = false ∧
+    state.futureModelResidue = false ∧
+    state.operationAbortedVisible = false ∧
+    state.replacementTurnStarted = false ∧
+    state.privateQueueReplayAttempted = false ∧
+    state.duplicateUnlockVisible = false
+
+-- Manual-cancellation proofs establish owned-run abort, foreign-user ownership transfer, ordinary-run preservation, clean residue, and host-owned queue behavior.
+theorem manual_owned_decision_cancels :
+    manualCancellationPostcondition true (runManualCancellation .decision) := by
+  simp [manualCancellationPostcondition, runManualCancellation,
+    manualSettleStep, manualUnlockStep, manualRunningState]
+
+theorem manual_owned_continuation_cancels :
+    manualCancellationPostcondition true
+      (runManualCancellation .continuation) := by
+  simp [manualCancellationPostcondition, runManualCancellation,
+    manualSettleStep, manualUnlockStep, manualRunningState]
+
+theorem manual_ordinary_run_is_preserved :
+    manualCancellationPostcondition false (runManualCancellation .ordinary) := by
+  simp [manualCancellationPostcondition, runManualCancellation,
+    manualSettleStep, manualUnlockStep, manualRunningState]
+
+theorem foreign_user_work_clears_continuation_ownership :
+    manualCancellationPostcondition false runContinuationAfterForeignInput := by
+  simp [manualCancellationPostcondition, runContinuationAfterForeignInput,
+    manualSettleStep, manualUnlockStep, startForeignUserWork,
+    manualRunningState]
+
+structure ManualCancellationGuarantees : Prop where
+  decisionAborts :
+    manualCancellationPostcondition true (runManualCancellation .decision)
+  continuationAborts :
+    manualCancellationPostcondition true
+      (runManualCancellation .continuation)
+  ordinaryPreserved :
+    manualCancellationPostcondition false (runManualCancellation .ordinary)
+  foreignUserPreserved :
+    manualCancellationPostcondition false runContinuationAfterForeignInput
+
+ theorem manual_cancellation_is_correct : ManualCancellationGuarantees := by
+  exact {
+    decisionAborts := manual_owned_decision_cancels
+    continuationAborts := manual_owned_continuation_cancels
+    ordinaryPreserved := manual_ordinary_run_is_preserved
+    foreignUserPreserved := foreign_user_work_clears_continuation_ownership
+  }
+
 -- The guarantee record gathers all whole-process obligations under abort-safe cleanup and the two explicit host-settlement assumptions.
 structure TakeoverGuarantees
     (environment : EnvironmentAssumptions)
@@ -570,10 +702,12 @@ theorem process_is_correct
     (streamWasVisible : Bool) :
     TakeoverGuarantees environment streamWasVisible ∧
       InquiryMarkerGuarantees ∧
-      ContinueGuarantees := by
+      ContinueGuarantees ∧
+      ManualCancellationGuarantees := by
   exact ⟨takeover_process_is_correct environment assumptions streamWasVisible,
     inquiry_marker_is_correct,
-    typed_continue_is_correct⟩
+    typed_continue_is_correct,
+    manual_cancellation_is_correct⟩
 
 -- Executable projections expose deterministic summaries of immediate cleanup and clean exactly-once completion.
 def takeoverPostconditionBool (state : ProcessState) : Bool :=
@@ -594,6 +728,19 @@ def takeoverPostconditionBool (state : ProcessState) : Bool :=
 def continueEvidenceOrderedBool (evidence : ContinueEvidence) : Bool :=
   (!evidence.hookPublished || evidence.tuiEntryStored) &&
     (!evidence.continuationDispatched || evidence.tuiEntryStored)
+
+def manualCancellationPostconditionBool
+    (expectedAbort : Bool)
+    (state : ManualCancellationState) : Bool :=
+  state.phase == .settled &&
+    !state.watchdogLocked &&
+    state.abortRequested == expectedAbort &&
+    !state.visibleResidue &&
+    !state.futureModelResidue &&
+    !state.operationAbortedVisible &&
+    !state.replacementTurnStarted &&
+    !state.privateQueueReplayAttempted &&
+    !state.duplicateUnlockVisible
 
 def outputPostconditionBool (state : ProcessState) : Bool :=
   state.phase == .complete &&
@@ -641,4 +788,11 @@ def main : IO Unit := do
   IO.println s!"Decision stream may be visible before takeover: {visibleDecision.decisionStreamVisible}"
   IO.println s!"Takeover immediately clears decision residue: {WatchdogUserTakeover.takeoverPostconditionBool takeover}"
   IO.println s!"User work completes once with clean context: {WatchdogUserTakeover.outputPostconditionBool completed}"
+  let cancelledContinuation :=
+    WatchdogUserTakeover.runManualCancellation .continuation
+  let ordinaryUnlock := WatchdogUserTakeover.runManualCancellation .ordinary
+  let foreignUserUnlock := WatchdogUserTakeover.runContinuationAfterForeignInput
   IO.println s!"Typed continue avoids user decisions and persists before dispatch: {WatchdogUserTakeover.continueEvidenceOrderedBool acceptedContinue}"
+  IO.println s!"Manual unlock cancels an owned continuation without residue: {WatchdogUserTakeover.manualCancellationPostconditionBool true cancelledContinuation}"
+  IO.println s!"Manual unlock preserves an ordinary run: {WatchdogUserTakeover.manualCancellationPostconditionBool false ordinaryUnlock}"
+  IO.println s!"Foreign user work clears continuation ownership: {WatchdogUserTakeover.manualCancellationPostconditionBool false foreignUserUnlock}"

@@ -358,6 +358,8 @@ Always assigns `locked=false` first, resets `waitUntilMs` to `0`, then cancels t
 
 Human unlock is **not** subject to the AI decision-window invalid re-ask protocol and does **not** publish `user-ready`.
 
+If the current main run is exactly correlated to the watchdog's submitted decision or accepted automated continuation, human unlock additionally records that exact claim/exchange/cycle as a one-shot cancellation target and calls public `ctx.abort()`. Uninterruptible `message_end` clears its partial assistant content, replaces abort presentation with the internal `pi-continue-watchdog:cancelled` marker, excludes that marked assistant from future model context, and best-effort splices the exact settled assistant entry. The cancellation emits no second unlock through the main-abort path and starts no cleanup/summary model turn. An ordinary or uncorrelated user-started run is never aborted. Queued-message behavior remains Pi-owned: the extension does not inspect, copy, replay, or explicitly clear private steering/follow-up queues and does not guarantee delivery or automatic resumption across abort. Cancellation does not roll back completed tool side effects or promise to stop detached/background work outside the active run signal.
+
 ---
 
 ## Confirmed acceptance examples
@@ -430,6 +432,19 @@ These examples are the accepted product contract. Each is externally observable 
 - exactly one muted TUI-only reason entry, `Continue watchdog unlocked · Taking over manually.`, is appended
 - the AI typed format `Continue watchdog unlocked · <TYPE> · <reason>` is **not** used
 - same-state unlock still assigns and still persists the entry
+
+**Given** a submitted watchdog decision or accepted automated continuation is the exact current main run
+**When** the human uses the unlock command or configured shortcut
+**Then**
+
+- the explicit manual unlock output occurs exactly once
+- the watchdog-owned run is aborted through public Pi APIs
+- partial assistant output and `Operation aborted` residue are removed from settled TUI/session presentation and future model context
+- no replacement model turn starts
+- the abort settle does not trigger another unlock notification or `user-ready`
+- unrelated session entries are preserved; queued-message behavior follows Pi's abort semantics without watchdog replay
+
+**And given** the current run is ordinary user work, fails exact correlation, or genuine user/foreign custom work has started inside a previously correlated continuation lifecycle, manual unlock changes watchdog state but does not abort that run.
 
 ### Example 4 — An actually aborted main run automatically unlocks
 

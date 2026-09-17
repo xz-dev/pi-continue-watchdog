@@ -49,7 +49,7 @@ Use `pi update --extensions` to update. Reload Pi extensions or start a new sess
    If another decision check opens before an ordinary agent turn finishes successfully, the new check receives a bounded, chronological list of normalized prior watchdog results as **model-generated reference only**. Errored, aborted, length-limited, and intermediate tool-use attempts do not clear that list; a successful ordinary turn does. Raw hidden answers, XML, partial output, provider errors, TUI text, and audit records are never replayed. If the list is too large, the oldest complete summaries are omitted and their count is reported.
 4. **Continue.** The decision folds into the compact prompt `Continue until user assistance is required.` and work resumes without user input. Every accepted continue is recorded in TUI history (`Continue watchdog continued · <TYPE> · <reason>`) so repeated continuations stay visible.
 5. **Wait.** Has no reason type. It requires a reason and an integer `wait_seconds` from 1 to 1800 (no clamping — invalid values are rejected). It consumes one shared attempt, keeps the lock, folds the exchange to nothing, and suppresses further checks until the deadline passes. If the agent stays active, the wait is not restarted. Unlock or a new user message cancels it.
-6. **Unlock.** Records one muted TUI line (`Continue watchdog unlocked · <TYPE> · <reason>`) and stops automatic continuation. No extra work turn is started.
+6. **Unlock.** Records one muted TUI line (`Continue watchdog unlocked · <TYPE> · <reason>`) and stops automatic continuation. A human `/unlock-continue-watchdog` or unlock shortcut also aborts the current run when it is exactly correlated to a watchdog decision or automated continuation, then removes that run's partial output and abort residue. An ordinary uncorrelated user-started run is preserved, including genuine user steering that starts inside the same Pi agent lifecycle as an earlier continuation. Queued-message behavior remains Pi-owned during abort: the extension neither clears nor privately replays Pi queues and makes no exactly-once delivery guarantee. No cleanup or summary model turn is started, and already-completed or detached/background side effects are not rolled back.
 7. **Limits.** Invalid XML gets re-asked up to **3 attempts**, then the watchdog stops asking until a new user message or manual lock. Each lock cycle allows up to **10** valid continue/wait outcomes. If the final outcome is a wait, the stop signal fires only after that wait fully expires.
 
 The extension never blindly continues: it asks first, so finished work can unlock cleanly and external automation can be awaited without a wasted turn.
@@ -59,10 +59,10 @@ The extension never blindly continues: it asks first, so finished work can unloc
 | Command | Effect |
 |---|---|
 | `/lock-continue-watchdog` | Start a fresh lock cycle (notifies `Continue watchdog locked`) |
-| `/unlock-continue-watchdog [reason]` | Unlock now; optional reason is kept in TUI history |
+| `/unlock-continue-watchdog [reason]` | Unlock now; cancel an exact current watchdog-owned run and clean its residue; optional reason is kept in TUI history |
 | `/status-continue-watchdog` | Show current lock/attempt state and why the next check would (not) fire |
 
-A keyboard shortcut (default `alt+u`, configurable via `unlockShortcut`) performs the same unlock as `/unlock-continue-watchdog` without a reason. While the watchdog is locked, the `Continue Watchdog | …` state row names the effective gesture (for example `enabled · alt+u unlock`).
+A keyboard shortcut (default `alt+u`, configurable via `unlockShortcut`) performs the same ownership-aware unlock as `/unlock-continue-watchdog` without a reason. It never aborts an uncorrelated ordinary user run. While the watchdog is locked, the `Continue Watchdog | …` state row names the effective gesture (for example `enabled · alt+u unlock`).
 
 ## Configuration
 
