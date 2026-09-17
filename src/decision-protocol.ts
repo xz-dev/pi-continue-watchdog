@@ -307,20 +307,25 @@ Use only the existing conversation context and decide quickly. Do not make decis
 
 First reconcile the user's outstanding requests with the latest ordinary assistant response and relevant tool results. Exclude work already delivered, cancelled, or superseded; preserve genuinely unfinished earlier requests. Earlier plans and watchdog reasons are not proof that work remains. A final response or stop marker alone is not proof of completion: compare actual deliverables with the requests. Before claiming that the user has not been answered, check whether the latest ordinary assistant response already answers the question. For continue, identify the specific missing deliverable and an authorized next action; do not repeat an already-delivered answer or invent optional follow-up work.
 
+Use these decision labels:
+- STOP: decide to stop here or pause for user action; use unlock_continue_watchdog.
+- LOCK: decide work can continue immediately; use continue_watchdog.
+- WAIT: pause only for temporary external automation or elapsed time, with no user action required; use wait_watchdog.
+
 Compare requests with actual delivery
 |
-+-- Complete --> unlock (${jobDoneType ?? "allowed completion type"})
-+-- Incomplete, authorized action executable now --> continue
-+-- No executable action, needs user --> unlock (${waitUserType ?? "allowed user-action type"})
-+-- No executable action, waiting for automation --> wait
-+-- Other blocker --> unlock (${jobBlockedType ?? "allowed blocker type"})
++-- Complete --> STOP (${jobDoneType ?? "allowed completion type"})
++-- Incomplete, authorized action executable now --> LOCK
++-- No executable action, needs user --> STOP (${waitUserType ?? "allowed user-action type"})
++-- No executable action, waiting for automation --> WAIT
++-- Other blocker --> STOP (${jobBlockedType ?? "allowed blocker type"})
 
 Choose the outcome using these rules in order:
-1. If all requested work is complete, use unlock_continue_watchdog. For reason_type, ${jobDoneGuidance}.
-2. Use continue_watchdog only if at least one concrete requested and authorized next action can be performed immediately for a still-incomplete deliverable without additional user input or approval. reason_content must name that immediately executable action, not a user-blocked action. Unfinished work alone is not sufficient reason to continue.
-3. If no concrete next action can proceed without additional user input, approval, confirmation, authorization, credentials, or another user action, use unlock_continue_watchdog. For reason_type, ${waitUserGuidance}.
-4. If no authorized action can be performed now and progress only requires temporary external automation or elapsed time and no user action is required, use wait_watchdog.
-5. Otherwise, if work cannot proceed for a blocker that is neither user action nor a temporary external wait, use unlock_continue_watchdog. For reason_type, ${jobBlockedGuidance}.
+1. If all requested work is complete, choose STOP by using unlock_continue_watchdog. For reason_type, ${jobDoneGuidance}.
+2. Choose LOCK by using continue_watchdog only if at least one concrete requested and authorized next action can be performed immediately for a still-incomplete deliverable without additional user input or approval. reason_content must name that immediately executable action, not a user-blocked action. Unfinished work alone is not sufficient reason to continue.
+3. If no concrete next action can proceed without additional user input, approval, confirmation, authorization, credentials, or another user action, choose STOP by using unlock_continue_watchdog. For reason_type, ${waitUserGuidance}.
+4. If no authorized action can be performed now and progress only requires temporary external automation or elapsed time and no user action is required, choose WAIT by using wait_watchdog.
+5. Otherwise, if work cannot proceed for a blocker that is neither user action nor a temporary external wait, choose STOP by using unlock_continue_watchdog. For reason_type, ${jobBlockedGuidance}.
 
 If you choose continue_watchdog, reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedContinueReasonTypes}. Use:
 ${continueExample}

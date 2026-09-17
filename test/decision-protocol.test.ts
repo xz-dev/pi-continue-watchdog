@@ -549,6 +549,18 @@ test("fixed prompt suffix requires typed reasons for both decisions", () => {
 	assert.match(prompt, /<wait_seconds>300<\/wait_seconds>/);
 	assert.match(prompt, /integer wait_seconds from 1 through 1800/);
 	assert.match(prompt, /<function>unlock_continue_watchdog<\/function>/);
+	assert.match(
+		prompt,
+		/STOP: decide to stop here or pause for user action; use unlock_continue_watchdog/,
+	);
+	assert.match(
+		prompt,
+		/LOCK: decide work can continue immediately; use continue_watchdog/,
+	);
+	assert.match(
+		prompt,
+		/WAIT: pause only for temporary external automation or elapsed time/,
+	);
 	assert.match(prompt, /Choose the outcome using these rules in order/);
 	assert.match(
 		prompt,
@@ -575,7 +587,7 @@ test("fixed prompt suffix requires typed reasons for both decisions", () => {
 	assert.match(prompt, /default reason_type is JOB_BLOCKED/);
 	assert.ok(
 		prompt.indexOf("default reason_type is JOB_DONE") <
-			prompt.indexOf("2. Use continue_watchdog only if"),
+			prompt.indexOf("2. Choose LOCK by using continue_watchdog only if"),
 	);
 	assert.match(prompt, /If you choose continue_watchdog/);
 	assert.match(prompt, /If you choose unlock_continue_watchdog/);
@@ -599,22 +611,24 @@ test("completion reconciliation precedes continuation even with stale configured
 	assert.match(prompt, /Before claiming that the user has not been answered/);
 	assert.match(prompt, /identify the specific missing deliverable/);
 	const done = prompt.indexOf("1. If all requested work is complete");
-	const work = prompt.indexOf("2. Use continue_watchdog only if");
+	const work = prompt.indexOf(
+		"2. Choose LOCK by using continue_watchdog only if",
+	);
 	assert.ok(done >= 0 && work > done);
-	assert.match(prompt, /\+-- Complete --> unlock \(JOB_DONE\)/);
+	assert.match(prompt, /\+-- Complete --> STOP \(JOB_DONE\)/);
 	assert.match(
 		prompt,
-		/\+-- Incomplete, authorized action executable now --> continue/,
+		/\+-- Incomplete, authorized action executable now --> LOCK/,
 	);
 	assert.match(
 		prompt,
-		/\+-- No executable action, needs user --> unlock \(WAIT_USER\)/,
+		/\+-- No executable action, needs user --> STOP \(WAIT_USER\)/,
 	);
 	assert.match(
 		prompt,
-		/\+-- No executable action, waiting for automation --> wait/,
+		/\+-- No executable action, waiting for automation --> WAIT/,
 	);
-	assert.match(prompt, /\+-- Other blocker --> unlock \(JOB_BLOCKED\)/);
+	assert.match(prompt, /\+-- Other blocker --> STOP \(JOB_BLOCKED\)/);
 	assert.match(
 		buildDecisionReaskPrompt(prompt, INVALID_DECISION_XML_ERROR),
 		/latest ordinary assistant response and relevant tool results/,
@@ -648,10 +662,10 @@ test("fixed prompt suffix XML-escapes an arbitrary reason type and lists types u
 		prompt,
 		/choose the allowed reason_type value that represents a non-user blocker/,
 	);
-	assert.match(prompt, /\+-- Complete --> unlock \(allowed completion type\)/);
+	assert.match(prompt, /\+-- Complete --> STOP \(allowed completion type\)/);
 	assert.match(
 		prompt,
-		/\+-- No executable action, needs user --> unlock \(allowed user-action type\)/,
+		/\+-- No executable action, needs user --> STOP \(allowed user-action type\)/,
 	);
 	assert.equal(prompt.includes("WAIT_USER"), false);
 	assert.equal(prompt.includes("JOB_DONE"), false);
