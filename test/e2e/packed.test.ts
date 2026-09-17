@@ -532,7 +532,7 @@ async function shutdownSession(session: AgentSession): Promise<void> {
 	session.dispose();
 }
 
-function createRpcUiContext(): ExtensionUIContext {
+function createRpcUiContext(notifications?: string[]): ExtensionUIContext {
 	// bindExtensions only treats a supplied public UI context as UI-capable; the
 	// watchdog uses notify in this E2E and does not require a real terminal/TUI.
 	return {
@@ -545,7 +545,9 @@ function createRpcUiContext(): ExtensionUIContext {
 		async input() {
 			return undefined;
 		},
-		notify() {},
+		notify(message: string) {
+			notifications?.push(message);
+		},
 		onTerminalInput() {
 			return () => {};
 		},
@@ -1264,6 +1266,284 @@ test("packed command unlock and canonical programmatic abort prevent a decision 
 	assert.equal(requests.length, 1);
 });
 
+test("packed manual unlock cancels watchdog-owned runs, leaves queue semantics to Pi, and preserves ordinary runs", {
+	timeout: 95_000,
+}, async (t) => {
+	// Decision cancellation: explicit unlock is the only visible unlock and the
+	// internal aborted assistant leaves no persisted partial output.
+	{
+		const fixture = await makePackedFixture(t);
+		let markDecisionStarted: (() => void) | undefined;
+		const decisionStarted = new Promise<void>((resolveStarted) => {
+			markDecisionStarted = resolveStarted;
+		});
+		const notifications: string[] = [];
+		const { baseUrl, requests } = await startMockServer(t, [
+			{ kind: "stop", text: "ordinary work complete" },
+			{ kind: "delayed", started: () => markDecisionStarted?.() },
+		]);
+		const { session } = await createSession(fixture, baseUrl, {
+			uiContext: createRpcUiContext(notifications),
+		});
+		let closed = false;
+		t.after(async () => {
+			if (!closed) await shutdownSession(session);
+		});
+
+		await session.prompt("Open a decision that manual unlock will cancel.");
+		await waitFor(
+			() => requests.length === 2,
+			18_000,
+			"manual decision cancellation",
+		);
+		await decisionStarted;
+		await session.prompt("/unlock-continue-watchdog");
+		await waitForSessionIdle(session, 5_000, "cancelled decision");
+
+		assert.equal(isDecisionRequest(requests[1] as RequestRecord), true);
+		assert.deepEqual(notifications, ["Continue watchdog unlocked"]);
+		const serialized = session.sessionManager
+			.getEntries()
+			.map((entry) => JSON.stringify(entry));
+		assert.equal(
+			serialized.some((entry) => entry.includes("partial")),
+			false,
+		);
+		assert.equal(
+			serialized.some((entry) => entry.includes("Operation aborted")),
+			false,
+		);
+		await shutdownSession(session);
+		closed = true;
+	}
+
+	// Continuation cancellation leaves queue processing to stock Pi. The extension
+	// does not inspect or replay the follow-up that Pi consumes during abort.
+	{
+		const fixture = await makePackedFixture(t);
+		let markContinuationStarted: (() => void) | undefined;
+		const continuationStarted = new Promise<void>((resolveStarted) => {
+			markContinuationStarted = resolveStarted;
+		});
+		const notifications: string[] = [];
+		let markLaterOrdinaryStarted: (() => void) | undefined;
+		const laterOrdinaryStarted = new Promise<void>((resolveStarted) => {
+			markLaterOrdinaryStarted = resolveStarted;
+		});
+		const { baseUrl, requests } = await startMockServer(t, [
+			{ kind: "stop", text: "ordinary work complete" },
+			{ kind: "continue" },
+			{ kind: "delayed", started: () => markContinuationStarted?.() },
+			{ kind: "delayed", started: () => markLaterOrdinaryStarted?.() },
+		]);
+		const { session } = await createSession(fixture, baseUrl, {
+			uiContext: createRpcUiContext(notifications),
+		});
+		let closed = false;
+		t.after(async () => {
+			if (!closed) await shutdownSession(session);
+		});
+
+		await session.prompt(
+			"Open an automated continuation that will be cancelled.",
+		);
+		await waitFor(
+			() => requests.length === 3,
+			20_000,
+			"streaming continuation",
+		);
+		await continuationStarted;
+		const queued = session.prompt("queued user work", {
+			source: "interactive",
+			streamingBehavior: "followUp",
+		});
+		await waitFor(
+			() => session.pendingMessageCount === 1,
+			2_000,
+			"queued user work to enter Pi follow-up queue",
+		);
+		await session.prompt("/unlock-continue-watchdog");
+		await queued;
+		await waitForSessionIdle(session, 5_000, "cancelled continuation");
+
+		assert.deepEqual(notifications, ["Continue watchdog unlocked"]);
+		assert.equal(session.pendingMessageCount, 0);
+		assert.equal(requests.length, 3);
+		assert.equal(
+			requests.some((request) =>
+				request.messages.some((message) =>
+					textOf(message).includes("queued user work"),
+				),
+			),
+			false,
+		);
+		const serialized = session.sessionManager
+			.getEntries()
+			.map((entry) => JSON.stringify(entry));
+		assert.equal(
+			serialized.some((entry) => entry.includes("partial")),
+			false,
+		);
+		assert.equal(
+			serialized.some((entry) => entry.includes("Operation aborted")),
+			false,
+		);
+
+		const laterOrdinary = session.prompt(
+			"later ordinary run must abort normally",
+		);
+		await waitFor(() => requests.length === 4, 3_000, "later ordinary run");
+		await laterOrdinaryStarted;
+		await session.abort();
+		await laterOrdinary;
+		await waitForSessionIdle(session, 3_000, "later ordinary abort");
+		const latestAssistant = session.sessionManager
+			.getBranch()
+			.flatMap((entry) =>
+				entry.type === "message" && entry.message.role === "assistant"
+					? [entry.message]
+					: [],
+			)
+			.at(-1);
+		assert.equal(latestAssistant?.stopReason, "aborted");
+		assert.notEqual(
+			latestAssistant?.errorMessage,
+			"pi-continue-watchdog:cancelled",
+		);
+		assert.deepEqual(notifications, [
+			"Continue watchdog unlocked",
+			"Continue watchdog unlocked",
+		]);
+		await shutdownSession(session);
+		closed = true;
+	}
+
+	// Genuine steering that starts inside the continuation's agent lifecycle
+	// clears continuation ownership before a later manual unlock.
+	{
+		const fixture = await makePackedFixture(t);
+		let markContinuationStarted: (() => void) | undefined;
+		const continuationStarted = new Promise<void>((resolveStarted) => {
+			markContinuationStarted = resolveStarted;
+		});
+		let markUserStarted: (() => void) | undefined;
+		const userStarted = new Promise<void>((resolveStarted) => {
+			markUserStarted = resolveStarted;
+		});
+		const notifications: string[] = [];
+		let abortCalls = 0;
+		const timeline: string[] = [];
+		const { baseUrl, requests } = await startMockServer(t, [
+			{ kind: "stop", text: "ordinary work complete" },
+			{ kind: "continue" },
+			{
+				kind: "delayed",
+				started: () => {
+					timeline.push("provider:user-started");
+					markUserStarted?.();
+				},
+			},
+		]);
+		const { session } = await createSession(fixture, baseUrl, {
+			uiContext: createRpcUiContext(notifications),
+			abortHandler: (activeSession) => {
+				abortCalls += 1;
+				timeline.push("abort-handler");
+				activeSession.agent.abort();
+			},
+		});
+		let closed = false;
+		t.after(async () => {
+			if (!closed) await shutdownSession(session);
+		});
+
+		const unsubscribe = session.subscribe((event) => {
+			if (event.type === "agent_start") timeline.push("agent-start");
+			if (event.type === "message_start") {
+				timeline.push(
+					`message-start:${event.message.role}:${"customType" in event.message ? event.message.customType : ""}`,
+				);
+			}
+			if (
+				event.type === "message_start" &&
+				event.message.role === "custom" &&
+				JSON.stringify(event.message).includes(
+					"pi-continue-watchdog:inquiry-fold",
+				)
+			) {
+				markContinuationStarted?.();
+			}
+		});
+		t.after(unsubscribe);
+
+		await session.prompt("Start a continuation then accept genuine steering.");
+		await continuationStarted;
+		await session.prompt("genuine steering work", {
+			source: "interactive",
+			streamingBehavior: "steer",
+		});
+		await waitFor(() => requests.length === 3, 20_000, "steering user request");
+		await userStarted;
+		timeline.push("unlock-command");
+		await session.prompt("/unlock-continue-watchdog");
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+		assert.equal(
+			abortCalls,
+			0,
+			`unexpected abort; timeline: ${timeline.join(" -> ")}`,
+		);
+		assert.equal(
+			session.isIdle,
+			false,
+			`user run settled unexpectedly; timeline: ${timeline.join(" -> ")}`,
+		);
+		assert.deepEqual(notifications, ["Continue watchdog unlocked"]);
+		assert.equal(
+			textOf(requests[2]?.messages.at(-1) ?? {}).includes(
+				"genuine steering work",
+			),
+			true,
+		);
+		await session.abort();
+		await waitForSessionIdle(session, 3_000, "steering cleanup abort");
+		await shutdownSession(session);
+		closed = true;
+	}
+
+	// Ordinary current work is not a watchdog-owned cancellation target.
+	{
+		const fixture = await makePackedFixture(t);
+		let markOrdinaryStarted: (() => void) | undefined;
+		const ordinaryStarted = new Promise<void>((resolveStarted) => {
+			markOrdinaryStarted = resolveStarted;
+		});
+		const notifications: string[] = [];
+		const { baseUrl, requests } = await startMockServer(t, [
+			{ kind: "delayed", started: () => markOrdinaryStarted?.() },
+		]);
+		const { session } = await createSession(fixture, baseUrl, {
+			uiContext: createRpcUiContext(notifications),
+		});
+		let closed = false;
+		t.after(async () => {
+			if (!closed) await shutdownSession(session);
+		});
+
+		const ordinary = session.prompt("ordinary user run remains active");
+		await waitFor(() => requests.length === 1, 3_000, "ordinary streaming run");
+		await ordinaryStarted;
+		await session.prompt("/unlock-continue-watchdog");
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+		assert.equal(session.isIdle, false);
+		assert.deepEqual(notifications, ["Continue watchdog unlocked"]);
+		await session.abort();
+		await ordinary;
+		await waitForSessionIdle(session, 3_000, "ordinary cleanup abort");
+		await shutdownSession(session);
+		closed = true;
+	}
+});
+
 test("packed interactive and RPC input preempt a streaming decision once", {
 	timeout: 70_000,
 }, async (t) => {
@@ -1612,7 +1892,7 @@ test("packed decision request retains delivered answer and completion-first guid
 	assert.match(prompt, /A final response or stop marker alone is not proof/);
 	assert.ok(
 		prompt.indexOf("1. If all requested work is complete") <
-			prompt.indexOf("2. Use continue_watchdog only if"),
+			prompt.indexOf("2. Choose LOCK by using continue_watchdog only if"),
 	);
 	assert.equal(requests.length, 2);
 	const entries = session.sessionManager.getBranch();

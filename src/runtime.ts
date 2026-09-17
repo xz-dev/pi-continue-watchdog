@@ -35,14 +35,19 @@ import { BUILT_IN_CONFIG, type ContinueWatchdogConfig } from "./config.js";
 import { type LoadedConfig, loadRuntimeConfig } from "./config-loader.js";
 import {
 	buildAutomatedContinuationMessage,
+	CANCELLED_WATCHDOG_RUN_ERROR,
+	CONTINUATION_MESSAGE_TYPE,
 	createDecisionFoldMessage,
+	DECISION_FOLD_MESSAGE_TYPE,
 	DECISION_INQUIRY_NAMESPACE,
 	type DecisionTerminalResult,
+	findCancelledContinuationAssistantEntryId,
 	findDecisionAssistantEntryId,
 	findPreemptedDecisionAssistantEntryIds,
 	INQUIRY_MARKER_ENTRY_TYPE,
 	neutralizeDecisionAssistant,
 	PREEMPTED_DECISION_ERROR,
+	parseDecisionFoldDetails,
 } from "./context-fold.js";
 import {
 	type ControllerEffect,
@@ -196,6 +201,22 @@ type SelfDecisionRun =
 			readonly cycleId: number;
 	  };
 
+type WatchdogOwnedRun = {
+	readonly kind: "continuation";
+	readonly claim: HubMainClaim;
+	readonly exchangeId: string;
+	readonly cycleId: number;
+	phase: "pending-start" | "running";
+	cancelRequested: boolean;
+};
+
+type CancellationTarget = {
+	readonly kind: "decision" | "continuation";
+	readonly claim: HubMainClaim;
+	readonly exchangeId: string;
+	readonly cycleId: number;
+};
+
 type RuntimeContext = ExtensionCommandContext | ExtensionContext;
 
 export interface DecisionRuntimeOptions {
@@ -251,6 +272,8 @@ export interface DecisionRuntime {
 	 * lock/unlock transition so a later settle cannot continue stale work.
 	 */
 	clearOperationalPendingWork(): void;
+	/** Cancel only an exact watchdog-owned run during a human unlock. */
+	handleManualUnlock(ctx: RuntimeContext, claim: HubMainClaim): void;
 	/** Retain terminal-error unlock intent; publication waits for aggregate idle. */
 	retainErrorUnlock(claim: HubMainClaim): void;
 	/**
@@ -389,10 +412,9 @@ export function createDecisionRuntime(
 		readonly cycleId: number;
 		readonly response: DecisionResponse;
 	} | null = null;
-	let decisionAssistantToSplice: {
-		readonly exchangeId: string;
-		readonly cycleId: number;
-	} | null = null;
+	let decisionAssistantToSplice: CancellationTarget | null = null;
+	let watchdogOwnedRun: WatchdogOwnedRun | null = null;
+	let manualCancellation: CancellationTarget | null = null;
 	let pendingFinalization: PendingFinalization | null = null;
 	/**
 	 * User takeover capture shared from pi-extension-utils. 0.85.1 aborts
@@ -788,9 +810,11 @@ export function createDecisionRuntime(
 		}
 		activeDecision = null;
 		selfDecisionRun = { kind: "none" };
-		suppressDecisionAbort = false;
+		if (manualCancellation === null) {
+			suppressDecisionAbort = false;
+			decisionAssistantToSplice = null;
+		}
 		capturedDecisionResponse = null;
-		decisionAssistantToSplice = null;
 		pendingFinalization = null;
 		clearLiveStatus();
 		// Human/abort unlock must not inherit an automatic unlock publication intent.
@@ -876,11 +900,19 @@ export function createDecisionRuntime(
 			const spliceEntry = (options.pi as ExtensionAPI & Partial<SpliceEntryAPI>)
 				.spliceEntry;
 			if (typeof spliceEntry !== "function") return;
-			const entryId = findDecisionAssistantEntryId(
-				ctx.sessionManager.getBranch(),
-				pending.exchangeId,
-				pending.cycleId,
-			);
+			const branch = ctx.sessionManager.getBranch();
+			const entryId =
+				pending.kind === "continuation"
+					? findCancelledContinuationAssistantEntryId(
+							branch,
+							pending.exchangeId,
+							pending.cycleId,
+						)
+					: findDecisionAssistantEntryId(
+							branch,
+							pending.exchangeId,
+							pending.cycleId,
+						);
 			if (entryId !== null) spliceEntry.call(options.pi, entryId);
 		} catch {
 			// Tree cleanup is best effort and never replaces message clearing/folding.
@@ -1006,6 +1038,49 @@ export function createDecisionRuntime(
 		if (!suppressDecisionAbort) return false;
 		suppressDecisionAbort = false;
 		return true;
+	};
+
+	const handleManualUnlock = (
+		ctx: RuntimeContext,
+		claim: HubMainClaim,
+	): void => {
+		if (!owns(claim)) return;
+		let target: CancellationTarget | null = null;
+		const active = activeDecision;
+		if (active?.submitted && owns(active.claim)) {
+			target = {
+				kind: "decision",
+				claim: active.claim,
+				exchangeId: active.exchangeId,
+				cycleId: active.protocol.currentCycleId,
+			};
+			active.invalidated = true;
+			retainInquiryCleanup(active, { outcome: "preempted" });
+			activeDecision = null;
+		} else if (
+			watchdogOwnedRun?.phase === "running" &&
+			!watchdogOwnedRun.cancelRequested &&
+			owns(watchdogOwnedRun.claim)
+		) {
+			target = {
+				kind: "continuation",
+				claim: watchdogOwnedRun.claim,
+				exchangeId: watchdogOwnedRun.exchangeId,
+				cycleId: watchdogOwnedRun.cycleId,
+			};
+			watchdogOwnedRun.cancelRequested = true;
+		}
+		clearOperationalPendingWork();
+		if (target === null || !owns(target.claim)) return;
+		manualCancellation = target;
+		decisionAssistantToSplice = target;
+		suppressDecisionAbort = true;
+		try {
+			ctx.abort();
+		} catch {
+			// The correlated cancellation target remains authoritative for cleanup.
+		}
+		retryInquiryCleanup();
 	};
 
 	const silentlyAbandonDecision = (): void => {
@@ -1581,6 +1656,10 @@ export function createDecisionRuntime(
 		// Safe to call again after re-entrant demotion — every step is idempotent.
 		options.controllerHolder.controller?.unlock();
 		clearOperationalPendingWork();
+		watchdogOwnedRun = null;
+		manualCancellation = null;
+		decisionAssistantToSplice = null;
+		suppressDecisionAbort = false;
 		options.controllerHolder.controller = null;
 		configReady = false;
 		configLoad = null;
@@ -2170,6 +2249,14 @@ export function createDecisionRuntime(
 			});
 			if (stopIfStale(claim)) return false;
 			try {
+				watchdogOwnedRun = {
+					kind: "continuation",
+					claim,
+					exchangeId: active.exchangeId,
+					cycleId: finalCycleId,
+					phase: "pending-start",
+					cancelRequested: false,
+				};
 				options.pi.sendMessage(
 					createDecisionFoldMessage({
 						exchangeId: active.exchangeId,
@@ -2185,6 +2272,7 @@ export function createDecisionRuntime(
 					content: continuationMessage,
 				});
 			} catch {
+				watchdogOwnedRun = null;
 				if (!allIdleForClaim(claim)) return deferAcceptedContinue();
 				retainInquiryCleanup(active, watchdogResult);
 				retryInquiryCleanup();
@@ -2310,6 +2398,24 @@ export function createDecisionRuntime(
 					},
 					quarantinedDecision.exchangeId,
 					quarantinedDecision.cycleId,
+				),
+			};
+		}
+		const cancellation = manualCancellation;
+		if (
+			cancellation !== null &&
+			event.message.role === "assistant" &&
+			isAbortedAssistant(event.message)
+		) {
+			return {
+				message: neutralizeDecisionAssistant(
+					{
+						...event.message,
+						stopReason: "stop" as const,
+						errorMessage: CANCELLED_WATCHDOG_RUN_ERROR,
+					},
+					cancellation.exchangeId,
+					cancellation.cycleId,
 				),
 			};
 		}
@@ -2512,6 +2618,35 @@ export function createDecisionRuntime(
 			else quarantinedDecision = null;
 			return;
 		}
+		const ownedRun = watchdogOwnedRun;
+		if (
+			ownedRun?.phase === "running" &&
+			(message.role === "user" || message.role === "custom")
+		) {
+			// A foreign input can start inside the same Pi agent lifecycle, without a
+			// new agent_start/agent_settled pair. From this message onward the active
+			// run is no longer solely watchdog-owned, so a later manual unlock must
+			// not abort it under stale continuation identity.
+			watchdogOwnedRun = null;
+		}
+		if (ownedRun?.phase === "pending-start") {
+			const fold =
+				message.role === "custom" &&
+				message.customType === DECISION_FOLD_MESSAGE_TYPE
+					? parseDecisionFoldDetails(message.details)
+					: undefined;
+			if (
+				fold?.inquiryId === ownedRun.exchangeId &&
+				fold.attempt === ownedRun.cycleId &&
+				fold.watchdogOutcome === "continue" &&
+				fold.replacement?.customType === CONTINUATION_MESSAGE_TYPE &&
+				owns(ownedRun.claim)
+			) {
+				ownedRun.phase = "running";
+				return;
+			}
+			watchdogOwnedRun = null;
+		}
 		const active = activeDecision;
 		if (active === null || active.invalidated || !owns(active.claim)) return;
 		const isCurrentDecision = active.inquiry.matchesPrompt(message);
@@ -2708,6 +2843,8 @@ export function createDecisionRuntime(
 			pendingTakeover.capture(event.text);
 			suppressDecisionAbort = true;
 			decisionAssistantToSplice = {
+				kind: "decision",
+				claim: active.claim,
 				exchangeId: active.exchangeId,
 				cycleId: active.protocol.currentCycleId,
 			};
@@ -2763,6 +2900,15 @@ export function createDecisionRuntime(
 
 		options.pi.on("agent_settled", async (_event, ctx: ExtensionContext) => {
 			retryInquiryCleanup();
+			watchdogOwnedRun = null;
+			// manualCancellation belongs to the run whose abort produced this
+			// authoritative settle. Foreign input may already have cleared active
+			// ownership, so retirement cannot depend on watchdogOwnedRun still being
+			// present. The independent splice target remains until presentation cleanup.
+			if (manualCancellation !== null) {
+				manualCancellation = null;
+				suppressDecisionAbort = false;
+			}
 			const preserveGeneration = selfDecisionRun.kind !== "none";
 			if (stopped || !observeLiveState(ctx, { preserveGeneration })) return;
 
@@ -2816,6 +2962,10 @@ export function createDecisionRuntime(
 		lifecycleGeneration += 1;
 		localActivityGeneration += 1;
 		quarantinedDecision = null;
+		watchdogOwnedRun = null;
+		manualCancellation = null;
+		decisionAssistantToSplice = null;
+		suppressDecisionAbort = false;
 		graceCoordinator.dispose();
 		const detached = attachment;
 		if (detached !== null) options.hub.detach(detached);
@@ -2850,6 +3000,7 @@ export function createDecisionRuntime(
 		getMainClaim,
 		isCurrentMainClaim: (claim) => options.hub.isCurrentMain(claim),
 		clearOperationalPendingWork,
+		handleManualUnlock,
 		retainErrorUnlock(claim): void {
 			if (!owns(claim) || currentController(claim)?.snapshot.locked !== false)
 				return;

@@ -19,6 +19,7 @@ export const DECISION_MESSAGE_TYPE = `${DECISION_INQUIRY_NAMESPACE}:inquiry`;
 export const DECISION_FOLD_MESSAGE_TYPE = `${DECISION_INQUIRY_NAMESPACE}:inquiry-fold`;
 export const CONTINUATION_MESSAGE_TYPE = "pi-continue-watchdog:continuation";
 export const PREEMPTED_DECISION_ERROR = "pi-continue-watchdog:preempted";
+export const CANCELLED_WATCHDOG_RUN_ERROR = "pi-continue-watchdog:cancelled";
 export const INQUIRY_MARKER_ENTRY_TYPE = "pi-continue-watchdog:inquiry-marker";
 
 export interface DecisionMessageDetails extends InquiryCorrelation {}
@@ -342,7 +343,8 @@ function isPreemptedAssistant(
 		!isObject(input) ||
 		input.role !== "assistant" ||
 		input.stopReason !== "stop" ||
-		input.errorMessage !== PREEMPTED_DECISION_ERROR ||
+		(input.errorMessage !== PREEMPTED_DECISION_ERROR &&
+			input.errorMessage !== CANCELLED_WATCHDOG_RUN_ERROR) ||
 		!Array.isArray(input.content) ||
 		input.content.length !== 0 ||
 		!isObject(input.details) ||
@@ -418,6 +420,69 @@ export function findDecisionAssistantEntryId(
 		if (foldSeen) return assistantId;
 	}
 	return decisionSeen && foldSeen ? assistantId : null;
+}
+
+function isCancelledWatchdogAssistant(
+	input: unknown,
+	exchangeId: string,
+	cycleId: number,
+): boolean {
+	if (
+		!isObject(input) ||
+		input.role !== "assistant" ||
+		input.stopReason !== "stop" ||
+		input.errorMessage !== CANCELLED_WATCHDOG_RUN_ERROR ||
+		!Array.isArray(input.content) ||
+		input.content.length !== 0 ||
+		!isObject(input.details) ||
+		!isObject(input.details.piInquiry)
+	) {
+		return false;
+	}
+	const details = decisionDetails(input.details.piInquiry);
+	return details?.inquiryId === exchangeId && details.attempt === cycleId;
+}
+
+export function findCancelledContinuationAssistantEntryId(
+	entries: readonly SessionEntry[],
+	exchangeId: string,
+	cycleId: number,
+): string | null {
+	let foldSeen = false;
+	for (let index = 0; index < entries.length; index += 1) {
+		const entry = entries[index];
+		const boundary = entryCorrelation(entry);
+		if (
+			foldSeen &&
+			boundary !== undefined &&
+			(boundary.exchangeId !== exchangeId || boundary.cycleId !== cycleId)
+		) {
+			return null;
+		}
+		if (
+			entry?.type === "custom_message" &&
+			entry.customType === DECISION_FOLD_MESSAGE_TYPE
+		) {
+			const fold = parseDecisionFoldDetails(entry.details);
+			if (
+				fold?.inquiryId === exchangeId &&
+				fold.attempt === cycleId &&
+				fold.watchdogOutcome === "continue" &&
+				fold.replacement?.customType === CONTINUATION_MESSAGE_TYPE
+			) {
+				foldSeen = true;
+			}
+			continue;
+		}
+		if (
+			foldSeen &&
+			entry?.type === "message" &&
+			isCancelledWatchdogAssistant(entry.message, exchangeId, cycleId)
+		) {
+			return entry.id;
+		}
+	}
+	return null;
 }
 
 export function findPreemptedDecisionAssistantEntryIds(
@@ -506,7 +571,15 @@ export function neutralizeDecisionAssistant<T>(
 }
 
 export function foldDecisionContext<T extends object>(messages: T[]): T[] {
-	return foldInquiryContext(messages, DECISION_INQUIRY_NAMESPACE);
+	const folded = foldInquiryContext(messages, DECISION_INQUIRY_NAMESPACE);
+	const filtered = folded.filter((message) => {
+		if (!isObject(message) || message.role !== "assistant") return true;
+		if (message.errorMessage !== CANCELLED_WATCHDOG_RUN_ERROR) return true;
+		if (!isObject(message.details) || !isObject(message.details.piInquiry))
+			return true;
+		return decisionDetails(message.details.piInquiry) === undefined;
+	});
+	return filtered.length === folded.length ? folded : filtered;
 }
 
 export function registerDecisionContextFolding(pi: ExtensionAPI): void {

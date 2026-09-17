@@ -111,6 +111,11 @@ export interface MainCommandRuntime {
 	): Promise<void> | void;
 	/** Invalidate pending runtime work after a direct human unlock. */
 	clearOperationalPendingWork(): void;
+	/** Abort and clean only an exact watchdog-owned current run. */
+	handleManualUnlock?(
+		ctx: ExtensionCommandContext,
+		claim: HubMainClaim,
+	): Promise<void> | void;
 	applyEffect(
 		effect: CommandRuntimeEffect,
 		ctx: ExtensionCommandContext,
@@ -581,7 +586,11 @@ export async function handleUnlock(
 	) {
 		return;
 	}
-	runtime.clearOperationalPendingWork();
+	if (control.claim !== null && runtime.handleManualUnlock !== undefined) {
+		await runtime.handleManualUnlock(ctx, control.claim);
+	} else {
+		runtime.clearOperationalPendingWork();
+	}
 
 	const reason = normaliseHumanUnlockReason(args);
 	await applyControllerEffects(

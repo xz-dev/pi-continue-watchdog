@@ -8,6 +8,7 @@ import {
 import { MAX_PROMPT_CHARACTERS } from "../src/config.js";
 import {
 	buildAutomatedContinuationMessage,
+	CANCELLED_WATCHDOG_RUN_ERROR,
 	CONTINUATION_MESSAGE_TYPE,
 	createDecisionFoldMessage,
 	createDecisionPromptMessage,
@@ -746,6 +747,23 @@ test("an incomplete exchange stays raw without poisoning a later complete exchan
 		user("interleaving user message", 4),
 		continuationMessage(7, completeExchangeId),
 	]);
+});
+
+test("cancelled watchdog assistants are excluded without removing unrelated messages", () => {
+	const correlated = neutralizeDecisionAssistant(
+		{
+			role: "assistant",
+			content: [{ type: "text", text: "partial output" }],
+			stopReason: "aborted",
+			errorMessage: CANCELLED_WATCHDOG_RUN_ERROR,
+			timestamp: 3,
+		},
+		EXCHANGE_ID,
+		1,
+		{ stopReason: "stop" },
+	);
+	const unrelated = assistant([text("ordinary assistant")], 4);
+	assert.deepEqual(foldDecisionContext([unrelated, correlated]), [unrelated]);
 });
 
 test("builders reject invalid inputs and the context hook uses foldDecisionContext", () => {

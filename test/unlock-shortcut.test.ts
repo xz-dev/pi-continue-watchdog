@@ -20,10 +20,12 @@ type ShortcutHandler = (ctx: ExtensionCommandContext) => Promise<void> | void;
 
 interface ShortcutHarness {
 	readonly shortcuts: Map<string, ShortcutHandler>;
+	readonly commands: Map<string, ShortcutHandler>;
 	readonly notifications: string[];
 	readonly handlers: Map<string, LifecycleHandler[]>;
 	readonly controller: ReturnType<typeof createLockDecisionController>;
 	readonly ctx: ExtensionContext;
+	readonly aborts: () => number;
 	readonly fire: (name: string) => Promise<void>;
 }
 
@@ -34,7 +36,9 @@ function createHarness(
 	const hub = createObservableAgentHub();
 	const handlers = new Map<string, LifecycleHandler[]>();
 	const shortcuts = new Map<string, ShortcutHandler>();
+	const commands = new Map<string, ShortcutHandler>();
 	const notifications: string[] = [];
+	let aborts = 0;
 	const config: ContinueWatchdogConfig = {
 		...BUILT_IN_CONFIG,
 		unlockShortcut,
@@ -54,7 +58,19 @@ function createHarness(
 		},
 		setActiveTools(): void {},
 		registerEntryRenderer(): void {},
-		registerCommand(): void {},
+		registerCommand(
+			name: string,
+			{
+				handler,
+			}: {
+				readonly handler: (
+					args: string,
+					ctx: ExtensionCommandContext,
+				) => Promise<void> | void;
+			},
+		): void {
+			commands.set(name, (ctx) => handler("", ctx));
+		},
 		registerShortcut(
 			key: string,
 			{ handler }: { readonly handler: ShortcutHandler },
@@ -79,6 +95,9 @@ function createHarness(
 				notifications.push(message);
 			},
 		},
+		abort(): void {
+			aborts += 1;
+		},
 	} as unknown as ExtensionContext;
 
 	const fire = async (name: string): Promise<void> => {
@@ -87,7 +106,16 @@ function createHarness(
 		}
 	};
 
-	return { shortcuts, notifications, handlers, controller, ctx, fire };
+	return {
+		shortcuts,
+		commands,
+		notifications,
+		handlers,
+		controller,
+		ctx,
+		aborts: () => aborts,
+		fire,
+	};
 }
 
 async function startSession(harness: ShortcutHarness): Promise<void> {
@@ -133,6 +161,24 @@ test("shortcut while unlocked matches command behavior: unconditional unlock not
 	await handler(harness.ctx as unknown as ExtensionCommandContext);
 	assert.equal(harness.controller.snapshot.locked, false);
 	assert.deepEqual(harness.notifications, ["Continue watchdog unlocked"]);
+});
+
+test("shortcut and slash command share ownership-aware cancellation while ordinary runs stay alive", async () => {
+	for (const entrypoint of ["shortcut", "command"] as const) {
+		const harness = createHarness("alt+u", { locked: true });
+		await startSession(harness);
+		const opened = harness.controller.beginDecision(0);
+		assert.equal(opened.snapshot.decisionOpen, true);
+		const invoke =
+			entrypoint === "shortcut"
+				? harness.shortcuts.get("alt+u")
+				: harness.commands.get("unlock-continue-watchdog");
+		assert.ok(invoke);
+		await invoke(harness.ctx as unknown as ExtensionCommandContext);
+		assert.equal(harness.controller.snapshot.locked, false);
+		assert.equal(harness.aborts(), 0);
+		assert.deepEqual(harness.notifications, ["Continue watchdog unlocked"]);
+	}
 });
 
 test("shortcut during a pending decision clears the decision like the command", async () => {

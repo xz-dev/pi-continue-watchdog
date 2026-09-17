@@ -11,6 +11,8 @@ import {
 	CONTINUE_ENTRY_TYPE,
 	HUMAN_UNLOCK_ENTRY_TYPE,
 	type HumanUnlockEntry,
+	handleUnlock,
+	type MainCommandRuntime,
 	WAIT_ENTRY_TYPE,
 } from "../src/commands.js";
 import {
@@ -169,6 +171,7 @@ interface Harness {
 	answerInvalid(text?: string): unknown;
 	endDecisionMessage(message: unknown): Promise<unknown>;
 	blockToolCall(): Promise<unknown>;
+	unlock(): Promise<void>;
 }
 
 function assistant(content: unknown[], stopReason = "stop"): unknown {
@@ -631,6 +634,23 @@ function createHarness(options?: {
 		}
 		return result;
 	};
+	harness.unlock = async () => {
+		const commandRuntime: MainCommandRuntime = {
+			get controller() {
+				return runtime.controller;
+			},
+			isCurrentMain: runtime.isCurrentMain,
+			getTriggerStatus: runtime.getTriggerStatus,
+			getMainClaim: runtime.getMainClaim,
+			isCurrentMainClaim: runtime.isCurrentMainClaim,
+			restartLockCycle: runtime.restartLockCycle,
+			clearOperationalPendingWork: runtime.clearOperationalPendingWork,
+			handleManualUnlock: runtime.handleManualUnlock,
+			applyEffect: runtime.applyEffect,
+			reconcileIdle: runtime.reconcileIdle,
+		};
+		await handleUnlock(pi, commandRuntime, "", ctx as never);
+	};
 
 	return harness;
 }
@@ -736,6 +756,217 @@ async function settleResponse(
 	harness.streaming = false;
 	await settleOnly(harness);
 }
+
+async function startAcceptedContinuation(
+	harness: Harness,
+	confirmStart = true,
+): Promise<SentMessage> {
+	await harness.openDecision();
+	const answer = harness.answerContinue();
+	await harness.endDecisionMessage(answer);
+	await harness.fire("agent_end", { type: "agent_end", messages: [answer] });
+	harness.streaming = false;
+	await settleOnly(harness);
+	const fold = harness.sent.at(-1);
+	assert.equal(fold?.message.customType, DECISION_FOLD_MESSAGE_TYPE);
+	assert.equal(
+		parseDecisionFoldDetails(fold?.message.details)?.watchdogOutcome,
+		"continue",
+	);
+	assert.ok(fold);
+	harness.branch.push({
+		id: `fold-${harness.branch.length + 1}`,
+		type: "custom_message",
+		customType: fold.message.customType,
+		details: fold.message.details,
+	});
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	if (confirmStart) {
+		await harness.fire("message_start", {
+			type: "message_start",
+			message: {
+				role: "custom",
+				...fold.message,
+				timestamp: Date.now(),
+			},
+		});
+	}
+	return fold;
+}
+
+test("manual unlock aborts an exact active watchdog decision and leaves no abort presentation", async () => {
+	const harness = createHarness({ spliceBehavior: "success" });
+	await startIdle(harness);
+	await harness.openDecision();
+	const turnsBefore = harness.triggeredTurns;
+
+	await harness.unlock();
+
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.aborts, 1);
+	assert.equal(harness.triggeredTurns, turnsBefore);
+	assert.deepEqual(harness.notifications, [
+		{ message: "Continue watchdog unlocked", level: undefined },
+	]);
+
+	const aborted = assistant([text("partial decision output")], "aborted");
+	const replacement = (await harness.endDecisionMessage(
+		aborted,
+	)) as DecisionMessageReplacement;
+	assert.deepEqual(replacement.message.content, []);
+	assert.equal(replacement.message.stopReason, "stop");
+	assert.equal(
+		replacement.message.errorMessage,
+		"pi-continue-watchdog:cancelled",
+	);
+	const persisted = harness.branch.at(-1);
+	assert.ok(persisted?.type === "message");
+	(persisted as { message: unknown }).message = replacement.message;
+	assert.equal(harness.runtime.consumeDecisionAbortSuppression(), true);
+	assert.equal(harness.runtime.consumeDecisionAbortSuppression(), false);
+	await harness.fire("agent_end", { type: "agent_end", messages: [aborted] });
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.aborts, 1);
+	assert.equal(harness.spliceAttempts.length, 1);
+	assert.equal(
+		harness.branch.some((entry) => entry.id === persisted.id),
+		false,
+	);
+});
+
+test("manual unlock aborts an exact active automated continuation but preserves ordinary runs", async () => {
+	const continuation = createHarness({ spliceBehavior: "success" });
+	await startIdle(continuation);
+	await startAcceptedContinuation(continuation);
+	const turnsBefore = continuation.triggeredTurns;
+
+	await continuation.unlock();
+
+	assert.equal(continuation.controller.snapshot.locked, false);
+	assert.equal(continuation.aborts, 1);
+	assert.equal(continuation.triggeredTurns, turnsBefore);
+	const aborted = assistant([text("partial continuation output")], "aborted");
+	const replacement = (await continuation.endDecisionMessage(
+		aborted,
+	)) as DecisionMessageReplacement;
+	assert.deepEqual(replacement.message.content, []);
+	assert.equal(replacement.message.stopReason, "stop");
+	assert.equal(
+		replacement.message.errorMessage,
+		"pi-continue-watchdog:cancelled",
+	);
+	const persisted = continuation.branch.at(-1);
+	assert.ok(persisted?.type === "message");
+	(persisted as { message: unknown }).message = replacement.message;
+	assert.equal(continuation.runtime.consumeDecisionAbortSuppression(), true);
+	continuation.streaming = false;
+	await settleOnly(continuation);
+	assert.deepEqual(continuation.spliceAttempts, [persisted.id]);
+	assert.equal(
+		continuation.branch.some((entry) => entry.id === persisted.id),
+		false,
+	);
+
+	const ordinary = createHarness();
+	await startIdle(ordinary);
+	ordinary.runtime.applyTransition(ordinary.controller.lock(), undefined, {
+		suppressNotify: true,
+	});
+	await ordinary.startUnrelatedRun();
+	await ordinary.unlock();
+	assert.equal(ordinary.controller.snapshot.locked, false);
+	assert.equal(ordinary.aborts, 0);
+});
+
+test("repeated unlock, ownership loss, and shutdown cannot retarget cancellation", async () => {
+	const repeated = createHarness();
+	await startIdle(repeated);
+	await startAcceptedContinuation(repeated);
+	await repeated.unlock();
+	await repeated.unlock();
+	assert.equal(repeated.aborts, 1);
+	assert.deepEqual(repeated.notifications, [
+		{ message: "Continue watchdog unlocked", level: undefined },
+		{ message: "Continue watchdog unlocked", level: undefined },
+	]);
+
+	const demoted = createHarness({ hasUI: false });
+	await startIdle(demoted);
+	await startAcceptedContinuation(demoted);
+	const usurper = demoted.hub.bind({
+		instance: createHubAttachmentInstance(),
+		sessionId: "replacement-main",
+		hasUI: true,
+	});
+	assert.ok(usurper.mainClaim);
+	await demoted.unlock();
+	assert.equal(demoted.aborts, 0);
+
+	const shutdown = createHarness();
+	await startIdle(shutdown);
+	await startAcceptedContinuation(shutdown);
+	await shutdown.runtime.shutdown(shutdown.ctx);
+	assert.equal(shutdown.runtime.consumeDecisionAbortSuppression(), false);
+});
+
+test("cancel settlement retires identity before a later ordinary abort", async () => {
+	const harness = createHarness({ spliceBehavior: "success" });
+	await startIdle(harness);
+	await startAcceptedContinuation(harness);
+	await harness.unlock();
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: { role: "user", content: [text("queued during abort")] },
+	});
+	const cancelled = assistant([text("cancelled continuation")], "aborted");
+	const replacement = (await harness.endDecisionMessage(
+		cancelled,
+	)) as DecisionMessageReplacement;
+	assert.equal(
+		replacement.message.errorMessage,
+		"pi-continue-watchdog:cancelled",
+	);
+	harness.streaming = false;
+	await settleOnly(harness);
+
+	await harness.startUnrelatedRun();
+	const ordinaryAbort = assistant([text("ordinary partial output")], "aborted");
+	assert.equal(await harness.endDecisionMessage(ordinaryAbort), undefined);
+	assert.equal(harness.runtime.consumeDecisionAbortSuppression(), false);
+});
+
+test("genuine user work starting inside a continuation lifecycle clears owned-run cancellation", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	await startAcceptedContinuation(harness);
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: { role: "user", content: [text("steering user work")] },
+	});
+
+	await harness.unlock();
+
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.aborts, 0);
+});
+
+test("continuation ownership fails closed on a non-matching first message", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	await startAcceptedContinuation(harness, false);
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: { role: "user", content: [text("ordinary work")] },
+	});
+
+	await harness.unlock();
+
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.aborts, 0);
+});
 
 test("idle arms one unref timer and opens one visible decision-only window", async () => {
 	const harness = createHarness();

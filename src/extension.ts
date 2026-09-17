@@ -114,6 +114,8 @@ export function createContinueWatchdogExtension(
 			restartLockCycle: (ctx, restartOptions) =>
 				runtime.restartLockCycle(ctx, restartOptions),
 			clearOperationalPendingWork: () => runtime.clearOperationalPendingWork(),
+			handleManualUnlock: (ctx, claim) =>
+				runtime.handleManualUnlock(ctx, claim),
 			applyEffect: runtime.applyEffect,
 			reconcileIdle: runtime.reconcileIdle,
 		};
