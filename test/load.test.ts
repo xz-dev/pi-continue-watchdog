@@ -30,6 +30,7 @@ function createFakePi(): FakePi {
 			activeTools = [...toolNames];
 		},
 		registerEntryRenderer(): void {},
+		registerMessageRenderer(): void {},
 		registerCommand(): void {},
 		appendEntry(): void {},
 	} as unknown as ExtensionAPI;

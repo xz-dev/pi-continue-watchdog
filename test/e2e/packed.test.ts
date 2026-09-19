@@ -240,6 +240,20 @@ function textOf(message: RequestRecord["messages"][number]): string {
 	return JSON.stringify(message.content);
 }
 
+function contentText(message: RequestRecord["messages"][number]): string {
+	if (typeof message.content === "string") return message.content;
+	if (!Array.isArray(message.content)) return "";
+	return message.content
+		.map((block) =>
+			typeof block === "object" &&
+			block !== null &&
+			typeof (block as { readonly text?: unknown }).text === "string"
+				? (block as { readonly text: string }).text
+				: "",
+		)
+		.join("");
+}
+
 function isDecisionRequest(request: RequestRecord): boolean {
 	return request.messages.some((message) =>
 		textOf(message).includes(decisionPromptStart),
@@ -890,6 +904,7 @@ test("packed artifact asks after threshold compaction settles", {
 	assert.equal(decisionRequest.messages.at(-1)?.role, "user");
 	const decisionContent = textOf(decisionRequest.messages.at(-1) ?? {});
 	assert.equal(decisionContent.includes(decisionPromptStart), true);
+	assert.equal(decisionContent.includes("Previous watchdog results"), false);
 	assert.equal(decisionContent.includes("Do not call tools"), true);
 	assert.equal(decisionContent.includes("Do not output multiple"), true);
 	assert.equal(
@@ -897,6 +912,74 @@ test("packed artifact asks after threshold compaction settles", {
 			'[\\"JOB_DONE\\",\\"WAIT_USER\\",\\"JOB_BLOCKED\\"]',
 		),
 		true,
+	);
+});
+
+test("packed Pi branch and compaction retain only the active shared event body", {
+	timeout: 15_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t);
+	const siblingBody =
+		"Continue watchdog waiting · 1s · 2026-09-19T10:00:00.000+00:00\n\nSibling-only event.";
+	const compactedBody =
+		"Continue watchdog waiting · 2s · 2026-09-19T10:00:01.000+00:00\n\nCompacted active-branch event.";
+	const retainedBody =
+		"Continue watchdog waiting · 3s · 2026-09-19T10:00:02.000+00:00\n\nRetained active-branch event.";
+	const manager = SessionManager.inMemory(fixture.cwd);
+	const rootId = manager.appendCustomEntry("fixture:root", {});
+	manager.appendCustomMessageEntry(
+		"pi-continue-watchdog:event",
+		siblingBody,
+		true,
+		{ kind: "wait" },
+	);
+	manager.branch(rootId);
+	manager.appendCustomMessageEntry(
+		"pi-continue-watchdog:event",
+		compactedBody,
+		true,
+		{ kind: "wait" },
+	);
+	const retainedId = manager.appendCustomMessageEntry(
+		"pi-continue-watchdog:event",
+		retainedBody,
+		true,
+		{ kind: "wait" },
+	);
+	manager.appendCompaction(
+		"Only the active retained event remains exact after compaction.",
+		retainedId,
+		100,
+	);
+
+	const { baseUrl, requests } = await startMockServer(t, [{ kind: "stop" }]);
+	const { session } = await createSession(fixture, baseUrl, {
+		sessionManager: manager,
+	});
+	t.after(() => shutdownSession(session));
+	await session.prompt("Inspect the retained active-branch context once.");
+	assert.equal(requests.length, 1);
+	const payload = requests[0];
+	assert.ok(payload);
+	const retainedMessages = payload.messages.filter(
+		(message) => contentText(message) === retainedBody,
+	);
+	assert.equal(retainedMessages.length, 1);
+	assert.equal(
+		payload.messages.some((message) =>
+			contentText(message).includes(siblingBody),
+		),
+		false,
+	);
+	assert.equal(
+		payload.messages.some((message) =>
+			contentText(message).includes(compactedBody),
+		),
+		false,
+	);
+	assert.equal(
+		JSON.stringify(payload).includes("Previous watchdog results"),
+		false,
 	);
 });
 
@@ -970,6 +1053,11 @@ test("packed source artifact waits a real 10 seconds, decides continue, and fold
 	);
 	assert.equal(folded.length, 1);
 	const continuationContent = textOf(folded[0] ?? {});
+	const continuationBody = contentText(folded[0] ?? {});
+	assert.match(
+		continuationBody,
+		/Continue watchdog continued · WORK_REMAINS · \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}/,
+	);
 	assert.match(continuationContent, /not a message or request from the user/);
 	assert.equal(continuationContent.includes(customContinuePrompt), true);
 	assert.match(
@@ -995,14 +1083,26 @@ test("packed source artifact waits a real 10 seconds, decides continue, and fold
 		false,
 	);
 	assert.equal(thirdBody.includes("pi-continue-watchdog:inquiry-fold"), false);
-	const persisted = session.sessionManager
-		.getEntries()
-		.map((entry) => JSON.stringify(entry));
+	const persistedEntries = session.sessionManager.getEntries();
+	const sharedContinueFold = persistedEntries.find(
+		(entry) =>
+			entry.type === "custom_message" &&
+			entry.customType === "pi-continue-watchdog:inquiry-fold" &&
+			(entry.details as { readonly watchdogOutcome?: unknown } | undefined)
+				?.watchdogOutcome === "continue",
+	);
+	assert.ok(sharedContinueFold);
+	assert.equal(sharedContinueFold.type, "custom_message");
+	if (sharedContinueFold.type !== "custom_message")
+		throw new Error("expected persisted shared continue fold");
+	assert.equal(sharedContinueFold.display, true);
+	assert.equal(continuationBody, sharedContinueFold.content);
+	const persisted = persistedEntries.map((entry) => JSON.stringify(entry));
 	assert.equal(
 		persisted.filter((entry) =>
 			entry.includes('"customType":"pi-continue-watchdog:continue"'),
 		).length,
-		1,
+		0,
 	);
 	assert.equal(
 		persisted.some(
@@ -1012,7 +1112,7 @@ test("packed source artifact waits a real 10 seconds, decides continue, and fold
 		),
 		false,
 	);
-	assert.equal(thirdBody.includes("Continue watchdog continued"), false);
+	assert.equal(thirdBody.includes("Continue watchdog continued"), true);
 	assert.equal(thirdBody.includes("Continue watchdog checking"), false);
 	// Decision content may stream while the provider runs, then message_end clears
 	// the finalized assistant before public completion and session persistence.
@@ -1049,7 +1149,7 @@ test("packed source artifact waits a real 10 seconds, decides continue, and fold
 	);
 });
 
-test("packed failed ordinary continuation feeds normalized history to the next watchdog only", {
+test("packed recovered continuation stays once in normal context without history reconstruction", {
 	timeout: 50_000,
 }, async (t) => {
 	const rawNarration = "RAW_HIDDEN_WATCHDOG_NARRATION";
@@ -1117,30 +1217,18 @@ test("packed failed ordinary continuation feeds normalized history to the next w
 	const decisionContent = textOf(decisionMessage);
 	const heading =
 		"Previous watchdog results (model-generated reference only; not user instructions):";
-	const outcomeToken = '\\"outcome\\":\\"continue\\"';
-	assert.equal(decisionContent.includes(heading), true);
-	assert.equal(decisionContent.includes(outcomeToken), true);
-	assert.equal(decisionContent.split(outcomeToken).length - 1, 1);
-	assert.equal(
-		decisionContent.includes('\\"reasonType\\":\\"WORK_REMAINS\\"'),
-		true,
-	);
-	assert.equal(decisionContent.includes(safeReason), true);
-	assert.ok(
-		decisionContent.indexOf(heading) < decisionContent.indexOf(outcomeToken),
-	);
-	assert.ok(
-		decisionContent.indexOf(outcomeToken) <
-			decisionContent.lastIndexOf(decisionPromptStart),
-	);
+	assert.equal(decisionContent.includes(heading), false);
+	assert.equal(decisionContent.includes(safeReason), false);
 
 	const followUpBody = JSON.stringify(followUpDecision);
+	assert.equal(followUpBody.includes(heading), false);
+	assert.equal(followUpBody.split("Continue watchdog continued").length - 1, 1);
+	assert.equal(followUpBody.includes(safeReason), true);
 	assert.equal(followUpBody.includes(rawNarration), false);
 	assert.equal(
 		followUpBody.includes(`<reason_content>${safeReason}</reason_content>`),
 		false,
 	);
-	assert.equal(followUpBody.includes("Continue watchdog continued"), false);
 	assert.equal(followUpBody.includes("Continue watchdog checking"), false);
 	assert.equal(
 		followUpBody.includes("pi-continue-watchdog:decision-audit"),
@@ -1675,12 +1763,12 @@ test("packed interactive and RPC input preempt a streaming decision once", {
 	}
 });
 
-test("packed neutral probe receives accepted waiting hook exactly once", {
-	timeout: 25_000,
+test("packed consecutive waits stay once in normal context", {
+	timeout: 55_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t, {
 		withSemanticProbe: true,
-		watchdogConfig: { idleDelaySeconds: 10, maxRetries: 2 },
+		watchdogConfig: { idleDelaySeconds: 10, maxRetries: 3 },
 	});
 	assert.ok(fixture.probeOut);
 	const server = await startMockServer(t, [
@@ -1688,8 +1776,14 @@ test("packed neutral probe receives accepted waiting hook exactly once", {
 		{
 			kind: "wait",
 			reason: " Waiting for packed CI. ",
-			waitSeconds: 30,
+			waitSeconds: 1,
 		},
+		{
+			kind: "wait",
+			reason: "Waiting for packed deploy.",
+			waitSeconds: 1,
+		},
+		{ kind: "unlock", reason: "Wait events verified." },
 	]);
 	const { session } = await createSession(fixture, server.baseUrl);
 	t.after(() => shutdownSession(session));
@@ -1700,26 +1794,115 @@ test("packed neutral probe receives accepted waiting hook exactly once", {
 		18_000,
 		"accepted wait decision request",
 	);
+	await waitFor(
+		() => server.requests.length === 4,
+		45_000,
+		"second post-wait decision request",
+	);
 	await waitForSessionIdle(session, 3_000, "accepted packed wait");
 
-	const waitEntries = session.sessionManager
-		.getBranch()
-		.filter(
+	const branch = session.sessionManager.getBranch();
+	const waitFold = branch.find(
+		(entry) =>
+			entry.type === "custom_message" &&
+			entry.customType === "pi-continue-watchdog:inquiry-fold" &&
+			(entry.details as { readonly watchdogOutcome?: unknown } | undefined)
+				?.watchdogOutcome === "wait",
+	);
+	assert.ok(waitFold);
+	assert.equal(waitFold.type, "custom_message");
+	if (waitFold.type !== "custom_message")
+		throw new Error("expected persisted shared wait fold");
+	assert.equal(waitFold.display, true);
+	assert.equal(
+		branch.filter(
 			(entry) =>
 				entry.type === "custom" &&
 				entry.customType === "pi-continue-watchdog:wait",
-		);
-	assert.equal(waitEntries.length, 1);
-	assert.deepEqual(await readProbeEnvelopes(fixture.probeOut), [
-		{
-			version: 1,
-			name: "watchdog-waiting",
-			values: {
-				REASON: "Waiting for packed CI.",
-				WAIT_SECONDS: "30",
+		).length,
+		0,
+	);
+	const postWaitRequest = server.requests[2];
+	assert.ok(postWaitRequest);
+	assert.equal(isDecisionRequest(postWaitRequest), true);
+	const providerWait = postWaitRequest.messages.find((message) =>
+		contentText(message).includes("Continue watchdog waiting"),
+	);
+	assert.ok(providerWait);
+	const waitBody = contentText({ content: waitFold.content });
+	assert.equal(contentText(providerWait), waitBody);
+	assert.match(
+		waitBody,
+		/Continue watchdog waiting · 1s · \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}/,
+	);
+	assert.match(waitBody, /Requested watchdog delay: 1 second/);
+	assert.match(
+		waitBody,
+		/Deadline: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}/,
+	);
+	const finalDecision = server.requests[3];
+	assert.ok(finalDecision);
+	assert.equal(isDecisionRequest(finalDecision), true);
+	assert.equal(server.requests.slice(1).every(isDecisionRequest), true);
+	const finalBody = JSON.stringify(finalDecision);
+	const timelineMessages = finalDecision.messages
+		.map(contentText)
+		.filter((content) => content.startsWith("Continue watchdog"));
+	assert.deepEqual(
+		timelineMessages.map((content) =>
+			content.startsWith("Continue watchdog waiting")
+				? "waiting"
+				: content.startsWith("Continue watchdog delay elapsed")
+					? "elapsed"
+					: "other",
+		),
+		["waiting", "elapsed", "waiting", "elapsed", "elapsed"],
+	);
+	assert.match(timelineMessages[0] ?? "", /Waiting for packed CI\./);
+	assert.match(timelineMessages[2] ?? "", /Waiting for packed deploy\./);
+	assert.equal(
+		(timelineMessages[4] ?? "").startsWith(timelineMessages[3] ?? ""),
+		true,
+	);
+	assert.equal(finalBody.split("Continue watchdog waiting").length - 1, 2);
+	assert.equal(
+		finalBody.split("Continue watchdog delay elapsed").length - 1,
+		3,
+	);
+	assert.equal(
+		branch.filter(
+			(entry) =>
+				entry.type === "custom_message" &&
+				entry.customType === "pi-continue-watchdog:event" &&
+				(entry.details as { readonly kind?: unknown } | undefined)?.kind ===
+					"wait-completed",
+		).length,
+		2,
+	);
+	assert.equal(finalBody.includes("Previous watchdog results"), false);
+	assert.deepEqual(
+		(await readProbeEnvelopes(fixture.probeOut)).filter(
+			(envelope) => envelope.name === "watchdog-waiting",
+		),
+		[
+			{
+				version: 1,
+				name: "watchdog-waiting",
+				values: {
+					REASON: "Waiting for packed CI.",
+					WAIT_SECONDS: "1",
+				},
 			},
-		},
-	]);
+			{
+				version: 1,
+				name: "watchdog-waiting",
+				values: {
+					REASON: "Waiting for packed deploy.",
+					WAIT_SECONDS: "1",
+				},
+			},
+		],
+	);
 });
 
 test("packed neutral probe receives typed continue and AI unlock hooks", {
@@ -1906,14 +2089,30 @@ test("packed decision request retains delivered answer and completion-first guid
 	);
 	const unlock = entries.find(
 		(entry) =>
-			entry.type === "custom" &&
-			entry.customType === "pi-continue-watchdog:unlock",
+			entry.type === "custom_message" &&
+			entry.customType === "pi-continue-watchdog:inquiry-fold" &&
+			(entry.details as { readonly watchdogOutcome?: unknown } | undefined)
+				?.watchdogOutcome === "unlock",
 	);
-	assert.ok(unlock?.type === "custom");
-	assert.deepEqual(unlock.data, {
-		reasonType: "JOB_DONE",
-		reason: "The requested explanation was delivered.",
-	});
+	assert.ok(unlock?.type === "custom_message");
+	if (unlock?.type !== "custom_message")
+		throw new Error("expected shared unlock event");
+	const unlockEvent = (
+		unlock.details as {
+			readonly watchdogEvent?: {
+				readonly kind?: unknown;
+				readonly reasonType?: unknown;
+				readonly reason?: unknown;
+			};
+		}
+	).watchdogEvent;
+	assert.equal(unlockEvent?.kind, "unlock");
+	assert.equal(unlockEvent?.reasonType, "JOB_DONE");
+	assert.equal(unlockEvent?.reason, "The requested explanation was delivered.");
+	assert.match(
+		contentText({ content: unlock.content }),
+		/Continue watchdog unlocked · JOB_DONE · /,
+	);
 });
 
 test("packed approval-gated decision prompt prioritizes WAIT_USER without continuation", {
@@ -1982,14 +2181,33 @@ test("packed approval-gated decision prompt prioritizes WAIT_USER without contin
 		.getBranch()
 		.find(
 			(entry) =>
-				entry.type === "custom" &&
-				entry.customType === "pi-continue-watchdog:unlock",
+				entry.type === "custom_message" &&
+				entry.customType === "pi-continue-watchdog:inquiry-fold" &&
+				(entry.details as { readonly watchdogOutcome?: unknown } | undefined)
+					?.watchdogOutcome === "unlock",
 		);
-	assert.ok(unlockEntry?.type === "custom");
-	assert.deepEqual(unlockEntry.data, {
-		reasonType: "WAIT_USER",
-		reason: "Production deployment requires explicit user approval.",
-	});
+	assert.ok(unlockEntry?.type === "custom_message");
+	if (unlockEntry?.type !== "custom_message")
+		throw new Error("expected shared WAIT_USER unlock event");
+	const unlockEvent = (
+		unlockEntry.details as {
+			readonly watchdogEvent?: {
+				readonly kind?: unknown;
+				readonly reasonType?: unknown;
+				readonly reason?: unknown;
+			};
+		}
+	).watchdogEvent;
+	assert.equal(unlockEvent?.kind, "unlock");
+	assert.equal(unlockEvent?.reasonType, "WAIT_USER");
+	assert.equal(
+		unlockEvent?.reason,
+		"Production deployment requires explicit user approval.",
+	);
+	assert.match(
+		contentText({ content: unlockEntry.content }),
+		/Continue watchdog unlocked · WAIT_USER · /,
+	);
 });
 
 test("packed automatic continuation cannot satisfy an unresolved approval request", {
@@ -2042,7 +2260,7 @@ test("packed automatic continuation cannot satisfy an unresolved approval reques
 	);
 });
 
-test("packed persisted session resumes without watchdog decision context or working hang", {
+test("packed mixed legacy and shared records survive persistent resume without backfill", {
 	timeout: 45_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t, {
@@ -2056,6 +2274,11 @@ test("packed persisted session resumes without watchdog decision context or work
 	const sessionDir = join(fixture.root, "sessions");
 	await mkdir(sessionDir, { recursive: true });
 	const firstManager = SessionManager.create(fixture.cwd, sessionDir);
+	firstManager.appendCustomEntry("pi-continue-watchdog:wait", {
+		reason: "Legacy wait stays TUI-only.",
+		waitSeconds: 300,
+		waitUntilMs: 123_456,
+	});
 	const first = await createSession(fixture, baseUrl, {
 		sessionManager: firstManager,
 	});
@@ -2069,12 +2292,28 @@ test("packed persisted session resumes without watchdog decision context or work
 		"persisted unlock decision",
 	);
 	await waitForSessionIdle(first.session, 3_000, "persisted unlock decision");
+	const sharedUnlock = first.session.sessionManager
+		.getBranch()
+		.find(
+			(entry) =>
+				entry.type === "custom_message" &&
+				entry.customType === "pi-continue-watchdog:inquiry-fold" &&
+				(entry.details as { readonly watchdogOutcome?: unknown } | undefined)
+					?.watchdogOutcome === "unlock",
+		);
+	assert.ok(sharedUnlock);
+	assert.equal(sharedUnlock.type, "custom_message");
+	if (sharedUnlock.type !== "custom_message")
+		throw new Error("expected persisted shared unlock");
+	const sharedUnlockBody = contentText({ content: sharedUnlock.content });
 	const sessionFile = first.session.sessionManager.getSessionFile();
 	assert.ok(sessionFile);
 	await shutdownSession(first.session);
 
 	const rawSession = await readFile(sessionFile, "utf8");
 	assert.equal(rawSession.includes("resume context is clean"), true);
+	assert.equal(rawSession.includes("Legacy wait stays TUI-only."), true);
+	assert.equal(rawSession.includes("Continue watchdog waiting"), false);
 	assert.equal(
 		rawSession.includes("pi-continue-watchdog:decision-audit"),
 		true,
@@ -2085,6 +2324,29 @@ test("packed persisted session resumes without watchdog decision context or work
 		sessionManager: resumedManager,
 	});
 	t.after(() => shutdownSession(resumed.session));
+	assert.equal(
+		resumed.session.sessionManager
+			.getBranch()
+			.some(
+				(entry) =>
+					entry.type === "custom" &&
+					entry.customType === "pi-continue-watchdog:wait" &&
+					JSON.stringify(entry.data).includes("Legacy wait stays TUI-only."),
+			),
+		true,
+	);
+	assert.equal(
+		resumed.session.sessionManager
+			.getBranch()
+			.some(
+				(entry) =>
+					entry.type === "custom_message" &&
+					entry.customType === "pi-continue-watchdog:event" &&
+					(entry.details as { readonly kind?: unknown } | undefined)?.kind ===
+						"wait-completed",
+			),
+		false,
+	);
 	await resumed.session.prompt("Continue after restoring this session.");
 	await waitForSessionIdle(resumed.session, 3_000, "resumed ordinary request");
 	assert.equal(requests.length, 3);
@@ -2092,7 +2354,14 @@ test("packed persisted session resumes without watchdog decision context or work
 	const resumedPayload = JSON.stringify(requests[2]);
 	assert.equal(resumedPayload.includes(decisionPromptStart), false);
 	assert.equal(resumedPayload.includes("<watchdog>"), false);
-	assert.equal(resumedPayload.includes("resume context is clean"), false);
+	assert.equal(resumedPayload.includes("resume context is clean"), true);
+	assert.equal(
+		requests[2]?.messages.some(
+			(message) => contentText(message) === sharedUnlockBody,
+		),
+		true,
+	);
+	assert.equal(resumedPayload.includes("Legacy wait stays TUI-only."), false);
 	assert.equal(
 		resumedPayload.includes("pi-continue-watchdog:decision-audit"),
 		false,

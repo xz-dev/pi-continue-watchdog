@@ -124,6 +124,88 @@ structure ContinuationEnvelope where
   stopAtUserBoundary : Bool
   deriving DecidableEq, Repr
 
+-- Shared automatic events carry one immutable body through both human rendering and model context.
+-- Timestamp syntax and body formatting are implementation obligations tested outside this process model;
+-- the model proves routing, wait identity, elapsed-time arithmetic, and invalidation rather than model judgment.
+inductive SharedEventKind where
+  | continued
+  | waiting
+  | waitCompleted
+  | unlocked
+  | decisionFailed
+  | exhausted
+  deriving DecidableEq, Repr
+
+structure RuntimeTimestamp where
+  wallClockMs : Nat
+  rfc3339WithNumericOffset : String
+  deriving DecidableEq, Repr
+
+structure SharedEvent where
+  kind : SharedEventKind
+  occurredAt : RuntimeTimestamp
+  body : String
+  startsOrdinaryWork : Bool
+  deriving DecidableEq, Repr
+
+structure CurrentWait where
+  identity : Nat
+  acceptedAt : RuntimeTimestamp
+  requestedSeconds : Nat
+  deadlineMs : Nat
+  deriving DecidableEq, Repr
+
+structure WaitWakeSnapshot where
+  wait : CurrentWait
+  observedAt : RuntimeTimestamp
+  event : SharedEvent
+  deriving DecidableEq, Repr
+
+structure ExhaustionPublication where
+  eventPublished : Bool
+  hookPublished : Bool
+  deriving DecidableEq, Repr
+
+
+def humanEventBody (event : SharedEvent) : String :=
+  event.body
+
+def modelEventBody (event : SharedEvent) : String :=
+  event.body
+
+def appendSharedEvent
+    (timeline : List SharedEvent)
+    (event : SharedEvent) : List SharedEvent :=
+  timeline ++ [event]
+
+def commitWait
+    (identity : Nat)
+    (acceptedAt : RuntimeTimestamp)
+    (requestedSeconds : Nat) : CurrentWait :=
+  {
+    identity
+    acceptedAt
+    requestedSeconds
+    deadlineMs := acceptedAt.wallClockMs + requestedSeconds * 1000
+  }
+
+def publishExhaustionEvent
+    (state : ExhaustionPublication) : ExhaustionPublication :=
+  if state.eventPublished then state
+  else { state with eventPublished := true }
+
+def observedElapsedSeconds (wake : WaitWakeSnapshot) : Nat :=
+  (wake.observedAt.wallClockMs - wake.wait.acceptedAt.wallClockMs) / 1000
+
+def waitWakeEligible (wait : CurrentWait) (observedAtMs : Nat) : Bool :=
+  wait.deadlineMs ≤ observedAtMs
+
+def invalidateCurrentWait (_wait : Option CurrentWait) : Option CurrentWait :=
+  none
+
+def reuseWakeSnapshot (wake : WaitWakeSnapshot) : WaitWakeSnapshot :=
+  wake
+
 def buildContinuationEnvelope
     (accepted : AcceptedContinue) : ContinuationEnvelope :=
   {
@@ -616,6 +698,73 @@ theorem continuation_preserves_reason_and_guidance
       (buildContinuationEnvelope accepted).guidance = accepted.guidance := by
   simp [buildContinuationEnvelope]
 
+-- Shared-timeline proofs establish one body for both readers and wait-local timing without external-progress claims.
+theorem shared_event_body_is_identical
+    (event : SharedEvent) :
+    humanEventBody event = modelEventBody event := by
+  rfl
+
+theorem shared_timeline_append_preserves_order
+    (timeline : List SharedEvent)
+    (event : SharedEvent) :
+    appendSharedEvent timeline event = timeline ++ [event] := by
+  rfl
+
+theorem committed_wait_uses_one_acceptance_origin
+    (identity : Nat)
+    (acceptedAt : RuntimeTimestamp)
+    (requestedSeconds : Nat) :
+    (commitWait identity acceptedAt requestedSeconds).deadlineMs =
+      acceptedAt.wallClockMs + requestedSeconds * 1000 := by
+  rfl
+
+theorem exhaustion_event_publication_is_idempotent
+    (state : ExhaustionPublication) :
+    publishExhaustionEvent (publishExhaustionEvent state) =
+      publishExhaustionEvent state := by
+  cases state with
+  | mk eventPublished hookPublished =>
+      cases eventPublished <;> rfl
+
+theorem wake_snapshot_reuse_is_immutable
+    (wake : WaitWakeSnapshot) :
+    reuseWakeSnapshot wake = wake := by
+  rfl
+
+theorem invalidation_removes_pending_wait
+    (wait : Option CurrentWait) :
+    invalidateCurrentWait wait = none := by
+  rfl
+
+theorem wake_retains_originating_wait
+    (wake : WaitWakeSnapshot) :
+    (reuseWakeSnapshot wake).wait.identity = wake.wait.identity ∧
+      (reuseWakeSnapshot wake).wait.acceptedAt = wake.wait.acceptedAt ∧
+      (reuseWakeSnapshot wake).wait.deadlineMs = wake.wait.deadlineMs := by
+  simp [reuseWakeSnapshot]
+
+theorem late_wake_reports_observed_elapsed :
+    let accepted : RuntimeTimestamp :=
+      { wallClockMs := 0,
+        rfc3339WithNumericOffset := "2026-09-19T16:02:16.951+08:00" }
+    let observed : RuntimeTimestamp :=
+      { wallClockMs := 1531000,
+        rfc3339WithNumericOffset := "2026-09-19T16:27:47.951+08:00" }
+    let wait : CurrentWait := commitWait 1 accepted 1500
+    let wake : WaitWakeSnapshot :=
+      { wait,
+        observedAt := observed,
+        event := {
+          kind := .waitCompleted,
+          occurredAt := observed,
+          body := "requested=1500; elapsed=1531; external-status=unknown",
+          startsOrdinaryWork := false } }
+    waitWakeEligible wait observed.wallClockMs = true ∧
+      observedElapsedSeconds wake = 1531 ∧
+      wake.wait.requestedSeconds = 1500 ∧
+      wake.event.startsOrdinaryWork = false := by
+  decide
+
 -- Outcome proofs establish WAIT_USER priority, external-wait separation, immediate-action continue, and terminal unlock categories.
 theorem user_boundary_has_priority
     (facts : DecisionFacts)
@@ -717,6 +866,44 @@ structure ProcessGuarantees : Prop where
     (buildContinuationEnvelope accepted).reasonType = accepted.reasonType ∧
       (buildContinuationEnvelope accepted).reason = accepted.reason ∧
       (buildContinuationEnvelope accepted).guidance = accepted.guidance
+  sharedEventBodySame : ∀ event,
+    humanEventBody event = modelEventBody event
+  sharedTimelineOrder : ∀ timeline event,
+    appendSharedEvent timeline event = timeline ++ [event]
+  waitCommitOrigin : ∀ identity acceptedAt requestedSeconds,
+    (commitWait identity acceptedAt requestedSeconds).deadlineMs =
+      acceptedAt.wallClockMs + requestedSeconds * 1000
+  exhaustionEventOneShot : ∀ state,
+    publishExhaustionEvent (publishExhaustionEvent state) =
+      publishExhaustionEvent state
+  wakeSnapshotStable : ∀ wake,
+    reuseWakeSnapshot wake = wake
+  waitInvalidationClears : ∀ wait,
+    invalidateCurrentWait wait = none
+  wakeKeepsWaitIdentity : ∀ wake,
+    (reuseWakeSnapshot wake).wait.identity = wake.wait.identity ∧
+      (reuseWakeSnapshot wake).wait.acceptedAt = wake.wait.acceptedAt ∧
+      (reuseWakeSnapshot wake).wait.deadlineMs = wake.wait.deadlineMs
+  observedElapsedExample :
+    let accepted : RuntimeTimestamp :=
+      { wallClockMs := 0,
+        rfc3339WithNumericOffset := "2026-09-19T16:02:16.951+08:00" }
+    let observed : RuntimeTimestamp :=
+      { wallClockMs := 1531000,
+        rfc3339WithNumericOffset := "2026-09-19T16:27:47.951+08:00" }
+    let wait : CurrentWait := commitWait 1 accepted 1500
+    let wake : WaitWakeSnapshot :=
+      { wait,
+        observedAt := observed,
+        event := {
+          kind := .waitCompleted,
+          occurredAt := observed,
+          body := "requested=1500; elapsed=1531; external-status=unknown",
+          startsOrdinaryWork := false } }
+    waitWakeEligible wait observed.wallClockMs = true ∧
+      observedElapsedSeconds wake = 1531 ∧
+      wake.wait.requestedSeconds = 1500 ∧
+      wake.event.startsOrdinaryWork = false
   completionFirst : ∀ facts,
     facts.allWorkComplete = true → selectDecisionOutcome facts = .jobDone
   userBoundaryFirst : ∀ facts,
@@ -763,6 +950,14 @@ theorem process_is_correct : ProcessGuarantees := by
     continuationAttributed := continuation_is_extension_authored
     continuationNotAuthorization := continuation_does_not_authorize
     continuationPreservesDecision := continuation_preserves_reason_and_guidance
+    sharedEventBodySame := shared_event_body_is_identical
+    sharedTimelineOrder := shared_timeline_append_preserves_order
+    waitCommitOrigin := committed_wait_uses_one_acceptance_origin
+    exhaustionEventOneShot := exhaustion_event_publication_is_idempotent
+    wakeSnapshotStable := wake_snapshot_reuse_is_immutable
+    waitInvalidationClears := invalidation_removes_pending_wait
+    wakeKeepsWaitIdentity := wake_retains_originating_wait
+    observedElapsedExample := late_wake_reports_observed_elapsed
     completionFirst := completed_work_is_done
     userBoundaryFirst := user_boundary_has_priority
     externalWaitDistinct := external_wait_is_not_user_wait
@@ -829,4 +1024,14 @@ def main : IO Unit := do
   IO.println s!"Narrow layout: lines={narrow.lineCount}; columns={narrow.visibleColumns}/24"
   IO.println s!"Continuation envelope: extensionAuthored={continuation.extensionAuthored}; userAuthored={continuation.userAuthored}; userAuthorization={continuation.conveysUserAuthorization}; reasonType={continuation.reasonType}; stopAtUserBoundary={continuation.stopAtUserBoundary}"
   IO.println s!"Decision priority: completedDespiteStalePlan={repr completedDespiteStalePlan}; approvalGate={repr approvalGate}; independentWork={repr independentWork}"
-  IO.println "Proved: fixed delay precedes inquiry, wake rechecks official idle, disconnect removes busy children, reconnect retries every second and reports fresh live state, preemption is clean and exactly-once, the scoped status projection is one bounded line, automatic continuation is extension-authored and non-authorizing, reconciled completion wins over stale action flags, WAIT_USER wins for incomplete work when no authorized action can proceed, external waits remain distinct, and independent unfinished authorized work may continue."
+  let sharedEvent : OfficialPiIdleInquiry.SharedEvent := {
+    kind := .continued
+    occurredAt := {
+      wallClockMs := 1
+      rfc3339WithNumericOffset := "2026-09-19T16:39:21.901+08:00"
+    }
+    body := "one immutable human/model body"
+    startsOrdinaryWork := true
+  }
+  IO.println s!"Shared event body equality: {decide (OfficialPiIdleInquiry.humanEventBody sharedEvent = OfficialPiIdleInquiry.modelEventBody sharedEvent)}"
+  IO.println "Proved: fixed delay precedes inquiry, wake rechecks official idle, disconnect removes busy children, reconnect retries every second and reports fresh live state, preemption is clean and exactly-once, the scoped status projection is one bounded line, automatic continuation is extension-authored and non-authorizing, shared events route one immutable body in append order to human and model context, one acceptance sample determines each wait deadline, retry-exhaustion event publication is idempotent, wait wake snapshots retain one originating wait and report observed elapsed wall-clock time, reconciled completion wins over stale action flags, WAIT_USER wins for incomplete work when no authorized action can proceed, external waits remain distinct, and independent unfinished authorized work may continue."

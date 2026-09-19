@@ -719,6 +719,7 @@ test("session finalizes wait, consumes one retry, and records its absolute deadl
 	assert.equal(finalized.cycleId, 1);
 	assert.equal(finalized.reason, "Waiting for CI.");
 	assert.equal(finalized.waitSeconds, 300);
+	assert.equal(finalized.acceptedAtMs, 10_000);
 	assert.equal(finalized.waitUntilMs, 310_000);
 	assert.deepEqual(finalized.transition.effects, [
 		{ kind: "restoreDecisionTools", decisionId: 1 },

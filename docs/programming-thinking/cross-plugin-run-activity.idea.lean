@@ -2,10 +2,12 @@ import Std
 
 /-
 Historical/local run-classification submodel. The authoritative activity,
-disconnect, replaceable fixed-ten-second fence, and inquiry-cancellation model is
-`official-pi-idle-inquiry.idea.lean`. Production now queries live public
-`ctx.isIdle()` at every relevant event and does not infer activity from event
-labels or introduce a business-level uncertain state.
+disconnect, replaceable fixed-ten-second fence, inquiry-cancellation, and shared
+automatic-event timeline model is `official-pi-idle-inquiry.idea.lean`.
+Production now queries live public `ctx.isIdle()` at every relevant event, does
+not infer activity from event labels, and routes one stored event body to human
+and model context instead of reconstructing decision-only history. This file
+models neither event-body formatting nor wait elapsed-time policy.
 -/
 
 set_option autoImplicit false
@@ -399,4 +401,4 @@ def main : IO Unit := do
   let unknown := CrossPluginRunActivity.executeDecision 23 41 .unknown false
   IO.println s!"Observation decision: {CrossPluginRunActivity.summary observation}"
   IO.println s!"Unknown marker defaults to work: {CrossPluginRunActivity.summary unknown}"
-  IO.println "Proved: optional Reflect counting pauses for decision asks, every terminal path resumes it, observation is opt-in, and decisions terminate cleanly."
+  IO.println "Proved: optional Reflect counting pauses for decision asks, every terminal path resumes it, observation is opt-in, decisions terminate cleanly, and this historical classifier does not create a second watchdog event-history stream."

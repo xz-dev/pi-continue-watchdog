@@ -3,11 +3,13 @@ import Std
 
 /-
 Residue/exactly-once takeover submodel. The authoritative combined lifecycle,
-busy-child set, disconnect, fixed-ten-second fence, and cancellation model is
-`official-pi-idle-inquiry.idea.lean`. Production realizes this cleanup through
-a shared terminal inquiry handle whose idempotent remove-fold is retried after
-send failure; the Pi adapter alone calls public `ctx.abort()` and passes the
-original input through exactly once.
+busy-child set, disconnect, fixed-ten-second fence, cancellation, and shared
+automatic-event timeline model is `official-pi-idle-inquiry.idea.lean`.
+Production realizes cleanup through a shared terminal inquiry handle whose
+idempotent remove-fold is retried after send failure; successful result folds
+retain one canonical human/model event body, while preempted/cancelled folds
+remain remove-only. The Pi adapter alone calls public `ctx.abort()` and passes
+the original input through exactly once.
 -/
 
 set_option autoImplicit false
@@ -472,7 +474,7 @@ structure ContinueEvidence where
   reasonLength : Nat
   userDecisionMade : Bool
   auditStored : Bool
-  tuiEntryStored : Bool
+  sharedEventStored : Bool
   hookPublished : Bool
   continuationDispatched : Bool
   deriving DecidableEq, Repr
@@ -481,19 +483,19 @@ def validContinueReason (evidence : ContinueEvidence) : Prop :=
   evidence.reasonLength > 0 ∧ evidence.reasonLength ≤ 1000
 
 def continueEvidenceOrdered (evidence : ContinueEvidence) : Prop :=
-  (evidence.hookPublished = true → evidence.tuiEntryStored = true) ∧
-    (evidence.continuationDispatched = true → evidence.tuiEntryStored = true)
+  (evidence.hookPublished = true → evidence.sharedEventStored = true) ∧
+    (evidence.continuationDispatched = true → evidence.sharedEventStored = true)
 
 structure ContinueGuarantees : Prop where
   accepted : ∀ evidence, validContinueReason evidence →
     evidence.userDecisionMade = false →
     evidence.auditStored = true →
-    evidence.tuiEntryStored = true →
+    evidence.sharedEventStored = true →
     evidence.hookPublished = true →
     evidence.continuationDispatched = true →
     continueEvidenceOrdered evidence
   persistenceFailureClosed : ∀ evidence,
-    evidence.tuiEntryStored = false →
+    evidence.sharedEventStored = false →
     evidence.hookPublished = false →
     evidence.continuationDispatched = false →
     continueEvidenceOrdered evidence
@@ -504,7 +506,7 @@ def protocolContinueEvidence (reasonType : ContinueReasonType) (reasonLength : N
     reasonLength
     userDecisionMade := false
     auditStored := false
-    tuiEntryStored := false
+    sharedEventStored := false
     hookPublished := false
     continuationDispatched := false
   }
@@ -518,10 +520,10 @@ theorem protocol_continue_makes_no_user_decision
 theorem typed_continue_is_correct : ContinueGuarantees := by
   exact {
     accepted := by
-      intro evidence validReason noUserDecision auditStored tuiStored hookPublished dispatched
-      simp [continueEvidenceOrdered, tuiStored]
+      intro evidence validReason noUserDecision auditStored sharedStored hookPublished dispatched
+      simp [continueEvidenceOrdered, sharedStored]
     persistenceFailureClosed := by
-      intro evidence tuiMissing hookMissing dispatchMissing
+      intro evidence sharedMissing hookMissing dispatchMissing
       simp [continueEvidenceOrdered, hookMissing, dispatchMissing]
   }
 
@@ -726,8 +728,8 @@ def takeoverPostconditionBool (state : ProcessState) : Bool :=
     state.watchdogLocked
 
 def continueEvidenceOrderedBool (evidence : ContinueEvidence) : Bool :=
-  (!evidence.hookPublished || evidence.tuiEntryStored) &&
-    (!evidence.continuationDispatched || evidence.tuiEntryStored)
+  (!evidence.hookPublished || evidence.sharedEventStored) &&
+    (!evidence.continuationDispatched || evidence.sharedEventStored)
 
 def manualCancellationPostconditionBool
     (expectedAbort : Bool)
@@ -770,7 +772,7 @@ def acceptedContinue : WatchdogUserTakeover.ContinueEvidence :=
     reasonLength := 24
     userDecisionMade := false
     auditStored := true
-    tuiEntryStored := true
+    sharedEventStored := true
     hookPublished := true
     continuationDispatched := true
   }
@@ -792,7 +794,7 @@ def main : IO Unit := do
     WatchdogUserTakeover.runManualCancellation .continuation
   let ordinaryUnlock := WatchdogUserTakeover.runManualCancellation .ordinary
   let foreignUserUnlock := WatchdogUserTakeover.runContinuationAfterForeignInput
-  IO.println s!"Typed continue avoids user decisions and persists before dispatch: {WatchdogUserTakeover.continueEvidenceOrderedBool acceptedContinue}"
+  IO.println s!"Typed continue avoids user decisions and persists one shared human/model event before hook and dispatch: {WatchdogUserTakeover.continueEvidenceOrderedBool acceptedContinue}"
   IO.println s!"Manual unlock cancels an owned continuation without residue: {WatchdogUserTakeover.manualCancellationPostconditionBool true cancelledContinuation}"
   IO.println s!"Manual unlock preserves an ordinary run: {WatchdogUserTakeover.manualCancellationPostconditionBool false ordinaryUnlock}"
   IO.println s!"Foreign user work clears continuation ownership: {WatchdogUserTakeover.manualCancellationPostconditionBool false foreignUserUnlock}"

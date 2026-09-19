@@ -58,6 +58,7 @@ function createHarness(
 		},
 		setActiveTools(): void {},
 		registerEntryRenderer(): void {},
+		registerMessageRenderer(): void {},
 		registerCommand(
 			name: string,
 			{

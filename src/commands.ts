@@ -1,5 +1,4 @@
 import type {
-	CustomEntry,
 	EntryRenderer,
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -12,7 +11,10 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
-
+import {
+	DECISION_FOLD_MESSAGE_TYPE,
+	parseDecisionFoldDetails,
+} from "./context-fold.js";
 import type { ControllerEffect, LockDecisionController } from "./controller.js";
 import { MAX_WAIT_SECONDS } from "./decision-protocol.js";
 import type { HubMainClaim } from "./hub.js";
@@ -20,6 +22,10 @@ import type {
 	WatchdogTriggerBlocker,
 	WatchdogTriggerStatus,
 } from "./runtime.js";
+import {
+	parseWatchdogEvent,
+	WATCHDOG_EVENT_MESSAGE_TYPE,
+} from "./watchdog-event.js";
 
 /** Pi command names omit the slash used for interactive invocation. */
 export const LOCK_CONTINUE_WATCHDOG_COMMAND = "lock-continue-watchdog";
@@ -349,7 +355,42 @@ const TIMELINE_TYPES = new Set([
 	WATCHDOG_STATUS_ENTRY_TYPE,
 ]);
 
-function timelineLine(entry: CustomEntry<unknown>): string | null {
+type TimelineBranchEntry = {
+	readonly type: string;
+	readonly customType?: string;
+	readonly content?: unknown;
+	readonly data?: unknown;
+	readonly details?: unknown;
+	readonly timestamp?: string;
+};
+
+function timelineMessageText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((block) =>
+			typeof block === "object" &&
+			block !== null &&
+			typeof (block as { readonly text?: unknown }).text === "string"
+				? (block as { readonly text: string }).text
+				: "",
+		)
+		.join("");
+}
+
+function timelineLine(entry: TimelineBranchEntry): string | null {
+	if (entry.type === "custom_message") {
+		const event =
+			entry.customType === DECISION_FOLD_MESSAGE_TYPE
+				? parseDecisionFoldDetails(entry.details)?.watchdogEvent
+				: entry.customType === WATCHDOG_EVENT_MESSAGE_TYPE
+					? parseWatchdogEvent(entry.details)
+					: undefined;
+		if (event === undefined) return null;
+		const content = timelineMessageText(entry.content);
+		return content.length === 0 ? null : content;
+	}
+	if (entry.type !== "custom" || entry.customType === undefined) return null;
 	if (!TIMELINE_TYPES.has(entry.customType)) return null;
 	const data = entry.data as Record<string, unknown> | undefined;
 	if (entry.customType === MANUAL_LOCK_ENTRY_TYPE)
@@ -368,10 +409,9 @@ function timelineLine(entry: CustomEntry<unknown>): string | null {
 }
 
 export function formatContinueTimeline(
-	branch: readonly { readonly type: string }[],
+	branch: readonly TimelineBranchEntry[],
 ): string {
 	const entries = branch
-		.filter((entry): entry is CustomEntry<unknown> => entry.type === "custom")
 		.map(timelineLine)
 		.filter((line): line is string => line !== null)
 		.slice(-100);
@@ -611,11 +651,33 @@ export async function handleUnlock(
 	}
 }
 
-/** Register human main-session commands and the TUI-only unlock-reason entry. */
+export function createWatchdogEventMessageRenderer() {
+	return (
+		message: { readonly content: unknown },
+		{ outputPad }: { readonly outputPad: number },
+		theme: Theme,
+	) => {
+		const box = new Box(outputPad, 1, (text) =>
+			theme.bg("customMessageBg", text),
+		);
+		box.addChild(new Text(String(message.content), 0, 0));
+		return box;
+	};
+}
+
+/** Register human main-session commands and shared watchdog rendering. */
 export function createMainCommands(
 	pi: ExtensionAPI,
 	runtime: MainCommandRuntime,
 ): void {
+	pi.registerMessageRenderer(
+		DECISION_FOLD_MESSAGE_TYPE,
+		createWatchdogEventMessageRenderer(),
+	);
+	pi.registerMessageRenderer(
+		WATCHDOG_EVENT_MESSAGE_TYPE,
+		createWatchdogEventMessageRenderer(),
+	);
 	pi.registerEntryRenderer<WatchdogStatusEntry>(
 		WATCHDOG_STATUS_ENTRY_TYPE,
 		createWatchdogStatusEntryRenderer(),

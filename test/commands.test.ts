@@ -16,6 +16,7 @@ import {
 	createHumanUnlockEntryRenderer,
 	createMainCommands,
 	createWaitEntryRenderer,
+	createWatchdogEventMessageRenderer,
 	createWatchdogStatusEntryRenderer,
 	formatContinueTimeline,
 	formatUnlockEntryText,
@@ -30,7 +31,12 @@ import {
 	UNLOCK_CONTINUE_WATCHDOG_COMMAND,
 	WAIT_ENTRY_TYPE,
 } from "../src/commands.js";
+import { createDecisionFoldMessage } from "../src/context-fold.js";
 import { createLockDecisionController } from "../src/controller.js";
+import {
+	createContinueWatchdogEvent,
+	formatContinueWatchdogEvent,
+} from "../src/watchdog-event.js";
 
 type RegisteredCommand = {
 	readonly description: string | undefined;
@@ -85,6 +91,7 @@ function createHarness(): CommandHarness {
 		registerCommand(name: string, definition: RegisteredCommand): void {
 			commands.set(name, definition);
 		},
+		registerMessageRenderer(): void {},
 		registerEntryRenderer(
 			customType: string,
 			renderer: (entry: { data?: HumanUnlockEntry }) => {
@@ -324,6 +331,34 @@ test("watchdog status entries render standard colored Pi-TUI boxes", () => {
 		true,
 	);
 	assert.equal(foregrounds.includes("warning"), true);
+});
+
+test("shared watchdog renderer preserves the canonical multiline body", () => {
+	const body =
+		"Continue watchdog continued · WORK_REMAINS · 2026-09-19T17:45:00.000+08:00\n\nAutomated boundary.";
+	const backgrounds: string[] = [];
+	const component = createWatchdogEventMessageRenderer()(
+		{ content: body },
+		{ outputPad: 2 },
+		{
+			bg(color: string, text: string): string {
+				backgrounds.push(color);
+				return text;
+			},
+		} as never,
+	);
+
+	assert.deepEqual(
+		component
+			.render(200)
+			.map((line) => line.trim())
+			.filter((line) => line.length > 0),
+		[body.split("\n")[0], "Automated boundary."],
+	);
+	assert.equal(
+		backgrounds.every((color) => color === "customMessageBg"),
+		true,
+	);
 });
 
 test("accepted continue entry renders its typed reason", () => {
@@ -675,6 +710,41 @@ test("continue timeline includes the six default key event kinds from the branch
 			"decision-failed · invalid XML",
 		].join("\n"),
 	);
+});
+
+test("continue timeline includes shared bodies once and retains legacy readers", () => {
+	const event = createContinueWatchdogEvent({
+		occurredAtMs: 0,
+		offsetMinutes: 0,
+		reasonType: "WORK_REMAINS",
+		reason: "Shared timeline reason.",
+	});
+	const body = formatContinueWatchdogEvent(event, "Continue guidance.");
+	const fold = createDecisionFoldMessage({
+		exchangeId: "timeline-exchange",
+		cycleId: 1,
+		outcome: "continue",
+		continuePrompt: body,
+		watchdogEvent: event,
+	});
+	const timeline = formatContinueTimeline([
+		{
+			type: "custom_message",
+			customType: fold.customType,
+			content: fold.content,
+			details: fold.details,
+		},
+		{
+			type: "custom",
+			customType: "pi-continue-watchdog:wait",
+			data: { waitSeconds: 30, reason: "Legacy wait." },
+			timestamp: "2026-01-01",
+		},
+	]);
+
+	assert.equal(timeline.startsWith(body), true);
+	assert.equal(timeline.split(body).length - 1, 1);
+	assert.equal(timeline.endsWith("wait · 30s · Legacy wait."), true);
 });
 
 test("continue timeline fallback is Unicode bounded", () => {

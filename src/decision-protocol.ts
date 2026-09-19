@@ -125,6 +125,7 @@ export interface DecisionProtocolFinalization {
 	readonly reasonType?: string;
 	readonly reason?: string;
 	readonly waitSeconds?: number;
+	readonly acceptedAtMs?: number;
 	readonly waitUntilMs?: number;
 	readonly notification?: string;
 	/** Response cycle that produced this finalization (valid and invalid outcomes). */
@@ -682,9 +683,8 @@ export function createDecisionProtocolSession(
 			return finalized;
 		}
 		if (plan.outcome === "wait") {
-			const waitUntilMs = Math.ceil(
-				(options.now?.() ?? Date.now()) + plan.waitSeconds * 1_000,
-			);
+			const acceptedAtMs = options.now?.() ?? Date.now();
+			const waitUntilMs = Math.ceil(acceptedAtMs + plan.waitSeconds * 1_000);
 			const transition = options.controller.recordValidWait(
 				options.decisionId,
 				waitUntilMs,
@@ -698,6 +698,7 @@ export function createDecisionProtocolSession(
 				transition,
 				reason: plan.reason,
 				waitSeconds: plan.waitSeconds,
+				acceptedAtMs,
 				waitUntilMs,
 				cycleId,
 			};

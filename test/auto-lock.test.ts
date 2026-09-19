@@ -87,6 +87,7 @@ function createMultiHandlerPi(options?: {
 		registerEntryRenderer(customType: string): void {
 			entryRendererTypes.push(customType);
 		},
+		registerMessageRenderer(): void {},
 		registerCommand(name: string): void {
 			commandNames.push(name);
 		},

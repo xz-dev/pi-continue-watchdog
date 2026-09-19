@@ -263,6 +263,7 @@ function createExtensionHarness(controller: LockDecisionController): {
 			activeTools = [...toolNames];
 		},
 		registerEntryRenderer() {},
+		registerMessageRenderer() {},
 		registerCommand() {},
 		registerShortcut() {},
 		appendEntry(customType: string, data: unknown) {

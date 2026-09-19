@@ -94,6 +94,7 @@ function createAttachmentHarness(options: {
 			activeToolSets.push([...names]);
 		},
 		registerEntryRenderer(): void {},
+		registerMessageRenderer(): void {},
 		registerCommand(): void {},
 		registerShortcut(): void {},
 		appendEntry(): void {},
