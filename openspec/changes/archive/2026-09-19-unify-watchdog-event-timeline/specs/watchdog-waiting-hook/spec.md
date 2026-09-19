@@ -1,10 +1,7 @@
-## Purpose
-
-Expose each durably accepted timed watchdog wait as a precise, optional semantic signal without changing the wait decision contract or timer behavior.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Accepted waits publish a waiting hook
+
 The watchdog SHALL publish exactly one `pi:semantic-hook:v1` envelope named `watchdog-waiting` after a current valid `wait_watchdog` decision has been durably published as its shared human/model wait event. Its values SHALL contain the validated trimmed reason in `REASON` and the accepted integer duration rendered as a decimal string in `WAIT_SECONDS`. The envelope SHALL NOT contain or imply a wait reason type. Optional diagnostic-audit persistence SHALL NOT substitute for, or independently gate, publication of the shared wait event. Timestamp additions to conversation history SHALL NOT change the hook's existing names, values, or consumer-independent delivery contract.
 
 #### Scenario: Valid wait is recorded
@@ -28,25 +25,3 @@ The watchdog SHALL publish exactly one `pi:semantic-hook:v1` envelope named `wat
 - **WHEN** a completed-wait timing event is published at the later eligible wake
 - **THEN** it does not republish the original `watchdog-waiting` hook
 - **AND** the hook continues to mean wait acceptance, not wait completion
-
-### Requirement: Waiting and exhaustion remain distinct events
-An accepted wait that consumes the final retry budget SHALL publish its waiting hook at acceptance while preserving the existing rule that exhaustion cannot become user-ready until the wait deadline has elapsed.
-
-#### Scenario: Final-attempt wait begins
-- **WHEN** the final valid attempt records a wait whose deadline is still in the future
-- **THEN** `watchdog-waiting` is published immediately and no `user-ready` exhaustion hook is published before the deadline
-
-#### Scenario: Final-attempt wait expires
-- **WHEN** the final wait deadline has elapsed and existing terminal-idle conditions still hold
-- **THEN** the existing `user-ready` hook may publish `STOP_KIND=EXHAUSTED` independently of the earlier waiting hook
-
-### Requirement: Notification consumers remain optional
-Waiting-hook publication SHALL be best-effort to current listeners only and SHALL not make the watchdog depend on, identify, acknowledge, wait for, or import any notification consumer.
-
-#### Scenario: No listener is present
-- **WHEN** an accepted wait is recorded without any semantic-hook listener
-- **THEN** the wait state, deadline, fold cleanup, and later scheduling proceed normally
-
-#### Scenario: Listener throws
-- **WHEN** a semantic-hook listener throws while receiving `watchdog-waiting`
-- **THEN** the accepted wait remains active and later watchdog behavior is unchanged

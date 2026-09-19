@@ -1,18 +1,7 @@
-## Purpose
-
-Ensures every automatic continuation is clearly attributed to the watchdog, carries its model-generated reason, and cannot be mistaken for user approval or authorization.
-
-## Requirements
-
-### Requirement: Automated continuation attribution
-The system SHALL identify every automatic continuation message as originating from the pi-continue-watchdog extension and SHALL state that the message is not a message or request from the user.
-
-#### Scenario: Provider receives automatic continuation
-- **WHEN** the watchdog accepts a continue decision and triggers the next model turn
-- **THEN** the continuation content identifies the pi-continue-watchdog extension as its source
-- **AND** the continuation content states that it is not a user message or request
+## MODIFIED Requirements
 
 ### Requirement: Continue reason propagation
+
 The system SHALL include the normalized accepted continue reason type and reason content in the automatic continuation message as a model-generated watchdog result. The continuation SHALL be a shared timestamped event whose canonical body is the same text shown in human conversation history and supplied to the model. The accepted reason SHALL NOT be repeated in a separate TUI-only result plus an independently assembled model-only history summary.
 
 #### Scenario: Accepted typed continue result
@@ -26,27 +15,8 @@ The system SHALL include the normalized accepted continue reason type and reason
 - **THEN** the shared event contains the entire accepted reason for both readers
 - **AND** no secondary history-specific length limit drops or shortens it
 
-### Requirement: No implied user authorization
-The system SHALL state that an automatic continuation message is not user approval, confirmation, consent, or authorization and SHALL NOT represent it as permission for an action that requires user approval.
-
-#### Scenario: Prior assistant requested approval
-- **WHEN** existing conversation context contains an unresolved request for user approval
-- **AND** the watchdog emits an automatic continuation
-- **THEN** the continuation message explicitly denies that it supplies the requested approval or authorization
-- **AND** instructs the agent to stop and ask the user before performing the approval-gated action
-
-### Requirement: Bounded resumed work
-The system SHALL instruct the agent to resume only work already requested and authorized by the user and to stop when additional user input, approval, or assistance is required.
-
-#### Scenario: Remaining work needs no new approval
-- **WHEN** the watchdog reason identifies actionable remaining work that is already within the user's request and authorization
-- **THEN** the continuation message directs the agent to resume that work
-
-#### Scenario: Remaining work reaches user boundary
-- **WHEN** resumed work reaches a step requiring new user input, approval, or assistance
-- **THEN** the continuation message requires the agent to stop and ask the user
-
 ### Requirement: Configurable guidance preservation
+
 The system SHALL retain the effective configured continuation guidance inside the fixed automated attribution and authorization-boundary wrapper. This complete body, including guidance and wrapper, SHALL be available to both the human and the model; rendering SHALL NOT substitute a reason-only summary. An old continuation event SHALL retain the guidance that was effective when it was accepted.
 
 #### Scenario: Custom continuation guidance is configured
@@ -60,6 +30,7 @@ The system SHALL retain the effective configured continuation guidance inside th
 - **THEN** reopening or rendering the old event does not regenerate its guidance
 
 ### Requirement: Provider-facing semantics
+
 The system SHALL preserve the attribution and authorization-boundary text after conversion to the provider-facing message format, regardless of the provider-facing role assigned to extension custom messages. The canonical event text visible to the human SHALL be preserved as a text segment in that provider payload without silently adding a second explanation or independently formatting its timestamp or reason.
 
 #### Scenario: Custom message converts to user role
@@ -68,7 +39,10 @@ The system SHALL preserve the attribution and authorization-boundary text after 
 - **AND** the message body still denies user approval, confirmation, consent, or authorization
 - **AND** its canonical event text matches the human-visible body after presentation-only styling is removed
 
+## ADDED Requirements
+
 ### Requirement: Shared event is not additional authority
+
 New shared wait, completed-wait, AI-unlock, decision-failure, and exhaustion bodies SHALL identify the extension as their source and SHALL explicitly deny being a user message, request, approval, confirmation, consent, or authorization. Model-generated reasons SHALL be identified as such and SHALL NOT be promoted into runtime-verified task facts.
 
 #### Scenario: Wait reason claims a background task is healthy
