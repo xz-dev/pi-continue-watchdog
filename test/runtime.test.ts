@@ -18,6 +18,7 @@ import type {
 } from "../src/process-domain.js";
 import {
 	createDecisionRuntime,
+	type DecisionRuntimeOptions,
 	type RuntimeClock,
 	type RuntimeTimerHandle,
 } from "../src/runtime.js";
@@ -102,9 +103,15 @@ interface Harness {
 	readonly controller: ReturnType<typeof createLockDecisionController>;
 	aborts: number;
 	pendingMessages: boolean;
+	branch: unknown[];
 	ctx: ExtensionContext;
 	runtime: ReturnType<typeof createDecisionRuntime>;
-	fire(name: string, event: unknown): Promise<void>;
+	/** `idle: false` makes ctx.isIdle() report busy during this event only. */
+	fire(
+		name: string,
+		event: unknown,
+		options?: { readonly idle?: boolean },
+	): Promise<void>;
 	setIdle(idle: boolean): Promise<void>;
 	settle(): Promise<void>;
 	advanceFence(ms: number): Promise<void>;
@@ -122,6 +129,7 @@ interface Harness {
 
 function fakeContext(overrides?: {
 	pendingMessages?: () => boolean;
+	branch?: () => unknown[];
 }): ExtensionContext {
 	return {
 		cwd: "/project",
@@ -129,7 +137,7 @@ function fakeContext(overrides?: {
 		hasUI: false,
 		sessionManager: {
 			getSessionId: () => "session-1",
-			getBranch: () => [] as never,
+			getBranch: () => (overrides?.branch?.() ?? []) as never,
 			getLeafId: () => null,
 		},
 		isProjectTrusted: () => true,
@@ -149,6 +157,7 @@ function createHarness(options?: {
 	readonly fenceMs?: number;
 	readonly isRootProcess?: boolean;
 	readonly onSend?: (message: SentMessage["message"]) => undefined | Error;
+	readonly jevWait?: DecisionRuntimeOptions["jevWait"];
 }): Harness {
 	const config: ContinueWatchdogConfig = {
 		idleDelaySeconds: 10,
@@ -181,6 +190,7 @@ function createHarness(options?: {
 		registeredTools,
 		controller,
 		pendingMessages: false,
+		branch: [] as unknown[],
 		get aborts() {
 			return aborts;
 		},
@@ -250,15 +260,26 @@ function createHarness(options?: {
 		injectedController: true,
 		initialConfig: config,
 		clock,
+		// Never reach a real endpoint: no ambient keys unless a test injects them.
+		jevWait: options?.jevWait ?? {
+			env: {},
+			fetchFn: async () => {
+				throw new Error("unexpected jev request");
+			},
+		},
 	});
 	runtime.registerLifecycle();
 	harness.runtime = runtime;
 	harness.ctx = ctx;
 
-	harness.fire = async (name, event) => {
+	harness.fire = async (name, event, fireOptions) => {
 		ctx = fakeContext({
 			pendingMessages: () => harness.pendingMessages,
+			branch: () => harness.branch,
 		});
+		if (fireOptions?.idle === false) {
+			(ctx as unknown as { isIdle(): boolean }).isIdle = () => false;
+		}
 		harness.ctx = ctx;
 		const list = handlers.get(name) ?? [];
 		for (const handler of list) {
@@ -276,6 +297,7 @@ function createHarness(options?: {
 		// Simulate the public isIdle probe by swapping the context's isIdle.
 		ctx = fakeContext({
 			pendingMessages: () => harness.pendingMessages,
+			branch: () => harness.branch,
 		});
 		(ctx as unknown as { isIdle(): boolean }).isIdle = () => idle;
 		harness.ctx = ctx;
@@ -664,4 +686,353 @@ test("reason over 1000 code points is rejected", () => {
 		["JOB_DONE"],
 	);
 	assert.ok("error" in result);
+});
+
+function assistantEntry(id: string, text: string, stopReason = "stop") {
+	return {
+		type: "message",
+		id,
+		message: {
+			role: "assistant",
+			stopReason,
+			content: [{ type: "text", text }],
+		},
+	};
+}
+
+function jevResponse(choice: string, confidence: number): Response {
+	return new Response(
+		JSON.stringify({ answers: { waiting_user: { choice, confidence } } }),
+	);
+}
+
+async function flush(): Promise<void> {
+	for (let index = 0; index < 10; index += 1) {
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+}
+
+function jevHarness(
+	respond: () => Promise<Response> | Response,
+	onSend?: (message: SentMessage["message"]) => undefined | Error,
+) {
+	const calls: Array<{ url: string; body: string; signal?: AbortSignal }> = [];
+	const harness = createHarness({
+		jevWait: {
+			env: { TYPESAFE_API_KEY: "ts-key" },
+			fetchFn: async (url, init) => {
+				calls.push({
+					url,
+					body: String(init.body),
+					signal: init.signal ?? undefined,
+				});
+				return respond();
+			},
+		},
+		onSend,
+	});
+	return { harness, calls };
+}
+
+const continuationCount = (harness: Harness): number =>
+	harness.sent.filter(
+		(sent) => sent.message.customType === CONTINUATION_MESSAGE_TYPE,
+	).length;
+
+test("jev gate: no key means zero requests and an unchanged continuation", async () => {
+	let fetches = 0;
+	const harness = createHarness({
+		jevWait: {
+			env: {},
+			fetchFn: async () => {
+				fetches += 1;
+				return jevResponse("waiting_user", 1);
+			},
+		},
+	});
+	harness.branch = [assistantEntry("a1", "Which one?")];
+	await harness.eligibleIdle();
+	await flush();
+	assert.equal(fetches, 0);
+	assert.equal(continuationCount(harness), 1);
+	assert.equal(harness.controller.snapshot.attempt, 1);
+});
+
+test("jev gate: a text-less final message makes no request", async () => {
+	const { harness, calls } = jevHarness(() => jevResponse("waiting_user", 1));
+	harness.branch = [
+		assistantEntry("a1", "   "),
+		// A tool-only final turn has no text blocks.
+		{
+			type: "message",
+			id: "a2",
+			message: { role: "assistant", stopReason: "toolUse", content: [] },
+		},
+	];
+	await harness.eligibleIdle();
+	await flush();
+	assert.equal(calls.length, 0);
+	assert.equal(continuationCount(harness), 1);
+});
+
+test("jev gate: confident waiting verdict unlocks as WAIT_USER without an attempt", async () => {
+	const { harness, calls } = jevHarness(() =>
+		jevResponse("waiting_user", 0.93),
+	);
+	harness.branch = [
+		assistantEntry("a1", "Done with A.\n\nShould I use Postgres or SQLite?"),
+	];
+	await harness.eligibleIdle();
+	await flush();
+	assert.equal(calls.length, 1);
+	assert.match(calls[0].body, /Should I use Postgres or SQLite\?/);
+	assert.equal(calls[0].body.includes("ts-key"), false);
+	assert.equal(continuationCount(harness), 0);
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	const ready = harness.hooks.filter((hook) => hook.name === "user-ready");
+	assert.deepEqual(ready, [
+		{
+			name: "user-ready",
+			values: {
+				STOP_KIND: "AI_UNLOCK",
+				REASON_TYPE: "WAIT_USER",
+				REASON:
+					"jev model judged the final output to be a question for the user: Should I use Postgres or SQLite?",
+			},
+		},
+	]);
+	// No further continuation once unlocked.
+	await harness.advanceFence(30_000);
+	assert.equal(continuationCount(harness), 0);
+});
+
+test("jev gate: low confidence, not-waiting, and failures continue", async () => {
+	for (const respond of [
+		() => jevResponse("waiting_user", 0.5),
+		() => jevResponse("not_waiting", 0.99),
+		() => jevResponse("unclear", 0.99),
+		() => new Response("boom", { status: 500 }),
+	]) {
+		const { harness, calls } = jevHarness(respond);
+		harness.branch = [assistantEntry("a1", "Which one?")];
+		await harness.eligibleIdle();
+		await flush();
+		assert.equal(calls.length, 1);
+		assert.equal(continuationCount(harness), 1);
+		assert.equal(harness.controller.snapshot.attempt, 1);
+		assert.equal(
+			harness.hooks.some((hook) => hook.name === "user-ready"),
+			false,
+		);
+	}
+});
+
+test("jev gate: a verdict made stale by new activity is dropped; the entry is classified once", async () => {
+	let release: (response: Response) => void = () => {};
+	const { harness, calls } = jevHarness(
+		() =>
+			new Promise<Response>((resolve) => {
+				release = resolve;
+			}),
+	);
+	harness.branch = [assistantEntry("a1", "Which one?")];
+	await harness.eligibleIdle();
+	await flush();
+	assert.equal(calls.length, 1);
+	// Another extension starts a turn during the request, which then settles.
+	await harness.fire("agent_start", {});
+	await harness.settle();
+	await harness.advanceFence(10_000);
+	await flush();
+	// Re-qualification reuses the in-flight classification for the same entry.
+	assert.equal(calls.length, 1);
+	release(jevResponse("not_waiting", 0.99));
+	await flush();
+	// Only the still-current qualification acts on the verdict.
+	assert.equal(continuationCount(harness), 1);
+	assert.equal(harness.controller.snapshot.attempt, 1);
+});
+
+test("jev gate: manual unlock or a new lock cycle during the request wins", async () => {
+	for (const interrupt of ["unlock", "restart"] as const) {
+		let release: (response: Response) => void = () => {};
+		const { harness } = jevHarness(
+			() =>
+				new Promise<Response>((resolve) => {
+					release = resolve;
+				}),
+		);
+		harness.branch = [assistantEntry("a1", "Which one?")];
+		await harness.eligibleIdle();
+		await flush();
+		if (interrupt === "unlock") await harness.unlock();
+		else harness.runtime.restartLockCycle();
+		release(jevResponse("waiting_user", 0.99));
+		await flush();
+		assert.equal(continuationCount(harness), 0);
+		assert.equal(
+			harness.hooks.some((hook) => hook.name === "user-ready"),
+			false,
+		);
+		assert.equal(harness.controller.snapshot.attempt, 0);
+	}
+});
+
+test("jev gate: shutdown aborts the in-flight request without dispatch or unlock", async () => {
+	const { harness, calls } = jevHarness(() => new Promise<Response>(() => {}));
+	harness.branch = [assistantEntry("a1", "Which one?")];
+	await harness.eligibleIdle();
+	await flush();
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0].signal?.aborted, false);
+	await harness.runtime.shutdown();
+	assert.equal(calls[0].signal?.aborted, true);
+	await flush();
+	assert.equal(continuationCount(harness), 0);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(
+		harness.hooks.some((hook) => hook.name === "user-ready"),
+		false,
+	);
+});
+
+test("jev gate: tree navigation during the request drops the old verdict and classifies the new entry", async () => {
+	const releases: Array<(response: Response) => void> = [];
+	const { harness, calls } = jevHarness(
+		() =>
+			new Promise<Response>((resolve) => {
+				releases.push(resolve);
+			}),
+	);
+	harness.branch = [assistantEntry("a1", "Status: all good.")];
+	await harness.eligibleIdle();
+	await flush();
+	assert.equal(calls.length, 1);
+	// Navigate to another branch whose final message asks the user.
+	harness.branch = [assistantEntry("b1", "Approve deleting data?")];
+	// Real Pi emits session_tree while its branch-summary controller is still
+	// set, so ctx.isIdle() reports busy inside the event; no settle follows.
+	await harness.fire("session_tree", {}, { idle: false });
+	assert.notEqual(
+		harness.runtime.getTriggerStatus().blocker,
+		"local-agent-busy",
+	);
+	releases[0](jevResponse("not_waiting", 0.99));
+	await flush();
+	assert.equal(continuationCount(harness), 0);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	// The re-armed fence classifies the new branch's entry.
+	await harness.advanceFence(10_000);
+	await flush();
+	assert.equal(calls.length, 2);
+	assert.match(calls[1].body, /Approve deleting data\?/);
+	releases[1](jevResponse("waiting_user", 0.95));
+	await flush();
+	assert.equal(continuationCount(harness), 0);
+	assert.equal(harness.controller.snapshot.locked, false);
+});
+
+test("jev gate: revisiting an entry reuses its classification (A -> B -> A)", async () => {
+	// Failed sends roll back, so every entry can qualify again.
+	const { harness, calls } = jevHarness(
+		() => jevResponse("not_waiting", 0.99),
+		(message) =>
+			message.customType === CONTINUATION_MESSAGE_TYPE
+				? new Error("send failed")
+				: undefined,
+	);
+	const a = assistantEntry("a1", "Report A.");
+	const b = assistantEntry("b1", "Report B.");
+	harness.branch = [a];
+	await harness.eligibleIdle();
+	await flush();
+	for (const branch of [[b], [a]]) {
+		harness.branch = branch;
+		await harness.fire("session_tree", {}, { idle: false });
+		await harness.advanceFence(10_000);
+		await flush();
+	}
+	assert.equal(calls.length, 2);
+	assert.equal(
+		calls.filter((call) => call.body.includes("Report A.")).length,
+		1,
+	);
+});
+
+test("jev gate: a key that appears later still enables the gate for the same entry", async () => {
+	const env: Record<string, string | undefined> = {};
+	const calls: string[] = [];
+	const harness = createHarness({
+		jevWait: {
+			env,
+			fetchFn: async (_url, init) => {
+				calls.push(String(init.body));
+				return jevResponse("waiting_user", 0.99);
+			},
+		},
+		onSend: (message) =>
+			message.customType === CONTINUATION_MESSAGE_TYPE
+				? new Error("send failed")
+				: undefined,
+	});
+	harness.branch = [assistantEntry("a1", "Which one?")];
+	await harness.eligibleIdle();
+	await flush();
+	assert.equal(calls.length, 0);
+	env.TYPESAFE_API_KEY = "late-key";
+	await harness.fire("agent_end", {});
+	await harness.advanceFence(10_000);
+	await flush();
+	assert.equal(calls.length, 1);
+	assert.equal(harness.controller.snapshot.locked, false);
+});
+
+test("jev gate: invalidation during a delayed credential lookup sends nothing", async () => {
+	for (const interrupt of ["unlock", "navigate"] as const) {
+		let resolveKey: ((key: string) => void) | null = null;
+		let fetches = 0;
+		const harness = createHarness({
+			jevWait: {
+				env: {},
+				fetchFn: async () => {
+					fetches += 1;
+					return jevResponse("waiting_user", 0.99);
+				},
+			},
+		});
+		harness.branch = [assistantEntry("a1", "Which one?")];
+		await harness.fire("session_start", {});
+		// Delayed Pi credential lookup.
+		(
+			harness.ctx as unknown as {
+				modelRegistry: {
+					getApiKeyForProvider(provider: string): Promise<string | undefined>;
+				};
+			}
+		).modelRegistry = {
+			getApiKeyForProvider: (provider) =>
+				provider === "typesafe"
+					? new Promise((resolve) => {
+							resolveKey = resolve;
+						})
+					: Promise.resolve(undefined),
+		};
+		await harness.fire("agent_start", {});
+		await harness.setIdle(true);
+		await harness.settle();
+		await harness.advanceFence(10_000);
+		await flush();
+		if (interrupt === "unlock") {
+			await harness.unlock();
+		} else {
+			harness.branch = [assistantEntry("b1", "Other question?")];
+			await harness.fire("session_tree", {}, { idle: false });
+		}
+		assert.ok(resolveKey, "credential lookup was not reached");
+		(resolveKey as (key: string) => void)("late-key");
+		await flush();
+		assert.equal(fetches, 0, interrupt);
+		assert.equal(continuationCount(harness), 0, interrupt);
+	}
 });

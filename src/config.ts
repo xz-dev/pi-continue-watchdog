@@ -11,6 +11,8 @@
  *   replaces the default.
  * - decisionPrompt and continueReasonTypes are removed keys: each occurrence
  *   reports a named error diagnostic and has no effect.
+ * - jevWaitCheck is validated per field; its apiKey is global-only and a
+ *   project-layer apiKey is ignored with a diagnostic.
  * Invalid values are rejected (no silent clamp).
  */
 
@@ -39,6 +41,29 @@ export const MIN_RETRIES = 1;
  */
 export const MAX_RETRIES = 10;
 
+/** Minimum accepted jevWaitCheck.timeoutMs (inclusive). */
+export const MIN_JEV_TIMEOUT_MS = 1_000;
+
+/** jev classification of the final assistant output before a continuation. */
+export interface JevWaitCheckConfig {
+	enabled: boolean;
+	/** TypeSafe or OpenRouter System One endpoint; unset = automatic selection. */
+	apiUrl?: string;
+	model: string;
+	confidenceThreshold: number;
+	timeoutMs: number;
+	/** Global-only fallback key. */
+	apiKey?: string;
+}
+
+export const BUILT_IN_JEV_WAIT_CHECK: Readonly<JevWaitCheckConfig> =
+	Object.freeze({
+		enabled: true,
+		model: "jev-latest",
+		confidenceThreshold: 0.8,
+		timeoutMs: 15_000,
+	});
+
 export interface ContinueWatchdogConfig {
 	/** @deprecated Accepted and preserved, but the idle fence is fixed at 10s. */
 	idleDelaySeconds: number;
@@ -48,7 +73,16 @@ export interface ContinueWatchdogConfig {
 	reasonTypes: readonly string[];
 	/** Key binding for the human unlock shortcut, or false to disable it. */
 	unlockShortcut: string | false;
+	/** Omitted = built-in defaults. */
+	jevWaitCheck?: JevWaitCheckConfig;
 }
+
+/** One validated layer; nested jevWaitCheck fields merge individually. */
+export type ConfigLayer = Partial<
+	Omit<ContinueWatchdogConfig, "jevWaitCheck">
+> & {
+	jevWaitCheck?: Partial<JevWaitCheckConfig>;
+};
 
 export type ConfigDiagnosticSeverity = "warning" | "error";
 
@@ -60,7 +94,7 @@ export interface ConfigDiagnostic {
 }
 
 export interface ConfigResult {
-	config: Partial<ContinueWatchdogConfig>;
+	config: ConfigLayer;
 	diagnostics: ConfigDiagnostic[];
 }
 
@@ -75,6 +109,7 @@ export const BUILT_IN_CONFIG: Readonly<ContinueWatchdogConfig> = Object.freeze({
 	continuePrompt: DEFAULT_CONTINUE_PROMPT,
 	reasonTypes: DEFAULT_REASON_TYPES,
 	unlockShortcut: "alt+u",
+	jevWaitCheck: BUILT_IN_JEV_WAIT_CHECK,
 });
 
 const MAX_DIAGNOSTIC_LENGTH = 240;
@@ -85,6 +120,16 @@ const KNOWN_KEYS = new Set([
 	"continuePrompt",
 	"reasonTypes",
 	"unlockShortcut",
+	"jevWaitCheck",
+]);
+
+const JEV_KEYS = new Set([
+	"enabled",
+	"apiUrl",
+	"model",
+	"confidenceThreshold",
+	"timeoutMs",
+	"apiKey",
 ]);
 
 /** Keys removed by the unlock-tool change; configured values have no effect. */
@@ -108,7 +153,87 @@ function copyBuiltIn(): ContinueWatchdogConfig {
 		continuePrompt: BUILT_IN_CONFIG.continuePrompt,
 		reasonTypes: [...BUILT_IN_CONFIG.reasonTypes],
 		unlockShortcut: BUILT_IN_CONFIG.unlockShortcut,
+		jevWaitCheck: { ...BUILT_IN_JEV_WAIT_CHECK },
 	};
+}
+
+const nonBlank = (value: unknown): value is string =>
+	typeof value === "string" && value.trim().length > 0;
+
+function isHttpUrl(value: unknown): value is string {
+	if (!nonBlank(value)) return false;
+	try {
+		const { protocol } = new URL(value.trim());
+		return protocol === "https:" || protocol === "http:";
+	} catch {
+		return false;
+	}
+}
+
+/** Per-field jevWaitCheck validation; project layers cannot set apiKey. */
+function validateJevWaitCheck(
+	source: string,
+	value: unknown,
+	diagnostics: ConfigDiagnostic[],
+): Partial<JevWaitCheckConfig> {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) {
+		diagnostics.push(diagnostic(source, "jevWaitCheck must be an object"));
+		return {};
+	}
+	const input = value as Record<string, unknown>;
+	const out: Partial<JevWaitCheckConfig> = {};
+	const reject = (message: string): void => {
+		diagnostics.push(diagnostic(source, `jevWaitCheck.${message}`));
+	};
+	if (Object.hasOwn(input, "enabled")) {
+		if (typeof input.enabled === "boolean") out.enabled = input.enabled;
+		else reject("enabled must be a boolean");
+	}
+	if (Object.hasOwn(input, "apiUrl")) {
+		if (isHttpUrl(input.apiUrl)) out.apiUrl = input.apiUrl.trim();
+		else reject("apiUrl must be an http(s) URL");
+	}
+	if (Object.hasOwn(input, "model")) {
+		if (nonBlank(input.model)) out.model = input.model.trim();
+		else reject("model must be a non-empty string");
+	}
+	if (Object.hasOwn(input, "confidenceThreshold")) {
+		const threshold = input.confidenceThreshold;
+		if (
+			typeof threshold === "number" &&
+			Number.isFinite(threshold) &&
+			threshold >= 0 &&
+			threshold <= 1
+		) {
+			out.confidenceThreshold = threshold;
+		} else {
+			reject("confidenceThreshold must be a number between 0 and 1");
+		}
+	}
+	if (Object.hasOwn(input, "timeoutMs")) {
+		const timeout = input.timeoutMs;
+		if (
+			Number.isSafeInteger(timeout) &&
+			(timeout as number) >= MIN_JEV_TIMEOUT_MS
+		) {
+			out.timeoutMs = timeout as number;
+		} else {
+			reject(`timeoutMs must be an integer of at least ${MIN_JEV_TIMEOUT_MS}`);
+		}
+	}
+	if (Object.hasOwn(input, "apiKey")) {
+		if (source === "project") {
+			reject("apiKey is ignored in project configuration; set it globally");
+		} else if (nonBlank(input.apiKey)) {
+			out.apiKey = input.apiKey.trim();
+		} else {
+			reject("apiKey must be a non-empty string");
+		}
+	}
+	if (Object.keys(input).some((key) => !JEV_KEYS.has(key))) {
+		reject("contains unsupported keys that are ignored");
+	}
+	return out;
 }
 
 function validIdleDelaySeconds(value: unknown): value is number {
@@ -188,7 +313,7 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 	}
 
 	const input = value as Record<string, unknown>;
-	const config: Partial<ContinueWatchdogConfig> = {};
+	const config: ConfigLayer = {};
 	const diagnostics: ConfigDiagnostic[] = [];
 
 	if (Object.hasOwn(input, "idleDelaySeconds")) {
@@ -275,6 +400,11 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 		}
 	}
 
+	if (Object.hasOwn(input, "jevWaitCheck")) {
+		const jev = validateJevWaitCheck(source, input.jevWaitCheck, diagnostics);
+		if (Object.keys(jev).length > 0) config.jevWaitCheck = jev;
+	}
+
 	for (const key of Object.keys(input)) {
 		if (!KNOWN_KEYS.has(key) && !REMOVED_KEYS.has(key)) {
 			diagnostics.push(diagnostic(source, "ignoring unsupported keys"));
@@ -323,6 +453,13 @@ export function mergeConfig(
 		}
 		if (partial.unlockShortcut !== undefined) {
 			config.unlockShortcut = partial.unlockShortcut;
+		}
+		if (partial.jevWaitCheck !== undefined) {
+			const jev = { ...(config.jevWaitCheck ?? BUILT_IN_JEV_WAIT_CHECK) };
+			for (const [key, value] of Object.entries(partial.jevWaitCheck)) {
+				if (value !== undefined) Object.assign(jev, { [key]: value });
+			}
+			config.jevWaitCheck = jev;
 		}
 	}
 

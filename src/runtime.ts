@@ -18,7 +18,11 @@ import {
 	WATCHDOG_STATUS_ENTRY_TYPE,
 	type WatchdogStatusEntry,
 } from "./commands.js";
-import { BUILT_IN_CONFIG, type ContinueWatchdogConfig } from "./config.js";
+import {
+	BUILT_IN_CONFIG,
+	BUILT_IN_JEV_WAIT_CHECK,
+	type ContinueWatchdogConfig,
+} from "./config.js";
 import { type LoadedConfig, loadRuntimeConfig } from "./config-loader.js";
 import {
 	CANCELLED_WATCHDOG_RUN_ERROR,
@@ -37,6 +41,14 @@ import type {
 	HubMainClaim,
 	ObservableAgentHub,
 } from "./hub.js";
+import {
+	buildJevReason,
+	classifyJevWait,
+	finalAssistantText,
+	type JevFetch,
+	type JevVerdict,
+	resolveJevEndpoint,
+} from "./jev-wait-gate.js";
 import {
 	type DomainFence,
 	isProcessDomainFatalError,
@@ -136,6 +148,28 @@ export interface DecisionRuntimeOptions {
 	readonly agentDir?: string;
 	/** Fired once per control acquisition when the effective config is committed. */
 	readonly onConfigReady?: (config: ContinueWatchdogConfig) => void;
+	/** jev wait gate seams; defaults are global fetch and process.env. */
+	readonly jevWait?: {
+		readonly fetchFn?: JevFetch;
+		readonly env?: Readonly<Record<string, string | undefined>>;
+	};
+}
+
+/** Final assistant entry of the settled run (no user message after it). */
+function latestAssistantEntry(
+	ctx: ExtensionContext,
+): { readonly id: string; readonly text: string } | null {
+	const branch = ctx.sessionManager.getBranch();
+	for (let index = branch.length - 1; index >= 0; index -= 1) {
+		const entry = branch[index];
+		if (entry?.type !== "message") continue;
+		const role = (entry.message as { readonly role?: unknown }).role;
+		if (role === "user") return null;
+		if (role !== "assistant") continue;
+		const text = finalAssistantText(entry.message);
+		return text === undefined ? null : { id: entry.id, text };
+	}
+	return null;
 }
 
 export type WatchdogTriggerBlocker =
@@ -271,6 +305,14 @@ export function createDecisionRuntime(
 	let stateStatusWidgetRegistered = false;
 	/** Distinguishes this runtime's synchronous hub report from child reports. */
 	let publishingOwnHubObservation = false;
+	/**
+	 * At most one jev request per assistant entry id, shared by re-qualifications.
+	 * Only started requests are cached, so a later key still enables the gate.
+	 */
+	// ponytail: session-lifetime map (one small promise per classified message); prune if sessions get huge.
+	const jevClassifications = new Map<string, Promise<JevVerdict | null>>();
+	/** Aborts the in-flight jev request on shutdown. */
+	const jevAbort = new AbortController();
 
 	const isRootProcess = (): boolean =>
 		domainReady &&
@@ -778,22 +820,115 @@ export function createDecisionRuntime(
 					return;
 				}
 			}
-			if (!probePiAgentState(ctx).idle) return;
-			const after = aggregateInput();
+			const claim = stillQualified(ctx, generation);
+			if (claim === null) return;
+			const jevConfig = config.jevWaitCheck ?? BUILT_IN_JEV_WAIT_CHECK;
+			const entry = jevConfig.enabled ? latestAssistantEntry(ctx) : null;
+			if (entry === null) {
+				dispatchContinuation(claim);
+				return;
+			}
+			let request = jevClassifications.get(entry.id);
+			if (request === undefined) {
+				const endpoint = await resolveJevEndpoint(
+					jevConfig,
+					ctx.modelRegistry,
+					options.jevWait?.env,
+				).catch(() => undefined);
+				// Credential lookup is async: never start a request for a state or
+				// entry that is no longer current.
+				if (
+					stillQualified(ctx, generation) === null ||
+					!owns(claim) ||
+					latestAssistantEntry(ctx)?.id !== entry.id
+				) {
+					return;
+				}
+				// A concurrent qualification may have started the request meanwhile.
+				request = jevClassifications.get(entry.id);
+				if (request === undefined && endpoint !== undefined) {
+					request = classifyJevWait(entry.text, {
+						...endpoint,
+						model: jevConfig.model,
+						timeoutMs: jevConfig.timeoutMs,
+						signal: jevAbort.signal,
+						fetchFn: options.jevWait?.fetchFn,
+					}).catch(() => null);
+					jevClassifications.set(entry.id, request);
+				}
+			}
+			const verdict = request === undefined ? null : await request;
+			// Anything that changed during the await makes the verdict stale: activity,
+			// ownership (part of the generation), lock, or the classified entry itself.
 			if (
-				!after.allIdle ||
-				after.claim === null ||
-				!sameActivityGeneration(after.generation, generation) ||
-				!sameActivityGeneration(
-					graceCoordinator.snapshot.generation,
-					generation,
-				) ||
-				graceCoordinator.snapshot.phase !== "ready"
+				stillQualified(ctx, generation) === null ||
+				!owns(claim) ||
+				(jevConfig.enabled && latestAssistantEntry(ctx)?.id !== entry.id)
 			) {
 				return;
 			}
-			dispatchContinuation(after.claim);
+			if (
+				verdict?.choice === "waiting_user" &&
+				verdict.confidence >= jevConfig.confidenceThreshold
+			) {
+				applyJevUnlock(ctx, claim, buildJevReason(entry.text));
+				return;
+			}
+			dispatchContinuation(claim);
 		})();
+	};
+
+	/** Claim when the exact qualified generation still holds, else null. */
+	const stillQualified = (
+		ctx: ExtensionContext,
+		generation: ActivityGeneration,
+	): HubMainClaim | null => {
+		if (sessionContext !== ctx || !probePiAgentState(ctx).idle) return null;
+		const after = aggregateInput();
+		if (
+			!after.allIdle ||
+			after.claim === null ||
+			!sameActivityGeneration(after.generation, generation) ||
+			!sameActivityGeneration(
+				graceCoordinator.snapshot.generation,
+				generation,
+			) ||
+			graceCoordinator.snapshot.phase !== "ready"
+		) {
+			return null;
+		}
+		return after.claim;
+	};
+
+	/**
+	 * jev judged the final output to be a question for the user: unlock like the
+	 * tool does (no attempt consumed) and publish user-ready now, because no
+	 * later settle will arrive for this already-idle run.
+	 */
+	const applyJevUnlock = (
+		ctx: ExtensionContext,
+		claim: HubMainClaim,
+		reason: string,
+	): void => {
+		const controller = currentController(claim);
+		if (controller === null || !owns(claim)) return;
+		if (!controller.recordAiUnlock().applied) return;
+		pendingUnlock = {
+			STOP_KIND: "AI_UNLOCK",
+			REASON_TYPE: "WAIT_USER",
+			REASON: reason,
+		};
+		publishedForIdleEpoch = false;
+		localActivityGeneration += 1;
+		observeAggregate();
+		try {
+			ctx.ui.notify(
+				"Continue watchdog unlocked · WAIT_USER (jev: final output asks the user)",
+			);
+		} catch {
+			// Hosts without notify still get the user-ready hook.
+		}
+		void maybePublishUserReady();
 	};
 
 	const applyEffect = (
@@ -1434,6 +1569,15 @@ export function createDecisionRuntime(
 			observeLiveState(ctx);
 		});
 
+		// Tree navigation changes the branch without a turn: invalidate the current
+		// qualification and re-arm the fence so an old-branch verdict cannot act.
+		// Pi emits session_tree while its branch-summary controller is still set, so
+		// ctx.isIdle() reads busy here; do not probe. The fence expiry re-probes.
+		options.pi.on("session_tree", () => {
+			localActivityGeneration += 1;
+			observeAggregate();
+		});
+
 		(options.pi as ExtensionAPI & Partial<UninterruptibleMessageEndAPI>).on(
 			"message_end",
 			handleContinuationMessageEnd,
@@ -1481,6 +1625,7 @@ export function createDecisionRuntime(
 		if (stopped) return;
 		const detachedIdle = ctx === undefined ? true : probePiAgentState(ctx).idle;
 		stopped = true;
+		jevAbort.abort();
 		lifecycleGeneration += 1;
 		localActivityGeneration += 1;
 		watchdogOwnedRun = null;

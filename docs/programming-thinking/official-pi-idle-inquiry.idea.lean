@@ -6,7 +6,8 @@ Unlock-tool + direct-continuation process model. This file models the shipped
 pi-continue-watchdog behavior: one always-registered unlock tool, the fixed
 ten-second idle fence, aggregate idle across the hub and the authenticated
 process domain, direct continuation publication with attempt accounting and
-rollback, exhaustion, and the shared human/model event timeline. The pre-upgrade
+rollback, the optional jev wait gate before dispatch, exhaustion, and the shared
+human/model event timeline. The pre-upgrade
 XML inquiry protocol is removed; agents wait inside their own turn.
 -/
 
@@ -407,6 +408,57 @@ def freshLockCycle (state : RuntimeState) : RuntimeState :=
       pendingContinuation := none }
 
 /-!
+## jev wait gate
+
+After the fence qualifies and before dispatch, an optional jev verdict on the
+final assistant text is awaited. The verdict applies only when the exact
+qualified state is unchanged after the request (`stale = false`). A confident
+`waiting_user` unlocks without consuming an attempt; every other outcome,
+including no key or any failure (`none`), dispatches as before.
+-/
+
+inductive JevChoice where
+  | waitingUser
+  | notWaiting
+  | unclear
+  deriving DecidableEq, Repr
+
+structure JevVerdict where
+  choice : JevChoice
+  confident : Bool
+  deriving DecidableEq, Repr
+
+inductive GateOutcome where
+  | continued
+  | waitUserUnlocked
+  | dropped
+  deriving DecidableEq, Repr
+
+def jevWaits (verdict : Option JevVerdict) : Bool :=
+  match verdict with
+  | some v => v.choice == .waitingUser && v.confident
+  | none => false
+
+def applyJevGate (exchangeId : Nat) (verdict : Option JevVerdict)
+    (stale : Bool) (state : RuntimeState) : GateOutcome × RuntimeState :=
+  if stale || !continuationEligible state then (.dropped, state)
+  else if jevWaits verdict then (.waitUserUnlocked, unlock state)
+  else (.continued, dispatchContinuation exchangeId state)
+
+/-- Gate-aware fence expiry: the runtime's actual path. With no verdict and a
+fresh state it equals the plain `timerTick` dispatch (see
+`gated_tick_without_verdict_is_timer_tick`). A branch change or any other
+activity during the request is `stale`. -/
+def gatedTimerTick (verdict : Option JevVerdict) (stale : Bool)
+    (state : RuntimeState) : GateOutcome × RuntimeState :=
+  match state.fence with
+  | some fence =>
+      if fence.armed ∧ fence.remainingSeconds ≤ 1 then
+        applyJevGate fence.token verdict stale state
+      else (.continued, timerTick state)
+  | none => (.continued, state)
+
+/-!
 ## Lifecycle proofs
 
 Event labels never infer activity: each observation uses only its fresh
@@ -676,6 +728,65 @@ theorem armed_fence_expiry_dispatches
   simp [timerTick, hfence, dispatchContinuation, eligible]
 
 /-!
+## jev gate proofs
+-/
+
+/-- A stale verdict neither unlocks nor continues. -/
+theorem stale_jev_verdict_is_dropped
+    (exchangeId : Nat) (verdict : Option JevVerdict) (state : RuntimeState) :
+    applyJevGate exchangeId verdict true state = (.dropped, state) := by
+  simp [applyJevGate]
+
+/-- No key or any failure fails open to the ordinary dispatch. -/
+theorem missing_jev_verdict_fails_open
+    (exchangeId : Nat) (state : RuntimeState)
+    (eligible : continuationEligible state = true) :
+    applyJevGate exchangeId none false state =
+      (.continued, dispatchContinuation exchangeId state) := by
+  simp [applyJevGate, eligible, jevWaits]
+
+/-- A confident waiting verdict unlocks without consuming an attempt. -/
+theorem confident_wait_unlocks_without_attempt
+    (exchangeId : Nat) (state : RuntimeState)
+    (eligible : continuationEligible state = true) :
+    let result := applyJevGate exchangeId
+      (some { choice := .waitingUser, confident := true }) false state
+    result.1 = .waitUserUnlocked ∧ result.2.enabled = false ∧
+      result.2.attempt = state.attempt ∧ continuationClosed result.2 := by
+  simp [applyJevGate, eligible, jevWaits, unlock, continuationClosed]
+
+/-- A non-confident or non-waiting verdict continues exactly as before. -/
+theorem other_jev_verdict_continues
+    (exchangeId : Nat) (verdict : JevVerdict) (state : RuntimeState)
+    (eligible : continuationEligible state = true)
+    (notWait : jevWaits (some verdict) = false) :
+    applyJevGate exchangeId (some verdict) false state =
+      (.continued, dispatchContinuation exchangeId state) := by
+  simp [applyJevGate, eligible, notWait]
+
+/-- Without a verdict, an eligible gated expiry is exactly the plain
+`timerTick` dispatch: the gate adds no behavior when it has nothing to say. -/
+theorem gated_tick_without_verdict_is_timer_tick
+    (state : RuntimeState) (fence : IdleFence)
+    (hfence : state.fence = some fence)
+    (harmed : fence.armed = true)
+    (hdue : fence.remainingSeconds ≤ 1)
+    (eligible : continuationEligible state = true) :
+    (gatedTimerTick none false state).2 = timerTick state := by
+  have hnot : ¬ (1 < fence.remainingSeconds) := by omega
+  simp [gatedTimerTick, timerTick, hfence, harmed, hdue, hnot, applyJevGate,
+    eligible, jevWaits]
+
+/-- A stale gated expiry changes nothing. -/
+theorem stale_gated_tick_is_inert
+    (verdict : Option JevVerdict) (state : RuntimeState) (fence : IdleFence)
+    (hfence : state.fence = some fence)
+    (harmed : fence.armed = true)
+    (hdue : fence.remainingSeconds ≤ 1) :
+    gatedTimerTick verdict true state = (.dropped, state) := by
+  simp [gatedTimerTick, hfence, harmed, hdue, applyJevGate]
+
+/-!
 ## Deterministic executable summary
 -/
 
@@ -684,6 +795,9 @@ theorem armed_fence_expiry_dispatches
         (replaceFence (initialState true))).attempt
 #eval (freshLockCycle (initialState true)).attempt
 #eval (unlock (initialState true)).enabled
+#eval (applyJevGate 1 (some { choice := .waitingUser, confident := true })
+        false (initialState true)).1
+#eval (applyJevGate 1 none false (initialState true)).2.attempt
 
 /-- Aggregate correctness bundle: the model's key safety properties packaged
 for a single axiom audit. -/
@@ -736,7 +850,23 @@ theorem process_is_correct :
         (buildContinuationEnvelope guidance).stopAtUserBoundary = true ∧
         (buildContinuationEnvelope guidance).endedWithoutUnlockTool = true ∧
         (buildContinuationEnvelope guidance).waitByBlockingOrSleeping = true ∧
-        (buildContinuationEnvelope guidance).guidance = guidance) :=
+        (buildContinuationEnvelope guidance).guidance = guidance) ∧
+    (∀ exchangeId verdict state,
+      applyJevGate exchangeId verdict true state = (.dropped, state)) ∧
+    (∀ exchangeId state, continuationEligible state = true →
+      applyJevGate exchangeId none false state =
+        (.continued, dispatchContinuation exchangeId state)) ∧
+    (∀ exchangeId state, continuationEligible state = true →
+      let result := applyJevGate exchangeId
+        (some { choice := .waitingUser, confident := true }) false state
+      result.1 = .waitUserUnlocked ∧ result.2.enabled = false ∧
+        result.2.attempt = state.attempt ∧ continuationClosed result.2) ∧
+    (∀ state fence, state.fence = some fence → fence.armed = true →
+      fence.remainingSeconds ≤ 1 → continuationEligible state = true →
+      (gatedTimerTick none false state).2 = timerTick state) ∧
+    (∀ verdict state fence, state.fence = some fence → fence.armed = true →
+      fence.remainingSeconds ≤ 1 →
+      gatedTimerTick verdict true state = (.dropped, state)) :=
   ⟨idle_report_replaces_fence_token,
    main_activity_cancels_candidate,
    dispatch_consumes_one_attempt,
@@ -756,7 +886,12 @@ theorem process_is_correct :
       continuation_does_not_authorize guidance |> And.right,
       continuation_states_missing_tool_call guidance |> And.left,
       continuation_states_missing_tool_call guidance |> And.right,
-      continuation_preserves_guidance guidance⟩⟩
+      continuation_preserves_guidance guidance⟩,
+   stale_jev_verdict_is_dropped,
+   missing_jev_verdict_fails_open,
+   confident_wait_unlocks_without_attempt,
+   gated_tick_without_verdict_is_timer_tick,
+   fun verdict state fence => stale_gated_tick_is_inert verdict state fence⟩
 
 end OfficialPiIdleInquiry
 

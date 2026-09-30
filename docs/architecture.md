@@ -33,7 +33,10 @@ replace timer and wait one fixed 10-second fence
           ▼
 qualify the same generation and re-check ownership/auth
           │
-          ├─ locked, budget left ─► one direct continuation message → next turn
+          ├─ locked, budget left ─► jev wait gate (only with a key and final text)
+          │     ├─ confident waiting_user, state unchanged ─► AI unlock → user-ready WAIT_USER
+          │     ├─ state changed during the request ─────────► drop verdict, do nothing
+          │     └─ otherwise (incl. no key / failure) ───────► one direct continuation → next turn
           └─ locked, exhausted ───► one exhaustion event → user-ready EXHAUSTED
 
 anytime: main agent calls unlock_continue_watchdog(reason_type, reason)
@@ -50,6 +53,7 @@ anytime: main agent calls unlock_continue_watchdog(reason_type, reason)
 | `src/controller.ts` | Pure lock, continuation-attempt, and exhaustion accounting |
 | `src/runtime.ts` | Aggregate generation wiring, ownership/auth fencing, unlock-tool registration, direct continuation publication, scheduling, and hook publication |
 | `src/watchdog-event.ts` | Versioned event metadata, local-offset RFC 3339 timestamps, legacy-tolerant parsing, and canonical immutable human/model bodies |
+| `src/jev-wait-gate.ts` | jev key/endpoint resolution, the one-question Choice request, final-assistant-text extraction, and the `WAIT_USER` reason text; every failure is `null` so the runtime fails open |
 | `src/unlock-tool.ts` | The `unlock_continue_watchdog` tool: schema, argument validation, AI-unlock application, and rendering |
 | `src/context-fold.ts` | Read-only legacy decision-exchange folding plus cancelled-continuation removal before provider requests |
 | `src/abort-outcome.ts` | Detect canonical main-run `stopReason: "aborted"` outcomes |
@@ -252,7 +256,7 @@ Lock state, aggregate grace, ownership, and pending continuations are runtime-on
 
 ### Guaranteed in normal completed flows
 
-- there is no hidden decision question at all: continuation messages are visible by design and the unlock tool is a normal tool call;
+- there is no hidden decision question in model context: continuation messages are visible by design and the unlock tool is a normal tool call; the optional jev wait gate is an out-of-band HTTP request whose verdict adds no model-visible message;
 - new automatic result messages use the same immutable canonical body in human history and Agent/provider context;
 - a manually cancelled watchdog-owned continuation assistant is folded out of later provider context;
 - legacy decision internals in resumed sessions stay folded out of provider context;

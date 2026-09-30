@@ -39,7 +39,8 @@ Use `pi update --extensions` to update. Reload Pi extensions or start a new sess
    - The tool is registered only in root processes; child Pi processes never see it, and the active tool list never changes, so the provider prompt prefix and its cache stay stable.
 4. **Automatic continuation.** When the locked main agent goes idle without calling the unlock tool, the watchdog publishes exactly one visible continuation event and starts the next turn with it. Its immutable canonical body states that the agent ended its turn without calling `unlock_continue_watchdog`, embeds the configured `continuePrompt`, instructs the agent to call the tool now if the work is complete or the user is needed, otherwise to continue the remaining work, and — when something must be waited for — to block on it directly: monitor that task until it ends, or sleep for the estimated duration. The body is extension-attributed, timestamped, explicitly not a user message or authorization, and keeps the stop-at-user-boundary rule. A `watchdog-continued` hook with no values publishes after each durable continuation.
 5. **Manual unlock.** A human `/unlock-continue-watchdog` or unlock shortcut assigns unlocked first, then cancels the current run when it is exactly correlated to a watchdog-owned continuation, removing that run's partial output and abort residue. An ordinary uncorrelated user-started run is preserved, including genuine user steering that starts inside the same Pi agent lifecycle as an earlier continuation. Queued-message behavior remains Pi-owned during abort: the extension neither clears nor privately replays Pi queues and makes no exactly-once delivery guarantee. No cleanup or summary model turn is started, and already-completed or detached/background side effects are not rolled back.
-6. **Limits.** Each lock cycle allows up to **10** automatic continuations (`maxRetries`); when the budget is exhausted the watchdog stays locked, publishes one exhaustion event, and stops continuing until a new user message or manual lock. A continuation that cannot be durably published is rolled back and retried later.
+6. **jev wait gate.** Just before an automatic continuation, if a TypeSafe or OpenRouter key is available, the watchdog sends only the final assistant message's visible text (key redacted) to TypeSafe's **jev** model and asks one Choice question: is this message clearly waiting for a user answer? A `waiting_user` answer with confidence ≥ `confidenceThreshold` (default 0.8) unlocks instead of continuing, without consuming an attempt, shows `Continue watchdog unlocked · WAIT_USER (jev: …)`, and publishes `user-ready` with `STOP_KIND=AI_UNLOCK`, `REASON_TYPE=WAIT_USER`, and `REASON` = `jev model judged the final output to be a question for the user: <last paragraph>` (≤ 1000 code points; an overlong paragraph keeps its tail behind `…`). Everything else (no key, text-less final message, error, timeout, `not_waiting`, `unclear`, low confidence) continues exactly as before. Each assistant message is classified at most once per session, and a verdict is dropped when any activity, branch navigation, unlock, or new lock cycle happened during the request. Keys are resolved from Pi's own `typesafe` / `openrouter` credentials, then `TYPESAFE_API_KEY` / `OPENROUTER_API_KEY`, then the global `jevWaitCheck.apiKey`; TypeSafe is tried first.
+7. **Limits.** Each lock cycle allows up to **10** automatic continuations (`maxRetries`); when the budget is exhausted the watchdog stays locked, publishes one exhaustion event, and stops continuing until a new user message or manual lock. A continuation that cannot be durably published is rolled back and retried later.
 
 There is no hidden decision question, no XML protocol, and no re-ask machinery: the agent either calls the tool or is continued.
 
@@ -62,7 +63,8 @@ Precedence: **built-in defaults < global < trusted project**. Files: `~/.pi/agen
   "maxRetries": 10,
   "continuePrompt": "Continue until user assistance is required.",
   "reasonTypes": ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
-  "unlockShortcut": "alt+u"
+  "unlockShortcut": "alt+u",
+  "jevWaitCheck": { "enabled": true, "confidenceThreshold": 0.8, "timeoutMs": 15000 }
 }
 ```
 
@@ -72,6 +74,12 @@ Precedence: **built-in defaults < global < trusted project**. Files: `~/.pi/agen
 | `continuePrompt` | `Continue until user assistance is required.` | Non-blank guidance, ≤ 16384 Unicode code points; embedded verbatim in the fixed extension-attributed continuation body |
 | `reasonTypes` | `["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"]` | Allowed unlock-tool types; a valid list replaces defaults |
 | `unlockShortcut` | `"alt+u"` | Key id for the unlock shortcut, or `false` to disable (the command stays available). Why not `keybindings.json`: Pi exposes no namespaced keybinding ids for extension shortcuts, so plugin config is the only user-level rebinding surface; Pi's native conflict diagnostics still apply to the registered key |
+| `jevWaitCheck.enabled` | `true` | Gate is active only when a key resolves; `false` never sends a request |
+| `jevWaitCheck.apiUrl` | automatic | Must be an http(s) URL. `https://api.typesafe.ai/v1/systemone` or `https://openrouter.ai/api/v1/systemone`; unset tries TypeSafe then OpenRouter; a custom URL uses only `apiKey` |
+| `jevWaitCheck.model` | `"jev-latest"` | jev model id |
+| `jevWaitCheck.confidenceThreshold` | `0.8` | Number in `[0, 1]` |
+| `jevWaitCheck.timeoutMs` | `15000` | Integer ≥ `1000`; the request is not retried |
+| `jevWaitCheck.apiKey` | none | **Global file only**; a project value is ignored with a diagnostic |
 | `idleDelaySeconds` | `10` | **Deprecated**, accepted but ignored; the idle fence is fixed at 10 seconds |
 
 The removed keys `decisionPrompt` and `continueReasonTypes` are **errors**: when present, the extension reports an explicit diagnostic naming the key and it has no effect. Remove them from your configuration.
@@ -99,7 +107,7 @@ Delivery is best-effort; no consumer is required or waited for.
 - Only the elected main session decides; other attachments only observe. A UI-bound session wins main; otherwise the first-bound attachment is the best-effort main.
 - Lock state is runtime-only: it is not restored after a process restart, and a fresh process starts unlocked. New automatic-continue and exhaustion results are persistent shared conversation events, subject to Pi's normal active-branch and compaction behavior. Pre-upgrade records — including wait, completed-wait, AI-unlock, decision-failure events and inquiry exchanges — remain readable and stay folded out of provider context, but are never rewritten, backfilled into model history, assigned invented timestamps, or used to restore timers.
 - The unlock tool is registered only in root processes and never unregistered; its execution effect is main-only.
-- No external network connections are opened. Cross-process coordination uses an authenticated loopback transport local to this machine; all model traffic goes through the session's normal Pi provider.
+- The only external network connection is the optional jev wait gate (see Privacy). Cross-process coordination uses an authenticated loopback transport local to this machine; continuation turns go through the session's normal Pi provider.
 
 ## Development
 
@@ -113,4 +121,4 @@ npm run test:e2e   # packed install + stock Pi E2E
 
 ## Privacy
 
-The extension opens no external network connections. Cross-process coordination uses authenticated loopback sockets on this machine only; continuation turns use the session's normal Pi model provider. Automatic result events use one immutable timestamped body for both human history and model context. Raw hidden model output, provider errors, TUI-only legacy entries, and audit records are not promoted into that shared timeline.
+When a TypeSafe or OpenRouter key is available and `jevWaitCheck.enabled` is not `false`, the visible text of the final assistant message (never tool arguments/results, thinking, system prompt, or earlier messages; the key is redacted) is sent to that provider before an automatic continuation. Otherwise the extension opens no external network connections. Cross-process coordination uses authenticated loopback sockets on this machine only; continuation turns use the session's normal Pi model provider. Automatic result events use one immutable timestamped body for both human history and model context. Raw hidden model output, provider errors, TUI-only legacy entries, and audit records are not promoted into that shared timeline.

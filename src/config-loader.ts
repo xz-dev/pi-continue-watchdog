@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import {
 	type ConfigDiagnostic,
+	type ConfigLayer,
 	type ContinueWatchdogConfig,
 	loadConfigText,
 	mergeConfig,
@@ -46,7 +47,7 @@ async function readConfig(
 	source: string,
 	io: ConfigFileIO,
 ): Promise<{
-	config: Partial<ContinueWatchdogConfig>;
+	config: ConfigLayer;
 	diagnostics: ConfigDiagnostic[];
 }> {
 	try {
@@ -84,7 +85,7 @@ export async function loadRuntimeConfig(
 				io,
 			)
 		: {
-				config: {} as Partial<ContinueWatchdogConfig>,
+				config: {} as ConfigLayer,
 				diagnostics: [] as ConfigDiagnostic[],
 			};
 

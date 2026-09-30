@@ -112,6 +112,7 @@ Continue until user assistance is required.
 | `maxRetries` | `10` | Automatic continuations per lock cycle; safe integer in `[1, 10]` |
 | `continuePrompt` | exact default above | Guidance embedded verbatim in the fixed continuation body; nonblank and at most 16,384 Unicode code points |
 | `reasonTypes` | `["JOB_DONE","WAIT_USER","JOB_BLOCKED"]` | Allowed unlock-tool types. A valid configured list **replaces** the default. |
+| `jevWaitCheck` | `{enabled: true, model: "jev-latest", confidenceThreshold: 0.8, timeoutMs: 15000}` | jev wait gate (see below). Fields merge individually; `apiUrl` optional and must be an http(s) URL; `apiKey` is global-only and a project value is ignored with a diagnostic. |
 
 The removed keys `decisionPrompt` and `continueReasonTypes` are **errors**: when present, the extension reports a named error diagnostic and the key has no effect.
 
@@ -219,6 +220,17 @@ When the agent needs some work to finish, the continuation body instructs it to 
 5. Rolls the attempt back when the send throws, when ownership is lost during the send, or when the run settles while the continuation is still pending-start (Pi's asynchronous send failed before `message_start`). No hook is published for a rolled-back attempt, and a later qualified idle retries.
 
 When the budget is already spent, the existing exhaustion behavior applies instead: one shared exhaustion event and one `user-ready` `EXHAUSTED` envelope, no work turn.
+
+### jev wait gate (the only pre-continuation check)
+
+After the wake-time guards pass and before step 1, when `jevWaitCheck.enabled` is true, the latest branch entry of the settled run is an assistant message with `stopReason: "stop"` and non-blank visible text, and a key resolves (Pi `typesafe`/`openrouter` credentials, then `TYPESAFE_API_KEY`/`OPENROUTER_API_KEY`, then global `jevWaitCheck.apiKey`; TypeSafe first unless `apiUrl` selects one):
+
+1. Only that text, with the key redacted, is sent as one jev Choice question (`waiting_user` / `not_waiting` / `unclear`). Each assistant entry id is classified at most once per session (revisiting it reuses the same request); a qualification with no resolvable key sends nothing and caches nothing, so a key that appears later still enables the gate.
+2. The exact qualified generation (ownership, aggregate activity, grace phase, local activity), a fresh idle probe, the lock, and the classified entry being the branch's latest assistant entry must still hold both after the credential lookup (else no request is sent) and after the request. Tree navigation re-arms the fence without probing idle, because Pi emits `session_tree` while its branch-summary state still reads busy. If any check fails, the verdict is discarded and neither unlock nor continuation follows from it.
+3. `waiting_user` with confidence ≥ `confidenceThreshold`: AI unlock without consuming an attempt, one TUI notify, and one `user-ready` with `STOP_KIND=AI_UNLOCK`, `REASON_TYPE=WAIT_USER`, `REASON="jev model judged the final output to be a question for the user: " + last paragraph` (≤ 1000 code points, tail kept behind `…`). No model-visible message is added.
+4. Anything else (no key, no text, HTTP/network error, timeout, malformed answer, `not_waiting`, `unclear`, low confidence) proceeds to step 1 unchanged. No retry; shutdown aborts the request.
+
+The gate never runs on the exhaustion, terminal-error, abort, or unlocked paths and adds no fixed delay.
 
 ### Shared automatic timeline
 

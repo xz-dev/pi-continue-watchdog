@@ -387,3 +387,75 @@ test("invalid unlockShortcut values fall back to the default with one bounded di
 		),
 	);
 });
+
+test("jevWaitCheck defaults apply when unset", () => {
+	const merged = mergeConfig({}, {});
+	assert.deepEqual(merged.config.jevWaitCheck, {
+		enabled: true,
+		model: "jev-latest",
+		confidenceThreshold: 0.8,
+		timeoutMs: 15_000,
+	});
+	assert.deepEqual(merged.diagnostics, []);
+});
+
+test("jevWaitCheck merges per field across layers", () => {
+	const merged = mergeConfig(
+		{ jevWaitCheck: { enabled: false, apiKey: "global-key", timeoutMs: 5000 } },
+		{ jevWaitCheck: { model: "jev-custom" } },
+	);
+	assert.deepEqual(merged.config.jevWaitCheck, {
+		enabled: false,
+		model: "jev-custom",
+		confidenceThreshold: 0.8,
+		timeoutMs: 5000,
+		apiKey: "global-key",
+	});
+});
+
+test("invalid jevWaitCheck threshold keeps the lower-precedence value", () => {
+	const merged = mergeConfig(
+		{ jevWaitCheck: { confidenceThreshold: 0.9 } },
+		{ jevWaitCheck: { confidenceThreshold: 1.5, timeoutMs: 10 } },
+	);
+	assert.equal(merged.config.jevWaitCheck?.confidenceThreshold, 0.9);
+	assert.equal(merged.config.jevWaitCheck?.timeoutMs, 15_000);
+	const messages = merged.diagnostics.map((item) => item.message);
+	assert.ok(
+		messages.some((message) => message.includes("confidenceThreshold")),
+	);
+	assert.ok(messages.some((message) => message.includes("timeoutMs")));
+});
+
+test("project jevWaitCheck.apiKey is ignored with a diagnostic naming it", () => {
+	const merged = mergeConfig(
+		{ jevWaitCheck: { apiKey: "global-key" } },
+		{ jevWaitCheck: { apiKey: "project-key" } },
+	);
+	assert.equal(merged.config.jevWaitCheck?.apiKey, "global-key");
+	assert.ok(
+		merged.diagnostics.some(
+			(item) =>
+				item.source === "project" &&
+				item.message.includes("jevWaitCheck.apiKey"),
+		),
+	);
+});
+
+test("malformed jevWaitCheck.apiUrl keeps the lower-precedence endpoint", () => {
+	const merged = mergeConfig(
+		{ jevWaitCheck: { apiUrl: "https://api.typesafe.ai/v1/systemone" } },
+		{ jevWaitCheck: { apiUrl: "not-a-url" } },
+	);
+	assert.equal(
+		merged.config.jevWaitCheck?.apiUrl,
+		"https://api.typesafe.ai/v1/systemone",
+	);
+	assert.ok(
+		merged.diagnostics.some(
+			(item) =>
+				item.source === "project" &&
+				item.message.includes("jevWaitCheck.apiUrl"),
+		),
+	);
+});
