@@ -176,7 +176,10 @@ def appendSharedEvent
 The direct continuation body is extension-authored, explicitly not a user
 message or authorization, embeds the configured guidance, states that the
 agent ended its turn without calling the unlock tool, and carries the
-unlock-or-continue and wait-by-blocking instructions.
+unlock-or-continue and wait-by-blocking instructions. It also carries the
+completeness check shared verbatim with the unlock tool description: compare
+every requested task, including earlier ones, with what was delivered before
+unlocking, and treat a non-user blocker as an unlock case too.
 -/
 
 structure ContinuationEnvelope where
@@ -187,6 +190,8 @@ structure ContinuationEnvelope where
   stopAtUserBoundary : Bool
   endedWithoutUnlockTool : Bool
   waitByBlockingOrSleeping : Bool
+  checksEveryRequestedTask : Bool
+  unlockOnNonUserBlocker : Bool
   deriving DecidableEq, Repr
 
 def buildContinuationEnvelope (guidance : String) : ContinuationEnvelope :=
@@ -196,7 +201,9 @@ def buildContinuationEnvelope (guidance : String) : ContinuationEnvelope :=
     conveysUserAuthorization := false
     stopAtUserBoundary := true
     endedWithoutUnlockTool := true
-    waitByBlockingOrSleeping := true }
+    waitByBlockingOrSleeping := true
+    checksEveryRequestedTask := true
+    unlockOnNonUserBlocker := true }
 
 /-!
 ## Unlock tool
@@ -623,6 +630,12 @@ theorem continuation_states_missing_tool_call
     (guidance : String) :
     (buildContinuationEnvelope guidance).endedWithoutUnlockTool = true ∧
       (buildContinuationEnvelope guidance).waitByBlockingOrSleeping = true := by
+  simp [buildContinuationEnvelope]
+
+theorem continuation_requires_completeness_check
+    (guidance : String) :
+    (buildContinuationEnvelope guidance).checksEveryRequestedTask = true ∧
+      (buildContinuationEnvelope guidance).unlockOnNonUserBlocker = true := by
   simp [buildContinuationEnvelope]
 
 theorem continuation_preserves_guidance

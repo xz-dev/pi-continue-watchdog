@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { stripVTControlCharacters } from "node:util";
+
+import {
+	initTheme,
+	ToolExecutionComponent,
+} from "@earendil-works/pi-coding-agent";
 
 import {
 	buildUnlockToolParameters,
@@ -11,11 +17,14 @@ import {
 	normalizeUnlockReason,
 	normalizeUnlockReasonType,
 	prepareUnlockToolArguments,
+	UNLOCK_COMPLETENESS_CHECK,
 	UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
+	UNLOCK_REASON_DESCRIPTION,
 	UNLOCK_TOOL_DESCRIPTION,
 	UNLOCK_TOOL_PROMPT_GUIDELINES,
 	UNLOCK_TOOL_PROMPT_SNIPPET,
 	type UnlockToolHost,
+	unlockReasonTypeDescription,
 	unlockReasonTypeEnum,
 	unlockToolUserReadyValues,
 	validateUnlockToolArguments,
@@ -29,6 +38,37 @@ test("tool name and description state the contract", () => {
 	assert.match(UNLOCK_TOOL_DESCRIPTION, /automatically continue your work/);
 	assert.match(UNLOCK_TOOL_DESCRIPTION, /pi-continue-watchdog extension/);
 	assert.match(UNLOCK_TOOL_DESCRIPTION, /reason_type/);
+	assert.ok(UNLOCK_TOOL_DESCRIPTION.includes(UNLOCK_COMPLETENESS_CHECK));
+	assert.match(
+		UNLOCK_COMPLETENESS_CHECK,
+		/including earlier requests and not only the latest one/,
+	);
+	assert.match(UNLOCK_COMPLETENESS_CHECK, /cancelled, or superseded/);
+	assert.match(UNLOCK_COMPLETENESS_CHECK, /do it instead of calling this tool/);
+});
+
+test("reason_type and reason descriptions explain each value", () => {
+	assert.equal(
+		unlockReasonTypeDescription(DEFAULT_TYPES),
+		"Why work stops: JOB_DONE = all requested work is complete; WAIT_USER = user input, approval, or other user action is required; JOB_BLOCKED = work is blocked by something other than a user action. Matched case-insensitively after trimming.",
+	);
+	// Custom types are listed by name only; built-ins keep their meaning.
+	assert.equal(
+		unlockReasonTypeDescription(["job_done", "Needs_Review"]),
+		"Why work stops: JOB_DONE = all requested work is complete; NEEDS_REVIEW. Matched case-insensitively after trimming.",
+	);
+	const schema = JSON.parse(
+		JSON.stringify(buildUnlockToolParameters(DEFAULT_TYPES)),
+	) as { properties: Record<string, { description?: string }> };
+	assert.equal(
+		schema.properties.reason_type.description,
+		unlockReasonTypeDescription(DEFAULT_TYPES),
+	);
+	assert.equal(schema.properties.reason.description, UNLOCK_REASON_DESCRIPTION);
+	assert.match(
+		UNLOCK_REASON_DESCRIPTION,
+		/what was delivered, what the user must do, or what blocks the work/,
+	);
 });
 
 test("tool is listed in the system prompt with stable guidelines", () => {
@@ -45,6 +85,8 @@ test("tool is listed in the system prompt with stable guidelines", () => {
 	assert.match(joined, /call unlock_continue_watchdog/);
 	assert.match(joined, /automatically continues your work/);
 	assert.match(joined, /sleep for your estimated duration/);
+	assert.match(joined, /blocked without a user action/);
+	assert.match(joined, /including earlier requests, is still missing/);
 	// Deterministic: two definitions produce identical prompt contributions.
 	const again = createUnlockToolDefinition(
 		{ reasonTypes: DEFAULT_TYPES },
@@ -243,7 +285,8 @@ test("unlockToolUserReadyValues carries type and reason", () => {
 	);
 });
 
-test("successful unlock renders one line: header hides once the result is in", () => {
+test("unlock tool row renders through Pi's ToolExecutionComponent without duplication", () => {
+	initTheme(undefined, false);
 	const tool = createUnlockToolDefinition(
 		{ reasonTypes: DEFAULT_TYPES },
 		{
@@ -252,77 +295,49 @@ test("successful unlock renders one line: header hides once the result is in", (
 			applyAiUnlock: () => true,
 		},
 	);
-	const theme = { fg: (_color: string, text: string) => text } as never;
-	const lines = (component: { render(width: number): string[] }) =>
-		component.render(200).join("\n").trim();
-	const renderRow = (result: {
+	const rows = (result?: {
 		content: { type: "text"; text: string }[];
 		details?: unknown;
-		isError?: boolean;
-	}) => {
-		const state = {};
-		let invalidations = 0;
-		const context = (isPartial: boolean) =>
-			({
-				state,
-				isPartial,
-				isError: result.isError ?? false,
-				invalidate: () => {
-					invalidations += 1;
-				},
-			}) as never;
-		const args = { reason_type: "job_done", reason: "All done." };
-		// Pi order: call slot, then result slot; invalidate() redraws both.
-		const running = lines(
-			tool.renderCall?.(args as never, theme, context(true)) as never,
+		isError: boolean;
+	}): string[] => {
+		const row = new ToolExecutionComponent(
+			UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
+			"call-1",
+			{ reason_type: "WAIT_USER", reason: "Need approval." },
+			{},
+			tool as never,
+			{ requestRender() {} } as never,
+			"/tmp",
 		);
-		lines(tool.renderCall?.(args as never, theme, context(false)) as never);
-		const body = lines(
-			tool.renderResult?.(
-				result as never,
-				{ expanded: false, isPartial: false },
-				theme,
-				context(false),
-			) as never,
-		);
-		const header = lines(
-			tool.renderCall?.(args as never, theme, context(false)) as never,
-		);
-		// A second result render with the same outcome does not redraw again.
-		tool.renderResult?.(
-			result as never,
-			{ expanded: false, isPartial: false },
-			theme,
-			context(false),
-		);
-		return { running, header, body, invalidations };
+		row.setArgsComplete();
+		row.markExecutionStarted();
+		if (result !== undefined) row.updateResult(result as never, false);
+		return row
+			.render(160)
+			.map((line) => stripVTControlCharacters(line).trim())
+			.filter((line) => line.length > 0);
 	};
 
-	const unlocked = renderRow({
-		content: [{ type: "text", text: "Continue watchdog unlocked · JOB_DONE" }],
-		details: {
-			outcome: "unlocked",
-			reasonType: "JOB_DONE",
-			reason: "All done.",
-		},
-	});
-	assert.equal(unlocked.running, "Continue watchdog unlock · JOB_DONE");
-	assert.equal(unlocked.header, "");
-	assert.equal(
-		unlocked.body,
-		"Continue watchdog unlocked · JOB_DONE · All done.",
+	assert.deepEqual(rows(), ["Continue watchdog unlock · WAIT_USER"]);
+	assert.deepEqual(
+		rows({
+			content: [
+				{ type: "text", text: "Continue watchdog unlocked · WAIT_USER" },
+			],
+			details: {
+				outcome: "unlocked",
+				reasonType: "WAIT_USER",
+				reason: "Need approval.",
+			},
+			isError: false,
+		}),
+		["Continue watchdog unlocked · WAIT_USER · Need approval."],
 	);
-	assert.equal(unlocked.invalidations, 1);
-
-	const informational = renderRow({
-		content: [{ type: "text", text: "Continue watchdog is not locked." }],
-		details: { outcome: "not-locked" },
-	});
-	assert.equal(informational.header, "Continue watchdog unlock · JOB_DONE");
-
-	const failed = renderRow({
-		content: [{ type: "text", text: "reason_type must match" }],
-		isError: true,
-	});
-	assert.equal(failed.header, "Continue watchdog unlock · JOB_DONE");
+	assert.deepEqual(
+		rows({
+			content: [{ type: "text", text: "reason_type must match" }],
+			isError: true,
+		}),
+		["Continue watchdog unlock · WAIT_USER", "reason_type must match"],
+	);
 });

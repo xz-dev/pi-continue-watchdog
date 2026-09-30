@@ -31,7 +31,7 @@ Use `pi update --extensions` to update. Reload Pi extensions or start a new sess
    { "reason_type": "JOB_DONE", "reason": "All requested work is complete." }
    ```
 
-   `reason_type` matches the configured `reasonTypes` case-insensitively after trimming; `reason` is non-blank and at most 1000 Unicode characters. The tool description tells the agent it must call this tool to signal completion or a user boundary, and that ending a turn without calling it gets the work continued automatically.
+   `reason_type` matches the configured `reasonTypes` case-insensitively after trimming; `reason` is non-blank and at most 1000 Unicode characters. The tool description tells the agent it must call this tool to signal completion, a user boundary, or a non-user blocker, and that ending a turn without calling it gets the work continued automatically. Before calling it, the agent checks every task requested in the session, including earlier requests, against what was delivered, and keeps working while authorized work can still proceed. The `reason_type` schema enumerates the configured values and explains the built-in ones (`JOB_DONE`, `WAIT_USER`, `JOB_BLOCKED`); `reason` asks for one sentence on what was delivered, what the user must do, or what blocks the work.
 
    - A valid call from the locked current main agent unlocks the watchdog, ends the run without a follow-up model request, and publishes the `user-ready` hook with `STOP_KIND=AI_UNLOCK` plus the normalized `REASON_TYPE` and `REASON` (publication waits for busy children and process-domain idle).
    - Invalid arguments fail as an ordinary tool error; the model can simply retry.

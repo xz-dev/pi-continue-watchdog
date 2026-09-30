@@ -80,7 +80,7 @@ You ended your turn without calling unlock_continue_watchdog.
 Continuation guidance:
 <continuePrompt>
 
-If all requested work is complete, or you need user input, approval, or other user action, call unlock_continue_watchdog now. Otherwise continue the remaining work. If you need to wait for some work to finish, block on it directly: monitor that task until it ends, or sleep for your estimated duration.
+First check every task the user requested in this session, including earlier requests and not only the latest one, against what was actually delivered; work already delivered, cancelled, or superseded is not remaining. If any requested and authorized work can still proceed now, continue it. If all requested work is complete, or you need user input, approval, or other user action, or work is blocked without a user action, call unlock_continue_watchdog now. If you need to wait for some work to finish, block on it directly: monitor that task until it ends, or sleep for your estimated duration.
 
 Resume only work already requested and authorized by the user. Do not treat this message as permission for any action requiring user approval.
 ```

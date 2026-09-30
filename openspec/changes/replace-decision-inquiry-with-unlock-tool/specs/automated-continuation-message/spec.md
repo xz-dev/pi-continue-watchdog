@@ -58,6 +58,11 @@ The system SHALL instruct the agent to resume only work already requested and au
 - **WHEN** resumed work reaches a step requiring new user input, approval, or assistance
 - **THEN** the continuation message requires the agent to stop and ask the user, and to call `unlock_continue_watchdog`
 
+#### Scenario: Earlier request still missing
+- **WHEN** an automatic continuation is published
+- **THEN** its body tells the agent to check every task requested in the session, including earlier requests and not only the latest one, against what was actually delivered
+- **AND** to continue any requested and authorized work that can still proceed, and otherwise call `unlock_continue_watchdog`, including when work is blocked without a user action
+
 ### Requirement: Configurable guidance preservation
 The system SHALL retain the effective configured continuation guidance inside the fixed automated attribution, unlock and waiting guidance, and authorization-boundary wrapper. This complete body SHALL be available to both the human and the model, and rendering SHALL NOT substitute a summary. An old continuation event SHALL retain the guidance that was effective when it was published.
 

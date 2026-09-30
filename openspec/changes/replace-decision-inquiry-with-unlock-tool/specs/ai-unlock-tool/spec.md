@@ -17,16 +17,25 @@ The watchdog SHALL register exactly one model-callable tool named `unlock_contin
 - **THEN** no `unlock_continue_watchdog` tool is registered in that child
 
 ### Requirement: Model-facing tool contract
-The tool description SHALL state that it belongs to the pi-continue-watchdog extension and that the agent must call it to signal that the requested work is complete or that user input, approval, or other user action is required. It SHALL also state that ending a turn without calling it causes the agent to be continued automatically. The tool SHALL accept exactly two parameters:
+The tool description SHALL state that it belongs to the pi-continue-watchdog extension and that the agent must call it to signal that the requested work is complete, that user input, approval, or other user action is required, or that work is blocked without a user action. It SHALL also state that ending a turn without calling it causes the agent to be continued automatically.
+
+The description SHALL require a completeness check before calling: compare every task the user requested in the session, including earlier requests and not only the latest one, with what was actually delivered; delivered, cancelled, or superseded work is not remaining; and if requested and authorized work can still proceed now, the agent continues it instead of calling the tool. The same check SHALL appear in the session-stable prompt guideline and in the automatic continuation body.
+
+The tool SHALL accept exactly two parameters:
 - `reason_type`: a string matching one of the effective configured `reasonTypes`, case-insensitive after trimming.
 - `reason`: a string that is non-empty after trimming and at most 1000 Unicode code points.
 
-The schema SHALL enumerate the effective allowed reason types.
+The schema SHALL enumerate the effective allowed reason types. The `reason_type` description SHALL explain each built-in value (`JOB_DONE`: all requested work is complete; `WAIT_USER`: user input, approval, or other user action is required; `JOB_BLOCKED`: work is blocked by something other than a user action) and SHALL list any other configured value by name only. The `reason` description SHALL ask for one concise sentence on what was delivered, what the user must do, or what blocks the work.
 
 #### Scenario: Model reads the tool
 - **WHEN** the provider receives the tool definition
 - **THEN** the description states the call-to-stop obligation and the automatic continuation consequence
-- **AND** the `reason_type` schema lists the configured reason types
+- **AND** the description requires checking every requested task, including earlier ones, before calling
+- **AND** the `reason_type` schema lists the configured reason types with the meaning of each built-in one
+
+#### Scenario: Custom reason type
+- **WHEN** `reasonTypes` contains a value other than the built-in ones
+- **THEN** the `reason_type` description lists it by name without inventing a meaning
 
 ### Requirement: Valid call from the locked main agent unlocks
 When the current main agent calls the tool with valid arguments while the watchdog is locked, the watchdog SHALL:

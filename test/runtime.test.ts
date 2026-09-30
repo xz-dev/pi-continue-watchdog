@@ -351,6 +351,11 @@ test("idle continuation: direct message, no inquiry", async () => {
 		body,
 		/monitor that task until it ends, or sleep for your estimated duration/,
 	);
+	assert.match(
+		body,
+		/check every task the user requested in this session, including earlier requests and not only the latest one/,
+	);
+	assert.match(body, /work is blocked without a user action/);
 	assert.equal(harness.controller.snapshot.attempt, 1);
 	assert.equal(harness.controller.snapshot.locked, true);
 	// No inquiry prompt was ever sent.

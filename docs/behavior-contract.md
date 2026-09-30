@@ -187,7 +187,7 @@ Unlock first makes `locked=false`, then invalidates the current aggregate grace 
 - `reason_type`: a string matched case-insensitively after trimming against the effective `reasonTypes`; the matched configured value is emitted uppercase
 - `reason`: trimmed, non-empty, at most 1000 Unicode code points
 
-The tool description states that the agent must call this tool to signal that all requested work is complete or that user input, approval, or other user action is required, and that ending a turn without calling it causes the work to be continued automatically. The tool is never unregistered, so the active tool list and system-prompt prefix stay stable. Child Pi processes in the watchdog process domain never register it.
+The tool description states that the agent must call this tool to signal that all requested work is complete, that user input, approval, or other user action is required, or that work is blocked without a user action, and that ending a turn without calling it causes the work to be continued automatically. It carries the completeness check shared with the continuation body: before calling, compare every task the user requested in the session, including earlier requests and not only the latest one, with what was actually delivered (delivered, cancelled, or superseded work is not remaining), and keep working instead while requested and authorized work can still proceed. The `reason_type` schema enumerates the effective values and its description explains each built-in one (`JOB_DONE` complete, `WAIT_USER` user action required, `JOB_BLOCKED` non-user blocker); custom values are listed by name. The `reason` description asks for one concise sentence on what was delivered, what the user must do, or what blocks the work. The tool is never unregistered, so the active tool list and system-prompt prefix stay stable. Child Pi processes in the watchdog process domain never register it.
 
 ### Execution
 
@@ -213,7 +213,7 @@ When the agent needs some work to finish, the continuation body instructs it to 
 **Then** the plugin:
 
 1. Consumes one attempt (`recordAutomaticContinue`), setting exhaustion at the budget.
-2. Publishes exactly one visible continuation custom message with `triggerTurn`, whose canonical body carries the runtime timestamp, extension attribution, non-authorization warning, the "ended without calling unlock_continue_watchdog" notice, the configured `continuePrompt`, the unlock-or-continue guidance, the wait-by-blocking-or-sleeping instruction, and the user-boundary stop rule.
+2. Publishes exactly one visible continuation custom message with `triggerTurn`, whose canonical body carries the runtime timestamp, extension attribution, non-authorization warning, the "ended without calling unlock_continue_watchdog" notice, the configured `continuePrompt`, the completeness check over every requested task including earlier ones, the unlock-or-continue guidance (including the non-user blocker case), the wait-by-blocking-or-sleeping instruction, and the user-boundary stop rule.
 3. Correlates the watchdog-owned run through the message's exchange identity so manual unlock can cancel exactly that run.
 4. Publishes the `watchdog-continued` hook with no values, only after the durable send: Pi's `sendMessage` is fire-and-forget, so the hook fires when the correlated continuation message reaches `message_start` (Pi appends it to the session at that point) while the claim is still owned, and at most once per exchange.
 5. Rolls the attempt back when the send throws, when ownership is lost during the send, or when the run settles while the continuation is still pending-start (Pi's asynchronous send failed before `message_start`). No hook is published for a rolled-back attempt, and a later qualified idle retries.
@@ -310,7 +310,7 @@ These examples are the accepted product contract. Each is externally observable 
 **Then**
 
 - exactly one visible continuation message is published with `triggerTurn`; no hidden inquiry is sent and no tools are blocked
-- the canonical body carries the RFC 3339 timestamp, extension attribution, non-authorization warning, the ended-without-calling-tool notice, the configured `continuePrompt`, the unlock-or-continue guidance, and the wait-by-blocking-or-sleeping instruction
+- the canonical body carries the RFC 3339 timestamp, extension attribution, non-authorization warning, the ended-without-calling-tool notice, the configured `continuePrompt`, the completeness check over every requested task including earlier ones, the unlock-or-continue guidance, and the wait-by-blocking-or-sleeping instruction
 - one shared attempt is consumed; the `watchdog-continued` hook publishes with no values
 
 ### Example 6 — The unlock tool stops the cycle

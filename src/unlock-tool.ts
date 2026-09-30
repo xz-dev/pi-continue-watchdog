@@ -15,8 +15,14 @@ export const UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME = "unlock_continue_watchdog";
 /** Hard limit for the model-provided reason, in Unicode code points. */
 export const MAX_TOOL_REASON_CHARACTERS = 1000;
 
-export const UNLOCK_TOOL_DESCRIPTION =
-	"Signal that your work should stop and control returns to the user. Call this tool when all requested work is complete, or when user input, approval, or other user action is required, or work is blocked without a user action. If you end your turn without calling this tool, the pi-continue-watchdog extension will automatically continue your work. This tool belongs to the pi-continue-watchdog extension; calling it is your decision, not a user request. Provide reason_type (one of the allowed values for this project) and a concise reason.";
+/**
+ * Shared completeness check, used verbatim by the tool description, the
+ * prompt guideline, and the continuation event body.
+ */
+export const UNLOCK_COMPLETENESS_CHECK =
+	"Before calling it, check every task the user requested in this session, including earlier requests and not only the latest one, against what was actually delivered; work already delivered, cancelled, or superseded is not remaining. If any requested and authorized work can still proceed now, do it instead of calling this tool.";
+
+export const UNLOCK_TOOL_DESCRIPTION = `Signal that your work should stop and control returns to the user. Call this tool when all requested work is complete, or when user input, approval, or other user action is required, or work is blocked without a user action. ${UNLOCK_COMPLETENESS_CHECK} If you end your turn without calling this tool, the pi-continue-watchdog extension will automatically continue your work. This tool belongs to the pi-continue-watchdog extension; calling it is your decision, not a user request. Provide reason_type (one of the allowed values for this project) and a concise reason.`;
 
 /** One-line entry for the system prompt's available-tools section. */
 export const UNLOCK_TOOL_PROMPT_SNIPPET =
@@ -24,7 +30,7 @@ export const UNLOCK_TOOL_PROMPT_SNIPPET =
 
 /** Session-stable system prompt guidelines; never change during a lock cycle. */
 export const UNLOCK_TOOL_PROMPT_GUIDELINES: readonly string[] = Object.freeze([
-	"Before ending a turn because all requested work is complete, or because you need user input, approval, or other user action, call unlock_continue_watchdog with a reason_type and a concise reason. If you end a turn without calling it, the pi-continue-watchdog extension automatically continues your work.",
+	"Before ending a turn because all requested work is complete, because you need user input, approval, or other user action, or because work is blocked without a user action, call unlock_continue_watchdog with a reason_type and a concise reason. First confirm that no task the user requested in this session, including earlier requests, is still missing and can proceed now. If you end a turn without calling it, the pi-continue-watchdog extension automatically continues your work.",
 	"If you need to wait for some work to finish, do not end the turn to wait: block on or monitor that task directly, or sleep for your estimated duration.",
 ]);
 
@@ -100,6 +106,27 @@ export function validateUnlockToolArguments(
 	return { reasonType, reason };
 }
 
+/** Meanings of the built-in reason types; custom types are listed by name only. */
+const KNOWN_REASON_TYPE_MEANINGS: Readonly<Record<string, string>> = {
+	JOB_DONE: "all requested work is complete",
+	WAIT_USER: "user input, approval, or other user action is required",
+	JOB_BLOCKED: "work is blocked by something other than a user action",
+};
+
+/** Model-facing reason_type description for the effective reason types. */
+export function unlockReasonTypeDescription(
+	reasonTypes: readonly string[],
+): string {
+	const values = unlockReasonTypeEnum(reasonTypes).map((entry) => {
+		const meaning = KNOWN_REASON_TYPE_MEANINGS[entry];
+		return meaning === undefined ? entry : `${entry} = ${meaning}`;
+	});
+	return `Why work stops: ${values.join("; ")}. Matched case-insensitively after trimming.`;
+}
+
+/** Model-facing reason description. */
+export const UNLOCK_REASON_DESCRIPTION = `One concise sentence: what was delivered, what the user must do, or what blocks the work. Non-empty after trimming and at most ${MAX_TOOL_REASON_CHARACTERS} Unicode characters.`;
+
 /** Canonical (uppercased, de-duplicated) schema values for the reason types. */
 export function unlockReasonTypeEnum(reasonTypes: readonly string[]): string[] {
 	return [...new Set(reasonTypes.map((entry) => entry.toUpperCase()))];
@@ -119,14 +146,11 @@ export function buildUnlockToolParameters(
 		{
 			reason_type: Type.Union(
 				unlockReasonTypeEnum(reasonTypes).map((entry) => Type.Literal(entry)),
-				{
-					description:
-						"Why work stops. Matched case-insensitively after trimming.",
-				},
+				{ description: unlockReasonTypeDescription(reasonTypes) },
 			),
 			reason: Type.String({
 				minLength: 1,
-				description: `Concise reason, non-empty after trimming and at most ${MAX_TOOL_REASON_CHARACTERS} Unicode characters.`,
+				description: UNLOCK_REASON_DESCRIPTION,
 			}),
 		},
 		{ additionalProperties: false },
@@ -224,14 +248,12 @@ export function createUnlockToolDefinition(
 			};
 		},
 		renderCall(args: unknown, theme, context) {
-			// Pi renders call and result in the same row. Once the unlock succeeded,
-			// the result line already states the reason type, so the call header
-			// would only repeat it; errors and informational results keep both.
-			if (
-				context?.isPartial === false &&
-				!context.isError &&
-				unlockSucceeded(context.state)
-			) {
+			// Pi renders call and result in the same row. Once a final non-error
+			// result exists it states the outcome itself, so the call header would
+			// only repeat it; errors keep the header to show which call failed.
+			// Decided from the render context alone: calling invalidate() from a
+			// renderer re-enters Pi's updateDisplay and duplicates the result row.
+			if (context?.isPartial === false && !context.isError) {
 				return new Container();
 			}
 			const reasonType =
@@ -248,17 +270,7 @@ export function createUnlockToolDefinition(
 				0,
 			);
 		},
-		renderResult(result, _options, theme, context) {
-			// Pi renders the call slot before the result slot, so the header only
-			// sees the outcome on the next render. Redraw once when it changes.
-			if (context?.state !== undefined) {
-				const state = context.state as UnlockRenderState;
-				const unlocked = result.details?.outcome === "unlocked";
-				if (state.unlocked !== unlocked) {
-					state.unlocked = unlocked;
-					context.invalidate();
-				}
-			}
+		renderResult(result, _options, theme) {
 			const text = result.content
 				.map((block) => (block.type === "text" ? block.text : ""))
 				.join("");
@@ -269,15 +281,6 @@ export function createUnlockToolDefinition(
 			return new Text(theme.fg("toolOutput", `${text}${reason}`), 0, 0);
 		},
 	} as ToolDefinition<TSchema, UnlockToolDetails>;
-}
-
-/** Row-local renderer state shared between renderCall and renderResult. */
-interface UnlockRenderState {
-	unlocked?: boolean;
-}
-
-function unlockSucceeded(state: unknown): boolean {
-	return (state as UnlockRenderState | undefined)?.unlocked === true;
 }
 
 /** Pending user-ready intent recorded by a valid tool unlock. */
