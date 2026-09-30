@@ -242,3 +242,87 @@ test("unlockToolUserReadyValues carries type and reason", () => {
 		},
 	);
 });
+
+test("successful unlock renders one line: header hides once the result is in", () => {
+	const tool = createUnlockToolDefinition(
+		{ reasonTypes: DEFAULT_TYPES },
+		{
+			isCurrentMain: () => true,
+			isLocked: () => true,
+			applyAiUnlock: () => true,
+		},
+	);
+	const theme = { fg: (_color: string, text: string) => text } as never;
+	const lines = (component: { render(width: number): string[] }) =>
+		component.render(200).join("\n").trim();
+	const renderRow = (result: {
+		content: { type: "text"; text: string }[];
+		details?: unknown;
+		isError?: boolean;
+	}) => {
+		const state = {};
+		let invalidations = 0;
+		const context = (isPartial: boolean) =>
+			({
+				state,
+				isPartial,
+				isError: result.isError ?? false,
+				invalidate: () => {
+					invalidations += 1;
+				},
+			}) as never;
+		const args = { reason_type: "job_done", reason: "All done." };
+		// Pi order: call slot, then result slot; invalidate() redraws both.
+		const running = lines(
+			tool.renderCall?.(args as never, theme, context(true)) as never,
+		);
+		lines(tool.renderCall?.(args as never, theme, context(false)) as never);
+		const body = lines(
+			tool.renderResult?.(
+				result as never,
+				{ expanded: false, isPartial: false },
+				theme,
+				context(false),
+			) as never,
+		);
+		const header = lines(
+			tool.renderCall?.(args as never, theme, context(false)) as never,
+		);
+		// A second result render with the same outcome does not redraw again.
+		tool.renderResult?.(
+			result as never,
+			{ expanded: false, isPartial: false },
+			theme,
+			context(false),
+		);
+		return { running, header, body, invalidations };
+	};
+
+	const unlocked = renderRow({
+		content: [{ type: "text", text: "Continue watchdog unlocked · JOB_DONE" }],
+		details: {
+			outcome: "unlocked",
+			reasonType: "JOB_DONE",
+			reason: "All done.",
+		},
+	});
+	assert.equal(unlocked.running, "Continue watchdog unlock · JOB_DONE");
+	assert.equal(unlocked.header, "");
+	assert.equal(
+		unlocked.body,
+		"Continue watchdog unlocked · JOB_DONE · All done.",
+	);
+	assert.equal(unlocked.invalidations, 1);
+
+	const informational = renderRow({
+		content: [{ type: "text", text: "Continue watchdog is not locked." }],
+		details: { outcome: "not-locked" },
+	});
+	assert.equal(informational.header, "Continue watchdog unlock · JOB_DONE");
+
+	const failed = renderRow({
+		content: [{ type: "text", text: "reason_type must match" }],
+		isError: true,
+	});
+	assert.equal(failed.header, "Continue watchdog unlock · JOB_DONE");
+});

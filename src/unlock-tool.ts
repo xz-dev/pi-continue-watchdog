@@ -3,7 +3,7 @@ import type {
 	ExtensionAPI,
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Container, Text } from "@earendil-works/pi-tui";
 import { type TSchema, Type } from "typebox";
 import type { ContinueWatchdogConfig } from "./config.js";
 import { hasAtMostUnicodeCodePoints } from "./config.js";
@@ -223,7 +223,17 @@ export function createUnlockToolDefinition(
 				terminate: true,
 			};
 		},
-		renderCall(args: unknown, theme) {
+		renderCall(args: unknown, theme, context) {
+			// Pi renders call and result in the same row. Once the unlock succeeded,
+			// the result line already states the reason type, so the call header
+			// would only repeat it; errors and informational results keep both.
+			if (
+				context?.isPartial === false &&
+				!context.isError &&
+				unlockSucceeded(context.state)
+			) {
+				return new Container();
+			}
 			const reasonType =
 				typeof (args as { reason_type?: unknown } | null)?.reason_type ===
 				"string"
@@ -238,7 +248,17 @@ export function createUnlockToolDefinition(
 				0,
 			);
 		},
-		renderResult(result, _options, theme) {
+		renderResult(result, _options, theme, context) {
+			// Pi renders the call slot before the result slot, so the header only
+			// sees the outcome on the next render. Redraw once when it changes.
+			if (context?.state !== undefined) {
+				const state = context.state as UnlockRenderState;
+				const unlocked = result.details?.outcome === "unlocked";
+				if (state.unlocked !== unlocked) {
+					state.unlocked = unlocked;
+					context.invalidate();
+				}
+			}
 			const text = result.content
 				.map((block) => (block.type === "text" ? block.text : ""))
 				.join("");
@@ -249,6 +269,15 @@ export function createUnlockToolDefinition(
 			return new Text(theme.fg("toolOutput", `${text}${reason}`), 0, 0);
 		},
 	} as ToolDefinition<TSchema, UnlockToolDetails>;
+}
+
+/** Row-local renderer state shared between renderCall and renderResult. */
+interface UnlockRenderState {
+	unlocked?: boolean;
+}
+
+function unlockSucceeded(state: unknown): boolean {
+	return (state as UnlockRenderState | undefined)?.unlocked === true;
 }
 
 /** Pending user-ready intent recorded by a valid tool unlock. */

@@ -12,7 +12,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
-import { tmpdir } from "node:os";
+import { loadavg, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test, { type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -578,6 +578,7 @@ interface ChildHarnessSnapshot {
 interface ChildHarness {
 	readonly process: ChildProcess;
 	command<T>(command: string, prompt?: string): Promise<T>;
+	output(): string;
 	stop(): Promise<void>;
 }
 
@@ -678,6 +679,10 @@ function spawnPackedChild(
 					...(prompt === undefined ? {} : { prompt }),
 				});
 			});
+		},
+		/** Captured child output, for failure diagnostics only. */
+		output(): string {
+			return `stdout=${stdout}\nstderr=${stderr}`;
 		},
 		async stop(): Promise<void> {
 			if (child.exitCode === null && child.signalCode === null) {
@@ -882,11 +887,36 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		"prompt",
 		"Stay busy across the root's first idle delay.",
 	);
-	await waitFor(
-		() => requests.some((request) => request.model === "child-process-model"),
-		5_000,
-		"child held provider request",
-	);
+	const childPromptedAt = Date.now();
+	try {
+		await waitFor(
+			() => requests.some((request) => request.model === "child-process-model"),
+			5_000,
+			"child held provider request",
+		);
+	} catch (error) {
+		// Intermittent (1 in ~10 runs, not reproduced). Record what the child and
+		// the mock server saw so the next failure can be diagnosed.
+		const snapshot = await child
+			.command("snapshot")
+			.catch((snapshotError: unknown) => String(snapshotError));
+		console.error(
+			[
+				"child held provider request did not arrive; diagnostics:",
+				`child exit: code=${child.process.exitCode} signal=${child.process.signalCode}`,
+				`child snapshot: ${JSON.stringify(snapshot)}`,
+				`mock requests (ms after prompt): ${JSON.stringify(
+					requests.map((request) => ({
+						model: request.model,
+						at: request.receivedAt - childPromptedAt,
+					})),
+				)}`,
+				`load average: ${loadavg().join(" ")}`,
+				child.output(),
+			].join("\n"),
+		);
+		throw error;
+	}
 	await root.session.prompt("Settle while the independent child stays busy.");
 	await waitForSessionIdle(root.session, 3_000, "root first ordinary work");
 	await new Promise((resolvePromise) => setTimeout(resolvePromise, 10_300));
