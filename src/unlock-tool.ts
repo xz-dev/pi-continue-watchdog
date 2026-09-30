@@ -22,7 +22,11 @@ export const MAX_TOOL_REASON_CHARACTERS = 1000;
 export const UNLOCK_COMPLETENESS_CHECK =
 	"Before calling it, check every task the user requested in this session, including earlier requests and not only the latest one, against what was actually delivered; work already delivered, cancelled, or superseded is not remaining. If any requested and authorized work can still proceed now, do it instead of calling this tool.";
 
-export const UNLOCK_TOOL_DESCRIPTION = `Signal that your work should stop and control returns to the user. Call this tool when all requested work is complete, or when user input, approval, or other user action is required, or work is blocked without a user action. ${UNLOCK_COMPLETENESS_CHECK} If you end your turn without calling this tool, the pi-continue-watchdog extension will automatically continue your work. This tool belongs to the pi-continue-watchdog extension; calling it is your decision, not a user request. Provide reason_type (one of the allowed values for this project) and a concise reason.`;
+/** The tool stops continuation only; shared by the description and the guideline. */
+export const UNLOCK_DELIVERY_BOUNDARY =
+	"This tool only stops the automatic continuation; it is not a delivery channel. Write every answer, result, question, or report for the user in your normal reply text before calling it, and do not rely on the user seeing this tool's arguments.";
+
+export const UNLOCK_TOOL_DESCRIPTION = `Signal that your work should stop and control returns to the user. Call this tool when all requested work is complete, or when user input, approval, or other user action is required, or work is blocked without a user action. ${UNLOCK_COMPLETENESS_CHECK} If you end your turn without calling this tool, the pi-continue-watchdog extension will automatically continue your work. This tool belongs to the pi-continue-watchdog extension; calling it is your decision, not a user request. ${UNLOCK_DELIVERY_BOUNDARY} Provide reason_type (one of the allowed values for this project) and a concise reason.`;
 
 /** One-line entry for the system prompt's available-tools section. */
 export const UNLOCK_TOOL_PROMPT_SNIPPET =
@@ -30,7 +34,7 @@ export const UNLOCK_TOOL_PROMPT_SNIPPET =
 
 /** Session-stable system prompt guidelines; never change during a lock cycle. */
 export const UNLOCK_TOOL_PROMPT_GUIDELINES: readonly string[] = Object.freeze([
-	"Before ending a turn because all requested work is complete, because you need user input, approval, or other user action, or because work is blocked without a user action, call unlock_continue_watchdog with a reason_type and a concise reason. First confirm that no task the user requested in this session, including earlier requests, is still missing and can proceed now. If you end a turn without calling it, the pi-continue-watchdog extension automatically continues your work.",
+	`Before ending a turn because all requested work is complete, because you need user input, approval, or other user action, or because work is blocked without a user action, call unlock_continue_watchdog with a reason_type and a concise reason. First confirm that no task the user requested in this session, including earlier requests, is still missing and can proceed now. If you end a turn without calling it, the pi-continue-watchdog extension automatically continues your work. ${UNLOCK_DELIVERY_BOUNDARY}`,
 	"If you need to wait for some work to finish, do not end the turn to wait: block on or monitor that task directly, or sleep for your estimated duration.",
 ]);
 
@@ -125,7 +129,7 @@ export function unlockReasonTypeDescription(
 }
 
 /** Model-facing reason description. */
-export const UNLOCK_REASON_DESCRIPTION = `One concise sentence: what was delivered, what the user must do, or what blocks the work. Non-empty after trimming and at most ${MAX_TOOL_REASON_CHARACTERS} Unicode characters.`;
+export const UNLOCK_REASON_DESCRIPTION = `One concise sentence for the watchdog record and notifications: what was delivered, what the user must do, or what blocks the work. Not the user-facing answer; the user may not see it. Non-empty after trimming and at most ${MAX_TOOL_REASON_CHARACTERS} Unicode characters.`;
 
 /** Canonical (uppercased, de-duplicated) schema values for the reason types. */
 export function unlockReasonTypeEnum(reasonTypes: readonly string[]): string[] {

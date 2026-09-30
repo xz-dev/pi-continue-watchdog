@@ -19,6 +19,7 @@ import {
 	prepareUnlockToolArguments,
 	UNLOCK_COMPLETENESS_CHECK,
 	UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME,
+	UNLOCK_DELIVERY_BOUNDARY,
 	UNLOCK_REASON_DESCRIPTION,
 	UNLOCK_TOOL_DESCRIPTION,
 	UNLOCK_TOOL_PROMPT_GUIDELINES,
@@ -340,4 +341,26 @@ test("unlock tool row renders through Pi's ToolExecutionComponent without duplic
 		}),
 		["Continue watchdog unlock · WAIT_USER", "reason_type must match"],
 	);
+});
+
+test("tool text states it is not a delivery channel without claiming invisibility", () => {
+	assert.ok(UNLOCK_TOOL_DESCRIPTION.includes(UNLOCK_DELIVERY_BOUNDARY));
+	assert.ok(
+		UNLOCK_TOOL_PROMPT_GUIDELINES[0].includes(UNLOCK_DELIVERY_BOUNDARY),
+	);
+	assert.match(
+		UNLOCK_DELIVERY_BOUNDARY,
+		/only stops the automatic continuation/,
+	);
+	assert.match(UNLOCK_DELIVERY_BOUNDARY, /not a delivery channel/);
+	assert.match(UNLOCK_DELIVERY_BOUNDARY, /normal reply text before calling it/);
+	assert.match(UNLOCK_REASON_DESCRIPTION, /Not the user-facing answer/);
+	assert.match(UNLOCK_REASON_DESCRIPTION, /the user may not see it/);
+	for (const text of [
+		UNLOCK_TOOL_DESCRIPTION,
+		UNLOCK_TOOL_PROMPT_GUIDELINES[0],
+		UNLOCK_REASON_DESCRIPTION,
+	]) {
+		assert.doesNotMatch(text, /cannot see|can't see|never see|invisible/i);
+	}
 });
