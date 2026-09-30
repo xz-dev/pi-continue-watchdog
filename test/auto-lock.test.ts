@@ -152,16 +152,6 @@ function userMessageStart(): unknown {
 	return { type: "message_start", message: { role: "user" } };
 }
 
-function decisionId(
-	controller: ReturnType<typeof createLockDecisionController>,
-): number {
-	const decision = controller
-		.beginDecision(Number.MAX_SAFE_INTEGER)
-		.effects.find((effect) => effect.kind === "openDecisionWindow");
-	assert.ok(decision, "expected a decision window");
-	return decision.decisionId;
-}
-
 test("actual main user message_start locks without a command notification", () => {
 	const harness = createHarness();
 
@@ -169,7 +159,8 @@ test("actual main user message_start locks without a command notification", () =
 		harness.calls.filter((name) => name === "message_start").length,
 		2,
 	);
-	assert.equal(harness.handlers.has("input"), true);
+	// The decision-window input preemption hook is gone; auto-lock observes
+	// message_start directly.
 	assert.equal(harness.handlers.has("message_start"), true);
 	const firstMessageStart = harness.calls.indexOf("message_start");
 	const secondMessageStart = harness.calls.indexOf(
@@ -199,11 +190,6 @@ test("actual main user message_start locks without a command notification", () =
 		locked: true,
 		attempt: 0,
 		exhausted: false,
-		decisionFailed: false,
-		invalidDecisionAttempts: 0,
-		lastInvalidDecisionError: null,
-		decisionOpen: false,
-		waitUntilMs: 0,
 	});
 });
 
@@ -211,10 +197,8 @@ test("Example 1: a new main user message performs silent unlock cleanup before f
 	const harness = createHarness();
 	const { controller } = harness;
 	controller.lock();
-	const openDecision = decisionId(controller);
-	controller.recordInvalidDecision(openDecision, "invalid once");
-	assert.equal(controller.snapshot.decisionOpen, true);
-	assert.equal(controller.snapshot.invalidDecisionAttempts, 1);
+	controller.recordAutomaticContinue();
+	assert.equal(controller.snapshot.attempt, 1);
 
 	const timeline: string[] = [];
 	const unlock = controller.unlock.bind(controller);
@@ -234,35 +218,20 @@ test("Example 1: a new main user message performs silent unlock cleanup before f
 	assert.equal(controller.snapshot.locked, true);
 	assert.equal(controller.snapshot.attempt, 0);
 	assert.equal(controller.snapshot.exhausted, false);
-	assert.equal(controller.snapshot.decisionFailed, false);
-	assert.equal(controller.snapshot.invalidDecisionAttempts, 0);
-	assert.equal(controller.snapshot.decisionOpen, false);
 });
 
-test("every actual main user start resets exhausted and decision-failed cycles", () => {
+test("every actual main user start resets exhausted cycles", () => {
 	const harness = createHarness();
 	const { controller } = harness;
 
 	controller.lock();
-	controller.recordValidContinue(decisionId(controller));
+	controller.recordAutomaticContinue();
 	assert.equal(controller.snapshot.exhausted, true);
 	assert.equal(controller.snapshot.attempt, 1);
 	harness.fire(userMessageStart());
 	assert.equal(controller.snapshot.locked, true);
 	assert.equal(controller.snapshot.attempt, 0);
 	assert.equal(controller.snapshot.exhausted, false);
-
-	controller.lock();
-	const failedDecision = decisionId(controller);
-	controller.recordInvalidDecision(failedDecision, "first");
-	controller.recordInvalidDecision(failedDecision, "second");
-	controller.recordInvalidDecision(failedDecision, "third");
-	assert.equal(controller.snapshot.decisionFailed, true);
-	harness.fire(userMessageStart());
-	assert.equal(controller.snapshot.locked, true);
-	assert.equal(controller.snapshot.attempt, 0);
-	assert.equal(controller.snapshot.decisionFailed, false);
-	assert.equal(controller.snapshot.invalidDecisionAttempts, 0);
 });
 
 test("non-user roles and missing messages are inert", () => {

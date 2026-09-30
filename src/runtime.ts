@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 
 import {
-	type AgentEndEvent,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
@@ -10,12 +9,6 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { probePiAgentState } from "pi-extension-utils/pi-agent-state";
-import {
-	createInquiryRuntime,
-	type InquiryAttemptHandle,
-	type InquiryFoldMessage,
-} from "pi-extension-utils/pi-inquiry";
-import { PreemptTakeover } from "pi-extension-utils/preempt-takeover";
 
 import {
 	type ActivityGeneration,
@@ -30,16 +23,6 @@ import { type LoadedConfig, loadRuntimeConfig } from "./config-loader.js";
 import {
 	CANCELLED_WATCHDOG_RUN_ERROR,
 	CONTINUATION_MESSAGE_TYPE,
-	createDecisionFoldMessage,
-	DECISION_FOLD_MESSAGE_TYPE,
-	DECISION_INQUIRY_NAMESPACE,
-	findCancelledContinuationAssistantEntryId,
-	findDecisionAssistantEntryId,
-	findPreemptedDecisionAssistantEntryIds,
-	INQUIRY_MARKER_ENTRY_TYPE,
-	neutralizeDecisionAssistant,
-	PREEMPTED_DECISION_ERROR,
-	parseDecisionFoldDetails,
 } from "./context-fold.js";
 import {
 	type ControllerEffect,
@@ -47,18 +30,6 @@ import {
 	createLockDecisionController,
 	type LockDecisionController,
 } from "./controller.js";
-import {
-	buildDecisionPrompt,
-	createDecisionProtocolSession,
-	DECISION_TOOL_BLOCK_REASON,
-	type DecisionProtocolPlan,
-	type DecisionProtocolSession,
-	type DecisionResponse,
-	formatDecisionFailedNotification,
-	MAX_WAIT_SECONDS,
-	normalizeAssistantDecisionResponse,
-	validateDecisionResponse,
-} from "./decision-protocol.js";
 import type { FatalExitAdapter } from "./fatal-exit.js";
 import type {
 	HubAttachment,
@@ -74,23 +45,19 @@ import {
 import {
 	createUserReadyEnvelope,
 	createWatchdogContinuedEnvelope,
-	createWatchdogWaitingEnvelope,
 	emitSemanticHook,
 	type UserReadyValues,
 } from "./semantic-hook.js";
 import {
-	createCompletedWaitWatchdogEvent,
+	createUnlockToolDefinition,
+	registerUnlockTool,
+	unlockToolUserReadyValues,
+} from "./unlock-tool.js";
+import {
 	createContinueWatchdogEvent,
-	createDecisionFailedWatchdogEvent,
 	createExhaustedWatchdogEvent,
-	createUnlockWatchdogEvent,
-	createWaitWatchdogEvent,
-	formatCompletedWaitWatchdogEvent,
 	formatContinueWatchdogEvent,
-	formatDecisionFailedWatchdogEvent,
 	formatExhaustedWatchdogEvent,
-	formatUnlockWatchdogEvent,
-	formatWaitWatchdogEvent,
 	WATCHDOG_EVENT_MESSAGE_TYPE,
 } from "./watchdog-event.js";
 
@@ -115,72 +82,7 @@ const nodeClock: RuntimeClock = {
 	now: () => Date.now(),
 };
 
-const WATCHDOG_STATUS_WIDGET_KEY = "pi-continue-watchdog:status";
 const WATCHDOG_STATE_WIDGET_KEY = "pi-continue-watchdog:state";
-
-/** Context-excluded persisted metadata for one model decision response. */
-export const DECISION_AUDIT_ENTRY_TYPE = "pi-continue-watchdog:decision-audit";
-
-export type DecisionAuditEntry =
-	| {
-			readonly version: 1;
-			readonly exchangeId: string;
-			readonly cycleId: number;
-			readonly outcome: "continue";
-			readonly reasonType: string;
-			readonly reason: string;
-	  }
-	| {
-			readonly version: 1;
-			readonly exchangeId: string;
-			readonly cycleId: number;
-			readonly outcome: "wait";
-			readonly reason: string;
-			readonly waitSeconds: number;
-	  }
-	| {
-			readonly version: 1;
-			readonly exchangeId: string;
-			readonly cycleId: number;
-			readonly outcome: "unlock";
-			readonly reasonType: string;
-			readonly reason: string;
-	  }
-	| {
-			readonly version: 1;
-			readonly exchangeId: string;
-			readonly cycleId: number;
-			readonly outcome: "invalid";
-			readonly error: string;
-	  };
-
-interface ActiveDecision {
-	readonly decisionId: number;
-	readonly exchangeId: string;
-	readonly claim: HubMainClaim;
-	protocol: DecisionProtocolSession;
-	readonly waitCompletionIdentity: string | null;
-	readonly domainFence: DomainFence;
-	inquiry: InquiryAttemptHandle;
-	aggregateGeneration: ActivityGeneration;
-	invalidated: boolean;
-	/** True while a public fire-and-forget dispatch awaits matching lifecycle. */
-	dispatchPending: boolean;
-	/** True only after Pi emits this decision's correlated custom message_start. */
-	submitted: boolean;
-}
-
-interface PendingFinalization {
-	readonly active: ActiveDecision;
-	readonly cycleId: number;
-	readonly plan: DecisionProtocolPlan;
-}
-
-interface InquiryMarkerEntry {
-	readonly version: 1;
-	readonly exchangeId: string;
-	readonly cycleId: number;
-}
 
 interface SpliceEntryAPI {
 	spliceEntry(entryId: string): void;
@@ -197,41 +99,25 @@ interface UninterruptibleMessageEndAPI {
 	): void;
 }
 
-interface WaitCompletionSnapshot {
-	readonly identity: string;
-	readonly content: string;
+/** True for the cancelled watchdog-owned continuation assistant. */
+function isDirectContinuationAssistant(
+	message: unknown,
+	exchangeId: string,
+): boolean {
+	if (typeof message !== "object" || message === null) return false;
+	const details = (message as { readonly details?: unknown }).details;
+	if (typeof details !== "object" || details === null) return false;
+	const continuation = (details as { readonly piContinuation?: unknown })
+		.piContinuation;
+	if (
+		typeof continuation !== "object" ||
+		continuation === null ||
+		(continuation as { readonly exchangeId?: unknown }).exchangeId !==
+			exchangeId
+	)
+		return false;
+	return true;
 }
-
-interface WaitTimingSnapshot {
-	readonly identity: string;
-	readonly acceptedAtMs: number;
-	readonly waitSeconds: number;
-	readonly deadlineMs: number;
-}
-
-type SelfDecisionRun =
-	| { readonly kind: "none" }
-	| {
-			readonly kind: "provisional" | "confirmed";
-			readonly exchangeId: string;
-			readonly cycleId: number;
-	  };
-
-type WatchdogOwnedRun = {
-	readonly kind: "continuation";
-	readonly claim: HubMainClaim;
-	readonly exchangeId: string;
-	readonly cycleId: number;
-	phase: "pending-start" | "running";
-	cancelRequested: boolean;
-};
-
-type CancellationTarget = {
-	readonly kind: "decision" | "continuation";
-	readonly claim: HubMainClaim;
-	readonly exchangeId: string;
-	readonly cycleId: number;
-};
 
 type RuntimeContext = ExtensionCommandContext | ExtensionContext;
 
@@ -257,12 +143,10 @@ export type WatchdogTriggerBlocker =
 	| "config-loading"
 	| "unlocked"
 	| "exhausted"
-	| "decision-failed"
 	| "observable-agent-busy"
 	| "local-agent-busy"
 	| "pending-messages"
-	| "decision-open"
-	| "decision-finalizing";
+	| "continuation-in-flight";
 
 export interface WatchdogTriggerStatus {
 	readonly main: boolean;
@@ -284,20 +168,14 @@ export interface DecisionRuntime {
 	getMainClaim(): HubMainClaim | null;
 	isCurrentMainClaim(claim: HubMainClaim): boolean;
 	/**
-	 * Drop in-flight decision finalization/timer work after a controller
-	 * lock/unlock transition so a later settle cannot continue stale work.
+	 * Drop in-flight continuation/timer work after a controller lock/unlock
+	 * transition so a later settle cannot continue stale work.
 	 */
 	clearOperationalPendingWork(): void;
 	/** Cancel only an exact watchdog-owned run during a human unlock. */
 	handleManualUnlock(ctx: RuntimeContext, claim: HubMainClaim): void;
 	/** Retain terminal-error unlock intent; publication waits for aggregate idle. */
 	retainErrorUnlock(claim: HubMainClaim): void;
-	/**
-	 * Atomically consume the marker suppressing a watchdog decision aborted by
-	 * user input. Returns true once; afterwards a later unrelated abort is never
-	 * suppressed. Used by the abort-outcome path to avoid emitting an unlock.
-	 */
-	consumeDecisionAbortSuppression(): boolean;
 	/**
 	 * Start a fresh cycle through the full silent unlock-cleanup-lock sequence.
 	 * The exact current-main claim is fenced across every re-entrant effect.
@@ -306,10 +184,7 @@ export interface DecisionRuntime {
 		ctx?: RuntimeContext,
 		options?: { readonly notifyLocked?: boolean },
 	): void;
-	applyEffect(
-		effect: Exclude<ControllerEffect, { kind: "notify" }>,
-		ctx?: RuntimeContext,
-	): void;
+	applyEffect(effect: ControllerEffect, ctx?: RuntimeContext): void;
 	applyTransition(
 		transition: ControllerTransition,
 		ctx?: RuntimeContext,
@@ -327,46 +202,6 @@ export interface DecisionRuntime {
 	shutdown(ctx?: ExtensionContext): Promise<void>;
 }
 
-function terminalAssistant(messages: readonly unknown[]): unknown | undefined {
-	for (let index = messages.length - 1; index >= 0; index -= 1) {
-		const message = messages[index];
-		if (
-			typeof message === "object" &&
-			message !== null &&
-			(message as { readonly role?: unknown }).role === "assistant"
-		) {
-			return message;
-		}
-	}
-	return undefined;
-}
-
-function hasAssistantStopReason(message: unknown, stopReason: string): boolean {
-	return (
-		typeof message === "object" &&
-		message !== null &&
-		(message as { readonly stopReason?: unknown }).stopReason === stopReason
-	);
-}
-
-function isAbortedAssistant(message: unknown): boolean {
-	return hasAssistantStopReason(message, "aborted");
-}
-
-function isPreemptedAssistant(message: unknown): boolean {
-	return (
-		hasAssistantStopReason(message, "stop") &&
-		typeof message === "object" &&
-		message !== null &&
-		(message as { readonly errorMessage?: unknown }).errorMessage ===
-			PREEMPTED_DECISION_ERROR
-	);
-}
-
-function isErroredAssistant(message: unknown): boolean {
-	return hasAssistantStopReason(message, "error");
-}
-
 function originalErrorMessage(error: unknown): string {
 	if (error instanceof Error && error.message.trim().length > 0) {
 		return error.message;
@@ -376,16 +211,9 @@ function originalErrorMessage(error: unknown): string {
 		: "Unknown error";
 }
 
-function assistantErrorMessage(message: unknown): string {
-	if (typeof message !== "object" || message === null) return "Unknown error";
-	return originalErrorMessage(
-		(message as { readonly errorMessage?: unknown }).errorMessage,
-	);
-}
-
 /**
- * Compose one attachment's idle timer, decision protocol, and Pi lifecycle.
- * The process hub remains the only cross-attachment coordination seam.
+ * Compose one attachment's idle timer, unlock tool, direct continuation, and
+ * Pi lifecycle. The process hub remains the only cross-attachment seam.
  */
 export function createDecisionRuntime(
 	options: DecisionRuntimeOptions,
@@ -413,50 +241,32 @@ export function createDecisionRuntime(
 	/** Binary AI lifecycle state: agent_start = busy, true agent_settled = idle. */
 	let localAiBusy = true;
 	let stopped = false;
-	let activeDecision: ActiveDecision | null = null;
-	let selfDecisionRun: SelfDecisionRun = { kind: "none" };
-	/** Suppress an aborted internal decision after user takeover or domain failure. */
-	let suppressDecisionAbort = false;
-	/** Keep one failed-domain decision turn quarantined until its lifecycle ends. */
-	let quarantinedDecision: {
+	let watchdogOwnedRun: {
+		readonly kind: "continuation";
+		readonly claim: HubMainClaim;
 		readonly exchangeId: string;
-		readonly cycleId: number;
-		inputObserved: boolean;
+		phase: "pending-start" | "running";
+		cancelRequested: boolean;
 	} | null = null;
-	let capturedDecisionResponse: {
-		readonly active: ActiveDecision;
-		readonly cycleId: number;
-		readonly response: DecisionResponse;
+	let manualCancellation: {
+		readonly kind: "continuation";
+		readonly claim: HubMainClaim;
+		readonly exchangeId: string;
 	} | null = null;
-	let decisionAssistantToSplice: CancellationTarget | null = null;
-	let watchdogOwnedRun: WatchdogOwnedRun | null = null;
-	let manualCancellation: CancellationTarget | null = null;
-	let pendingFinalization: PendingFinalization | null = null;
-	/**
-	 * User takeover capture shared from pi-extension-utils. 0.85.1 aborts
-	 * asynchronously and drops queued steering, so the watchdog re-issues the
-	 * takeover as a fresh turn after the preempted decision settles. The
-	 * shared guard prevents the re-issued prompt from re-entering this
-	 * capture path (re-entrancy guard).
-	 */
-	const pendingTakeover = new PreemptTakeover();
-	/** Retried until Pi accepts the exact correlated remove-fold. */
-	let pendingInquiryCleanup: InquiryFoldMessage | null = null;
+	let decisionAssistantToSplice: {
+		readonly kind: "continuation";
+		readonly claim: HubMainClaim;
+		readonly exchangeId: string;
+	} | null = null;
+	/** True from continuation send until its correlated message_start is seen. */
+	let continuationDispatchPending = false;
 	/** Retained for automatic unlock until the next all-idle settle. */
 	let pendingUnlock: UserReadyValues | null = null;
-	/** Timing identity for the current accepted wait only. */
-	let pendingWaitTiming: WaitTimingSnapshot | null = null;
-	/** Completed wait retained until a correlated inquiry start confirms ownership. */
-	let pendingWaitCompletion: WaitCompletionSnapshot | null = null;
 	/** At-most-once semantic publication guard for the current aggregate-idle epoch. */
 	let publishedForIdleEpoch = false;
 	/** Retry exhaustion is persisted once per lock cycle, even across re-entrant activity. */
 	let exhaustionEventPublished = false;
 	let exhaustionEventPublicationInFlight = false;
-	let terminalWaitTimer: RuntimeTimerHandle | null = null;
-	let activeStatus: WatchdogStatusEntry | null = null;
-	let statusTui: { requestRender(): void } | null = null;
-	let statusWidgetRegistered = false;
 	let stateStatusTui: { requestRender(): void } | null = null;
 	let stateStatusWidgetRegistered = false;
 	/** Distinguishes this runtime's synchronous hub report from child reports. */
@@ -495,17 +305,12 @@ export function createDecisionRuntime(
 			: null;
 	};
 
-	const clearTerminalWaitTimer = (): void => {
-		if (terminalWaitTimer !== null) clock.clearTimeout(terminalWaitTimer);
-		terminalWaitTimer = null;
-	};
-
 	const stateStatusProjection = (): {
 		readonly activity: "idle" | "running";
 		readonly enabled: boolean;
 		readonly rootRunning: boolean;
 		readonly busySubagents: number;
-		readonly decision: "asking" | { readonly askInMs: number } | null;
+		readonly next: "continuing" | { readonly askInMs: number } | null;
 	} | null => {
 		const ctx = sessionContext;
 		const claim = getMainClaim();
@@ -530,17 +335,13 @@ export function createDecisionRuntime(
 		const busySubagents =
 			localBusySubagents +
 			Math.max(0, options.processDomain?.snapshot.busyParticipants ?? 0);
-		let decision: "asking" | { readonly askInMs: number } | null = null;
-		if (
-			activeDecision !== null ||
-			selfDecisionRun.kind !== "none" ||
-			pendingFinalization !== null
-		) {
-			decision = "asking";
+		let next: "continuing" | { readonly askInMs: number } | null = null;
+		if (continuationDispatchPending || watchdogOwnedRun !== null) {
+			next = "continuing";
 		} else {
 			const grace = graceCoordinator.snapshot;
 			if (grace.phase === "grace" && grace.deadlineMs !== null) {
-				decision = { askInMs: Math.max(0, grace.deadlineMs - now()) };
+				next = { askInMs: Math.max(0, grace.deadlineMs - now()) };
 			}
 		}
 		return {
@@ -548,7 +349,7 @@ export function createDecisionRuntime(
 			enabled: controller.snapshot.locked,
 			rootRunning,
 			busySubagents,
-			decision,
+			next,
 		};
 	};
 
@@ -568,14 +369,14 @@ export function createDecisionRuntime(
 		return busySubagents > 0 ? subagents : "none";
 	};
 
-	const decisionLabel = (
-		decision: "asking" | { readonly askInMs: number } | null,
+	const nextLabel = (
+		next: "continuing" | { readonly askInMs: number } | null,
 		compact = false,
 	): string => {
-		if (decision === "asking") return "asking";
-		if (decision === null) return "";
-		const seconds = Math.ceil(decision.askInMs / 1000);
-		return compact ? `T-${seconds}s` : `asking in ${seconds}s`;
+		if (next === "continuing") return "continuing";
+		if (next === null) return "";
+		const seconds = Math.ceil(next.askInMs / 1000);
+		return compact ? `T-${seconds}s` : `continuing in ${seconds}s`;
 	};
 
 	const renderStateStatus = (
@@ -586,13 +387,13 @@ export function createDecisionRuntime(
 		if (status === null) return [];
 		const safeWidth = Math.max(1, Math.floor(width));
 		const third =
-			status.decision === null
+			status.next === null
 				? stateStatusActors(status.rootRunning, status.busySubagents)
-				: decisionLabel(status.decision);
+				: nextLabel(status.next);
 		const thirdCompact =
-			status.decision === null
+			status.next === null
 				? stateStatusActors(status.rootRunning, status.busySubagents, true)
-				: decisionLabel(status.decision, true);
+				: nextLabel(status.next, true);
 		const unlockHint = status.enabled
 			? config.unlockShortcut === false
 				? " · /unlock-continue-watchdog"
@@ -628,7 +429,7 @@ export function createDecisionRuntime(
 		stateStatusTick = null;
 	};
 	const stateStatusCountdownActive = (): boolean =>
-		stateStatusTui !== null && stateStatusProjection()?.decision != null;
+		stateStatusTui !== null && stateStatusProjection()?.next != null;
 	const scheduleStateStatusTick = (): void => {
 		if (stateStatusTick !== null) return;
 		const handle = clock.setTimeout(function tick(): void {
@@ -690,82 +491,6 @@ export function createDecisionRuntime(
 		stateStatusTui?.requestRender();
 	};
 
-	const renderLiveStatus = (
-		width: number,
-		theme: ExtensionContext["ui"]["theme"],
-	): string[] => {
-		const status = activeStatus;
-		if (status === null) return [];
-		const safeWidth = Math.max(1, Math.floor(width));
-		const styleLine = (content: string): string => {
-			const clipped = visibleWidth(content) <= safeWidth ? content : "…";
-			const padding = " ".repeat(
-				Math.max(0, safeWidth - visibleWidth(clipped)),
-			);
-			return theme.bg("toolPendingBg", clipped + padding);
-		};
-		const detail = `Attempt ${status.cycleId} · waiting for model`;
-		return [
-			styleLine(""),
-			styleLine(` ${theme.fg("accent", "Continue watchdog checking")} `),
-			styleLine(` ${theme.fg("toolOutput", detail)} `),
-			styleLine(""),
-		];
-	};
-
-	const showLiveStatus = (status: WatchdogStatusEntry): string | null => {
-		activeStatus = status;
-		const ctx = sessionContext;
-		if (ctx === null || !ctx.hasUI || typeof ctx.ui.setWidget !== "function") {
-			return null;
-		}
-		if (!statusWidgetRegistered) {
-			try {
-				ctx.ui.setWidget(
-					WATCHDOG_STATUS_WIDGET_KEY,
-					(tui, theme) => {
-						statusTui = tui;
-						return {
-							render: (width: number) => renderLiveStatus(width, theme),
-							invalidate() {},
-							dispose() {
-								statusTui = null;
-								statusWidgetRegistered = false;
-							},
-						};
-					},
-					{ placement: "belowEditor" },
-				);
-				statusWidgetRegistered = true;
-			} catch (error) {
-				statusWidgetRegistered = false;
-				statusTui = null;
-				return originalErrorMessage(error);
-			}
-			return null;
-		}
-		statusTui?.requestRender();
-		return null;
-	};
-
-	const clearLiveStatus = (): void => {
-		activeStatus = null;
-		const ctx = sessionContext;
-		if (
-			ctx !== null &&
-			statusWidgetRegistered &&
-			typeof ctx.ui.setWidget === "function"
-		) {
-			try {
-				ctx.ui.setWidget(WATCHDOG_STATUS_WIDGET_KEY, undefined);
-			} catch {
-				// A stale host may reject cleanup during shutdown or demotion.
-			}
-		}
-		statusWidgetRegistered = false;
-		statusTui = null;
-	};
-
 	const appendStatus = (status: WatchdogStatusEntry): boolean => {
 		try {
 			options.pi.appendEntry<WatchdogStatusEntry>(
@@ -778,67 +503,15 @@ export function createDecisionRuntime(
 		}
 	};
 
-	const checkingStatus = (active: ActiveDecision): WatchdogStatusEntry => ({
-		kind: "checking",
-		exchangeId: active.exchangeId,
-		cycleId: active.protocol.currentCycleId,
-		message: "Continue watchdog checking",
-	});
-
-	const retainInquiryCleanup = (
-		active: ActiveDecision,
-		watchdogOutcome: "invalidated" | "preempted" = "invalidated",
-	): InquiryFoldMessage | null => {
-		const fold = active.inquiry.cancel();
-		if (fold === null) return null;
-		pendingInquiryCleanup = {
-			...fold,
-			details: {
-				...fold.details,
-				watchdogOutcome,
-			} as InquiryFoldMessage["details"],
-		};
-		return pendingInquiryCleanup;
-	};
-
-	const retryInquiryCleanup = (): void => {
-		const cleanup = pendingInquiryCleanup;
-		if (cleanup === null) return;
-		try {
-			options.pi.sendMessage(cleanup, {
-				triggerTurn: false,
-				deliverAs: "steer",
-			});
-			if (pendingInquiryCleanup === cleanup) pendingInquiryCleanup = null;
-		} catch {
-			// The same idempotent remove-fold is retried at terminal public events.
-		}
-	};
-
 	/**
-	 * Invalidate runtime-local decision state after a controller transition.
+	 * Invalidate runtime-local operational state after a controller transition.
 	 * Does not change controller lock/cycle accounting.
 	 */
 	const clearOperationalPendingWork = (): void => {
 		localActivityGeneration += 1;
-		clearTerminalWaitTimer();
-		if (activeDecision !== null) {
-			retainInquiryCleanup(activeDecision);
-			retryInquiryCleanup();
-		}
-		activeDecision = null;
-		selfDecisionRun = { kind: "none" };
-		if (manualCancellation === null) {
-			suppressDecisionAbort = false;
-			decisionAssistantToSplice = null;
-		}
-		capturedDecisionResponse = null;
-		pendingFinalization = null;
-		clearLiveStatus();
-		// Human/abort unlock must not inherit automatic terminal publication intent.
+		continuationDispatchPending = false;
+		if (manualCancellation === null) decisionAssistantToSplice = null;
 		pendingUnlock = null;
-		pendingWaitTiming = null;
-		pendingWaitCompletion = null;
 		exhaustionEventPublished = false;
 		exhaustionEventPublicationInFlight = false;
 		observeAggregate();
@@ -846,49 +519,14 @@ export function createDecisionRuntime(
 
 	const disableDomain = (): void => {
 		if (domainFatal) return;
-		const active = activeDecision;
-		const quarantine =
-			active !== null &&
-			localAiBusy &&
-			(active.dispatchPending || active.submitted);
-		if (quarantine && active !== null) {
-			quarantinedDecision = {
-				exchangeId: active.exchangeId,
-				cycleId: active.protocol.currentCycleId,
-				inputObserved: active.submitted,
-			};
-		}
-		if (active !== null) invalidateActiveDecision(true);
 		domainFatal = true;
 		domainReady = false;
 		clearOperationalPendingWork();
-		if (quarantine) {
-			// The trigger turn already started. Abort it and retain both tool blocking
-			// and assistant hiding until its agent lifecycle actually ends.
-			suppressDecisionAbort = true;
-			try {
-				sessionContext?.abort();
-			} catch {
-				// Quarantine remains authoritative when host abort is unavailable.
-			}
-		}
 	};
 
 	const handleRuntimeDomainFailure = (): void => {
-		const active = activeDecision;
-		const shouldAbort =
-			localAiBusy &&
-			(quarantinedDecision !== null ||
-				(active !== null && (active.dispatchPending || active.submitted)));
-		invalidateActiveDecision(true);
+		disableDomain();
 		observeAggregate();
-		if (!shouldAbort || suppressDecisionAbort) return;
-		suppressDecisionAbort = true;
-		try {
-			sessionContext?.abort();
-		} catch {
-			// Quarantine remains authoritative when host abort is unavailable.
-		}
 	};
 
 	const domainWrite = async (
@@ -913,47 +551,33 @@ export function createDecisionRuntime(
 			? false
 			: probePiAgentState(sessionContext).pendingMessages;
 
-	const spliceDecisionAssistant = (ctx: ExtensionContext): void => {
+	const spliceContinuationAssistant = (ctx: ExtensionContext): void => {
 		const pending = decisionAssistantToSplice;
 		decisionAssistantToSplice = null;
 		if (pending === null) return;
-
 		try {
 			const spliceEntry = (options.pi as ExtensionAPI & Partial<SpliceEntryAPI>)
 				.spliceEntry;
 			if (typeof spliceEntry !== "function") return;
 			const branch = ctx.sessionManager.getBranch();
-			const entryId =
-				pending.kind === "continuation"
-					? findCancelledContinuationAssistantEntryId(
-							branch,
-							pending.exchangeId,
-							pending.cycleId,
-						)
-					: findDecisionAssistantEntryId(
-							branch,
-							pending.exchangeId,
-							pending.cycleId,
-						);
-			if (entryId !== null) spliceEntry.call(options.pi, entryId);
+			let spliceId: string | null = null;
+			for (let index = branch.length - 1; index >= 0; index -= 1) {
+				const entry = branch[index];
+				if (
+					entry?.type === "message" &&
+					(entry.message as { readonly role?: unknown })?.role ===
+						"assistant" &&
+					(entry.message as { readonly errorMessage?: unknown })
+						.errorMessage === CANCELLED_WATCHDOG_RUN_ERROR &&
+					isDirectContinuationAssistant(entry.message, pending.exchangeId)
+				) {
+					spliceId = entry.id;
+					break;
+				}
+			}
+			if (spliceId !== null) spliceEntry.call(options.pi, spliceId);
 		} catch {
 			// Tree cleanup is best effort and never replaces message clearing/folding.
-		}
-	};
-
-	const recoverPreemptedDecisionAssistants = (ctx: ExtensionContext): void => {
-		try {
-			const spliceEntry = (options.pi as ExtensionAPI & Partial<SpliceEntryAPI>)
-				.spliceEntry;
-			if (typeof spliceEntry !== "function" || !probePiAgentState(ctx).idle)
-				return;
-			for (const entryId of findPreemptedDecisionAssistantEntryIds(
-				ctx.sessionManager.getBranch(),
-			)) {
-				spliceEntry.call(options.pi, entryId);
-			}
-		} catch {
-			// Resume recovery is best effort; context folding remains authoritative.
 		}
 	};
 
@@ -967,15 +591,10 @@ export function createDecisionRuntime(
 		left.ownershipGeneration === right.ownershipGeneration &&
 		left.localActivityGeneration === right.localActivityGeneration;
 
-	const selfRunFor = (active: ActiveDecision): boolean =>
-		selfDecisionRun.kind !== "none" &&
-		selfDecisionRun.exchangeId === active.exchangeId &&
-		selfDecisionRun.cycleId === active.protocol.currentCycleId;
-
 	const externalHubIdle = (): boolean => {
 		const snapshot = options.hub.snapshot;
 		const selfBusy =
-			selfDecisionRun.kind !== "none" && attachment !== null && !localIdle();
+			continuationDispatchPending && attachment !== null && !localIdle();
 		return (
 			snapshot.main !== null && snapshot.busyCount - (selfBusy ? 1 : 0) === 0
 		);
@@ -985,12 +604,10 @@ export function createDecisionRuntime(
 		owns(claim) &&
 		externalHubIdle() &&
 		domainIdle() &&
-		(localIdle() || selfDecisionRun.kind !== "none") &&
-		!hasPendingMessages() &&
-		selfDecisionRun.kind !== "provisional";
+		(localIdle() || continuationDispatchPending) &&
+		!hasPendingMessages();
 
 	let observeAggregate = (): void => {};
-	let readyGeneration: ActivityGeneration | null = null;
 	let qualifyReady = (_generation: ActivityGeneration): void => {};
 	const createGraceCoordinator = () =>
 		createActivityGraceCoordinator({
@@ -1003,82 +620,19 @@ export function createDecisionRuntime(
 		});
 	let graceCoordinator = createGraceCoordinator();
 
-	/**
-	 * Defer an open decision because local Pi became busy (user input took over or
-	 * an unrelated run started). Stay locked, close the decision window, consume
-	 * no continue/invalid retry, append no error card, and recover after the next
-	 * genuine agent_settled.
-	 */
-	const deferDecisionOnBusy = (
-		active: ActiveDecision,
-		cleanupOutcome?: "preempted",
-		deferCleanupSend = false,
-	): void => {
-		if (active.invalidated) return;
-		if (
-			cleanupOutcome === undefined &&
-			(active.submitted || selfRunFor(active))
-		) {
-			quarantinedDecision = {
-				exchangeId: active.exchangeId,
-				cycleId: active.protocol.currentCycleId,
-				inputObserved: active.submitted,
-			};
-		}
-		active.invalidated = true;
-		retainInquiryCleanup(active, cleanupOutcome ?? "invalidated");
-		if (!deferCleanupSend) retryInquiryCleanup();
-		const controller = options.controllerHolder.controller;
-		capturedDecisionResponse = null;
-		pendingFinalization = null;
-		clearLiveStatus();
-		if (controller !== null) {
-			applyTransition(
-				controller.invalidateDecision(active.decisionId),
-				undefined,
-				{
-					claim: active.claim,
-				},
-			);
-		}
-		activeDecision = null;
-		selfDecisionRun = { kind: "none" };
-		localActivityGeneration += 1;
-		observeAggregate();
-		// suppressDecisionAbort is owned by the user-takeover input hook and is
-		// intentionally not cleared here.
-	};
-
-	/**
-	 * Atomically consume the suppression marker for the watchdog decision that user
-	 * input preempted. True only once; afterwards the marker is clear so a later
-	 * unrelated user abort is never suppressed.
-	 */
-	const consumeDecisionAbortSuppression = (): boolean => {
-		if (!suppressDecisionAbort) return false;
-		suppressDecisionAbort = false;
-		return true;
-	};
-
 	const handleManualUnlock = (
 		ctx: RuntimeContext,
 		claim: HubMainClaim,
 	): void => {
 		if (!owns(claim)) return;
-		let target: CancellationTarget | null = null;
-		const active = activeDecision;
-		if (active?.submitted && owns(active.claim)) {
-			target = {
-				kind: "decision",
-				claim: active.claim,
-				exchangeId: active.exchangeId,
-				cycleId: active.protocol.currentCycleId,
-			};
-			active.invalidated = true;
-			retainInquiryCleanup(active, "preempted");
-			activeDecision = null;
-		} else if (
-			watchdogOwnedRun?.phase === "running" &&
+		let target: {
+			readonly kind: "continuation";
+			readonly claim: HubMainClaim;
+			readonly exchangeId: string;
+		} | null = null;
+		if (
+			watchdogOwnedRun !== null &&
+			watchdogOwnedRun.phase === "running" &&
 			!watchdogOwnedRun.cancelRequested &&
 			owns(watchdogOwnedRun.claim)
 		) {
@@ -1086,7 +640,6 @@ export function createDecisionRuntime(
 				kind: "continuation",
 				claim: watchdogOwnedRun.claim,
 				exchangeId: watchdogOwnedRun.exchangeId,
-				cycleId: watchdogOwnedRun.cycleId,
 			};
 			watchdogOwnedRun.cancelRequested = true;
 		}
@@ -1094,393 +647,102 @@ export function createDecisionRuntime(
 		if (target === null || !owns(target.claim)) return;
 		manualCancellation = target;
 		decisionAssistantToSplice = target;
-		suppressDecisionAbort = true;
 		try {
 			ctx.abort();
 		} catch {
 			// The correlated cancellation target remains authoritative for cleanup.
 		}
-		retryInquiryCleanup();
-	};
-
-	const silentlyAbandonDecision = (): void => {
-		// Unlock first so locked=false is authoritative, then clear runtime work.
-		options.controllerHolder.controller?.unlock();
-		clearOperationalPendingWork();
 	};
 
 	/**
-	 * Explicitly reclaim main when the hub has none. Detach never auto-promotes;
-	 * remaining attachments elect the deterministic preferred candidate here.
+	 * Publish the automatic continuation for a qualified idle generation.
+	 * Consumes one attempt, sends the visible continuation message, correlates
+	 * the watchdog-owned run, and publishes the `watchdog-continued` hook.
+	 * Rolls the attempt back when publication or ownership fails.
 	 */
-	const ensureMain = (): void => {
-		if (stopped || attachment === null) return;
-		if (options.hub.snapshot.main !== null) return;
-		options.hub.reclaimMain(attachment);
-	};
-
-	const sendDecisionPrompt = (
-		active: ActiveDecision,
-		cycleId: number,
-		decisionPrompt: string,
-		sendOptions?: { readonly deferOnBusy?: boolean },
-	): boolean => {
-		if (
-			active.invalidated ||
-			!activeGenerationCurrent(active) ||
-			hasPendingMessages()
-		)
-			return false;
-		if (!allIdleForClaim(active.claim)) {
-			// A transactional re-ask caller rolls accounting back before deferring.
-			if (sendOptions?.deferOnBusy !== false) deferDecisionOnBusy(active);
-			return false;
-		}
-
-		if (!allIdleForClaim(active.claim)) {
-			if (sendOptions?.deferOnBusy !== false) deferDecisionOnBusy(active);
-			return false;
-		}
-		active.dispatchPending = true;
-		active.submitted = false;
-		try {
-			options.pi.appendEntry<InquiryMarkerEntry>(INQUIRY_MARKER_ENTRY_TYPE, {
-				version: 1,
-				exchangeId: active.exchangeId,
-				cycleId,
-			});
-		} catch (error) {
-			active.dispatchPending = false;
-			throw error;
-		}
-		try {
-			const prompt = active.inquiry.prompt(decisionPrompt);
-			if (!active.inquiry.markSent()) {
-				return false;
-			}
-			options.pi.sendMessage(prompt, {
-				triggerTurn: true,
-				deliverAs: "steer",
-			});
-			if (hasPendingMessages() || !activeGenerationCurrent(active)) {
-				deferDecisionOnBusy(active);
-				return false;
-			}
-			return true;
-		} catch (error) {
-			active.dispatchPending = false;
-			if (!allIdleForClaim(active.claim)) {
-				// Final TOCTOU: Pi or an observable child became busy. Silent defer.
-				if (sendOptions?.deferOnBusy !== false) deferDecisionOnBusy(active);
-				return false;
-			}
-			// Genuine dispatch failure while still idle: fail closed with evidence.
-			throw error;
-		}
-	};
-
-	const openDecision = (decisionId: number): void => {
-		// Exact claim fence for this open attempt — not a live re-lookup later.
-		const claim = getMainClaim();
+	const dispatchContinuation = (claim: HubMainClaim): void => {
 		const controller = currentController(claim);
-		if (claim === null || controller === null || !owns(claim)) {
-			silentlyAbandonDecision();
-			return;
-		}
-		const stillOwns = (): boolean => owns(claim);
+		if (controller === null || !owns(claim)) return;
+		const transition = controller.recordAutomaticContinue();
+		if (!transition.applied) return;
 
-		// Keep ordinary active tools and system prompt unchanged. Decision answers
-		// are final XML text, not temporary decision tools.
-		const waitCompletion = pendingWaitCompletion;
-		const decisionIntent =
-			waitCompletion === null
-				? config.decisionPrompt
-				: `${waitCompletion.content}\n\n${config.decisionPrompt}`;
-		const decisionPrompt = buildDecisionPrompt(
-			decisionIntent,
-			config.reasonTypes,
-			config.continueReasonTypes,
-		);
-		const domainFence = options.processDomain?.snapshot.fence ?? {
-			domainEpoch: "local",
-			activityGeneration: 0n,
-		};
 		const exchangeId = createExchangeId();
-		const protocol = createDecisionProtocolSession({
-			controller,
-			decisionId,
-			decisionPrompt,
-			reasonTypes: config.reasonTypes,
-			continueReasonTypes: config.continueReasonTypes,
-			now,
+		const watchdogEvent = createContinueWatchdogEvent({
+			occurredAtMs: now(),
 		});
-		const active: ActiveDecision = {
-			decisionId,
-			exchangeId,
-			claim,
-			domainFence,
-			inquiry: createInquiryRuntime(DECISION_INQUIRY_NAMESPACE, {
-				inquiryId: exchangeId,
-			}).attempt(protocol.currentCycleId),
-			aggregateGeneration: readyGeneration ??
-				graceCoordinator.snapshot.generation ?? {
-					domainEpoch: domainFence.domainEpoch,
-					activityGeneration: domainFence.activityGeneration,
-					ownershipGeneration: claim.generation,
-					localActivityGeneration,
-				},
-			invalidated: false,
-			dispatchPending: false,
-			submitted: false,
-			protocol,
-			waitCompletionIdentity: waitCompletion?.identity ?? null,
-		};
-		activeDecision = active;
+		const content = formatContinueWatchdogEvent(
+			watchdogEvent,
+			config.continuePrompt,
+		);
+		continuationDispatchPending = true;
 		try {
-			if (!stillOwns()) {
-				silentlyAbandonDecision();
-				return;
-			}
-			if (!allIdleForClaim(claim)) {
-				deferDecisionOnBusy(active);
-				return;
-			}
-			const status = checkingStatus(active);
-			const widgetError = showLiveStatus(status);
-			if (widgetError !== null) {
-				appendStatus({
-					kind: "other-error",
-					exchangeId: active.exchangeId,
-					cycleId: active.protocol.currentCycleId,
-					message: widgetError,
-				});
-				silentlyAbandonDecision();
-				return;
-			}
-			if (!allIdleForClaim(claim)) {
-				deferDecisionOnBusy(active);
-				return;
-			}
-			sendDecisionPrompt(
-				active,
-				active.protocol.currentCycleId,
-				decisionPrompt,
+			watchdogOwnedRun = {
+				kind: "continuation",
+				claim,
+				exchangeId,
+				phase: "pending-start",
+				cancelRequested: false,
+			};
+			options.pi.sendMessage(
+				{
+					customType: CONTINUATION_MESSAGE_TYPE,
+					content,
+					display: true,
+					details: {
+						version: 1,
+						exchangeId,
+						generation: claim.generation,
+						event: watchdogEvent,
+					},
+				},
+				{ triggerTurn: true, deliverAs: "steer" },
 			);
-			// A demotion that lands during/after send must not leave a live exchange.
-			if (!stillOwns()) {
-				silentlyAbandonDecision();
-			}
 		} catch (error) {
-			if (stillOwns() && localIdle()) {
+			watchdogOwnedRun = null;
+			continuationDispatchPending = false;
+			controller.rollbackAutomaticContinue();
+			if (owns(claim)) {
 				appendStatus({
 					kind: "other-error",
-					exchangeId: active.exchangeId,
-					cycleId: active.protocol.currentCycleId,
+					exchangeId,
+					cycleId: transition.snapshot.attempt,
 					message: originalErrorMessage(error),
 				});
 			}
-			silentlyAbandonDecision();
-		}
-	};
-
-	const applyEffect = (
-		effect: Exclude<ControllerEffect, { kind: "notify" }>,
-		_ctx?: RuntimeContext,
-	): void => {
-		if (currentController() === null) return;
-		switch (effect.kind) {
-			case "openDecisionWindow":
-				openDecision(effect.decisionId);
-				break;
-			case "restoreDecisionTools":
-				// Historical effect name: closes the decision window; no tool swap.
-				if (activeDecision?.decisionId === effect.decisionId) {
-					activeDecision = null;
-					capturedDecisionResponse = null;
-					pendingFinalization = null;
-				}
-				break;
-			case "reaskDecision":
-			case "decisionFailed":
-				// Final decision effects are delivered only after agent_settled.
-				break;
-		}
-	};
-
-	const applyTransition = (
-		transition: ControllerTransition,
-		ctx?: RuntimeContext,
-		applyOptions?: {
-			readonly suppressNotify?: boolean;
-			readonly claim?: HubMainClaim;
-		},
-	): void => {
-		const claim = applyOptions?.claim ?? getMainClaim();
-		if (claim === null || !options.hub.isCurrentMain(claim)) return;
-		let opened: ActiveDecision | null = null;
-		for (const effect of transition.effects) {
-			if (!options.hub.isCurrentMain(claim)) return;
-			if (effect.kind === "notify") {
-				if (!applyOptions?.suppressNotify && ctx !== undefined) {
-					ctx.ui.notify(
-						effect.notification === "locked"
-							? "Continue watchdog locked"
-							: "Continue watchdog unlocked",
-					);
-				}
-				continue;
-			}
-			applyEffect(effect, ctx);
-			if (effect.kind === "openDecisionWindow") opened = activeDecision;
-		}
-		if (transition.applied) {
-			localActivityGeneration += 1;
 			observeAggregate();
+			return;
 		}
-		const latestGeneration = graceCoordinator.snapshot.generation;
-		if (opened !== null && latestGeneration !== null) {
-			opened.aggregateGeneration = latestGeneration;
+		if (!owns(claim)) {
+			// Ownership demoted across the send; the message is harmless steering,
+			// but no hook may claim it and the demoted owner's attempt is undone.
+			if (watchdogOwnedRun?.exchangeId === exchangeId) watchdogOwnedRun = null;
+			continuationDispatchPending = false;
+			controller.rollbackAutomaticContinue();
+			return;
 		}
+		// Pi's sendMessage is fire-and-forget: persistence of a triggerTurn custom
+		// message happens asynchronously on its message_start/message_end. The
+		// `watchdog-continued` hook is therefore published only when that exact
+		// correlated message starts (see handleMessageStart), never on the
+		// synchronous return here.
+		// The continuation turn is now the only local busy source; reconcile so
+		// hosts/tests that have not yet delivered agent_start still see it.
+		observeAggregate();
 	};
 
-	const getTriggerStatus = (): WatchdogTriggerStatus => {
-		const claim = getMainClaim();
-		const controller = currentController(claim);
-		const controllerSnapshot = controller?.snapshot;
-		const domain = options.processDomain?.snapshot;
-		const pendingMessages = hasPendingMessages();
-		let blocker: WatchdogTriggerBlocker | null = null;
-		if (claim === null || !owns(claim)) blocker = "not-main";
-		else if (!configReady || controllerSnapshot === undefined)
-			blocker = "config-loading";
-		else if (!controllerSnapshot.locked) blocker = "unlocked";
-		else if (controllerSnapshot.exhausted) blocker = "exhausted";
-		else if (controllerSnapshot.decisionFailed) blocker = "decision-failed";
-		else if (pendingFinalization !== null) blocker = "decision-finalizing";
-		else if (
-			controllerSnapshot.decisionOpen ||
-			activeDecision !== null ||
-			selfDecisionRun.kind !== "none"
-		)
-			blocker = "decision-open";
-		else if (pendingMessages) blocker = "pending-messages";
-		else if (!localIdle()) blocker = "local-agent-busy";
-		else if (!externalHubIdle() || domain?.allIdle === false)
-			blocker = "observable-agent-busy";
-
-		const grace = graceCoordinator.snapshot;
-		return {
-			main: claim !== null && owns(claim),
-			locked: controllerSnapshot?.locked ?? null,
-			attempt: controllerSnapshot?.attempt ?? null,
-			maxRetries: config.maxRetries,
-			blocker,
-			gracePhase: grace.phase,
-			graceRemainingMs:
-				grace.phase === "grace" && grace.deadlineMs !== null
-					? Math.max(0, Math.ceil(grace.deadlineMs - now()))
-					: null,
-			observableBusyCount: options.hub.snapshot.busyCount,
-			domainBusyParticipants: domain?.busyParticipants ?? null,
-		};
-	};
-
-	const aggregateInput = (): {
-		readonly allIdle: boolean;
-		readonly generation: ActivityGeneration;
-		readonly claim: HubMainClaim | null;
-		readonly fence: DomainFence;
-		readonly waitUntilMs: number;
-	} => {
-		const claim = getMainClaim();
-		const controller = currentController(claim);
-		const domain = options.processDomain?.snapshot;
-		const fence = domain?.fence ?? {
-			domainEpoch: "local",
-			activityGeneration: 0n,
-		};
-		const controllerEligible =
-			controller?.snapshot.locked === true &&
-			!controller.snapshot.exhausted &&
-			!controller.snapshot.decisionFailed &&
-			!controller.snapshot.decisionOpen;
-		const pendingMessages = hasPendingMessages();
-		const allIdle =
-			!stopped &&
-			configReady &&
-			claim !== null &&
-			owns(claim) &&
-			(domain === undefined
-				? options.hub.snapshot.allObservableIdle
-				: domain.allIdle) &&
-			externalHubIdle() &&
-			localIdle() &&
-			!pendingMessages &&
-			controllerEligible &&
-			activeDecision === null &&
-			pendingFinalization === null &&
-			pendingInquiryCleanup === null &&
-			selfDecisionRun.kind === "none";
-		return {
-			allIdle,
-			generation: {
-				domainEpoch: fence.domainEpoch,
-				activityGeneration: fence.activityGeneration,
-				ownershipGeneration: claim?.generation ?? 0,
-				localActivityGeneration,
-			},
-			claim,
-			fence,
-			waitUntilMs: controller?.snapshot.waitUntilMs ?? 0,
-		};
-	};
-
-	observeAggregate = (): void => {
-		const input = aggregateInput();
-		graceCoordinator.update({
-			allIdle: input.allIdle,
-			generation: input.generation,
-			notBeforeMs: input.waitUntilMs,
-		});
-		refreshStateStatus();
-	};
-
-	const publishCompletedWait = (
-		claim: HubMainClaim,
-		observedAtMs: number,
-	): string | null | undefined => {
-		const wait = pendingWaitTiming;
-		if (wait === null || observedAtMs < wait.deadlineMs) return null;
-		const event = createCompletedWaitWatchdogEvent({
-			waitIdentity: wait.identity,
-			acceptedAtMs: wait.acceptedAtMs,
-			observedAtMs,
-			waitSeconds: wait.waitSeconds,
-		});
-		const content = formatCompletedWaitWatchdogEvent(event);
+	/** Publish the continuation hook once its correlated message is durable. */
+	const publishContinuedHook = (claim: HubMainClaim): void => {
+		if (!owns(claim)) return;
 		try {
-			options.pi.sendMessage(
-				{
-					customType: WATCHDOG_EVENT_MESSAGE_TYPE,
-					content,
-					display: true,
-					details: event,
-				},
-				{ triggerTurn: false, deliverAs: "steer" },
-			);
+			emitSemanticHook(options.pi.events, createWatchdogContinuedEnvelope());
 		} catch {
-			return undefined;
+			// Listener failures never gate continuation.
 		}
-		if (pendingWaitTiming !== wait) return undefined;
-		pendingWaitCompletion = { identity: wait.identity, content };
-		pendingWaitTiming = null;
-		if (!allIdleForClaim(claim)) return undefined;
-		return content;
 	};
 
 	qualifyReady = (generation): void => {
 		void (async () => {
-			// Timer expiry performs a fresh official Pi query before any decision logic.
+			// Timer expiry performs a fresh official Pi query before any dispatch.
 			const ctx = sessionContext;
 			if (ctx === null || !probePiAgentState(ctx).idle) return;
 			const before = aggregateInput();
@@ -1530,29 +792,135 @@ export function createDecisionRuntime(
 			) {
 				return;
 			}
-			readyGeneration = generation;
-			const controller = currentController(after.claim);
-			if (controller !== null) {
-				const observedAtMs = now();
-				const completedWaitBody = publishCompletedWait(
-					after.claim,
-					observedAtMs,
-				);
-				if (completedWaitBody === undefined) {
-					readyGeneration = null;
-					return;
-				}
-				const transition = controller.beginDecision(observedAtMs);
-				if (!transition.applied) {
-					readyGeneration = null;
-					return;
-				}
-				applyTransition(transition, undefined, {
-					claim: after.claim,
-				});
-			}
-			readyGeneration = null;
+			dispatchContinuation(after.claim);
 		})();
+	};
+
+	const applyEffect = (
+		_effect: ControllerEffect,
+		_ctx?: RuntimeContext,
+	): void => {
+		// The controller now emits only notify effects; retained for the
+		// command/abort-outcome seams that apply transitions generically.
+	};
+
+	const applyTransition = (
+		transition: ControllerTransition,
+		ctx?: RuntimeContext,
+		applyOptions?: {
+			readonly suppressNotify?: boolean;
+			readonly claim?: HubMainClaim;
+		},
+	): void => {
+		const claim = applyOptions?.claim ?? getMainClaim();
+		if (claim === null || !options.hub.isCurrentMain(claim)) return;
+		for (const effect of transition.effects) {
+			if (!options.hub.isCurrentMain(claim)) return;
+			if (effect.kind === "notify") {
+				if (!applyOptions?.suppressNotify && ctx !== undefined) {
+					ctx.ui.notify(
+						effect.notification === "locked"
+							? "Continue watchdog locked"
+							: "Continue watchdog unlocked",
+					);
+				}
+				continue;
+			}
+			applyEffect(effect, ctx);
+		}
+		if (transition.applied) {
+			localActivityGeneration += 1;
+			observeAggregate();
+		}
+	};
+
+	const getTriggerStatus = (): WatchdogTriggerStatus => {
+		const claim = getMainClaim();
+		const controller = currentController(claim);
+		const controllerSnapshot = controller?.snapshot;
+		const domain = options.processDomain?.snapshot;
+		const pendingMessages = hasPendingMessages();
+		let blocker: WatchdogTriggerBlocker | null = null;
+		if (claim === null || !owns(claim)) blocker = "not-main";
+		else if (!configReady || controllerSnapshot === undefined)
+			blocker = "config-loading";
+		else if (!controllerSnapshot.locked) blocker = "unlocked";
+		else if (controllerSnapshot.exhausted) blocker = "exhausted";
+		else if (continuationDispatchPending || watchdogOwnedRun !== null)
+			blocker = "continuation-in-flight";
+		else if (pendingMessages) blocker = "pending-messages";
+		else if (!localIdle()) blocker = "local-agent-busy";
+		else if (!externalHubIdle() || domain?.allIdle === false)
+			blocker = "observable-agent-busy";
+
+		const grace = graceCoordinator.snapshot;
+		return {
+			main: claim !== null && owns(claim),
+			locked: controllerSnapshot?.locked ?? null,
+			attempt: controllerSnapshot?.attempt ?? null,
+			maxRetries: config.maxRetries,
+			blocker,
+			gracePhase: grace.phase,
+			graceRemainingMs:
+				grace.phase === "grace" && grace.deadlineMs !== null
+					? Math.max(0, Math.ceil(grace.deadlineMs - now()))
+					: null,
+			observableBusyCount: options.hub.snapshot.busyCount,
+			domainBusyParticipants: domain?.busyParticipants ?? null,
+		};
+	};
+
+	const aggregateInput = (): {
+		readonly allIdle: boolean;
+		readonly generation: ActivityGeneration;
+		readonly claim: HubMainClaim | null;
+		readonly fence: DomainFence;
+	} => {
+		const claim = getMainClaim();
+		const controller = currentController(claim);
+		const domain = options.processDomain?.snapshot;
+		const fence = domain?.fence ?? {
+			domainEpoch: "local",
+			activityGeneration: 0n,
+		};
+		const controllerEligible =
+			controller?.snapshot.locked === true && !controller.snapshot.exhausted;
+		const pendingMessages = hasPendingMessages();
+		const allIdle =
+			!stopped &&
+			configReady &&
+			claim !== null &&
+			owns(claim) &&
+			(domain === undefined
+				? options.hub.snapshot.allObservableIdle
+				: domain.allIdle) &&
+			externalHubIdle() &&
+			localIdle() &&
+			!pendingMessages &&
+			controllerEligible &&
+			!continuationDispatchPending &&
+			watchdogOwnedRun === null;
+		return {
+			allIdle,
+			generation: {
+				domainEpoch: fence.domainEpoch,
+				activityGeneration: fence.activityGeneration,
+				ownershipGeneration: claim?.generation ?? 0,
+				localActivityGeneration,
+			},
+			claim,
+			fence,
+		};
+	};
+
+	observeAggregate = (): void => {
+		const input = aggregateInput();
+		graceCoordinator.update({
+			allIdle: input.allIdle,
+			generation: input.generation,
+			notBeforeMs: 0,
+		});
+		refreshStateStatus();
 	};
 
 	const reconcileIdle = (): void => observeAggregate();
@@ -1594,8 +962,8 @@ export function createDecisionRuntime(
 
 	/**
 	 * Publish neutral `user-ready` at most once for the current all-idle epoch.
-	 * Only automatic unlock, exhausted, and decision-failed terminal states
-	 * produce a signal. Ordinary unlocked idle never publishes by inference.
+	 * Only AI unlock, error unlock, and exhaustion terminal states produce a
+	 * signal. Ordinary unlocked idle never publishes by inference.
 	 */
 	const maybePublishUserReady = async (): Promise<void> => {
 		if (
@@ -1605,7 +973,6 @@ export function createDecisionRuntime(
 			!options.hub.snapshot.allObservableIdle ||
 			!domainIdle() ||
 			!localIdle() ||
-			pendingFinalization !== null ||
 			publishedForIdleEpoch
 		) {
 			return;
@@ -1614,7 +981,6 @@ export function createDecisionRuntime(
 		const claim = getMainClaim();
 		const controller = currentController(claim);
 		if (claim === null || controller === null) return;
-		if (controller.snapshot.waitUntilMs > now()) return;
 
 		let envelope = null as ReturnType<typeof createUserReadyEnvelope> | null;
 		const unlockIntent = pendingUnlock;
@@ -1624,10 +990,6 @@ export function createDecisionRuntime(
 			const snapshot = controller.snapshot;
 			if (snapshot.locked && snapshot.exhausted) {
 				envelope = createUserReadyEnvelope({ STOP_KIND: "EXHAUSTED" });
-			} else if (snapshot.locked && snapshot.decisionFailed) {
-				envelope = createUserReadyEnvelope({
-					STOP_KIND: "DECISION_FAILED",
-				});
 			}
 		}
 
@@ -1654,15 +1016,10 @@ export function createDecisionRuntime(
 				if (pendingUnlock !== unlockIntent) return;
 			} else {
 				const live = liveController.snapshot;
-				if (live.waitUntilMs > now()) return;
 				let liveEnvelope: ReturnType<typeof createUserReadyEnvelope> | null =
 					null;
 				if (live.locked && live.exhausted) {
 					liveEnvelope = createUserReadyEnvelope({ STOP_KIND: "EXHAUSTED" });
-				} else if (live.locked && live.decisionFailed) {
-					liveEnvelope = createUserReadyEnvelope({
-						STOP_KIND: "DECISION_FAILED",
-					});
 				}
 				if (
 					liveEnvelope === null ||
@@ -1679,9 +1036,6 @@ export function createDecisionRuntime(
 				if (exhaustionEventPublicationInFlight) return;
 				exhaustionEventPublicationInFlight = true;
 				try {
-					const completedWaitBody = publishCompletedWait(claim, now());
-					if (completedWaitBody === undefined) return;
-					if (completedWaitBody !== null) pendingWaitCompletion = null;
 					const exhaustedEvent = createExhaustedWatchdogEvent({
 						occurredAtMs: now(),
 					});
@@ -1704,14 +1058,7 @@ export function createDecisionRuntime(
 			}
 			if (!allIdleForClaim(claim)) return;
 			const live = currentController(claim)?.snapshot;
-			if (
-				live === undefined ||
-				!live.locked ||
-				!live.exhausted ||
-				live.waitUntilMs > now()
-			) {
-				return;
-			}
+			if (live === undefined || !live.locked || !live.exhausted) return;
 		}
 		if (unlockIntent !== null) {
 			if (pendingUnlock !== unlockIntent) return;
@@ -1726,29 +1073,6 @@ export function createDecisionRuntime(
 		}
 	};
 
-	const scheduleTerminalWait = (waitUntilMs: number): void => {
-		clearTerminalWaitTimer();
-		const remainingMs = Math.ceil(waitUntilMs - now());
-		if (remainingMs <= 0) {
-			void maybePublishUserReady();
-			return;
-		}
-		const handle = clock.setTimeout(() => {
-			if (terminalWaitTimer !== handle) return;
-			terminalWaitTimer = null;
-			if (waitUntilMs > now()) {
-				scheduleTerminalWait(waitUntilMs);
-				return;
-			}
-			refreshStateStatus();
-			void maybePublishUserReady();
-		}, remainingMs);
-		terminalWaitTimer = handle;
-		if ("unref" in handle && typeof handle.unref === "function") {
-			handle.unref();
-		}
-	};
-
 	const dropControl = (): void => {
 		// Ownership has already been invalidated by the hub before cleanup starts.
 		// Safe to call again after re-entrant demotion — every step is idempotent.
@@ -1757,7 +1081,6 @@ export function createDecisionRuntime(
 		watchdogOwnedRun = null;
 		manualCancellation = null;
 		decisionAssistantToSplice = null;
-		suppressDecisionAbort = false;
 		options.controllerHolder.controller = null;
 		configReady = false;
 		configLoad = null;
@@ -1777,13 +1100,38 @@ export function createDecisionRuntime(
 		return true;
 	};
 
+	/** Apply a validated AI unlock from the tool: controller transition, cleared
+	 * pending continuation, and retained user-ready intent. Called from tool
+	 * execute while the run is still live. */
+	const applyAiUnlockFromTool = (call: {
+		readonly reasonType: string;
+		readonly reason: string;
+	}): boolean => {
+		const claim = getMainClaim();
+		const controller = currentController(claim);
+		if (claim === null || controller === null || !owns(claim)) return false;
+		const transition = controller.recordAiUnlock();
+		if (!transition.applied) return false;
+		continuationDispatchPending = false;
+		watchdogOwnedRun = null;
+		decisionAssistantToSplice = null;
+		pendingUnlock = unlockToolUserReadyValues(call);
+		publishedForIdleEpoch = false;
+		localActivityGeneration += 1;
+		observeAggregate();
+		return true;
+	};
+
 	const acquireControl = (claim: HubMainClaim): void => {
 		if (stopped || !options.hub.isCurrentMain(claim)) return;
 		ownedClaim = claim;
 		if (options.injectedController) {
 			options.controllerHolder.controller = injectedController;
 			configReady = injectedController !== null;
-			if (configReady) options.onConfigReady?.(config);
+			if (configReady) {
+				options.onConfigReady?.(config);
+				registerRuntimeUnlockTool();
+			}
 			syncHubState();
 			return;
 		}
@@ -1813,18 +1161,18 @@ export function createDecisionRuntime(
 			config = { ...loaded.config };
 			graceCoordinator.dispose();
 			graceCoordinator = createGraceCoordinator();
-			readyGeneration = null;
 			localActivityGeneration += 1;
 			options.controllerHolder.controller =
 				createLockDecisionController(config);
 			configReady = true;
-			for (const diagnostic of loaded.diagnostics) {
+			registerRuntimeUnlockTool();
+			for (const diagnosticItem of loaded.diagnostics) {
 				if (!owns(claim)) {
 					dropControl();
 					return;
 				}
 				try {
-					ctx.ui.notify(diagnostic.message, "warning");
+					ctx.ui.notify(diagnosticItem.message, diagnosticItem.severity);
 				} catch {
 					// Configuration remains usable when a non-TUI host rejects notify.
 				}
@@ -1842,6 +1190,21 @@ export function createDecisionRuntime(
 		})().finally(() => {
 			if (ownedClaim === claim) configLoad = null;
 		});
+	};
+
+	/** Register the unlock tool once per process, root processes only. */
+	let unlockToolRegistered = false;
+	const registerRuntimeUnlockTool = (): void => {
+		if (unlockToolRegistered || !isRootProcess()) return;
+		unlockToolRegistered = true;
+		registerUnlockTool(
+			options.pi,
+			createUnlockToolDefinition(config, {
+				isCurrentMain,
+				isLocked: () => currentController()?.snapshot.locked === true,
+				applyAiUnlock: (call) => applyAiUnlockFromTool(call),
+			}),
+		);
 	};
 
 	const syncHubState = (): void => {
@@ -1866,799 +1229,28 @@ export function createDecisionRuntime(
 		}
 	};
 
+	/**
+	 * Explicitly reclaim main when the hub has none. Detach never auto-promotes;
+	 * remaining attachments elect the deterministic preferred candidate here.
+	 */
+	const ensureMain = (): void => {
+		if (stopped || attachment === null) return;
+		if (options.hub.snapshot.main !== null) return;
+		options.hub.reclaimMain(attachment);
+	};
+
 	const unsubscribe = options.hub.subscribe(() => {
 		if (stopped) return;
-		if (!publishingOwnHubObservation) {
-			localActivityGeneration += 1;
-			invalidateActiveDecision(true);
-		}
+		if (!publishingOwnHubObservation) localActivityGeneration += 1;
 		syncHubState();
 	});
-
-	function invalidateActiveDecision(force = false): void {
-		const active = activeDecision;
-		const controller = options.controllerHolder.controller;
-		if (active === null || active.invalidated || controller === null) return;
-		const snapshot = options.processDomain?.snapshot;
-		if (
-			!force &&
-			snapshot !== undefined &&
-			snapshot.fence.domainEpoch === active.domainFence.domainEpoch &&
-			snapshot.fence.activityGeneration ===
-				active.domainFence.activityGeneration
-		) {
-			return;
-		}
-		if (active.submitted || selfRunFor(active)) {
-			// Invalidating the decision rejects its outcome, but an assistant run that
-			// has already started still belongs to this internal exchange. Retain only
-			// its redaction identity until message_end/agent_settled so stale XML cannot
-			// enter TUI history or session persistence. `selfRunFor` covers the narrow
-			// agent_start -> correlated message_start interval.
-			quarantinedDecision = {
-				exchangeId: active.exchangeId,
-				cycleId: active.protocol.currentCycleId,
-				inputObserved: active.submitted,
-			};
-		}
-		active.invalidated = true;
-		const fold = retainInquiryCleanup(active, "invalidated");
-		localActivityGeneration += 1;
-		selfDecisionRun = { kind: "none" };
-		capturedDecisionResponse = null;
-		decisionAssistantToSplice = null;
-		pendingFinalization = null;
-		clearLiveStatus();
-		applyTransition(
-			controller.invalidateDecision(active.decisionId),
-			undefined,
-			{
-				claim: active.claim,
-			},
-		);
-		if (fold !== null) retryInquiryCleanup();
-		observeAggregate();
-	}
 
 	const unsubscribeDomain = options.processDomain?.subscribe(
 		(_snapshot, source) => {
 			if (stopped || !domainReady || source === "local") return;
-			invalidateActiveDecision();
 			syncHubState();
 		},
 	);
-
-	const activeGenerationCurrent = (active: ActiveDecision): boolean => {
-		const current = graceCoordinator.snapshot.generation;
-		return (
-			current !== null &&
-			sameActivityGeneration(current, active.aggregateGeneration)
-		);
-	};
-
-	const withDecisionFence = async (
-		active: ActiveDecision,
-		effect: () => void,
-	): Promise<boolean> => {
-		if (!activeGenerationCurrent(active) || !allIdleForClaim(active.claim))
-			return false;
-		if (options.processDomain !== undefined) {
-			let confirmed = false;
-			try {
-				confirmed = await options.processDomain.confirm(active.domainFence);
-			} catch {
-				disableDomain();
-				return false;
-			}
-			if (!confirmed) {
-				invalidateActiveDecision(true);
-				return false;
-			}
-		}
-		observeAggregate();
-		if (!activeGenerationCurrent(active) || !allIdleForClaim(active.claim))
-			return false;
-		effect();
-		return activeGenerationCurrent(active) && allIdleForClaim(active.claim);
-	};
-
-	/**
-	 * Deliver a cached decision finalization. Returns true when a valid continue
-	 * was dispatched so this settle stays intermediate and must not publish
-	 * terminal `user-ready` yet.
-	 *
-	 * Captures the decision exchange claim and revalidates it immediately before
-	 * and after every ownership-dependent external/re-entrant call so a
-	 * synchronous demotion cannot continue into later messages, UI, or entries.
-	 */
-	const deliverPending = async (ctx: ExtensionContext): Promise<boolean> => {
-		const pending = pendingFinalization;
-		if (
-			pending === null ||
-			activeDecision !== pending.active ||
-			!owns(pending.active.claim)
-		) {
-			return false;
-		}
-		const { active, cycleId, plan } = pending;
-		if (active.invalidated) {
-			pendingFinalization = null;
-			invalidateActiveDecision();
-			return false;
-		}
-		const readyToFinalize = (): boolean =>
-			activeGenerationCurrent(active) &&
-			owns(active.claim) &&
-			domainIdle() &&
-			externalHubIdle() &&
-			localIdle() &&
-			!hasPendingMessages();
-		if (!readyToFinalize()) {
-			deferDecisionOnBusy(active);
-			return false;
-		}
-		// Exact claim carried by this decision exchange — not a live re-lookup.
-		const claim = active.claim;
-		if (options.processDomain !== undefined) {
-			if (!readyToFinalize()) return false;
-			let confirmed = false;
-			try {
-				confirmed = await options.processDomain.confirm(active.domainFence);
-			} catch {
-				disableDomain();
-				return false;
-			}
-			if (!confirmed) {
-				invalidateActiveDecision(true);
-				return false;
-			}
-			if (!readyToFinalize()) {
-				deferDecisionOnBusy(active);
-				return false;
-			}
-		}
-		// Local Pi and every observable attachment must still be idle to finalize;
-		// a busy race must not commit an invalid response or dispatch a re-ask.
-		if (!readyToFinalize()) {
-			deferDecisionOnBusy(active);
-			return false;
-		}
-		// Invalid re-asks have re-entrant status/UI work before dispatch. Keep the
-		// plan uncommitted through that work so an aggregate-busy edge consumes no
-		// invalid-attempt budget and can be retried at the next genuine idle settle.
-		if (plan.outcome === "invalid") {
-			const status = checkingStatus(active);
-			const widgetError = showLiveStatus(status);
-			if (widgetError !== null) {
-				appendStatus({
-					kind: "other-error",
-					exchangeId: active.exchangeId,
-					cycleId,
-					message: widgetError,
-				});
-				silentlyAbandonDecision();
-				return false;
-			}
-			if (!readyToFinalize()) return false;
-		}
-
-		const controllerBeforeCommit =
-			options.controllerHolder.controller?.snapshot;
-		pendingFinalization = null;
-		const finalization = active.protocol.commitResponse(cycleId, plan);
-
-		if (finalization.outcome === "reask") {
-			if (stopIfStale(claim)) return false;
-			if (!readyToFinalize()) {
-				// Local Pi became busy after this invalid response was committed but
-				// before the re-ask could dispatch. Defer the whole exchange so the
-				// next settle cannot re-commit or consume another attempt.
-				deferDecisionOnBusy(active);
-				return false;
-			}
-			if (
-				stopIfStale(claim) ||
-				!readyToFinalize() ||
-				finalization.reaskPrompt === undefined ||
-				!active.protocol.advanceAfterReask(cycleId)
-			) {
-				silentlyAbandonDecision();
-				return false;
-			}
-			if (stopIfStale(claim) || !readyToFinalize()) {
-				deferDecisionOnBusy(active);
-				return false;
-			}
-			active.inquiry.complete();
-			active.inquiry = createInquiryRuntime(DECISION_INQUIRY_NAMESPACE, {
-				inquiryId: active.exchangeId,
-			}).attempt(active.protocol.currentCycleId);
-			try {
-				if (
-					!sendDecisionPrompt(
-						active,
-						active.protocol.currentCycleId,
-						finalization.reaskPrompt,
-						{ deferOnBusy: false },
-					)
-				) {
-					const cycleRolledBack = active.protocol.rollbackAfterReask(cycleId);
-					const controllerRolledBack =
-						controllerBeforeCommit !== undefined &&
-						options.controllerHolder.controller?.rollbackInvalidDecision(
-							active.decisionId,
-							controllerBeforeCommit.invalidDecisionAttempts,
-							controllerBeforeCommit.lastInvalidDecisionError,
-						).applied === true;
-					if (!cycleRolledBack || !controllerRolledBack) {
-						silentlyAbandonDecision();
-						return false;
-					}
-					deferDecisionOnBusy(active);
-					return false;
-				}
-			} catch (error) {
-				if (owns(claim)) {
-					appendStatus({
-						kind: "other-error",
-						exchangeId: active.exchangeId,
-						cycleId: active.protocol.currentCycleId,
-						message: originalErrorMessage(error),
-					});
-				}
-				silentlyAbandonDecision();
-				return false;
-			}
-			if (stopIfStale(claim)) return false;
-			appendStatus({
-				kind: "validation-error",
-				exchangeId: active.exchangeId,
-				cycleId,
-				message: finalization.error ?? "Invalid watchdog decision response.",
-			});
-			// Re-ask is still an open decision cycle, not a terminal epoch.
-			return false;
-		}
-
-		if (stopIfStale(claim)) return false;
-		clearLiveStatus();
-		if (stopIfStale(claim)) return false;
-
-		if (finalization.outcome === "decision-failed") {
-			activeDecision = null;
-			capturedDecisionResponse = null;
-			if (finalization.cycleId === undefined) return false;
-			const error = finalization.error ?? "Continue watchdog decision failed.";
-			const watchdogEvent = createDecisionFailedWatchdogEvent({
-				occurredAtMs: now(),
-				error,
-			});
-			const eventContent = formatDecisionFailedWatchdogEvent(watchdogEvent);
-			if (
-				options.processDomain !== undefined &&
-				!(await withDecisionFence(active, () => {}))
-			)
-				return false;
-			if (
-				!appendStatus({
-					kind: "decision-failed",
-					exchangeId: active.exchangeId,
-					cycleId: finalization.cycleId,
-					message: error,
-				})
-			) {
-				silentlyAbandonDecision();
-				return false;
-			}
-			if (stopIfStale(claim)) return false;
-			try {
-				options.pi.sendMessage(
-					createDecisionFoldMessage({
-						exchangeId: active.exchangeId,
-						cycleId: finalization.cycleId,
-						outcome: "decision-failed",
-						eventContent,
-						watchdogEvent,
-					}),
-					{ triggerTurn: false, deliverAs: "steer" },
-				);
-				active.inquiry.complete();
-			} catch {
-				retainInquiryCleanup(active);
-				retryInquiryCleanup();
-			}
-			if (stopIfStale(claim)) return false;
-			try {
-				ctx.ui.notify(
-					finalization.notification ??
-						formatDecisionFailedNotification(
-							finalization.error ?? "Invalid decision.",
-						),
-					"warning",
-				);
-			} catch {
-				// Non-TUI hosts may reject notify; decision-failed is already final.
-			}
-			stopIfStale(claim);
-			return false;
-		}
-
-		if (
-			(finalization.outcome !== "continue" &&
-				finalization.outcome !== "wait" &&
-				finalization.outcome !== "unlock") ||
-			finalization.cycleId === undefined
-		) {
-			return false;
-		}
-
-		if (finalization.outcome === "wait") {
-			activeDecision = null;
-			capturedDecisionResponse = null;
-			const finalCycleId = finalization.cycleId;
-			const reason = finalization.reason;
-			const waitSeconds = finalization.waitSeconds;
-			const acceptedAtMs = finalization.acceptedAtMs;
-			const waitUntilMs = finalization.waitUntilMs;
-			if (
-				typeof reason !== "string" ||
-				reason.length === 0 ||
-				typeof waitSeconds !== "number" ||
-				!Number.isSafeInteger(waitSeconds) ||
-				waitSeconds < 1 ||
-				waitSeconds > MAX_WAIT_SECONDS ||
-				typeof waitUntilMs !== "number" ||
-				!Number.isSafeInteger(waitUntilMs) ||
-				waitUntilMs < 0 ||
-				typeof acceptedAtMs !== "number" ||
-				!Number.isFinite(acceptedAtMs)
-			) {
-				return false;
-			}
-			if (stopIfStale(claim)) return false;
-			const watchdogEvent = createWaitWatchdogEvent({
-				occurredAtMs: acceptedAtMs,
-				reason,
-				waitSeconds,
-				deadlineMs: waitUntilMs,
-			});
-			const eventContent = formatWaitWatchdogEvent(watchdogEvent);
-			if (stopIfStale(claim)) return false;
-			try {
-				options.pi.sendMessage(
-					createDecisionFoldMessage({
-						exchangeId: active.exchangeId,
-						cycleId: finalCycleId,
-						outcome: "wait",
-						eventContent,
-						watchdogEvent,
-					}),
-					{ triggerTurn: false, deliverAs: "steer" },
-				);
-				active.inquiry.complete({
-					customType: "pi-continue-watchdog:event",
-					content: eventContent,
-				});
-			} catch {
-				options.controllerHolder.controller?.rollbackValidWait(
-					controllerBeforeCommit?.waitUntilMs ?? 0,
-				);
-				retainInquiryCleanup(active);
-				retryInquiryCleanup();
-				silentlyAbandonDecision();
-				return false;
-			}
-			if (stopIfStale(claim)) return false;
-			pendingWaitTiming = {
-				identity: `${active.exchangeId}:${finalCycleId}:${acceptedAtMs}:${waitUntilMs}`,
-				acceptedAtMs,
-				waitSeconds,
-				deadlineMs: waitUntilMs,
-			};
-			pendingWaitCompletion = null;
-			try {
-				emitSemanticHook(
-					options.pi.events,
-					createWatchdogWaitingEnvelope({
-						REASON: reason,
-						WAIT_SECONDS: String(waitSeconds),
-					}),
-				);
-			} catch {
-				// Listener failures never gate an accepted wait.
-			}
-			if (stopIfStale(claim)) return false;
-			selfDecisionRun = { kind: "none" };
-			observeAggregate();
-			if (options.controllerHolder.controller?.snapshot.exhausted) {
-				scheduleTerminalWait(waitUntilMs);
-			}
-			return false;
-		}
-
-		if (finalization.outcome === "continue") {
-			activeDecision = null;
-			capturedDecisionResponse = null;
-			const finalCycleId = finalization.cycleId;
-			const reasonType = finalization.reasonType;
-			const reason = finalization.reason;
-			if (
-				typeof reasonType !== "string" ||
-				reasonType.length === 0 ||
-				typeof reason !== "string" ||
-				reason.length === 0
-			) {
-				return false;
-			}
-			const deferAcceptedContinue = (): false => {
-				options.controllerHolder.controller?.rollbackValidContinue();
-				active.invalidated = true;
-				clearLiveStatus();
-				return false;
-			};
-			if (stopIfStale(claim)) return false;
-			if (!allIdleForClaim(claim)) return deferAcceptedContinue();
-			if (options.processDomain !== undefined) {
-				let confirmed = false;
-				try {
-					confirmed = await options.processDomain.confirm(active.domainFence);
-				} catch {
-					disableDomain();
-					return false;
-				}
-				if (!confirmed) return deferAcceptedContinue();
-				if (!allIdleForClaim(claim)) return deferAcceptedContinue();
-			}
-			if (!allIdleForClaim(claim)) return deferAcceptedContinue();
-			const watchdogEvent = createContinueWatchdogEvent({
-				occurredAtMs: now(),
-				reasonType,
-				reason,
-			});
-			const continuationMessage = formatContinueWatchdogEvent(
-				watchdogEvent,
-				config.continuePrompt,
-			);
-			if (stopIfStale(claim)) return false;
-			try {
-				watchdogOwnedRun = {
-					kind: "continuation",
-					claim,
-					exchangeId: active.exchangeId,
-					cycleId: finalCycleId,
-					phase: "pending-start",
-					cancelRequested: false,
-				};
-				options.pi.sendMessage(
-					createDecisionFoldMessage({
-						exchangeId: active.exchangeId,
-						cycleId: finalCycleId,
-						outcome: "continue",
-						continuePrompt: continuationMessage,
-						watchdogEvent,
-					}),
-					{ triggerTurn: true, deliverAs: "steer" },
-				);
-				active.inquiry.complete({
-					customType: "pi-continue-watchdog:continuation",
-					content: continuationMessage,
-				});
-			} catch {
-				watchdogOwnedRun = null;
-				if (!allIdleForClaim(claim)) return deferAcceptedContinue();
-				options.controllerHolder.controller?.rollbackValidContinue();
-				retainInquiryCleanup(active);
-				retryInquiryCleanup();
-				silentlyAbandonDecision();
-				return false;
-			}
-			// Demotion after a successful send still must not claim intermediate continue.
-			if (stopIfStale(claim)) return false;
-			try {
-				emitSemanticHook(
-					options.pi.events,
-					createWatchdogContinuedEnvelope({
-						REASON_TYPE: reasonType,
-						REASON: reason,
-					}),
-				);
-			} catch {
-				// Listener failures never gate continuation.
-			}
-			// The continuation turn is now the only local busy source; reconcile the
-			// next retry from the controller state for hosts/tests that have not yet
-			// delivered its agent_start event.
-			reconcileIdle();
-			return true;
-		}
-
-		activeDecision = null;
-		capturedDecisionResponse = null;
-		// Valid AI unlock must carry both fields; never invent empty fallbacks.
-		const reasonType =
-			typeof finalization.reasonType === "string" &&
-			finalization.reasonType.length > 0
-				? finalization.reasonType
-				: null;
-		const reason =
-			typeof finalization.reason === "string" && finalization.reason.length > 0
-				? finalization.reason
-				: null;
-		if (reasonType === null || reason === null) {
-			stopIfStale(claim);
-			return false;
-		}
-		if (stopIfStale(claim)) return false;
-		const watchdogEvent = createUnlockWatchdogEvent({
-			occurredAtMs: now(),
-			reasonType,
-			reason,
-		});
-		const eventContent = formatUnlockWatchdogEvent(watchdogEvent);
-		try {
-			options.pi.sendMessage(
-				createDecisionFoldMessage({
-					exchangeId: active.exchangeId,
-					cycleId: finalization.cycleId,
-					outcome: "unlock",
-					eventContent,
-					watchdogEvent,
-				}),
-				{ triggerTurn: false, deliverAs: "steer" },
-			);
-			active.inquiry.complete({
-				customType: "pi-continue-watchdog:event",
-				content: eventContent,
-			});
-			pendingUnlock = {
-				STOP_KIND: "AI_UNLOCK",
-				REASON_TYPE: reasonType,
-				REASON: reason,
-			};
-			stopIfStale(claim);
-		} catch {
-			retainInquiryCleanup(active);
-			retryInquiryCleanup();
-			// The controller is already unlocked and must not be re-armed.
-			stopIfStale(claim);
-		}
-		// The shared event is the sole visible reasoned automatic-unlock output.
-		return false;
-	};
-
-	/**
-	 * Idempotent finalization for the active current decision. Safe to call from
-	 * agent_end and true-idle settle; no-ops when already finalized or inactive.
-	 */
-	const finalizeActiveDecision = (
-		response: ReturnType<typeof normalizeAssistantDecisionResponse> | "missing",
-	): void => {
-		const active = activeDecision;
-		if (
-			active === null ||
-			pendingFinalization !== null ||
-			!options.hub.isCurrentMain(active.claim)
-		) {
-			return;
-		}
-		const cycleId = active.protocol.currentCycleId;
-		pendingFinalization = {
-			active,
-			cycleId,
-			plan: active.protocol.planResponse(
-				cycleId,
-				response === "missing"
-					? { content: [{ type: "malformed" }] }
-					: response,
-			),
-		};
-	};
-
-	const handleDecisionMessageEnd = (
-		event: MessageEndEvent,
-		ctx?: ExtensionContext,
-	) => {
-		if (ctx !== undefined) {
-			retryInquiryCleanup();
-			observeLiveState(ctx, {
-				preserveGeneration: selfDecisionRun.kind !== "none",
-			});
-		}
-		if (quarantinedDecision !== null && event.message.role === "assistant") {
-			return {
-				message: neutralizeDecisionAssistant(
-					{
-						...event.message,
-						...(isAbortedAssistant(event.message)
-							? { stopReason: "stop" as const }
-							: {}),
-					},
-					quarantinedDecision.exchangeId,
-					quarantinedDecision.cycleId,
-				),
-			};
-		}
-		const cancellation = manualCancellation;
-		if (
-			cancellation !== null &&
-			event.message.role === "assistant" &&
-			isAbortedAssistant(event.message)
-		) {
-			return {
-				message: neutralizeDecisionAssistant(
-					{
-						...event.message,
-						stopReason: "stop" as const,
-						errorMessage: CANCELLED_WATCHDOG_RUN_ERROR,
-					},
-					cancellation.exchangeId,
-					cancellation.cycleId,
-				),
-			};
-		}
-		// Suppress the aborted assistant of a watchdog decision preempted by user
-		// input so the TUI does not show `Operation aborted` for the internal run.
-		// The TUI renders abort text from `stopReason`, so neutralize both fields;
-		// this only ever applies to the watchdog's own preempted internal turn.
-		if (
-			event.message.role === "assistant" &&
-			((suppressDecisionAbort && isAbortedAssistant(event.message)) ||
-				isPreemptedAssistant(event.message)) &&
-			decisionAssistantToSplice !== null
-		) {
-			return {
-				message: neutralizeDecisionAssistant(
-					{
-						...event.message,
-						stopReason: "stop" as const,
-						errorMessage: PREEMPTED_DECISION_ERROR,
-					},
-					decisionAssistantToSplice.exchangeId,
-					decisionAssistantToSplice.cycleId,
-				),
-			};
-		}
-		const active = activeDecision;
-		if (
-			active === null ||
-			!active.submitted ||
-			pendingFinalization !== null ||
-			event.message.role !== "assistant" ||
-			isErroredAssistant(event.message) ||
-			!options.hub.isCurrentMain(active.claim)
-		) {
-			return undefined;
-		}
-		if (isAbortedAssistant(event.message)) {
-			return {
-				message: {
-					...event.message,
-					content: [],
-				},
-			};
-		}
-		const cycleId = active.protocol.currentCycleId;
-		const captured = active.inquiry.capture(event.message);
-		if (captured === null) return undefined;
-		const response = normalizeAssistantDecisionResponse({
-			...event.message,
-			content: [{ type: "text", text: captured }],
-		});
-		capturedDecisionResponse = { active, cycleId, response };
-		// The current prompt's run is over; until the next prompt (re-ask,
-		// continue, or fold) is actually sent, an unrelated run must not be
-		// misattributed as this decision's answer.
-		active.dispatchPending = false;
-		active.submitted = false;
-
-		const validation = validateDecisionResponse(
-			response,
-			config.reasonTypes,
-			config.continueReasonTypes,
-		);
-		let audit: DecisionAuditEntry;
-		if (!validation.valid) {
-			audit = {
-				version: 1,
-				exchangeId: active.exchangeId,
-				cycleId,
-				outcome: "invalid",
-				error: validation.error,
-			};
-		} else if (validation.decision.kind === "continue") {
-			audit = {
-				version: 1,
-				exchangeId: active.exchangeId,
-				cycleId,
-				outcome: "continue",
-				reasonType: validation.decision.reasonType,
-				reason: validation.decision.reason,
-			};
-		} else if (validation.decision.kind === "wait") {
-			audit = {
-				version: 1,
-				exchangeId: active.exchangeId,
-				cycleId,
-				outcome: "wait",
-				reason: validation.decision.reason,
-				waitSeconds: validation.decision.waitSeconds,
-			};
-		} else {
-			audit = {
-				version: 1,
-				exchangeId: active.exchangeId,
-				cycleId,
-				outcome: "unlock",
-				reasonType: validation.decision.reasonType,
-				reason: validation.decision.reason,
-			};
-		}
-		try {
-			options.pi.appendEntry<DecisionAuditEntry>(
-				DECISION_AUDIT_ENTRY_TYPE,
-				audit,
-			);
-		} catch {
-			// Audit persistence is optional; context hiding must still succeed.
-		}
-
-		return {
-			message: active.inquiry.neutralize(event.message),
-		};
-	};
-
-	const handleAgentEnd = (event: AgentEndEvent): void => {
-		if (quarantinedDecision !== null) {
-			// Keep blocking and hiding until authoritative agent_settled. Some hosts
-			// emit message_end after agent_end, so clearing here could leak output.
-			return;
-		}
-		const active = activeDecision;
-		if (active?.dispatchPending && !active.submitted && !active.invalidated) {
-			// A foreign run may end before the correlated decision message_start is
-			// observed. It cannot supply or consume the watchdog decision response.
-			deferDecisionOnBusy(active);
-			return;
-		}
-		const assistant = terminalAssistant(event.messages);
-		// Aborts are owned by the abort-outcome path. Provider errors remain
-		// provisional because Pi may automatically retry within the same run;
-		// only a successful response or the final settled no-result may consume a
-		// decision attempt.
-		if (assistant !== undefined && isAbortedAssistant(assistant)) return;
-		if (assistant !== undefined && isErroredAssistant(assistant)) {
-			const active = activeDecision;
-			if (active !== null && owns(active.claim)) {
-				if (
-					!appendStatus({
-						kind: "other-error",
-						exchangeId: active.exchangeId,
-						cycleId: active.protocol.currentCycleId,
-						message: assistantErrorMessage(assistant),
-					}) ||
-					!owns(active.claim)
-				) {
-					silentlyAbandonDecision();
-				}
-			}
-			return;
-		}
-		const captured = capturedDecisionResponse;
-		if (
-			captured !== null &&
-			captured.active === activeDecision &&
-			captured.cycleId === activeDecision.protocol.currentCycleId
-		) {
-			capturedDecisionResponse = null;
-			finalizeActiveDecision(captured.response);
-			return;
-		}
-		finalizeActiveDecision(
-			assistant === undefined
-				? "missing"
-				: normalizeAssistantDecisionResponse(assistant),
-		);
-	};
 
 	const handleMessageStart = async (
 		event: { readonly message: unknown },
@@ -2668,33 +1260,11 @@ export function createDecisionRuntime(
 			readonly role?: unknown;
 			readonly customType?: unknown;
 			readonly details?: {
-				readonly inquiryId?: unknown;
-				readonly attempt?: unknown;
+				readonly exchangeId?: unknown;
+				readonly generation?: unknown;
 			};
 		};
-		const current = activeDecision;
-		if (ctx !== undefined) {
-			observeLiveState(ctx, {
-				preserveGeneration:
-					current?.inquiry.matchesPrompt(message) === true ||
-					(current !== null && selfRunFor(current)),
-			});
-		}
-		if (quarantinedDecision !== null) {
-			// Once the exact custom input has correlated this quarantine to a Pi run,
-			// retain it across every assistant/tool-result message until agent_settled.
-			// Before correlation, fail closed on the first non-matching input so an
-			// unrelated run can never have its assistant redacted.
-			if (quarantinedDecision.inputObserved) return;
-			const matchesQuarantine =
-				message.role === "custom" &&
-				message.customType === "pi-continue-watchdog:inquiry" &&
-				message.details?.inquiryId === quarantinedDecision.exchangeId &&
-				message.details?.attempt === quarantinedDecision.cycleId;
-			if (matchesQuarantine) quarantinedDecision.inputObserved = true;
-			else quarantinedDecision = null;
-			return;
-		}
+		if (ctx !== undefined) observeLiveState(ctx);
 		const ownedRun = watchdogOwnedRun;
 		if (
 			ownedRun?.phase === "running" &&
@@ -2705,66 +1275,76 @@ export function createDecisionRuntime(
 			// run is no longer solely watchdog-owned, so a later manual unlock must
 			// not abort it under stale continuation identity.
 			watchdogOwnedRun = null;
+			return;
 		}
 		if (ownedRun?.phase === "pending-start") {
-			const fold =
+			const isOwnContinuation =
 				message.role === "custom" &&
-				message.customType === DECISION_FOLD_MESSAGE_TYPE
-					? parseDecisionFoldDetails(message.details)
-					: undefined;
-			if (
-				fold?.inquiryId === ownedRun.exchangeId &&
-				fold.attempt === ownedRun.cycleId &&
-				fold.watchdogOutcome === "continue" &&
-				fold.replacement?.customType === CONTINUATION_MESSAGE_TYPE &&
-				owns(ownedRun.claim)
-			) {
+				message.customType === CONTINUATION_MESSAGE_TYPE &&
+				message.details?.exchangeId === ownedRun.exchangeId &&
+				owns(ownedRun.claim);
+			if (isOwnContinuation) {
 				ownedRun.phase = "running";
+				continuationDispatchPending = false;
+				publishContinuedHook(ownedRun.claim);
+				observeAggregate();
 				return;
 			}
 			watchdogOwnedRun = null;
-		}
-		const active = activeDecision;
-		if (active === null || active.invalidated || !owns(active.claim)) return;
-		const isCurrentDecision = active.inquiry.matchesPrompt(message);
-		if (
-			active.submitted &&
-			!isCurrentDecision &&
-			(message.role === "user" || message.role === "custom")
-		) {
-			deferDecisionOnBusy(active);
+			continuationDispatchPending = false;
+			observeAggregate();
 			return;
 		}
-		if (!active.dispatchPending) return;
-		if (!isCurrentDecision) {
-			deferDecisionOnBusy(active);
-			return;
+		if (continuationDispatchPending) {
+			continuationDispatchPending = false;
+			observeAggregate();
 		}
-		active.dispatchPending = false;
-		active.submitted = true;
-		if (
-			active.waitCompletionIdentity !== null &&
-			pendingWaitCompletion?.identity === active.waitCompletionIdentity
-		) {
-			pendingWaitCompletion = null;
-		}
-		selfDecisionRun = {
-			kind: "confirmed",
-			exchangeId: active.exchangeId,
-			cycleId: active.protocol.currentCycleId,
-		};
-		observeAggregate();
 	};
 
-	const observeLiveState = (
-		ctx = sessionContext,
-		observationOptions?: { readonly preserveGeneration?: boolean },
-	): boolean => {
+	/**
+	 * Neutralize the aborted assistant of a manually cancelled watchdog-owned
+	 * continuation run: empty content, cancelled marker, and a correlation the
+	 * context fold can remove. Registered uninterruptible so abort settle still
+	 * replaces the finalized message.
+	 */
+	const handleContinuationMessageEnd = (
+		event: MessageEndEvent,
+	): { readonly message: MessageEndEvent["message"] } | undefined => {
+		const cancellation = manualCancellation;
+		if (
+			cancellation === null ||
+			event.message.role !== "assistant" ||
+			event.message.stopReason !== "aborted"
+		)
+			return undefined;
+		const message = event.message as typeof event.message & {
+			readonly details?: unknown;
+		};
+		const details =
+			typeof message.details === "object" && message.details !== null
+				? { ...(message.details as Record<string, unknown>) }
+				: {};
+		return {
+			message: {
+				...message,
+				stopReason: "stop" as const,
+				errorMessage: CANCELLED_WATCHDOG_RUN_ERROR,
+				content: [],
+				// The correlation rides on the replacement message; AssistantMessage
+				// has no details field, but message_end replacements may carry extras.
+				details: {
+					...details,
+					piContinuation: { exchangeId: cancellation.exchangeId },
+				},
+			} as MessageEndEvent["message"],
+		};
+	};
+
+	const observeLiveState = (ctx = sessionContext): boolean => {
 		if (ctx === null || stopped) return false;
-		retryInquiryCleanup();
 		const { idle, busy } = probePiAgentState(ctx);
 		localAiBusy = busy;
-		if (!observationOptions?.preserveGeneration) localActivityGeneration += 1;
+		localActivityGeneration += 1;
 		if (attachment !== null) {
 			publishingOwnHubObservation = true;
 			try {
@@ -2793,20 +1373,6 @@ export function createDecisionRuntime(
 			sessionContext = ctx;
 			localAiBusy = probePiAgentState(ctx).busy;
 			if (options.processDomain !== undefined) {
-				let initialAttachComplete = false;
-				let initialDomainExitRequested = false;
-				const exitForInitialDomainFailure = (error: Error): boolean => {
-					if (
-						initialAttachComplete ||
-						initialDomainExitRequested ||
-						!isProcessDomainFatalError(error)
-					) {
-						return false;
-					}
-					initialDomainExitRequested = true;
-					options.fatalExit?.fail(error, ctx);
-					return true;
-				};
 				try {
 					await options.processDomain.attach(options.attachmentInstance, {
 						getIdle: () =>
@@ -2814,21 +1380,23 @@ export function createDecisionRuntime(
 								? false
 								: probePiAgentState(sessionContext).idle,
 						onFatal: (error) => {
-							if (exitForInitialDomainFailure(error)) {
+							if (isProcessDomainFatalError(error)) {
+								options.fatalExit?.fail(error, ctx);
 								disableDomain();
 								return;
 							}
 							handleRuntimeDomainFailure();
 						},
 					});
-					initialAttachComplete = true;
 					domainAttached = true;
 					domainReady = true;
 				} catch (error) {
 					const attachError =
 						error instanceof Error ? error : new Error("process domain failed");
 					disableDomain();
-					exitForInitialDomainFailure(attachError);
+					if (isProcessDomainFatalError(attachError)) {
+						options.fatalExit?.fail(attachError, ctx);
+					}
 					return;
 				}
 			}
@@ -2842,42 +1410,12 @@ export function createDecisionRuntime(
 			attachment = bound.attachment;
 			syncHubState();
 			await configLoad;
-			if (!stopped && probePiAgentState(ctx).idle)
-				recoverPreemptedDecisionAssistants(ctx);
 		});
 
 		options.pi.on("agent_start", async (_event, ctx) => {
 			const claim = getMainClaim();
 			const controller = currentController(claim);
-			// A run that starts before the watchdog decision was actually submitted is
-			// unrelated work (for example a compaction resume during fence confirm).
-			// Defer the provisional decision so this run is never captured as the
-			// decision answer and never marked internal in the process domain.
-			const active = activeDecision;
-			if (
-				active !== null &&
-				!active.invalidated &&
-				!active.dispatchPending &&
-				!active.submitted
-			) {
-				deferDecisionOnBusy(active);
-			}
-			const provisionalInternal =
-				active !== null &&
-				!active.invalidated &&
-				owns(active.claim) &&
-				((active.dispatchPending && !active.submitted) ||
-					(active.submitted && selfRunFor(active)));
-			if (provisionalInternal && active !== null) {
-				selfDecisionRun = {
-					kind: active.submitted ? "confirmed" : "provisional",
-					exchangeId: active.exchangeId,
-					cycleId: active.protocol.currentCycleId,
-				};
-			} else {
-				selfDecisionRun = { kind: "none" };
-			}
-			observeLiveState(ctx, { preserveGeneration: provisionalInternal });
+			observeLiveState(ctx);
 			if (claim !== null && controller !== null) {
 				const transition = controller.ensureLocked();
 				if (transition.applied) {
@@ -2888,152 +1426,53 @@ export function createDecisionRuntime(
 						claim,
 					});
 				}
-				// Already locked: preserve cycle/decision; do not clear active work.
+				// Already locked: preserve cycle; do not clear active work.
 			}
 		});
 
-		// A real user input (interactive or RPC) that arrives while a submitted
-		// watchdog decision is running must preempt it. Pi keeps the original user
-		// message queued when we return `continue`; do not re-send it. Abort only
-		// the watchdog decision, neutralize its aborted assistant, and persist a
-		// foldable preempted marker. Extension-injected messages never preempt.
-		options.pi.on("input", (event, ctx) => {
-			const active = activeDecision;
-			if (event.source !== "interactive" && event.source !== "rpc") {
-				observeLiveState(ctx);
-				return;
-			}
-			selfDecisionRun = { kind: "none" };
+		options.pi.on("agent_end", (_event, ctx) => {
 			observeLiveState(ctx);
-			// A re-issued takeover must pass through untouched so it becomes the
-			// fresh user turn instead of being captured again.
-			if (pendingTakeover.isReissuedTakeover(event.text)) {
-				return { action: "continue" };
-			}
-			if (
-				active === null ||
-				active.invalidated ||
-				!active.submitted ||
-				!owns(active.claim)
-			) {
-				return { action: "continue" };
-			}
-			// Swallow the raw takeover so 0.85.1's async abort cannot strand it as
-			// steering inside the hidden decision run; re-issue after settle. A
-			// second takeover before the first settles supersedes it (the newest
-			// user intent wins) rather than throwing on the shared single slot.
-			if (pendingTakeover.hasPending) pendingTakeover.clear();
-			pendingTakeover.capture(event.text);
-			suppressDecisionAbort = true;
-			decisionAssistantToSplice = {
-				kind: "decision",
-				claim: active.claim,
-				exchangeId: active.exchangeId,
-				cycleId: active.protocol.currentCycleId,
-			};
-			deferDecisionOnBusy(active, "preempted", true);
-			try {
-				ctx.abort();
-			} catch {
-				// The handle is already terminal even when host abort fails.
-			}
-			retryInquiryCleanup();
-			return { action: "handled" };
 		});
 
 		(options.pi as ExtensionAPI & Partial<UninterruptibleMessageEndAPI>).on(
 			"message_end",
-			handleDecisionMessageEnd,
+			handleContinuationMessageEnd,
 			{
 				uninterruptible: true,
 			},
 		);
-		options.pi.on("agent_end", (event, ctx) => {
-			observeLiveState(ctx, {
-				preserveGeneration: selfDecisionRun.kind !== "none",
-			});
-			handleAgentEnd(event);
-		});
-
-		// While a decision is open, block ordinary tools before execution. The
-		// agent loop continues so the final assistant XML can still be validated.
-		options.pi.on("tool_call", (_event, ctx) => {
-			observeLiveState(ctx, {
-				preserveGeneration: selfDecisionRun.kind !== "none",
-			});
-			if (quarantinedDecision !== null) {
-				return {
-					block: true,
-					reason: DECISION_TOOL_BLOCK_REASON,
-				};
-			}
-			const active = activeDecision;
-			if (
-				active === null ||
-				pendingFinalization !== null ||
-				!options.hub.isCurrentMain(active.claim)
-			) {
-				return;
-			}
-			return {
-				block: true,
-				reason: DECISION_TOOL_BLOCK_REASON,
-			};
-		});
 
 		options.pi.on("agent_settled", async (_event, ctx: ExtensionContext) => {
-			retryInquiryCleanup();
+			// A continuation still pending-start at settlement never became a run
+			// (Pi's asynchronous send failed before its message_start): return the
+			// attempt it consumed. No watchdog-continued hook was published for it.
+			const unstarted = watchdogOwnedRun;
+			if (unstarted?.phase === "pending-start") {
+				currentController(unstarted.claim)?.rollbackAutomaticContinue();
+			}
 			watchdogOwnedRun = null;
+			continuationDispatchPending = false;
 			// manualCancellation belongs to the run whose abort produced this
 			// authoritative settle. Foreign input may already have cleared active
 			// ownership, so retirement cannot depend on watchdogOwnedRun still being
 			// present. The independent splice target remains until presentation cleanup.
 			if (manualCancellation !== null) {
 				manualCancellation = null;
-				suppressDecisionAbort = false;
 			}
-			const preserveGeneration = selfDecisionRun.kind !== "none";
-			if (stopped || !observeLiveState(ctx, { preserveGeneration })) return;
+			if (stopped || !observeLiveState(ctx)) return;
 
-			if (quarantinedDecision !== null) {
-				quarantinedDecision = null;
-				suppressDecisionAbort = false;
-			}
-			const spliceBeforeNextTurn = decisionAssistantToSplice;
-			if (selfDecisionRun.kind === "provisional") {
-				const pending = activeDecision;
-				selfDecisionRun = { kind: "none" };
-				if (pending !== null) deferDecisionOnBusy(pending);
-			}
 			if (!isCurrentMain() || options.controllerHolder.controller === null)
 				return;
 
-			if (
-				spliceBeforeNextTurn !== null &&
-				probePiAgentState(ctx).idle &&
-				pendingFinalization === null &&
-				decisionAssistantToSplice === spliceBeforeNextTurn
-			) {
-				spliceDecisionAssistant(ctx);
+			if (decisionAssistantToSplice !== null && probePiAgentState(ctx).idle) {
+				spliceContinuationAssistant(ctx);
 			}
 
-			const active = activeDecision;
-			if (active?.dispatchPending && !active.submitted && !active.invalidated) {
-				deferDecisionOnBusy(active);
-			} else {
-				finalizeActiveDecision("missing");
-			}
-			const continued = await deliverPending(ctx);
-			if (!continued && probePiAgentState(ctx).idle)
-				spliceDecisionAssistant(ctx);
-			if (!continued) await maybePublishUserReady();
-
-			// Re-issue a captured takeover as a fresh user turn now that the
-			// preempted decision has settled. The shared guard lets this exact
-			// text through when it re-enters the input hook.
-			const takeover = pendingTakeover.takeForReissue();
-			if (takeover !== null && probePiAgentState(ctx).idle) {
-				await options.pi.sendUserMessage(takeover);
+			if (probePiAgentState(ctx).idle) {
+				await maybePublishUserReady();
+				// A qualified aggregate-idle state may already arm the next
+				// continuation; observeAggregate inside reconcileIdle covers it.
+				reconcileIdle();
 			}
 		});
 	};
@@ -3044,11 +1483,10 @@ export function createDecisionRuntime(
 		stopped = true;
 		lifecycleGeneration += 1;
 		localActivityGeneration += 1;
-		quarantinedDecision = null;
 		watchdogOwnedRun = null;
 		manualCancellation = null;
 		decisionAssistantToSplice = null;
-		suppressDecisionAbort = false;
+		continuationDispatchPending = false;
 		graceCoordinator.dispose();
 		const detached = attachment;
 		if (detached !== null) options.hub.detach(detached);
@@ -3089,7 +1527,6 @@ export function createDecisionRuntime(
 				return;
 			pendingUnlock = { STOP_KIND: "ERROR_UNLOCK" };
 		},
-		consumeDecisionAbortSuppression,
 		restartLockCycle,
 		applyEffect,
 		applyTransition,

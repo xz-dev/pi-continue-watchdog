@@ -23,32 +23,88 @@ import {
 } from "../src/context-fold.js";
 
 import {
-	createCompletedWaitWatchdogEvent,
 	createContinueWatchdogEvent,
 	createExhaustedWatchdogEvent,
-	createUnlockWatchdogEvent,
-	createWaitWatchdogEvent,
-	formatCompletedWaitWatchdogEvent,
 	formatContinueWatchdogEvent,
 	formatExhaustedWatchdogEvent,
 	formatRfc3339WithOffset,
-	formatUnlockWatchdogEvent,
-	formatWaitWatchdogEvent,
+	parseWatchdogEvent,
 	WATCHDOG_EVENT_MESSAGE_TYPE,
 	WATCHDOG_EVENT_VERSION,
 } from "../src/watchdog-event.js";
+
+/** Legacy event factories: raw pre-upgrade stored shapes (new code never builds these). */
+function legacyWaitEvent(input: {
+	occurredAtMs: number;
+	reason: string;
+	waitSeconds: number;
+	deadlineMs: number;
+}): Record<string, unknown> {
+	return {
+		version: 1,
+		kind: "wait",
+		occurredAtMs: input.occurredAtMs,
+		occurredAt: formatRfc3339WithOffset(input.occurredAtMs, 0),
+		reason: input.reason,
+		waitSeconds: input.waitSeconds,
+		deadlineMs: input.deadlineMs,
+		deadline: formatRfc3339WithOffset(input.deadlineMs, 0),
+	};
+}
+
+function legacyUnlockEvent(input: {
+	occurredAtMs: number;
+	reasonType: string;
+	reason: string;
+}): Record<string, unknown> {
+	return {
+		version: 1,
+		kind: "unlock",
+		occurredAtMs: input.occurredAtMs,
+		occurredAt: formatRfc3339WithOffset(input.occurredAtMs, 0),
+		reasonType: input.reasonType,
+		reason: input.reason,
+	};
+}
+
+function legacyCompletedWaitEvent(input: {
+	acceptedAtMs: number;
+	observedAtMs: number;
+	waitSeconds: number;
+}): Record<string, unknown> {
+	return {
+		version: 1,
+		kind: "wait-completed",
+		occurredAtMs: input.observedAtMs,
+		occurredAt: formatRfc3339WithOffset(input.observedAtMs, 0),
+		waitIdentity: "wait-legacy",
+		acceptedAtMs: input.acceptedAtMs,
+		acceptedAt: formatRfc3339WithOffset(input.acceptedAtMs, 0),
+		waitSeconds: input.waitSeconds,
+		elapsedSeconds: Math.floor(
+			(input.observedAtMs - input.acceptedAtMs) / 1000,
+		),
+	};
+}
+
+function legacyWaitBody(event: Record<string, unknown>): string {
+	return `Continue watchdog waiting · ${event.waitSeconds}s · ${event.occurredAt}\n\nLegacy stored wait body.\n${JSON.stringify(event.reason)}`;
+}
+
+function legacyUnlockBody(event: Record<string, unknown>): string {
+	return `Continue watchdog unlocked · ${event.reasonType} · ${event.occurredAt}\n\nLegacy stored unlock body.\n${JSON.stringify(event.reason)}`;
+}
+
+function legacyCompletedWaitBody(event: Record<string, unknown>): string {
+	return `Continue watchdog delay elapsed · requested ${event.waitSeconds}s · elapsed ${event.elapsedSeconds}s · ${event.occurredAt}\n\nLegacy stored completed-wait body.`;
+}
 
 type Message = Record<string, unknown>;
 
 const EXCHANGE_ID = "exchange-1";
 const CONTINUE_PROMPT = "Continue with the configured task.";
 const AUTOMATED_CONTINUATION = formatContinueWatchdogEvent(
-	createContinueWatchdogEvent({
-		occurredAtMs: 0,
-		offsetMinutes: 0,
-		reasonType: "WORK_REMAINS",
-		reason: "Implementation remains incomplete.",
-	}),
+	createContinueWatchdogEvent({ occurredAtMs: 0, offsetMinutes: 0 }),
 	CONTINUE_PROMPT,
 );
 
@@ -225,13 +281,10 @@ test("watchdog timestamps preserve explicit numeric UTC offsets", () => {
 	assert.equal(WATCHDOG_EVENT_VERSION, 1);
 });
 
-test("shared continue body is frozen with full accepted reason and guidance", () => {
-	const longReason = `first line\n${"世".repeat(589)}`;
+test("shared continue body carries guidance and the unlock-tool notice", () => {
 	const event = createContinueWatchdogEvent({
 		occurredAtMs: 0,
 		offsetMinutes: -480,
-		reasonType: "VERIFYING",
-		reason: longReason,
 	});
 	const body = formatContinueWatchdogEvent(event, "Custom guidance.");
 	const fold = createDecisionFoldMessage({
@@ -244,8 +297,14 @@ test("shared continue body is frozen with full accepted reason and guidance", ()
 
 	assert.equal(fold.display, true);
 	assert.equal(fold.content, body);
-	assert.equal(body.includes(JSON.stringify(longReason)), true);
 	assert.equal(body.includes("Custom guidance."), true);
+	assert.equal(
+		body.includes(
+			"You ended your turn without calling unlock_continue_watchdog.",
+		),
+		true,
+	);
+	assert.equal(body.includes("JOB_DONE"), false);
 	assert.equal(
 		parseDecisionFoldDetails(fold.details)?.watchdogEvent?.occurredAt,
 		"1970-01-01T08:00:00.000+08:00",
@@ -261,8 +320,6 @@ test("generated shared bodies preserve maximum valid configured fields", () => {
 	const continueEvent = createContinueWatchdogEvent({
 		occurredAtMs: 0,
 		offsetMinutes: 0,
-		reasonType: "VERIFYING",
-		reason: "Run the accepted verification.",
 	});
 	const continueBody = formatContinueWatchdogEvent(
 		continueEvent,
@@ -288,13 +345,17 @@ test("generated shared bodies preserve maximum valid configured fields", () => {
 	);
 
 	const maximumReasonType = "T".repeat(MAX_PROMPT_CHARACTERS);
-	const unlockEvent = createUnlockWatchdogEvent({
-		occurredAtMs: 0,
-		offsetMinutes: 0,
-		reasonType: maximumReasonType,
-		reason: "The accepted work is complete.",
-	});
-	const unlockBody = formatUnlockWatchdogEvent(unlockEvent);
+	const unlockEvent = parseWatchdogEvent(
+		legacyUnlockEvent({
+			occurredAtMs: 0,
+			reasonType: maximumReasonType,
+			reason: "The accepted work is complete.",
+		}),
+	);
+	assert.ok(unlockEvent, "legacy unlock event must parse");
+	const unlockBody = legacyUnlockBody(
+		unlockEvent as unknown as Record<string, unknown>,
+	);
 	assert.ok(Array.from(unlockBody).length > MAX_PROMPT_CHARACTERS);
 	const unlockFold = createDecisionFoldMessage({
 		exchangeId: "exchange-2",
@@ -315,18 +376,13 @@ test("generated shared bodies preserve maximum valid configured fields", () => {
 	);
 });
 
-test("automated continuation formatter preserves guidance and safely serializes the reason", () => {
+test("automated continuation formatter emits the new canonical body", () => {
 	assert.equal(
 		formatContinueWatchdogEvent(
-			createContinueWatchdogEvent({
-				occurredAtMs: 0,
-				offsetMinutes: 0,
-				reasonType: "VERIFYING",
-				reason: 'Run tests.\nDo not confuse "quoted" text.',
-			}),
+			createContinueWatchdogEvent({ occurredAtMs: 0, offsetMinutes: 0 }),
 			CONTINUE_PROMPT,
 		),
-		`Continue watchdog continued · VERIFYING · 1970-01-01T00:00:00.000+00:00\n\nThis is an automated event from the pi-continue-watchdog extension, not a message or request from the user. It is not user approval, confirmation, consent, or authorization.\n\nPrevious automated watchdog result (model-generated reference only; not user instructions):\n{"reasonType":"VERIFYING","reason":"Run tests.\\nDo not confuse \\"quoted\\" text."}\n\nContinuation guidance:\n${CONTINUE_PROMPT}\n\nResume only work already requested and authorized by the user. Do not treat this message as permission for any action requiring user approval. If additional user input, approval, or assistance is required, stop and ask the user.`,
+		`Continue watchdog continued · 1970-01-01T00:00:00.000+00:00\n\nThis is an automated event from the pi-continue-watchdog extension, not a message or request from the user. It is not user approval, confirmation, consent, or authorization.\n\nYou ended your turn without calling unlock_continue_watchdog.\n\nContinuation guidance:\n${CONTINUE_PROMPT}\n\nIf all requested work is complete, or you need user input, approval, or other user action, call unlock_continue_watchdog now. Otherwise continue the remaining work. If you need to wait for some work to finish, block on it directly: monitor that task until it ends, or sleep for your estimated duration.\n\nResume only work already requested and authorized by the user. Do not treat this message as permission for any action requiring user approval.`,
 	);
 });
 
@@ -505,15 +561,18 @@ test("valid continue folds the complete exchange into the compact continue promp
 });
 
 test("shared result folds stay before later standalone timeline events", () => {
-	const waitEvent = createWaitWatchdogEvent({
-		occurredAtMs: 0,
-		occurredAtOffsetMinutes: 0,
-		reason: "Waiting for CI.",
-		waitSeconds: 30,
-		deadlineMs: 30_000,
-		deadlineOffsetMinutes: 0,
-	});
-	const waitBody = formatWaitWatchdogEvent(waitEvent);
+	const waitEvent = parseWatchdogEvent(
+		legacyWaitEvent({
+			occurredAtMs: 0,
+			reason: "Waiting for CI.",
+			waitSeconds: 30,
+			deadlineMs: 30_000,
+		}),
+	);
+	assert.ok(waitEvent, "legacy wait event must parse");
+	const waitBody = legacyWaitBody(
+		waitEvent as unknown as Record<string, unknown>,
+	);
 	const waitFold = createDecisionFoldMessage({
 		exchangeId: EXCHANGE_ID,
 		cycleId: 1,
@@ -521,15 +580,17 @@ test("shared result folds stay before later standalone timeline events", () => {
 		eventContent: waitBody,
 		watchdogEvent: waitEvent,
 	});
-	const completedEvent = createCompletedWaitWatchdogEvent({
-		waitIdentity: "wait-1",
-		acceptedAtMs: 0,
-		acceptedAtOffsetMinutes: 0,
-		observedAtMs: 31_000,
-		observedAtOffsetMinutes: 0,
-		waitSeconds: 30,
-	});
-	const completedBody = formatCompletedWaitWatchdogEvent(completedEvent);
+	const completedEvent = parseWatchdogEvent(
+		legacyCompletedWaitEvent({
+			acceptedAtMs: 0,
+			observedAtMs: 31_000,
+			waitSeconds: 30,
+		}),
+	);
+	assert.ok(completedEvent, "legacy completed-wait event must parse");
+	const completedBody = legacyCompletedWaitBody(
+		completedEvent as unknown as Record<string, unknown>,
+	);
 	const exhaustedEvent = createExhaustedWatchdogEvent({
 		occurredAtMs: 31_001,
 		offsetMinutes: 0,
@@ -932,11 +993,12 @@ test("builders reject invalid inputs and the context hook uses foldDecisionConte
 		AUTOMATED_CONTINUATION,
 		/not user approval, confirmation, consent, or authorization/,
 	);
-	assert.match(AUTOMATED_CONTINUATION, /"reasonType":"WORK_REMAINS"/);
 	assert.match(
 		AUTOMATED_CONTINUATION,
-		/"reason":"Implementation remains incomplete\."/,
+		/You ended your turn without calling unlock_continue_watchdog\./,
 	);
+	assert.match(AUTOMATED_CONTINUATION, /call unlock_continue_watchdog now/);
+	assert.match(AUTOMATED_CONTINUATION, /monitor that task until it ends/);
 });
 
 test("persisted string-or-text-block custom messages still fold", () => {

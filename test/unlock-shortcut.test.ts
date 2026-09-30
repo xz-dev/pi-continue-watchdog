@@ -168,8 +168,6 @@ test("shortcut and slash command share ownership-aware cancellation while ordina
 	for (const entrypoint of ["shortcut", "command"] as const) {
 		const harness = createHarness("alt+u", { locked: true });
 		await startSession(harness);
-		const opened = harness.controller.beginDecision(0);
-		assert.equal(opened.snapshot.decisionOpen, true);
 		const invoke =
 			entrypoint === "shortcut"
 				? harness.shortcuts.get("alt+u")
@@ -182,16 +180,14 @@ test("shortcut and slash command share ownership-aware cancellation while ordina
 	}
 });
 
-test("shortcut during a pending decision clears the decision like the command", async () => {
+test("shortcut during an ordinary run unlocks without aborting it", async () => {
 	const harness = createHarness("alt+u", { locked: true });
 	await startSession(harness);
-	const opened = harness.controller.beginDecision(0);
-	assert.equal(opened.snapshot.decisionOpen, true);
 
 	const handler = harness.shortcuts.get("alt+u");
 	assert.ok(handler);
 	await handler(harness.ctx as unknown as ExtensionCommandContext);
 	assert.equal(harness.controller.snapshot.locked, false);
-	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.aborts(), 0);
 	assert.deepEqual(harness.notifications, ["Continue watchdog unlocked"]);
 });

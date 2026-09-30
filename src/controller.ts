@@ -1,8 +1,8 @@
 /**
- * Pure lock and decision-window state machine.
+ * Pure lock and attempt state machine.
  *
  * Runtime wiring owns activity generations, grace timers, Pi hooks, and
- * notifications. This controller owns only lock and decision accounting.
+ * notifications. This controller owns only lock and continuation accounting.
  */
 
 export interface LockDecisionControllerConfig {
@@ -11,32 +11,15 @@ export interface LockDecisionControllerConfig {
 
 export interface LockDecisionSnapshot {
 	readonly locked: boolean;
-	/** Number of valid continue-or-wait outcomes already consumed in this lock cycle. */
+	/** Number of automatic continuations already consumed in this lock cycle. */
 	readonly attempt: number;
 	readonly exhausted: boolean;
-	readonly decisionFailed: boolean;
-	readonly invalidDecisionAttempts: number;
-	readonly lastInvalidDecisionError: string | null;
-	readonly decisionOpen: boolean;
-	/** Earliest absolute time when another automatic decision may open. */
-	readonly waitUntilMs: number;
 }
 
-export type ControllerEffect =
-	| {
-			readonly kind: "openDecisionWindow";
-			readonly decisionId: number;
-			readonly attempt: number;
-	  }
-	| { readonly kind: "restoreDecisionTools"; readonly decisionId: number }
-	| {
-			readonly kind: "reaskDecision";
-			readonly decisionId: number;
-			readonly invalidDecisionAttempt: 1 | 2;
-			readonly error: string;
-	  }
-	| { readonly kind: "decisionFailed"; readonly error: string }
-	| { readonly kind: "notify"; readonly notification: "locked" | "unlocked" };
+export type ControllerEffect = {
+	readonly kind: "notify";
+	notification: "locked" | "unlocked";
+};
 
 export interface ControllerTransition {
 	readonly applied: boolean;
@@ -51,44 +34,18 @@ export interface LockDecisionController {
 	ensureLocked(): ControllerTransition;
 	unlock(): ControllerTransition;
 	onMainUserMessageStart(): ControllerTransition;
-	beginDecision(nowMs: number): ControllerTransition;
-	recordInvalidDecision(
-		decisionId: number,
-		error: unknown,
-	): ControllerTransition;
-	/** Undo a just-recorded non-terminal invalid decision after busy send defer. */
-	rollbackInvalidDecision(
-		decisionId: number,
-		previousAttempts: number,
-		previousError: string | null,
-	): ControllerTransition;
-	recordValidContinue(decisionId: number): ControllerTransition;
-	/** Undo a just-recorded continue when its send raced a newly busy Pi. */
-	rollbackValidContinue(): ControllerTransition;
-	recordValidWait(
-		decisionId: number,
-		waitUntilMs: number,
-	): ControllerTransition;
-	/** Undo a just-recorded wait when durable evidence cannot be written. */
-	rollbackValidWait(previousWaitUntilMs: number): ControllerTransition;
-	recordValidUnlock(decisionId: number): ControllerTransition;
-	/** Close a stale decision without consuming attempts or unlocking. */
-	invalidateDecision(decisionId: number): ControllerTransition;
+	/** Consume one automatic-continuation attempt; sets exhausted at the budget. */
+	recordAutomaticContinue(): ControllerTransition;
+	/** Undo a just-consumed continuation when its message cannot be published. */
+	rollbackAutomaticContinue(): ControllerTransition;
+	/** AI unlock tool effect: unlock without resetting cycle accounting. */
+	recordAiUnlock(): ControllerTransition;
 }
-
-const INVALID_DECISION_LIMIT = 3;
-const GENERIC_INVALID_DECISION_ERROR = "Invalid decision.";
 
 interface MutableState {
 	locked: boolean;
 	attempt: number;
 	exhausted: boolean;
-	decisionFailed: boolean;
-	invalidDecisionAttempts: number;
-	lastInvalidDecisionError: string | null;
-	decisionOpen: boolean;
-	decisionId: number | null;
-	waitUntilMs: number;
 }
 
 function snapshotOf(state: MutableState): LockDecisionSnapshot {
@@ -96,18 +53,7 @@ function snapshotOf(state: MutableState): LockDecisionSnapshot {
 		locked: state.locked,
 		attempt: state.attempt,
 		exhausted: state.exhausted,
-		decisionFailed: state.decisionFailed,
-		invalidDecisionAttempts: state.invalidDecisionAttempts,
-		lastInvalidDecisionError: state.lastInvalidDecisionError,
-		decisionOpen: state.decisionOpen,
-		waitUntilMs: state.waitUntilMs,
 	};
-}
-
-function normaliseInvalidDecisionError(error: unknown): string {
-	return typeof error === "string" && error.length > 0
-		? error
-		: GENERIC_INVALID_DECISION_ERROR;
 }
 
 function initialState(): MutableState {
@@ -115,18 +61,11 @@ function initialState(): MutableState {
 		locked: false,
 		attempt: 0,
 		exhausted: false,
-		decisionFailed: false,
-		invalidDecisionAttempts: 0,
-		lastInvalidDecisionError: null,
-		decisionOpen: false,
-		decisionId: null,
-		waitUntilMs: 0,
 	};
 }
 
 class PureLockDecisionController implements LockDecisionController {
 	private state = initialState();
-	private nextDecisionId = 1;
 	private readonly maxRetries: number;
 
 	public constructor(config: LockDecisionControllerConfig) {
@@ -138,10 +77,8 @@ class PureLockDecisionController implements LockDecisionController {
 	}
 
 	public lock(): ControllerTransition {
-		const effects = this.clearPendingIntents();
 		this.state = { ...initialState(), locked: true };
-		effects.push({ kind: "notify", notification: "locked" });
-		return this.applied(effects);
+		return this.applied([{ kind: "notify", notification: "locked" }]);
 	}
 
 	public ensureLocked(): ControllerTransition {
@@ -149,116 +86,31 @@ class PureLockDecisionController implements LockDecisionController {
 	}
 
 	/**
-	 * Assign locked=false, clear a pending decision, and notify. Attempt,
-	 * exhaustion, decisionFailed, and invalid counters remain visible.
+	 * Assign locked=false and notify. Attempt and exhaustion remain visible
+	 * until the next fresh lock resets the cycle.
 	 */
 	public unlock(): ControllerTransition {
-		const effects = this.clearPendingIntents();
-		this.state = {
-			...this.state,
-			locked: false,
-			decisionOpen: false,
-			decisionId: null,
-			waitUntilMs: 0,
-		};
-		effects.push({ kind: "notify", notification: "unlocked" });
-		return this.applied(effects);
+		this.state = { ...this.state, locked: false };
+		return this.applied([{ kind: "notify", notification: "unlocked" }]);
 	}
 
 	public onMainUserMessageStart(): ControllerTransition {
 		return this.lock();
 	}
 
-	public beginDecision(nowMs: number): ControllerTransition {
-		if (!this.isDecisionEligible(nowMs)) return this.noop();
-		const decisionId = this.nextDecisionId++;
-		this.state = {
-			...this.state,
-			decisionOpen: true,
-			decisionId,
-			invalidDecisionAttempts: 0,
-			lastInvalidDecisionError: null,
-		};
-		return this.applied([
-			{
-				kind: "openDecisionWindow",
-				decisionId,
-				attempt: this.state.attempt,
-			},
-		]);
-	}
-
-	public recordInvalidDecision(
-		decisionId: number,
-		error: unknown,
-	): ControllerTransition {
-		if (!this.isCurrentDecision(decisionId)) return this.noop();
-		const normalisedError = normaliseInvalidDecisionError(error);
-		const invalidDecisionAttempts = this.state.invalidDecisionAttempts + 1;
-		if (invalidDecisionAttempts < INVALID_DECISION_LIMIT) {
-			this.state = {
-				...this.state,
-				invalidDecisionAttempts,
-				lastInvalidDecisionError: normalisedError,
-			};
-			return this.applied([
-				{
-					kind: "reaskDecision",
-					decisionId,
-					invalidDecisionAttempt: invalidDecisionAttempts as 1 | 2,
-					error: normalisedError,
-				},
-			]);
-		}
-
-		this.state = {
-			...this.state,
-			decisionOpen: false,
-			decisionId: null,
-			decisionFailed: true,
-			invalidDecisionAttempts: INVALID_DECISION_LIMIT,
-			lastInvalidDecisionError: normalisedError,
-		};
-		return this.applied([
-			{ kind: "restoreDecisionTools", decisionId },
-			{ kind: "decisionFailed", error: normalisedError },
-		]);
-	}
-
-	public rollbackInvalidDecision(
-		decisionId: number,
-		previousAttempts: number,
-		previousError: string | null,
-	): ControllerTransition {
-		if (!this.isCurrentDecision(decisionId) || this.state.decisionFailed) {
-			return this.noop();
-		}
-		this.state = {
-			...this.state,
-			invalidDecisionAttempts: previousAttempts,
-			lastInvalidDecisionError: previousError,
-		};
-		return this.applied([]);
-	}
-
-	public recordValidContinue(decisionId: number): ControllerTransition {
-		if (!this.isCurrentDecision(decisionId)) return this.noop();
+	public recordAutomaticContinue(): ControllerTransition {
+		if (!this.state.locked || this.state.exhausted) return this.noop();
 		const attempt = this.state.attempt + 1;
 		this.state = {
 			...this.state,
 			attempt,
 			exhausted: attempt >= this.maxRetries,
-			invalidDecisionAttempts: 0,
-			lastInvalidDecisionError: null,
-			decisionOpen: false,
-			decisionId: null,
-			waitUntilMs: 0,
 		};
-		return this.applied([{ kind: "restoreDecisionTools", decisionId }]);
+		return this.applied([]);
 	}
 
-	public rollbackValidContinue(): ControllerTransition {
-		if (this.state.decisionOpen || this.state.attempt === 0) return this.noop();
+	public rollbackAutomaticContinue(): ControllerTransition {
+		if (this.state.attempt === 0) return this.noop();
 		this.state = {
 			...this.state,
 			attempt: this.state.attempt - 1,
@@ -267,98 +119,9 @@ class PureLockDecisionController implements LockDecisionController {
 		return this.applied([]);
 	}
 
-	public recordValidWait(
-		decisionId: number,
-		waitUntilMs: number,
-	): ControllerTransition {
-		if (
-			!this.isCurrentDecision(decisionId) ||
-			!Number.isSafeInteger(waitUntilMs) ||
-			waitUntilMs < 0
-		) {
-			return this.noop();
-		}
-		const attempt = this.state.attempt + 1;
-		this.state = {
-			...this.state,
-			attempt,
-			exhausted: attempt >= this.maxRetries,
-			invalidDecisionAttempts: 0,
-			lastInvalidDecisionError: null,
-			decisionOpen: false,
-			decisionId: null,
-			waitUntilMs,
-		};
-		return this.applied([{ kind: "restoreDecisionTools", decisionId }]);
-	}
-
-	public rollbackValidWait(previousWaitUntilMs: number): ControllerTransition {
-		if (
-			this.state.decisionOpen ||
-			this.state.attempt === 0 ||
-			!Number.isSafeInteger(previousWaitUntilMs) ||
-			previousWaitUntilMs < 0
-		) {
-			return this.noop();
-		}
-		this.state = {
-			...this.state,
-			attempt: this.state.attempt - 1,
-			exhausted: false,
-			waitUntilMs: previousWaitUntilMs,
-		};
-		return this.applied([]);
-	}
-
-	public invalidateDecision(decisionId: number): ControllerTransition {
-		if (!this.isCurrentDecision(decisionId)) return this.noop();
-		this.state = {
-			...this.state,
-			decisionOpen: false,
-			decisionId: null,
-		};
-		return this.applied([{ kind: "restoreDecisionTools", decisionId }]);
-	}
-
-	public recordValidUnlock(decisionId: number): ControllerTransition {
-		if (!this.isCurrentDecision(decisionId)) return this.noop();
-		this.state = {
-			...this.state,
-			locked: false,
-			decisionOpen: false,
-			decisionId: null,
-			waitUntilMs: 0,
-		};
-		return this.applied([
-			{ kind: "restoreDecisionTools", decisionId },
-			{ kind: "notify", notification: "unlocked" },
-		]);
-	}
-
-	private isDecisionEligible(nowMs: number): boolean {
-		return (
-			Number.isFinite(nowMs) &&
-			this.state.locked &&
-			!this.state.exhausted &&
-			!this.state.decisionFailed &&
-			!this.state.decisionOpen &&
-			nowMs >= this.state.waitUntilMs
-		);
-	}
-
-	private isCurrentDecision(decisionId: number): boolean {
-		return this.state.decisionOpen && this.state.decisionId === decisionId;
-	}
-
-	private clearPendingIntents(): ControllerEffect[] {
-		return this.state.decisionOpen && this.state.decisionId !== null
-			? [
-					{
-						kind: "restoreDecisionTools",
-						decisionId: this.state.decisionId,
-					},
-				]
-			: [];
+	public recordAiUnlock(): ControllerTransition {
+		if (!this.state.locked) return this.noop();
+		return this.unlock();
 	}
 
 	private applied(effects: readonly ControllerEffect[]): ControllerTransition {

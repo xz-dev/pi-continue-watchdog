@@ -5,15 +5,14 @@
  *
  * Validation:
  * - idleDelaySeconds remains accepted for configuration compatibility only;
- *   automatic inquiries always use the fixed ten-second runtime fence.
+ *   the idle fence is fixed at ten seconds.
  * - maxRetries remains a safe integer in [1, 10].
- * - reasonTypes and continueReasonTypes are nonempty arrays of trim-nonblank strings;
- *   valid lists replace.
+ * - reasonTypes is a nonempty array of trim-nonblank strings; a valid list
+ *   replaces the default.
+ * - decisionPrompt and continueReasonTypes are removed keys: each occurrence
+ *   reports a named error diagnostic and has no effect.
  * Invalid values are rejected (no silent clamp).
  */
-
-export const DEFAULT_DECISION_PROMPT =
-	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. It does not represent any decision by the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one.";
 
 export const DEFAULT_CONTINUE_PROMPT =
 	"Continue until user assistance is required.";
@@ -23,12 +22,6 @@ export const DEFAULT_REASON_TYPES: readonly string[] = Object.freeze([
 	"JOB_DONE",
 	"WAIT_USER",
 	"JOB_BLOCKED",
-]);
-
-/** Built-in allowed automatic-continue reason types; configured values replace. */
-export const DEFAULT_CONTINUE_REASON_TYPES: readonly string[] = Object.freeze([
-	"WORK_REMAINS",
-	"VERIFYING",
 ]);
 
 /** Maximum prompt size, measured in Unicode code points, accepted from config. */
@@ -47,21 +40,23 @@ export const MIN_RETRIES = 1;
 export const MAX_RETRIES = 10;
 
 export interface ContinueWatchdogConfig {
-	/** @deprecated Accepted and preserved, but the inquiry fence is fixed at 10s. */
+	/** @deprecated Accepted and preserved, but the idle fence is fixed at 10s. */
 	idleDelaySeconds: number;
 	maxRetries: number;
-	decisionPrompt: string;
 	/** Configurable guidance embedded in the fixed automated continuation envelope. */
 	continuePrompt: string;
 	reasonTypes: readonly string[];
-	continueReasonTypes: readonly string[];
 	/** Key binding for the human unlock shortcut, or false to disable it. */
 	unlockShortcut: string | false;
 }
 
+export type ConfigDiagnosticSeverity = "warning" | "error";
+
 export interface ConfigDiagnostic {
 	source: string;
 	message: string;
+	/** Removed-key diagnostics are errors; everything else stays a warning. */
+	severity: ConfigDiagnosticSeverity;
 }
 
 export interface ConfigResult {
@@ -77,10 +72,8 @@ export interface MergeConfigResult {
 export const BUILT_IN_CONFIG: Readonly<ContinueWatchdogConfig> = Object.freeze({
 	idleDelaySeconds: 10,
 	maxRetries: 10,
-	decisionPrompt: DEFAULT_DECISION_PROMPT,
 	continuePrompt: DEFAULT_CONTINUE_PROMPT,
 	reasonTypes: DEFAULT_REASON_TYPES,
-	continueReasonTypes: DEFAULT_CONTINUE_REASON_TYPES,
 	unlockShortcut: "alt+u",
 });
 
@@ -89,25 +82,31 @@ const MAX_DIAGNOSTIC_LENGTH = 240;
 const KNOWN_KEYS = new Set([
 	"idleDelaySeconds",
 	"maxRetries",
-	"decisionPrompt",
 	"continuePrompt",
 	"reasonTypes",
-	"continueReasonTypes",
 	"unlockShortcut",
 ]);
 
-function diagnostic(source: string, message: string): ConfigDiagnostic {
-	return { source, message: message.slice(0, MAX_DIAGNOSTIC_LENGTH) };
+/** Keys removed by the unlock-tool change; configured values have no effect. */
+const REMOVED_KEYS: ReadonlySet<string> = new Set([
+	"decisionPrompt",
+	"continueReasonTypes",
+]);
+
+function diagnostic(
+	source: string,
+	message: string,
+	severity: ConfigDiagnosticSeverity = "warning",
+): ConfigDiagnostic {
+	return { source, message: message.slice(0, MAX_DIAGNOSTIC_LENGTH), severity };
 }
 
 function copyBuiltIn(): ContinueWatchdogConfig {
 	return {
 		idleDelaySeconds: BUILT_IN_CONFIG.idleDelaySeconds,
 		maxRetries: BUILT_IN_CONFIG.maxRetries,
-		decisionPrompt: BUILT_IN_CONFIG.decisionPrompt,
 		continuePrompt: BUILT_IN_CONFIG.continuePrompt,
 		reasonTypes: [...BUILT_IN_CONFIG.reasonTypes],
-		continueReasonTypes: [...BUILT_IN_CONFIG.continueReasonTypes],
 		unlockShortcut: BUILT_IN_CONFIG.unlockShortcut,
 	};
 }
@@ -220,18 +219,15 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 		}
 	}
 
-	if (Object.hasOwn(input, "decisionPrompt")) {
-		const decision = input.decisionPrompt;
-		if (isValidPrompt(decision)) {
-			config.decisionPrompt = decision;
-		} else {
-			diagnostics.push(
-				diagnostic(
-					source,
-					`decisionPrompt must be a non-empty string of at most ${MAX_PROMPT_CHARACTERS} Unicode characters`,
-				),
-			);
-		}
+	for (const key of REMOVED_KEYS) {
+		if (!Object.hasOwn(input, key)) continue;
+		diagnostics.push(
+			diagnostic(
+				source,
+				`${key} was removed and has no effect; remove it from the configuration`,
+				"error",
+			),
+		);
 	}
 
 	if (Object.hasOwn(input, "continuePrompt")) {
@@ -248,16 +244,15 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 		}
 	}
 
-	for (const key of ["reasonTypes", "continueReasonTypes"] as const) {
-		if (!Object.hasOwn(input, key)) continue;
-		const reasonTypes = normalizeReasonTypes(input[key]);
+	if (Object.hasOwn(input, "reasonTypes")) {
+		const reasonTypes = normalizeReasonTypes(input.reasonTypes);
 		if (reasonTypes !== null) {
-			config[key] = reasonTypes;
+			config.reasonTypes = reasonTypes;
 		} else {
 			diagnostics.push(
 				diagnostic(
 					source,
-					`${key} must be a non-empty array of non-blank strings`,
+					"reasonTypes must be a non-empty array of non-blank strings",
 				),
 			);
 		}
@@ -281,7 +276,7 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 	}
 
 	for (const key of Object.keys(input)) {
-		if (!KNOWN_KEYS.has(key)) {
+		if (!KNOWN_KEYS.has(key) && !REMOVED_KEYS.has(key)) {
 			diagnostics.push(diagnostic(source, "ignoring unsupported keys"));
 			break;
 		}
@@ -320,17 +315,11 @@ export function mergeConfig(
 		if (partial.maxRetries !== undefined) {
 			config.maxRetries = partial.maxRetries;
 		}
-		if (partial.decisionPrompt !== undefined) {
-			config.decisionPrompt = partial.decisionPrompt;
-		}
 		if (partial.continuePrompt !== undefined) {
 			config.continuePrompt = partial.continuePrompt;
 		}
 		if (partial.reasonTypes !== undefined) {
 			config.reasonTypes = [...partial.reasonTypes];
-		}
-		if (partial.continueReasonTypes !== undefined) {
-			config.continueReasonTypes = [...partial.continueReasonTypes];
 		}
 		if (partial.unlockShortcut !== undefined) {
 			config.unlockShortcut = partial.unlockShortcut;

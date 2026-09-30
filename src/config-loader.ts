@@ -57,7 +57,9 @@ async function readConfig(
 		}
 		return {
 			config: {},
-			diagnostics: [{ source, message: READ_FAILURE_MESSAGE }],
+			diagnostics: [
+				{ source, message: READ_FAILURE_MESSAGE, severity: "error" },
+			],
 		};
 	}
 }

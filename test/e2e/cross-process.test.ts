@@ -27,13 +27,10 @@ import {
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 
-import { DECISION_FOLD_MESSAGE_TYPE } from "../../src/context-fold.js";
-
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const decisionPromptStart =
-	"This is an automated continuation check from the pi-continue-watchdog extension";
-const continuePrompt = "Continue until user assistance is required.";
+const continuationBodyStart = "Continue watchdog continued ·";
+const TOOL_NAME = "unlock_continue_watchdog";
 
 interface RequestRecord {
 	readonly receivedAt: number;
@@ -229,22 +226,22 @@ async function readProbeRecords(probeOut: string): Promise<ProbeRecord[]> {
 		.map((line) => JSON.parse(line) as ProbeRecord);
 }
 
-async function readProbeEnvelopes(
-	probeOut: string,
-): Promise<Array<Record<string, unknown>>> {
-	return (await readProbeRecords(probeOut))
-		.filter((record) => record.kind === "semantic-hook")
-		.map((record) => record.data ?? {});
-}
-
 function textOf(message: RequestRecord["messages"][number]): string {
 	return JSON.stringify(message.content);
 }
 
-function isDecisionRequest(request: RequestRecord): boolean {
-	return request.messages.some((message) =>
-		textOf(message).includes(decisionPromptStart),
-	);
+/**
+ * True only when the request was *triggered* by a direct continuation: its
+ * final user-role message is the continuation body. Later requests retain
+ * earlier bodies in history, so scanning every message would overcount.
+ */
+function isContinuationRequest(request: RequestRecord): boolean {
+	for (let index = request.messages.length - 1; index >= 0; index -= 1) {
+		const message = request.messages[index];
+		if (message.role !== "user") continue;
+		return textOf(message).includes(continuationBodyStart);
+	}
+	return false;
 }
 
 function sendSse(
@@ -307,8 +304,7 @@ async function startMockServer(
 								{
 									index: 0,
 									delta: {
-										content:
-											"<watchdog><function>continue_watchdog</function><reason_type>WORK_REMAINS</reason_type><reason_content>Implementation work remains.</reason_content></watchdog>",
+										content: "held continuation answer",
 									},
 									finish_reason: null,
 								},
@@ -323,17 +319,11 @@ async function startMockServer(
 				});
 				return;
 			}
-			if (
-				reply.kind === "continue" ||
-				reply.kind === "unlock" ||
-				reply.kind === "invalid"
-			) {
-				const content =
-					reply.kind === "continue"
-						? "<watchdog><function>continue_watchdog</function><reason_type>WORK_REMAINS</reason_type><reason_content>Implementation work remains.</reason_content></watchdog>"
-						: reply.kind === "unlock"
-							? `<watchdog><function>unlock_continue_watchdog</function><reason_type>${reply.reasonType ?? "JOB_DONE"}</reason_type><reason_content>${reply.reason ?? "finished"}</reason_content></watchdog>`
-							: (reply.text ?? "invalid watchdog response");
+			if (reply.kind === "unlock") {
+				const argumentsJson = JSON.stringify({
+					reason_type: reply.reasonType ?? "JOB_DONE",
+					reason: reply.reason ?? "finished",
+				});
 				sendSse(response, [
 					{
 						id,
@@ -341,7 +331,20 @@ async function startMockServer(
 						choices: [
 							{
 								index: 0,
-								delta: { content },
+								delta: {
+									content: "",
+									tool_calls: [
+										{
+											index: 0,
+											id: `call-${requests.length}`,
+											type: "function",
+											function: {
+												name: TOOL_NAME,
+												arguments: argumentsJson,
+											},
+										},
+									],
+								},
 								finish_reason: null,
 							},
 						],
@@ -816,7 +819,7 @@ function createRpcUiContext(): ExtensionUIContext {
 }
 
 test("packed stock Pi coordinates busy and decision epochs across an OS child", {
-	timeout: 130_000,
+	timeout: 260_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t, {
 		withSemanticProbe: true,
@@ -830,30 +833,21 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		mkdir(childCwd, { recursive: true }),
 	]);
 
-	let releaseHeldDecision: (() => void) | undefined;
-	const heldDecisionRelease = new Promise<void>((resolveRelease) => {
-		releaseHeldDecision = resolveRelease;
-	});
-	let heldDecisionStarted = false;
 	const { baseUrl, requests } = await startMockServer(t, [
+		// 1: child's first held (delayed) turn.
 		{ kind: "delayed" },
+		// 2: root's first ordinary turn.
 		{ kind: "stop", text: "root first epoch settled" },
+		// 3: answers continuation A (disconnect epoch) with the unlock tool.
 		{ kind: "unlock", reason: "first cross-process epoch complete" },
+		// 4: answers continuation B (child idle after reconnect).
 		{ kind: "unlock", reason: "heartbeat recovery complete" },
-		{ kind: "stop", text: "root fencing epoch settled" },
-		{
-			kind: "held-continue",
-			started: () => {
-				heldDecisionStarted = true;
-			},
-			release: heldDecisionRelease,
-		},
+		// 5: child's second held turn (streamed, never completes until abort).
 		{ kind: "delayed" },
-		// 0.84.1 consumed a model turn here for the invalidated-decision fold
-		// (a triggerTurn:false custom message became a follow-on turn). 0.85.1
-		// persists context-only custom messages without a model turn, so no
-		// request maps to this slot; the next request is the fresh decision.
-		{ kind: "unlock", reason: "fresh epoch complete" },
+		// 6: root's second ordinary turn keeps the lock.
+		{ kind: "stop", text: "root second epoch settled without unlocking" },
+		// 7: answers the final child-idle continuation with the unlock tool.
+		{ kind: "unlock", reason: "final child-idle epoch complete" },
 	]);
 	const root = await createSession(fixture, baseUrl, {
 		cwd: rootCwd,
@@ -897,9 +891,9 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 	await waitForSessionIdle(root.session, 3_000, "root first ordinary work");
 	await new Promise((resolvePromise) => setTimeout(resolvePromise, 10_300));
 	assert.equal(
-		requests.filter(isDecisionRequest).length,
+		requests.filter(isContinuationRequest).length,
 		0,
-		"root must not decide through a complete fixed fence while the OS child is busy",
+		"root must not continue through a complete fixed fence while the OS child is busy",
 	);
 
 	const disconnectedAt = Date.now();
@@ -908,22 +902,23 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 	// removes its busy ID and starts a fresh fixed inquiry fence.
 	await new Promise((resolvePromise) => setTimeout(resolvePromise, 6_500));
 	await waitFor(
-		() => requests.filter(isDecisionRequest).length === 1,
+		() => requests.filter(isContinuationRequest).length === 1,
 		15_000,
-		"busy-child disconnect decision",
+		"busy-child disconnect continuation",
 	);
-	await waitForSessionIdle(root.session, 3_000, "disconnect root decision");
-	const firstDecision = requests.find(isDecisionRequest);
-	assert.ok(firstDecision);
-	assert.equal(firstDecision.model, "root-process-model");
+	await waitForSessionIdle(root.session, 3_000, "disconnect root unlock");
+	const firstContinuation = requests.find(isContinuationRequest);
+	assert.ok(firstContinuation);
+	assert.equal(firstContinuation.model, "root-process-model");
 	assert.ok(
-		firstDecision.receivedAt - disconnectedAt >= 9_800,
-		"disconnect must still wait a complete fixed inquiry fence",
+		firstContinuation.receivedAt - disconnectedAt >= 9_800,
+		"disconnect must still wait a complete fixed idle fence",
 	);
 	assert.equal(
 		requests.filter(
 			(request) =>
-				request.model === "child-process-model" && isDecisionRequest(request),
+				request.model === "child-process-model" &&
+				isContinuationRequest(request),
 		).length,
 		0,
 	);
@@ -969,17 +964,17 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 	const childIdleAt = Date.now();
 	await child.command("abort");
 	await waitFor(
-		() => requests.filter(isDecisionRequest).length === 2,
+		() => requests.filter(isContinuationRequest).length === 2,
 		15_000,
-		"reconnected child live-idle decision",
+		"reconnected child live-idle continuation",
 	);
 	await waitForSessionIdle(root.session, 5_000, "reconnect recovery unlock");
-	const reconnectDecision = requests.filter(isDecisionRequest)[1];
-	assert.ok(reconnectDecision);
-	assert.equal(reconnectDecision.model, "root-process-model");
+	const reconnectContinuation = requests.filter(isContinuationRequest)[1];
+	assert.ok(reconnectContinuation);
+	assert.equal(reconnectContinuation.model, "root-process-model");
 	assert.ok(
-		reconnectDecision.receivedAt - childIdleAt >= 9_800,
-		"fresh child idle report must wait a complete fixed inquiry fence",
+		reconnectContinuation.receivedAt - childIdleAt >= 9_800,
+		"fresh child idle report must wait a complete fixed idle fence",
 	);
 	const childAfterReconnect =
 		await child.command<ChildHarnessSnapshot>("snapshot");
@@ -987,19 +982,12 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 	assert.deepEqual(childAfterReconnect.decisionTools, []);
 	assert.deepEqual(childAfterReconnect.customEntries, []);
 
-	await root.session.prompt(
-		"Open a decision that will be invalidated by child work.",
+	// The child becomes busy again BEFORE the root settles, so the root's
+	// post-settle fence must observe it and stay blocked.
+	const childBusyPrompt = child.command(
+		"prompt",
+		"Become busy across the root idle fence.",
 	);
-	await waitFor(
-		() => heldDecisionStarted,
-		15_000,
-		"held root decision after the fixed fence",
-	);
-	const entriesBeforeInvalidation =
-		root.session.sessionManager.getEntries().length;
-	const hooksBeforeInvalidation = (await readProbeEnvelopes(fixture.probeOut))
-		.length;
-	await child.command("prompt", "Become busy while the root decision is open.");
 	await waitFor(
 		() =>
 			requests.filter((request) => request.model === "child-process-model")
@@ -1007,127 +995,44 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		5_000,
 		"second child held provider request",
 	);
-	releaseHeldDecision?.();
-	// 0.85.1 semantics: a triggerTurn:false custom fold delivered while the
-	// held decision streams is persisted as a context-only custom message at
-	// turn end instead of becoming a follow-on model turn, so settlement is
-	// observed on the session transcript rather than an extra provider request.
-	await waitFor(
-		() =>
-			root.session.sessionManager
-				.getEntries()
-				.slice(entriesBeforeInvalidation)
-				.some(
-					(entry) =>
-						JSON.stringify(entry).includes(
-							`"customType":${JSON.stringify(DECISION_FOLD_MESSAGE_TYPE)}`,
-						) &&
-						JSON.stringify(entry).includes('"watchdogOutcome":"invalidated"'),
-				),
-		5_000,
-		"invalidated decision fold settlement",
+	await root.session.prompt(
+		"Settle again while the child becomes busy once more.",
 	);
-	await waitForSessionIdle(root.session, 3_000, "invalidated root decision");
-
-	const invalidatedEntries = root.session.sessionManager
-		.getEntries()
-		.slice(entriesBeforeInvalidation)
-		.map((entry) => JSON.stringify(entry));
-	const foldEntryToken = `"customType":${JSON.stringify(DECISION_FOLD_MESSAGE_TYPE)}`;
+	await waitForSessionIdle(root.session, 5_000, "post-reconnect ordinary work");
+	await childBusyPrompt.catch(() => {
+		// The child turn is aborted later; a rejected command result is expected.
+	});
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 10_300));
 	assert.equal(
-		invalidatedEntries.some(
-			(entry) =>
-				entry.includes(foldEntryToken) &&
-				entry.includes('"watchdogOutcome":"invalidated"'),
-		),
-		true,
-	);
-	assert.equal(
-		invalidatedEntries.some((entry) =>
-			entry.includes('"customType":"pi-continue-watchdog:continue"'),
-		),
-		false,
-	);
-	assert.equal(
-		invalidatedEntries.some((entry) =>
-			entry.includes('"customType":"pi-continue-watchdog:human-unlock"'),
-		),
-		false,
-	);
-	assert.equal(
-		invalidatedEntries.some(
-			(entry) =>
-				entry.includes(foldEntryToken) &&
-				entry.includes('"watchdogOutcome":"continue"'),
-		),
-		false,
-	);
-	assert.equal(
-		invalidatedEntries.some(
-			(entry) =>
-				entry.includes(foldEntryToken) &&
-				entry.includes('"watchdogOutcome":"unlock"'),
-		),
-		false,
-	);
-	assert.equal(
-		invalidatedEntries.some((entry) =>
-			entry.includes('"kind":"validation-error"'),
-		),
-		false,
-		"stale response must not consume an invalid-response retry",
-	);
-	assert.equal(
-		(await readProbeEnvelopes(fixture.probeOut)).length,
-		hooksBeforeInvalidation,
-	);
-	assert.equal(
-		requests.some((request) =>
-			request.messages.some((message) =>
-				textOf(message).includes(continuePrompt),
-			),
-		),
-		false,
-		"stale continue must not start a continuation turn",
-	);
-	// With no fold turn there is no provider request after the second child
-	// request; the next request belongs to the fresh post-invalidation decision.
-	assert.equal(
-		requests
-			.slice(7)
-			.some((request) => request.model === "child-process-model"),
-		false,
+		requests.filter(isContinuationRequest).length,
+		2,
+		"busy child must keep blocking continuation after reconnect",
 	);
 
 	const finalChildIdleAt = Date.now();
 	await child.command("abort");
 	await waitFor(
-		() => requests.filter(isDecisionRequest).length === 4,
+		() => requests.filter(isContinuationRequest).length === 3,
 		15_000,
-		"fresh post-invalidation decision",
+		"final child-idle continuation",
 	);
-	await waitForSessionIdle(
-		root.session,
-		5_000,
-		"fresh post-invalidation unlock",
-	);
-	const decisions = requests.filter(isDecisionRequest);
-	assert.equal(decisions.length, 4);
+	await waitForSessionIdle(root.session, 5_000, "final continuation unlock");
+	const continuations = requests.filter(isContinuationRequest);
+	assert.equal(continuations.length, 3);
 	assert.ok(
-		(decisions[3]?.receivedAt ?? 0) - finalChildIdleAt >= 9_800,
-		"post-invalidation idle must wait a complete fixed inquiry fence",
+		(continuations[2]?.receivedAt ?? 0) - finalChildIdleAt >= 9_800,
+		"final child idle must wait a complete fixed idle fence",
 	);
 	assert.equal(
-		decisions.every((request) => request.model === "root-process-model"),
+		continuations.every((request) => request.model === "root-process-model"),
 		true,
 	);
-	// Fold markers, decision audits, and continuation envelopes are context-only
-	// transformations: they must never leak into any provider request body.
+	// Direct continuation custom messages are context-bearing by design; the
+	// removed decision internals must never leak into any provider request body.
 	for (const request of requests) {
 		const body = JSON.stringify(request);
 		assert.equal(body.includes("pi-continue-watchdog:inquiry-fold"), false);
 		assert.equal(body.includes("pi-continue-watchdog:decision-audit"), false);
-		assert.equal(body.includes("pi-continue-watchdog:continuation"), false);
 	}
 	const finalChild = await child.command<ChildHarnessSnapshot>("snapshot");
 	assert.deepEqual(finalChild.decisionTools, []);

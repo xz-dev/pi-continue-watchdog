@@ -12,11 +12,8 @@ import {
 
 import {
 	type ContinueWatchdogEvent,
-	type DecisionFailedWatchdogEvent,
 	parseWatchdogEvent,
-	type UnlockWatchdogEvent,
 	WATCHDOG_EVENT_MESSAGE_TYPE,
-	type WaitWatchdogEvent,
 	type WatchdogEvent,
 } from "./watchdog-event.js";
 
@@ -68,19 +65,9 @@ export type DecisionFoldMessageInput =
 			readonly watchdogEvent?: ContinueWatchdogEvent;
 	  })
 	| (DecisionFoldMessageBase & {
-			readonly outcome: "wait";
+			readonly outcome: "wait" | "unlock" | "decision-failed";
 			readonly eventContent?: string;
-			readonly watchdogEvent?: WaitWatchdogEvent;
-	  })
-	| (DecisionFoldMessageBase & {
-			readonly outcome: "unlock";
-			readonly eventContent?: string;
-			readonly watchdogEvent?: UnlockWatchdogEvent;
-	  })
-	| (DecisionFoldMessageBase & {
-			readonly outcome: "decision-failed";
-			readonly eventContent?: string;
-			readonly watchdogEvent?: DecisionFailedWatchdogEvent;
+			readonly watchdogEvent?: WatchdogEvent;
 	  })
 	| (DecisionFoldMessageBase & { readonly outcome: "invalidated" })
 	| (DecisionFoldMessageBase & { readonly outcome: "preempted" });
@@ -525,8 +512,63 @@ export function foldDecisionContext<T extends object>(messages: T[]): T[] {
 	return filtered.length === folded.length ? folded : filtered;
 }
 
+/** Details attached to a direct continuation custom message. */
+export interface DirectContinuationDetails {
+	readonly version: 1;
+	readonly exchangeId: string;
+	readonly generation: number;
+	readonly event: unknown;
+}
+
+export function isDirectContinuationMessage(message: unknown): message is {
+	readonly role: "custom";
+	readonly customType: typeof CONTINUATION_MESSAGE_TYPE;
+	readonly details: DirectContinuationDetails;
+} {
+	if (
+		!isObject(message) ||
+		message.role !== "custom" ||
+		message.customType !== CONTINUATION_MESSAGE_TYPE
+	)
+		return false;
+	const details = message.details;
+	if (
+		!isObject(details) ||
+		details.version !== 1 ||
+		typeof details.exchangeId !== "string" ||
+		details.exchangeId.length === 0 ||
+		typeof details.generation !== "number" ||
+		!Number.isSafeInteger(details.generation)
+	)
+		return false;
+	return true;
+}
+
+/**
+ * Remove a cancelled direct-continuation assistant from provider context.
+ * Direct continuations are normal visible custom messages; only the aborted
+ * watchdog-owned assistant run is context-excluded after manual cancellation.
+ */
+export function foldCancelledDirectContinuation<T extends object>(
+	messages: T[],
+): T[] {
+	const filtered = messages.filter((message) => {
+		if (
+			!isObject(message) ||
+			message.role !== "assistant" ||
+			message.errorMessage !== CANCELLED_WATCHDOG_RUN_ERROR
+		)
+			return true;
+		if (!isObject(message.details)) return true;
+		return !isObject(message.details.piContinuation);
+	});
+	return filtered.length === messages.length ? messages : filtered;
+}
+
 export function registerDecisionContextFolding(pi: ExtensionAPI): void {
 	pi.on("context", (event) => ({
-		messages: foldDecisionContext(event.messages),
+		messages: foldCancelledDirectContinuation(
+			foldDecisionContext(event.messages),
+		),
 	}));
 }

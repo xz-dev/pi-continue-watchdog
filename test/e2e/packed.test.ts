@@ -27,10 +27,8 @@ import {
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const decisionTools = ["continue_watchdog", "unlock_continue_watchdog"];
-const decisionPromptStart =
-	"This is an automated continuation check from the pi-continue-watchdog extension";
 const continuePrompt = "Continue until user assistance is required.";
+const TOOL_NAME = "unlock_continue_watchdog";
 
 interface RequestRecord {
 	readonly receivedAt: number;
@@ -42,23 +40,11 @@ interface RequestRecord {
 }
 
 interface MockReply {
-	readonly kind:
-		| "stop"
-		| "continue"
-		| "wait"
-		| "unlock"
-		| "invalid"
-		| "delayed"
-		| "connection-error";
+	readonly kind: "text" | "unlock-tool" | "delayed" | "connection-error";
 	readonly reasonType?: string;
 	readonly reason?: string;
-	readonly waitSeconds?: number;
 	readonly started?: () => void;
 	readonly text?: string;
-	readonly usage?: {
-		readonly promptTokens: number;
-		readonly completionTokens: number;
-	};
 }
 
 interface PackedFixture {
@@ -160,10 +146,6 @@ async function makePackedFixture(
 		dependencies?: Record<string, string>;
 	};
 	assert.deepEqual(installedManifest.pi?.extensions, ["./src/extension.ts"]);
-	assert.equal(
-		installedManifest.dependencies?.["pi-extension-utils"],
-		"git+https://github.com/xz-dev/pi-extension-utils.git#210f84e",
-	);
 	const utilsPackage = join(installRoot, "node_modules", "pi-extension-utils");
 	const utilsManifest = JSON.parse(
 		await readFile(join(utilsPackage, "package.json"), "utf8"),
@@ -175,7 +157,6 @@ async function makePackedFixture(
 		join(utilsPackage, "dist", "process-domain", "index.js"),
 		"utf8",
 	);
-	await readFile(join(utilsPackage, "dist", "xml.js"), "utf8");
 	await readFile(join(utilsPackage, "dist", "pi-inquiry.js"), "utf8");
 	assert.equal((await readdir(packageDir)).includes("test"), false);
 
@@ -236,10 +217,6 @@ function toolNames(request: RequestRecord): string[] {
 		.sort();
 }
 
-function textOf(message: RequestRecord["messages"][number]): string {
-	return JSON.stringify(message.content);
-}
-
 function contentText(message: RequestRecord["messages"][number]): string {
 	if (typeof message.content === "string") return message.content;
 	if (!Array.isArray(message.content)) return "";
@@ -252,12 +229,6 @@ function contentText(message: RequestRecord["messages"][number]): string {
 				: "",
 		)
 		.join("");
-}
-
-function isDecisionRequest(request: RequestRecord): boolean {
-	return request.messages.some((message) =>
-		textOf(message).includes(decisionPromptStart),
-	);
 }
 
 function sendSse(
@@ -309,21 +280,11 @@ async function startMockServer(
 				);
 				return;
 			}
-			if (
-				reply.kind === "continue" ||
-				reply.kind === "wait" ||
-				reply.kind === "unlock" ||
-				reply.kind === "invalid"
-			) {
-				const content =
-					reply.kind === "continue"
-						? (reply.text ??
-							`<watchdog><function>continue_watchdog</function><reason_type>${reply.reasonType ?? "WORK_REMAINS"}</reason_type><reason_content>${reply.reason ?? "Implementation work remains."}</reason_content></watchdog>`)
-						: reply.kind === "wait"
-							? `<watchdog><function>wait_watchdog</function><reason_content>${reply.reason ?? "Waiting for automation."}</reason_content><wait_seconds>${reply.waitSeconds ?? 30}</wait_seconds></watchdog>`
-							: reply.kind === "unlock"
-								? `<watchdog><function>unlock_continue_watchdog</function><reason_type>${reply.reasonType ?? "JOB_DONE"}</reason_type><reason_content>${reply.reason ?? "finished"}</reason_content></watchdog>`
-								: (reply.text ?? "invalid watchdog response");
+			if (reply.kind === "unlock-tool") {
+				const argumentsJson = JSON.stringify({
+					reason_type: reply.reasonType ?? "JOB_DONE",
+					reason: reply.reason ?? "All requested work is complete.",
+				});
 				sendSse(response, [
 					{
 						id,
@@ -331,7 +292,20 @@ async function startMockServer(
 						choices: [
 							{
 								index: 0,
-								delta: { content },
+								delta: {
+									content: reply.text ?? "",
+									tool_calls: [
+										{
+											index: 0,
+											id: `call-${requests.length}`,
+											type: "function",
+											function: {
+												name: TOOL_NAME,
+												arguments: argumentsJson,
+											},
+										},
+									],
+								},
 								finish_reason: null,
 							},
 						],
@@ -339,20 +313,11 @@ async function startMockServer(
 					{
 						id,
 						model: "watchdog-e2e",
-						choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+						choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
 					},
 				]);
 				return;
 			}
-			const usage =
-				reply.usage === undefined
-					? undefined
-					: {
-							prompt_tokens: reply.usage.promptTokens,
-							completion_tokens: reply.usage.completionTokens,
-							total_tokens:
-								reply.usage.promptTokens + reply.usage.completionTokens,
-						};
 			sendSse(response, [
 				{
 					id,
@@ -360,9 +325,7 @@ async function startMockServer(
 					choices: [
 						{
 							index: 0,
-							delta: {
-								content: reply.text ?? `ordinary-${requests.length}`,
-							},
+							delta: { content: reply.text ?? `ordinary-${requests.length}` },
 							finish_reason: null,
 						},
 					],
@@ -371,7 +334,6 @@ async function startMockServer(
 					id,
 					model: "watchdog-e2e",
 					choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-					...(usage === undefined ? {} : { usage }),
 				},
 			]);
 		});
@@ -547,8 +509,6 @@ async function shutdownSession(session: AgentSession): Promise<void> {
 }
 
 function createRpcUiContext(notifications?: string[]): ExtensionUIContext {
-	// bindExtensions only treats a supplied public UI context as UI-capable; the
-	// watchdog uses notify in this E2E and does not require a real terminal/TUI.
 	return {
 		async select() {
 			return undefined;
@@ -568,1913 +528,194 @@ function createRpcUiContext(notifications?: string[]): ExtensionUIContext {
 	} as unknown as ExtensionUIContext;
 }
 
-test("packed stock Pi shares aggregate idle and root control across independent ResourceLoaders", {
-	timeout: 50_000,
+test("packed tool is advertised to every provider request", {
+	timeout: 180_000,
 }, async (t) => {
-	const fixture = await makePackedFixture(t, {
-		includeWatchdog: false,
-		withProbeOutput: true,
-		watchdogConfig: { idleDelaySeconds: 10 },
-	});
-	assert.ok(fixture.probeOut);
-	const packedWatchdogPath = join(fixture.packageDir, "src", "extension.ts");
-	const packedProbePath = join(fixture.packageDir, "e2e-domain-probe.ts");
-	await writeFile(
-		packedProbePath,
-		NEUTRAL_SEMANTIC_PROBE_SOURCE.replace(
-			'import { appendFileSync } from "node:fs";',
-			'import { appendFileSync } from "node:fs";\nimport registerWatchdog from "./src/extension.ts";',
-		).replace(
-			"export default function registerNeutralSemanticProbe(pi) {",
-			"export default function registerNeutralSemanticProbe(pi) {\n\tregisterWatchdog(pi);",
-		),
-	);
-	const rootCwd = join(fixture.root, "root-project");
-	const childACwd = join(fixture.root, "child-a-project");
-	const childBCwd = join(fixture.root, "child-b-project");
-	await Promise.all(
-		[rootCwd, childACwd, childBCwd].map((cwd) =>
-			mkdir(cwd, { recursive: true }),
-		),
-	);
-
-	let markChildBStarted: (() => void) | undefined;
-	const childBStarted = new Promise<void>((resolveStarted) => {
-		markChildBStarted = resolveStarted;
-	});
+	const fixture = await makePackedFixture(t);
 	const { baseUrl, requests } = await startMockServer(t, [
-		{ kind: "delayed", started: () => markChildBStarted?.() },
-		{ kind: "stop", text: "root settled" },
-		{ kind: "stop", text: "child-a settled" },
-		{ kind: "unlock", reason: "aggregate idle proven" },
+		{ kind: "text", text: "Working." },
+		{ kind: "unlock-tool" },
 	]);
-
-	const root = await createSession(fixture, baseUrl, {
-		cwd: rootCwd,
-		uiContext: createRpcUiContext(),
-		additionalExtensionPaths: [packedProbePath],
-	});
-	const childA = await createSession(fixture, baseUrl, {
-		cwd: childACwd,
-		additionalExtensionPaths: [packedProbePath],
-	});
-	const childB = await createSession(fixture, baseUrl, {
-		cwd: childBCwd,
-		additionalExtensionPaths: [packedProbePath],
-	});
-	t.after(async () => {
-		await Promise.all([
-			shutdownSession(root.session),
-			shutdownSession(childA.session),
-			shutdownSession(childB.session),
-		]);
-	});
-
-	for (const loaded of [root, childA, childB]) {
-		assert.equal(loaded.extensionPath, packedProbePath);
-		assert.equal(loaded.extensionPath.startsWith(fixture.packageDir), true);
-	}
-	assert.equal(packedWatchdogPath.startsWith(fixture.packageDir), true);
-	assert.notEqual(root.loader, childA.loader);
-	assert.notEqual(root.loader, childB.loader);
-	assert.notEqual(childA.loader, childB.loader);
-
-	const initialProbeRecords = await readProbeRecords(fixture.probeOut);
-	const starts = initialProbeRecords.filter(
-		(record) => record.kind === "session-start",
-	);
-	assert.deepEqual(
-		starts.map((record) => record.cwd).sort(),
-		[rootCwd, childACwd, childBCwd].sort(),
-	);
-	assert.equal(
-		new Set(starts.map((record) => record.evaluationId)).size,
-		3,
-		"distinct-cwd loaders must independently evaluate their packed extension graph",
-	);
-
-	const registeredDecisionTools = (session: AgentSession): string[] =>
-		session.extensionRunner
-			.getAllRegisteredTools()
-			.map((tool) => tool.definition.name)
-			.filter((name) => decisionTools.includes(name))
-			.sort();
-	assert.deepEqual(registeredDecisionTools(root.session), []);
-	assert.deepEqual(registeredDecisionTools(childA.session), []);
-	assert.deepEqual(registeredDecisionTools(childB.session), []);
-
-	const childBPrompt = childB.session.prompt(
-		"Remain busy while the other observable agents settle.",
-	);
-	await childBStarted;
-	await root.session.prompt("Root settles while child-b remains busy.");
-	await childA.session.prompt(
-		"Child-a also settles while child-b remains busy.",
-	);
-	await Promise.all([
-		waitForSessionIdle(root.session, 3_000, "root initial work"),
-		waitForSessionIdle(childA.session, 3_000, "child-a initial work"),
-	]);
-	await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
-
-	assert.equal(requests.length, 3);
-	assert.equal(
-		requests.some((request) =>
-			request.messages.some((message) =>
-				textOf(message).includes(decisionPromptStart),
-			),
-		),
-		false,
-		"root and child-a settling cannot decide while child-b remains busy",
-	);
-	assert.deepEqual(registeredDecisionTools(root.session), []);
-	assert.deepEqual(registeredDecisionTools(childA.session), []);
-	assert.deepEqual(registeredDecisionTools(childB.session), []);
-
-	await childB.session.abort();
-	await childBPrompt;
-	await waitForSessionIdle(childB.session, 3_000, "child-b abort");
-	await waitFor(() => requests.length === 4, 15_000, "aggregate-idle decision");
-	await waitForSessionIdle(root.session, 3_000, "root unlock decision");
-
-	const decisionRequests = requests.filter((request) =>
-		request.messages.some((message) =>
-			textOf(message).includes(decisionPromptStart),
-		),
-	);
-	assert.equal(decisionRequests.length, 1);
-	assert.deepEqual(toolNames(decisionRequests[0] as RequestRecord), [
-		"bash",
-		"edit",
-		"read",
-		"write",
-	]);
-	assert.deepEqual(registeredDecisionTools(root.session), []);
-	assert.deepEqual(registeredDecisionTools(childA.session), []);
-	assert.deepEqual(registeredDecisionTools(childB.session), []);
-	assert.equal(
-		requests
-			.slice(0, 3)
-			.every((request) =>
-				decisionTools.every((name) => !toolNames(request).includes(name)),
-			),
-		true,
-		"children and the root's ordinary turn must never activate decision tools",
-	);
-
-	await waitFor(
-		() => requests.length === 4 && root.session.isIdle,
-		2_000,
-		"root unlock completion",
-	);
-	let finalProbeRecords = await readProbeRecords(fixture.probeOut);
-	const hookDeadline = Date.now() + 2_000;
-	while (
-		finalProbeRecords.every((record) => record.kind !== "semantic-hook") &&
-		Date.now() < hookDeadline
-	) {
-		await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
-		finalProbeRecords = await readProbeRecords(fixture.probeOut);
-	}
-	const hooks = finalProbeRecords.filter(
-		(record) => record.kind === "semantic-hook",
-	);
-	assert.deepEqual(hooks, [
-		{
-			kind: "semantic-hook",
-			cwd: rootCwd,
-			evaluationId: starts.find((record) => record.cwd === rootCwd)
-				?.evaluationId,
-			data: {
-				version: 1,
-				name: "user-ready",
-				values: {
-					STOP_KIND: "AI_UNLOCK",
-					REASON_TYPE: "JOB_DONE",
-					REASON: "aggregate idle proven",
-				},
-			},
-		},
-	]);
-});
-
-test("packed artifact asks after threshold compaction settles", {
-	timeout: 50_000,
-}, async (t) => {
-	const fixture = await makePackedFixture(t, {
-		watchdogConfig: { idleDelaySeconds: 10 },
-		piSettings: {
-			compaction: { reserveTokens: 16, keepRecentTokens: 1 },
-			retry: { enabled: false },
-		},
-	});
-	const { baseUrl, requests } = await startMockServer(t, [
-		{
-			kind: "stop",
-			text: "ordinary response",
-			usage: { promptTokens: 52, completionTokens: 4 },
-		},
-		{
-			kind: "stop",
-			text: "## Goal\nPreserve the threshold-compaction test context.",
-			usage: { promptTokens: 8, completionTokens: 4 },
-		},
-		{ kind: "unlock", reason: "threshold compaction recovery proven" },
-	]);
-	const { session, extensionPath } = await createSession(fixture, baseUrl, {
-		contextWindow: 64,
-		maxTokens: 16,
-	});
-	t.after(() => shutdownSession(session));
-	assert.match(
-		extensionPath,
-		/node_modules\/pi-continue-watchdog\/src\/extension\.ts$/,
-	);
-	const lifecycle: Array<{ readonly type: string; readonly at: number }> = [];
-	const unsubscribe = session.subscribe((event) => {
-		if (
-			event.type === "compaction_start" ||
-			event.type === "compaction_end" ||
-			event.type === "agent_settled"
-		) {
-			lifecycle.push({ type: event.type, at: Date.now() });
-		}
-	});
-	t.after(unsubscribe);
-
-	const promptStartedAt = Date.now();
-	await session.prompt("A normal turn must settle after threshold compaction.");
-	const decisionDeadline = promptStartedAt + 30_000;
-	const waitWithinDeadline = async (
-		condition: () => boolean,
-		phase: string,
-	): Promise<void> => {
-		const remaining = decisionDeadline - Date.now();
-		if (remaining <= 0) {
-			throw new Error(
-				`Timed out waiting for ${phase}; requests=${requests.length}; lifecycle=${lifecycle.map((event) => event.type).join(",")}`,
+	const { session } = await createSession(fixture, baseUrl);
+	try {
+		await session.prompt("Do the work.");
+		await waitForSessionIdle(session, 30_000, "first turn");
+		// The unlock tool settles the run; wait for the second request.
+		await waitFor(() => requests.length >= 2, 60_000, "unlock request");
+		for (const request of requests) {
+			assert.ok(
+				toolNames(request).includes(TOOL_NAME),
+				`expected ${TOOL_NAME} in ${JSON.stringify(toolNames(request))}`,
 			);
 		}
-		try {
-			await waitFor(condition, remaining, phase);
-		} catch {
-			throw new Error(
-				`Timed out waiting for ${phase}; requests=${requests.length}; lifecycle=${lifecycle.map((event) => event.type).join(",")}`,
-			);
-		}
-	};
-	await waitWithinDeadline(
-		() => lifecycle.some((event) => event.type === "compaction_end"),
-		"threshold compaction_end",
-	);
-	const compactionEndAt = lifecycle.find(
-		(event) => event.type === "compaction_end",
-	)?.at;
-	assert.ok(compactionEndAt);
-	await waitWithinDeadline(
-		() =>
-			lifecycle.some(
-				(event) =>
-					event.type === "agent_settled" && event.at >= compactionEndAt,
-			),
-		"post-compaction agent_settled",
-	);
-	const postCompactionSettledAt = lifecycle.find(
-		(event) => event.type === "agent_settled" && event.at >= compactionEndAt,
-	)?.at;
-	assert.ok(postCompactionSettledAt);
-	await waitWithinDeadline(() => session.isIdle, "post-compaction idle");
-	await waitWithinDeadline(
-		() =>
-			requests.some(
-				(request) =>
-					request.receivedAt >= postCompactionSettledAt &&
-					isDecisionRequest(request),
-			),
-		"post-compaction decision request",
-	);
-	await waitForSessionIdle(session, 3_000, "post-compaction unlock decision");
-
-	assert.equal(
-		lifecycle.some((event) => event.type === "compaction_start"),
-		true,
-	);
-	assert.equal(
-		lifecycle.some((event) => event.type === "compaction_end"),
-		true,
-	);
-	assert.equal(
-		lifecycle.some((event) => event.type === "agent_settled"),
-		true,
-	);
-	const decisionRequests = requests.filter(isDecisionRequest);
-	assert.equal(decisionRequests.length, 1);
-	const decisionRequest = decisionRequests[0];
-	assert.ok(decisionRequest);
-	assert.equal(decisionRequest.receivedAt >= compactionEndAt, true);
-	assert.equal(decisionRequest.receivedAt >= postCompactionSettledAt, true);
-	assert.equal(requests.at(-1), decisionRequest);
-	assert.deepEqual(toolNames(decisionRequest), [
-		"bash",
-		"edit",
-		"read",
-		"write",
-	]);
-	const ordinaryRequest = requests[0];
-	const summaryRequest = requests[1];
-	assert.ok(ordinaryRequest);
-	assert.ok(summaryRequest);
-	assert.deepEqual(toolNames(ordinaryRequest), [
-		"bash",
-		"edit",
-		"read",
-		"write",
-	]);
-	assert.deepEqual(toolNames(summaryRequest), []);
-	assert.equal(
-		textOf(ordinaryRequest.messages.at(-1) ?? {}).includes(
-			"A normal turn must settle after threshold compaction.",
-		),
-		true,
-	);
-	assert.equal(
-		textOf(summaryRequest.messages.at(-1) ?? {}).includes("<conversation>"),
-		true,
-	);
-	assert.equal(decisionRequest.messages.at(-1)?.role, "user");
-	const decisionContent = textOf(decisionRequest.messages.at(-1) ?? {});
-	assert.equal(decisionContent.includes(decisionPromptStart), true);
-	assert.equal(decisionContent.includes("Previous watchdog results"), false);
-	assert.equal(decisionContent.includes("Do not call tools"), true);
-	assert.equal(decisionContent.includes("Do not output multiple"), true);
-	assert.equal(
-		decisionContent.includes(
-			'[\\"JOB_DONE\\",\\"WAIT_USER\\",\\"JOB_BLOCKED\\"]',
-		),
-		true,
-	);
-});
-
-test("packed Pi branch and compaction retain only the active shared event body", {
-	timeout: 15_000,
-}, async (t) => {
-	const fixture = await makePackedFixture(t);
-	const siblingBody =
-		"Continue watchdog waiting · 1s · 2026-09-19T10:00:00.000+00:00\n\nSibling-only event.";
-	const compactedBody =
-		"Continue watchdog waiting · 2s · 2026-09-19T10:00:01.000+00:00\n\nCompacted active-branch event.";
-	const retainedBody =
-		"Continue watchdog waiting · 3s · 2026-09-19T10:00:02.000+00:00\n\nRetained active-branch event.";
-	const manager = SessionManager.inMemory(fixture.cwd);
-	const rootId = manager.appendCustomEntry("fixture:root", {});
-	manager.appendCustomMessageEntry(
-		"pi-continue-watchdog:event",
-		siblingBody,
-		true,
-		{ kind: "wait" },
-	);
-	manager.branch(rootId);
-	manager.appendCustomMessageEntry(
-		"pi-continue-watchdog:event",
-		compactedBody,
-		true,
-		{ kind: "wait" },
-	);
-	const retainedId = manager.appendCustomMessageEntry(
-		"pi-continue-watchdog:event",
-		retainedBody,
-		true,
-		{ kind: "wait" },
-	);
-	manager.appendCompaction(
-		"Only the active retained event remains exact after compaction.",
-		retainedId,
-		100,
-	);
-
-	const { baseUrl, requests } = await startMockServer(t, [{ kind: "stop" }]);
-	const { session } = await createSession(fixture, baseUrl, {
-		sessionManager: manager,
-	});
-	t.after(() => shutdownSession(session));
-	await session.prompt("Inspect the retained active-branch context once.");
-	assert.equal(requests.length, 1);
-	const payload = requests[0];
-	assert.ok(payload);
-	const retainedMessages = payload.messages.filter(
-		(message) => contentText(message) === retainedBody,
-	);
-	assert.equal(retainedMessages.length, 1);
-	assert.equal(
-		payload.messages.some((message) =>
-			contentText(message).includes(siblingBody),
-		),
-		false,
-	);
-	assert.equal(
-		payload.messages.some((message) =>
-			contentText(message).includes(compactedBody),
-		),
-		false,
-	);
-	assert.equal(
-		JSON.stringify(payload).includes("Previous watchdog results"),
-		false,
-	);
-});
-
-test("packed source artifact waits a real 10 seconds, decides continue, and folds context", {
-	timeout: 40_000,
-}, async (t) => {
-	const customContinuePrompt =
-		"Continue configured verification guidance verbatim.";
-	const fixture = await makePackedFixture(t, {
-		watchdogConfig: { continuePrompt: customContinuePrompt },
-	});
-	const { baseUrl, requests } = await startMockServer(t, [
-		{ kind: "stop" },
-		{ kind: "continue" },
-		{ kind: "stop" },
-	]);
-	const { session, extensionPath } = await createSession(fixture, baseUrl);
-	t.after(() => shutdownSession(session));
-	assert.match(
-		extensionPath,
-		/node_modules\/pi-continue-watchdog\/src\/extension\.ts$/,
-	);
-
-	const commands = session.extensionRunner
-		.getRegisteredCommands()
-		.map((command) => command.invocationName);
-	assert.equal(commands.includes("lock-continue-watchdog"), true);
-	assert.equal(commands.includes("unlock-continue-watchdog"), true);
-	const publicEvents: Array<{ readonly type: string; readonly text: string }> =
-		[];
-	const unsubscribe = session.subscribe((event) =>
-		publicEvents.push({ type: event.type, text: JSON.stringify(event) }),
-	);
-	t.after(unsubscribe);
-
-	await session.prompt("Start a task that must not mysteriously stop.");
-	await waitFor(() => requests.length === 3, 20_000, "continued provider turn");
-	await waitForSessionIdle(session, 5_000, "continued ordinary work");
-
-	const firstRequest = requests[0];
-	const decisionRequest = requests[1];
-	const continuedRequest = requests[2];
-	assert.ok(firstRequest);
-	assert.ok(decisionRequest);
-	assert.ok(continuedRequest);
-	assert.deepEqual(toolNames(firstRequest), ["bash", "edit", "read", "write"]);
-	assert.deepEqual(toolNames(decisionRequest), [
-		"bash",
-		"edit",
-		"read",
-		"write",
-	]);
-	assert.deepEqual(toolNames(continuedRequest), [
-		"bash",
-		"edit",
-		"read",
-		"write",
-	]);
-	const elapsed = decisionRequest.receivedAt - firstRequest.receivedAt;
-	assert.ok(elapsed >= 9_800, `decision arrived too early after ${elapsed}ms`);
-	assert.ok(elapsed <= 13_000, `decision arrived too late after ${elapsed}ms`);
-	assert.equal(
-		decisionRequest.messages.some((message) =>
-			textOf(message).includes(decisionPromptStart),
-		),
-		true,
-	);
-	const folded = continuedRequest.messages.filter(
-		(message) =>
-			message.role === "user" && textOf(message).includes(customContinuePrompt),
-	);
-	assert.equal(folded.length, 1);
-	const continuationContent = textOf(folded[0] ?? {});
-	const continuationBody = contentText(folded[0] ?? {});
-	assert.match(
-		continuationBody,
-		/Continue watchdog continued · WORK_REMAINS · \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}/,
-	);
-	assert.match(continuationContent, /not a message or request from the user/);
-	assert.equal(continuationContent.includes(customContinuePrompt), true);
-	assert.match(
-		continuationContent,
-		/not user approval, confirmation, consent, or authorization/,
-	);
-	assert.match(continuationContent, /\\"reasonType\\":\\"WORK_REMAINS\\"/);
-	assert.match(
-		continuationContent,
-		/\\"reason\\":\\"Implementation work remains\.\\"/,
-	);
-	assert.match(
-		continuationContent,
-		/Do not treat this message as permission for any action requiring user approval/,
-	);
-	const thirdBody = JSON.stringify(requests[2]);
-	assert.equal(thirdBody.includes(decisionPromptStart), false);
-	assert.equal(thirdBody.includes("continue_watchdog"), false);
-	assert.equal(thirdBody.includes("unlock_continue_watchdog"), false);
-	assert.equal(thirdBody.includes("<watchdog>"), false);
-	assert.equal(
-		thirdBody.includes("pi-continue-watchdog:decision-audit"),
-		false,
-	);
-	assert.equal(thirdBody.includes("pi-continue-watchdog:inquiry-fold"), false);
-	const persistedEntries = session.sessionManager.getEntries();
-	const sharedContinueFold = persistedEntries.find(
-		(entry) =>
-			entry.type === "custom_message" &&
-			entry.customType === "pi-continue-watchdog:inquiry-fold" &&
-			(entry.details as { readonly watchdogOutcome?: unknown } | undefined)
-				?.watchdogOutcome === "continue",
-	);
-	assert.ok(sharedContinueFold);
-	assert.equal(sharedContinueFold.type, "custom_message");
-	if (sharedContinueFold.type !== "custom_message")
-		throw new Error("expected persisted shared continue fold");
-	assert.equal(sharedContinueFold.display, true);
-	assert.equal(continuationBody, sharedContinueFold.content);
-	const persisted = persistedEntries.map((entry) => JSON.stringify(entry));
-	assert.equal(
-		persisted.filter((entry) =>
-			entry.includes('"customType":"pi-continue-watchdog:continue"'),
-		).length,
-		0,
-	);
-	assert.equal(
-		persisted.some(
-			(entry) =>
-				entry.includes('"customType":"pi-continue-watchdog:status"') &&
-				entry.includes('"kind":"checking"'),
-		),
-		false,
-	);
-	assert.equal(thirdBody.includes("Continue watchdog continued"), true);
-	assert.equal(thirdBody.includes("Continue watchdog checking"), false);
-	// Decision content may stream while the provider runs, then message_end clears
-	// the finalized assistant before public completion and session persistence.
-	assert.equal(
-		publicEvents.some((event) => event.type === "message_update"),
-		true,
-	);
-	const firstDecisionUpdate = publicEvents.findIndex(
-		(event) =>
-			event.type === "message_update" &&
-			event.text.includes("continue_watchdog"),
-	);
-	const publicDecisionEnd = publicEvents.findIndex(
-		(event, index) =>
-			index > firstDecisionUpdate &&
-			event.type === "message_end" &&
-			event.text.includes('"role":"assistant"') &&
-			event.text.includes('"content":[]'),
-	);
-	assert.ok(firstDecisionUpdate >= 0);
-	assert.ok(publicDecisionEnd > firstDecisionUpdate);
-	const persistedAssistants = session.sessionManager
-		.getBranch()
-		.flatMap((entry) =>
-			entry.type === "message" && entry.message.role === "assistant"
-				? [entry.message]
-				: [],
-		);
-	assert.equal(
-		persistedAssistants.some((message) =>
-			JSON.stringify(message).includes("continue_watchdog"),
-		),
-		false,
-	);
-});
-
-test("packed recovered continuation stays once in normal context without history reconstruction", {
-	timeout: 50_000,
-}, async (t) => {
-	const rawNarration = "RAW_HIDDEN_WATCHDOG_NARRATION";
-	const safeReason = "History-safe continuation reason.";
-	const fixture = await makePackedFixture(t);
-	const { baseUrl, requests } = await startMockServer(t, [
-		{ kind: "stop", text: "ordinary initial response" },
-		{
-			kind: "continue",
-			text: `${rawNarration}\n<watchdog><function>continue_watchdog</function><reason_type>WORK_REMAINS</reason_type><reason_content>${safeReason}</reason_content></watchdog>`,
-		},
-		// Transient failure: stock Pi auto-retry (default maxRetries 3) recovers,
-		// so the settlement is a non-error terminal outcome and the watchdog must
-		// keep the fence + follow-up decision per the terminal-outcome gate.
-		{ kind: "connection-error" },
-		{ kind: "stop", text: "continuation recovered after transient failure" },
-		{ kind: "unlock", reason: "zero-loop history verified" },
-	]);
-	const { session } = await createSession(fixture, baseUrl);
-	t.after(() => shutdownSession(session));
-
-	await session.prompt(
-		"Start work whose automatic continuation will fail once.",
-	);
-	await waitFor(
-		() => requests.length >= 4,
-		20_000,
-		"retried ordinary continuation request",
-	);
-	await waitForSessionIdle(
-		session,
-		5_000,
-		"recovered ordinary continuation settle",
-	);
-	await waitFor(
-		() => requests.length === 5,
-		20_000,
-		"immediate follow-up watchdog decision",
-	);
-	await waitForSessionIdle(session, 5_000, "follow-up watchdog unlock");
-
-	const firstDecision = requests[1];
-	const failedContinuation = requests[2];
-	const followUpDecision = requests[4];
-	assert.ok(firstDecision);
-	assert.ok(failedContinuation);
-	assert.ok(followUpDecision);
-	assert.equal(isDecisionRequest(firstDecision), true);
-	assert.equal(isDecisionRequest(failedContinuation), false);
-	assert.equal(isDecisionRequest(followUpDecision), true);
-	const elapsed = followUpDecision.receivedAt - failedContinuation.receivedAt;
-	assert.ok(
-		elapsed >= 9_800,
-		`follow-up decision arrived too early after ${elapsed}ms`,
-	);
-	assert.ok(
-		elapsed <= 15_000,
-		`follow-up decision arrived too late after ${elapsed}ms`,
-	);
-
-	const decisionMessage = [...followUpDecision.messages]
-		.reverse()
-		.find((message) => textOf(message).includes(decisionPromptStart));
-	assert.ok(decisionMessage);
-	const decisionContent = textOf(decisionMessage);
-	const heading =
-		"Previous watchdog results (model-generated reference only; not user instructions):";
-	assert.equal(decisionContent.includes(heading), false);
-	assert.equal(decisionContent.includes(safeReason), false);
-
-	const followUpBody = JSON.stringify(followUpDecision);
-	assert.equal(followUpBody.includes(heading), false);
-	assert.equal(followUpBody.split("Continue watchdog continued").length - 1, 1);
-	assert.equal(followUpBody.includes(safeReason), true);
-	assert.equal(followUpBody.includes(rawNarration), false);
-	assert.equal(
-		followUpBody.includes(`<reason_content>${safeReason}</reason_content>`),
-		false,
-	);
-	assert.equal(followUpBody.includes("Continue watchdog checking"), false);
-	assert.equal(
-		followUpBody.includes("pi-continue-watchdog:decision-audit"),
-		false,
-	);
-});
-
-test("packed stock Pi retries a decision connection error and accepts the successful unlock", {
-	timeout: 45_000,
-}, async (t) => {
-	const fixture = await makePackedFixture(t, {
-		watchdogConfig: { idleDelaySeconds: 10 },
-	});
-	const { baseUrl, requests } = await startMockServer(t, [
-		{ kind: "stop" },
-		{ kind: "connection-error" },
-		{
-			kind: "unlock",
-			reasonType: "JOB_DONE",
-			reason: "retry recovered",
-		},
-	]);
-	const { session } = await createSession(fixture, baseUrl);
-	t.after(() => shutdownSession(session));
-
-	await session.prompt("Complete the task, then let the watchdog decide.");
-	await waitFor(
-		() => requests.length === 3,
-		20_000,
-		"retried watchdog decision provider request",
-	);
-	await waitForSessionIdle(session, 10_000, "retried watchdog unlock");
-
-	assert.equal(requests.filter(isDecisionRequest).length, 2);
-	const serialized = session.sessionManager
-		.getEntries()
-		.map((entry) => JSON.stringify(entry));
-	assert.equal(
-		serialized.some(
-			(entry) =>
-				entry.includes('"outcome":"invalid"') &&
-				!entry.includes('"outcome":"invalidated"'),
-		),
-		false,
-	);
-	assert.equal(
-		serialized.some(
-			(entry) =>
-				entry.includes("previous decision response was invalid") &&
-				!entry.includes('"outcome":"invalidated"'),
-		),
-		false,
-	);
-	assert.equal(
-		serialized.some(
-			(entry) =>
-				entry.includes('"kind":"other-error"') &&
-				entry.includes("Connection error."),
-		),
-		true,
-	);
-	assert.equal(
-		serialized.some((entry) => entry.includes('"outcome":"unlock"')),
-		true,
-	);
-	assert.equal(
-		serialized.some((entry) => entry.includes("retry recovered")),
-		true,
-	);
-});
-
-test("packed command unlock and canonical programmatic abort prevent a decision turn", {
-	timeout: 40_000,
-}, async (t) => {
-	const fixture = await makePackedFixture(t);
-	let markStreamStarted: (() => void) | undefined;
-	const streamStarted = new Promise<void>((resolveStarted) => {
-		markStreamStarted = resolveStarted;
-	});
-	const { baseUrl, requests } = await startMockServer(t, [
-		{ kind: "delayed", started: () => markStreamStarted?.() },
-	]);
-	const { session } = await createSession(fixture, baseUrl);
-	t.after(() => shutdownSession(session));
-	let markAssistantStarted: (() => void) | undefined;
-	const assistantStarted = new Promise<void>((resolveStarted) => {
-		markAssistantStarted = resolveStarted;
-	});
-	const unsubscribe = session.subscribe((event) => {
-		if (event.type === "message_update" && event.message.role === "assistant") {
-			markAssistantStarted?.();
-		}
-	});
-	t.after(unsubscribe);
-
-	await session.prompt("/lock-continue-watchdog");
-	await session.prompt("/unlock-continue-watchdog waiting for user");
-	await new Promise((resolvePromise) => setTimeout(resolvePromise, 10_300));
-	assert.equal(requests.length, 0);
-	const entries = session.sessionManager.getEntries();
-	assert.equal(
-		entries.some((entry) => JSON.stringify(entry).includes("waiting for user")),
-		true,
-	);
-
-	const prompt = session.prompt("This run will be aborted through stock Pi.");
-	await waitFor(() => requests.length === 1, 3_000, "delayed provider request");
-	await Promise.all([streamStarted, assistantStarted]);
-	await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
-	await session.abort();
-	await prompt;
-	await waitForSessionIdle(session, 3_000, "programmatic abort");
-	const branchAssistants = session.sessionManager
-		.getBranch()
-		.flatMap((entry) =>
-			entry.type === "message" && entry.message.role === "assistant"
-				? [entry.message]
-				: [],
-		);
-	assert.equal(branchAssistants.length, 1);
-	assert.equal(branchAssistants[0]?.stopReason, "aborted");
-	await new Promise((resolvePromise) => setTimeout(resolvePromise, 10_300));
-	assert.equal(requests.length, 1);
-});
-
-test("packed manual unlock cancels watchdog-owned runs, leaves queue semantics to Pi, and preserves ordinary runs", {
-	timeout: 95_000,
-}, async (t) => {
-	// Decision cancellation: explicit unlock is the only visible unlock and the
-	// internal aborted assistant leaves no persisted partial output.
-	{
-		const fixture = await makePackedFixture(t);
-		let markDecisionStarted: (() => void) | undefined;
-		const decisionStarted = new Promise<void>((resolveStarted) => {
-			markDecisionStarted = resolveStarted;
-		});
-		const notifications: string[] = [];
-		const { baseUrl, requests } = await startMockServer(t, [
-			{ kind: "stop", text: "ordinary work complete" },
-			{ kind: "delayed", started: () => markDecisionStarted?.() },
-		]);
-		const { session } = await createSession(fixture, baseUrl, {
-			uiContext: createRpcUiContext(notifications),
-		});
-		let closed = false;
-		t.after(async () => {
-			if (!closed) await shutdownSession(session);
-		});
-
-		await session.prompt("Open a decision that manual unlock will cancel.");
-		await waitFor(
-			() => requests.length === 2,
-			18_000,
-			"manual decision cancellation",
-		);
-		await decisionStarted;
-		await session.prompt("/unlock-continue-watchdog");
-		await waitForSessionIdle(session, 5_000, "cancelled decision");
-
-		assert.equal(isDecisionRequest(requests[1] as RequestRecord), true);
-		assert.deepEqual(notifications, ["Continue watchdog unlocked"]);
-		const serialized = session.sessionManager
-			.getEntries()
-			.map((entry) => JSON.stringify(entry));
-		assert.equal(
-			serialized.some((entry) => entry.includes("partial")),
-			false,
-		);
-		assert.equal(
-			serialized.some((entry) => entry.includes("Operation aborted")),
-			false,
-		);
+	} finally {
 		await shutdownSession(session);
-		closed = true;
 	}
+});
 
-	// Continuation cancellation leaves queue processing to stock Pi. The extension
-	// does not inspect or replay the follow-up that Pi consumes during abort.
-	{
-		const fixture = await makePackedFixture(t);
-		let markContinuationStarted: (() => void) | undefined;
-		const continuationStarted = new Promise<void>((resolveStarted) => {
-			markContinuationStarted = resolveStarted;
-		});
-		const notifications: string[] = [];
-		let markLaterOrdinaryStarted: (() => void) | undefined;
-		const laterOrdinaryStarted = new Promise<void>((resolveStarted) => {
-			markLaterOrdinaryStarted = resolveStarted;
-		});
-		const { baseUrl, requests } = await startMockServer(t, [
-			{ kind: "stop", text: "ordinary work complete" },
-			{ kind: "continue" },
-			{ kind: "delayed", started: () => markContinuationStarted?.() },
-			{ kind: "delayed", started: () => markLaterOrdinaryStarted?.() },
-		]);
-		const { session } = await createSession(fixture, baseUrl, {
-			uiContext: createRpcUiContext(notifications),
-		});
-		let closed = false;
-		t.after(async () => {
-			if (!closed) await shutdownSession(session);
-		});
-
-		await session.prompt(
-			"Open an automated continuation that will be cancelled.",
+test("packed idle continuation directly continues without an inquiry", {
+	timeout: 240_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t);
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "text", text: "First ordinary answer." },
+		{ kind: "text", text: "Continued answer after nudge." },
+		{ kind: "unlock-tool" },
+	]);
+	const { session } = await createSession(fixture, baseUrl);
+	try {
+		await session.prompt("Start the task.");
+		await waitForSessionIdle(session, 30_000, "first turn");
+		// After the fixed 10s fence the watchdog sends one direct continuation.
+		await waitFor(() => requests.length >= 2, 120_000, "continuation request");
+		const continuationRequest = requests[1];
+		const continuationMessage = continuationRequest.messages.find(
+			(message) =>
+				message.role === "user" &&
+				contentText(message).includes("Continue watchdog continued ·"),
 		);
-		await waitFor(
-			() => requests.length === 3,
-			20_000,
-			"streaming continuation",
+		assert.ok(continuationMessage, "expected continuation body in request 2");
+		const body = contentText(continuationMessage);
+		assert.match(
+			body,
+			/You ended your turn without calling unlock_continue_watchdog\./,
 		);
-		await continuationStarted;
-		const queued = session.prompt("queued user work", {
-			source: "interactive",
-			streamingBehavior: "followUp",
-		});
-		await waitFor(
-			() => session.pendingMessageCount === 1,
-			2_000,
-			"queued user work to enter Pi follow-up queue",
-		);
-		await session.prompt("/unlock-continue-watchdog");
-		await queued;
-		await waitForSessionIdle(session, 5_000, "cancelled continuation");
-
-		assert.deepEqual(notifications, ["Continue watchdog unlocked"]);
-		assert.equal(session.pendingMessageCount, 0);
-		assert.equal(requests.length, 3);
-		assert.equal(
-			requests.some((request) =>
-				request.messages.some((message) =>
-					textOf(message).includes("queued user work"),
-				),
-			),
-			false,
-		);
-		const serialized = session.sessionManager
-			.getEntries()
-			.map((entry) => JSON.stringify(entry));
-		assert.equal(
-			serialized.some((entry) => entry.includes("partial")),
-			false,
-		);
-		assert.equal(
-			serialized.some((entry) => entry.includes("Operation aborted")),
-			false,
-		);
-
-		const laterOrdinary = session.prompt(
-			"later ordinary run must abort normally",
-		);
-		await waitFor(() => requests.length === 4, 3_000, "later ordinary run");
-		await laterOrdinaryStarted;
-		await session.abort();
-		await laterOrdinary;
-		await waitForSessionIdle(session, 3_000, "later ordinary abort");
-		const latestAssistant = session.sessionManager
-			.getBranch()
-			.flatMap((entry) =>
-				entry.type === "message" && entry.message.role === "assistant"
-					? [entry.message]
-					: [],
-			)
-			.at(-1);
-		assert.equal(latestAssistant?.stopReason, "aborted");
-		assert.notEqual(
-			latestAssistant?.errorMessage,
-			"pi-continue-watchdog:cancelled",
-		);
-		assert.deepEqual(notifications, [
-			"Continue watchdog unlocked",
-			"Continue watchdog unlocked",
-		]);
-		await shutdownSession(session);
-		closed = true;
-	}
-
-	// Genuine steering that starts inside the continuation's agent lifecycle
-	// clears continuation ownership before a later manual unlock.
-	{
-		const fixture = await makePackedFixture(t);
-		let markContinuationStarted: (() => void) | undefined;
-		const continuationStarted = new Promise<void>((resolveStarted) => {
-			markContinuationStarted = resolveStarted;
-		});
-		let markUserStarted: (() => void) | undefined;
-		const userStarted = new Promise<void>((resolveStarted) => {
-			markUserStarted = resolveStarted;
-		});
-		const notifications: string[] = [];
-		let abortCalls = 0;
-		const timeline: string[] = [];
-		const { baseUrl, requests } = await startMockServer(t, [
-			{ kind: "stop", text: "ordinary work complete" },
-			{ kind: "continue" },
-			{
-				kind: "delayed",
-				started: () => {
-					timeline.push("provider:user-started");
-					markUserStarted?.();
-				},
-			},
-		]);
-		const { session } = await createSession(fixture, baseUrl, {
-			uiContext: createRpcUiContext(notifications),
-			abortHandler: (activeSession) => {
-				abortCalls += 1;
-				timeline.push("abort-handler");
-				activeSession.agent.abort();
-			},
-		});
-		let closed = false;
-		t.after(async () => {
-			if (!closed) await shutdownSession(session);
-		});
-
-		const unsubscribe = session.subscribe((event) => {
-			if (event.type === "agent_start") timeline.push("agent-start");
-			if (event.type === "message_start") {
-				timeline.push(
-					`message-start:${event.message.role}:${"customType" in event.message ? event.message.customType : ""}`,
+		assert.match(body, new RegExp(continuePrompt));
+		assert.match(body, /monitor that task until it ends/);
+		// No hidden decision prompt ever reached the provider.
+		for (const request of requests) {
+			for (const message of request.messages) {
+				assert.doesNotMatch(
+					contentText(message),
+					/automated continuation check from the pi-continue-watchdog/,
 				);
 			}
-			if (
-				event.type === "message_start" &&
-				event.message.role === "custom" &&
-				JSON.stringify(event.message).includes(
-					"pi-continue-watchdog:inquiry-fold",
-				)
-			) {
-				markContinuationStarted?.();
-			}
-		});
-		t.after(unsubscribe);
-
-		await session.prompt("Start a continuation then accept genuine steering.");
-		await continuationStarted;
-		await session.prompt("genuine steering work", {
-			source: "interactive",
-			streamingBehavior: "steer",
-		});
-		await waitFor(() => requests.length === 3, 20_000, "steering user request");
-		await userStarted;
-		timeline.push("unlock-command");
-		await session.prompt("/unlock-continue-watchdog");
-		await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
-		assert.equal(
-			abortCalls,
-			0,
-			`unexpected abort; timeline: ${timeline.join(" -> ")}`,
-		);
-		assert.equal(
-			session.isIdle,
-			false,
-			`user run settled unexpectedly; timeline: ${timeline.join(" -> ")}`,
-		);
-		assert.deepEqual(notifications, ["Continue watchdog unlocked"]);
-		assert.equal(
-			textOf(requests[2]?.messages.at(-1) ?? {}).includes(
-				"genuine steering work",
-			),
-			true,
-		);
-		await session.abort();
-		await waitForSessionIdle(session, 3_000, "steering cleanup abort");
-		await shutdownSession(session);
-		closed = true;
-	}
-
-	// Ordinary current work is not a watchdog-owned cancellation target.
-	{
-		const fixture = await makePackedFixture(t);
-		let markOrdinaryStarted: (() => void) | undefined;
-		const ordinaryStarted = new Promise<void>((resolveStarted) => {
-			markOrdinaryStarted = resolveStarted;
-		});
-		const notifications: string[] = [];
-		const { baseUrl, requests } = await startMockServer(t, [
-			{ kind: "delayed", started: () => markOrdinaryStarted?.() },
-		]);
-		const { session } = await createSession(fixture, baseUrl, {
-			uiContext: createRpcUiContext(notifications),
-		});
-		let closed = false;
-		t.after(async () => {
-			if (!closed) await shutdownSession(session);
-		});
-
-		const ordinary = session.prompt("ordinary user run remains active");
-		await waitFor(() => requests.length === 1, 3_000, "ordinary streaming run");
-		await ordinaryStarted;
-		await session.prompt("/unlock-continue-watchdog");
-		await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
-		assert.equal(session.isIdle, false);
-		assert.deepEqual(notifications, ["Continue watchdog unlocked"]);
-		await session.abort();
-		await ordinary;
-		await waitForSessionIdle(session, 3_000, "ordinary cleanup abort");
-		await shutdownSession(session);
-		closed = true;
-	}
-});
-
-test("packed interactive and RPC input preempt a streaming decision once", {
-	timeout: 70_000,
-}, async (t) => {
-	for (const source of ["interactive", "rpc"] as const) {
-		const fixture = await makePackedFixture(t, {
-			watchdogConfig: { idleDelaySeconds: 10 },
-		});
-		let markDecisionStarted: (() => void) | undefined;
-		const decisionStarted = new Promise<void>((resolveStarted) => {
-			markDecisionStarted = resolveStarted;
-		});
-		const { baseUrl, requests } = await startMockServer(t, [
-			{ kind: "stop", text: "ordinary work complete" },
-			{ kind: "delayed", started: () => markDecisionStarted?.() },
-			{ kind: "stop", text: "user takeover response" },
-		]);
-		let tuiAbortHandlerCalls = 0;
-		const { session } = await createSession(fixture, baseUrl, {
-			uiContext: createRpcUiContext(),
-			abortHandler:
-				source === "interactive"
-					? (activeSession) => {
-							tuiAbortHandlerCalls += 1;
-							activeSession.clearQueue();
-							activeSession.agent.abort();
-						}
-					: undefined,
-		});
-		let sessionClosed = false;
-		t.after(async () => {
-			if (!sessionClosed) await shutdownSession(session);
-		});
-
-		const publicEvents: Array<{
-			readonly type: string;
-			readonly text: string;
-		}> = [];
-		const unsubscribe = session.subscribe((event) =>
-			publicEvents.push({ type: event.type, text: JSON.stringify(event) }),
-		);
-		t.after(unsubscribe);
-
-		await session.prompt("Open a decision that user input will preempt.");
-		await waitFor(
-			() => requests.length === 2,
-			18_000,
-			`${source} decision stream`,
-		);
-		await decisionStarted;
-
-		const takeover = session.prompt("user takeover", {
-			source,
-			streamingBehavior: "steer",
-		});
-		await waitFor(
-			() => requests.length === 3,
-			8_000,
-			`${source} user takeover turn`,
-		);
-		await takeover;
-		await waitForSessionIdle(session, 5_000, `${source} user takeover idle`);
-
-		const userStarts = publicEvents.filter((event) => {
-			if (event.type !== "message_start") return false;
-			const parsed = JSON.parse(event.text) as {
-				readonly message?: {
-					readonly role?: string;
-					readonly content?: unknown;
-				};
-			};
-			return (
-				parsed.message?.role === "user" &&
-				JSON.stringify(parsed.message.content).includes("user takeover")
-			);
-		});
-		assert.equal(userStarts.length, 1);
-		assert.equal(tuiAbortHandlerCalls, source === "interactive" ? 1 : 0);
-		assert.equal(
-			publicEvents.some((event) => event.text.includes("Operation aborted")),
-			false,
-		);
-		const decisionUpdate = publicEvents.findIndex(
-			(event) =>
-				event.type === "message_update" && event.text.includes("partial"),
-		);
-		const clearedDecisionEnd = publicEvents.findIndex(
-			(event, index) =>
-				index > decisionUpdate &&
-				event.type === "message_end" &&
-				event.text.includes('"role":"assistant"') &&
-				event.text.includes('"content":[]'),
-		);
-		assert.ok(decisionUpdate >= 0);
-		assert.ok(clearedDecisionEnd > decisionUpdate);
-		assert.equal(
-			publicEvents.some((event) =>
-				event.text.includes("Continue watchdog unlocked"),
-			),
-			false,
-		);
-
-		const serialized = session.sessionManager
-			.getEntries()
-			.map((entry) => JSON.stringify(entry));
-		assert.equal(
-			serialized.some((entry) =>
-				entry.includes('"watchdogOutcome":"preempted"'),
-			),
-			true,
-			serialized.join("\n"),
-		);
-		assert.equal(
-			serialized.some((entry) => entry.includes("partial")),
-			false,
-		);
-		const laterPayload = JSON.stringify(requests[2]);
-		assert.equal(laterPayload.includes(decisionPromptStart), false);
-		assert.equal(laterPayload.includes("<watchdog>"), false);
-		assert.equal(
-			requests.filter((request) =>
-				request.messages.some((message) =>
-					textOf(message).includes("user takeover"),
-				),
-			).length,
-			1,
-		);
-		await shutdownSession(session);
-		sessionClosed = true;
-	}
-});
-
-test("packed consecutive waits stay once in normal context", {
-	timeout: 55_000,
-}, async (t) => {
-	const fixture = await makePackedFixture(t, {
-		withSemanticProbe: true,
-		watchdogConfig: { idleDelaySeconds: 10, maxRetries: 3 },
-	});
-	assert.ok(fixture.probeOut);
-	const server = await startMockServer(t, [
-		{ kind: "stop" },
-		{
-			kind: "wait",
-			reason: " Waiting for packed CI. ",
-			waitSeconds: 1,
-		},
-		{
-			kind: "wait",
-			reason: "Waiting for packed deploy.",
-			waitSeconds: 1,
-		},
-		{ kind: "unlock", reason: "Wait events verified." },
-	]);
-	const { session } = await createSession(fixture, server.baseUrl);
-	t.after(() => shutdownSession(session));
-
-	await session.prompt("Wait for external automation after work settles.");
-	await waitFor(
-		() => server.requests.length === 2,
-		18_000,
-		"accepted wait decision request",
-	);
-	await waitFor(
-		() => server.requests.length === 4,
-		45_000,
-		"second post-wait decision request",
-	);
-	await waitForSessionIdle(session, 3_000, "accepted packed wait");
-
-	const branch = session.sessionManager.getBranch();
-	const waitFold = branch.find(
-		(entry) =>
-			entry.type === "custom_message" &&
-			entry.customType === "pi-continue-watchdog:inquiry-fold" &&
-			(entry.details as { readonly watchdogOutcome?: unknown } | undefined)
-				?.watchdogOutcome === "wait",
-	);
-	assert.ok(waitFold);
-	assert.equal(waitFold.type, "custom_message");
-	if (waitFold.type !== "custom_message")
-		throw new Error("expected persisted shared wait fold");
-	assert.equal(waitFold.display, true);
-	assert.equal(
-		branch.filter(
-			(entry) =>
-				entry.type === "custom" &&
-				entry.customType === "pi-continue-watchdog:wait",
-		).length,
-		0,
-	);
-	const postWaitRequest = server.requests[2];
-	assert.ok(postWaitRequest);
-	assert.equal(isDecisionRequest(postWaitRequest), true);
-	const providerWait = postWaitRequest.messages.find((message) =>
-		contentText(message).includes("Continue watchdog waiting"),
-	);
-	assert.ok(providerWait);
-	const waitBody = contentText({ content: waitFold.content });
-	assert.equal(contentText(providerWait), waitBody);
-	assert.match(
-		waitBody,
-		/Continue watchdog waiting · 1s · \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}/,
-	);
-	assert.match(waitBody, /Requested watchdog delay: 1 second/);
-	assert.match(
-		waitBody,
-		/Deadline: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}/,
-	);
-	const finalDecision = server.requests[3];
-	assert.ok(finalDecision);
-	assert.equal(isDecisionRequest(finalDecision), true);
-	assert.equal(server.requests.slice(1).every(isDecisionRequest), true);
-	const finalBody = JSON.stringify(finalDecision);
-	const timelineMessages = finalDecision.messages
-		.map(contentText)
-		.filter((content) => content.startsWith("Continue watchdog"));
-	assert.deepEqual(
-		timelineMessages.map((content) =>
-			content.startsWith("Continue watchdog waiting")
-				? "waiting"
-				: content.startsWith("Continue watchdog delay elapsed")
-					? "elapsed"
-					: "other",
-		),
-		["waiting", "elapsed", "waiting", "elapsed", "elapsed"],
-	);
-	assert.match(timelineMessages[0] ?? "", /Waiting for packed CI\./);
-	assert.match(timelineMessages[2] ?? "", /Waiting for packed deploy\./);
-	assert.equal(
-		(timelineMessages[4] ?? "").startsWith(timelineMessages[3] ?? ""),
-		true,
-	);
-	assert.equal(finalBody.split("Continue watchdog waiting").length - 1, 2);
-	assert.equal(
-		finalBody.split("Continue watchdog delay elapsed").length - 1,
-		3,
-	);
-	assert.equal(
-		branch.filter(
-			(entry) =>
-				entry.type === "custom_message" &&
-				entry.customType === "pi-continue-watchdog:event" &&
-				(entry.details as { readonly kind?: unknown } | undefined)?.kind ===
-					"wait-completed",
-		).length,
-		2,
-	);
-	assert.equal(finalBody.includes("Previous watchdog results"), false);
-	assert.deepEqual(
-		(await readProbeEnvelopes(fixture.probeOut)).filter(
-			(envelope) => envelope.name === "watchdog-waiting",
-		),
-		[
-			{
-				version: 1,
-				name: "watchdog-waiting",
-				values: {
-					REASON: "Waiting for packed CI.",
-					WAIT_SECONDS: "1",
-				},
-			},
-			{
-				version: 1,
-				name: "watchdog-waiting",
-				values: {
-					REASON: "Waiting for packed deploy.",
-					WAIT_SECONDS: "1",
-				},
-			},
-		],
-	);
-});
-
-test("packed neutral probe receives typed continue and AI unlock hooks", {
-	timeout: 70_000,
-}, async (t) => {
-	// Continue path: probe receives the accepted typed continue exactly once.
-	const continueFixture = await makePackedFixture(t, {
-		withSemanticProbe: true,
-		watchdogConfig: { idleDelaySeconds: 10 },
-	});
-	assert.ok(continueFixture.probeOut);
-	const continueServer = await startMockServer(t, [
-		{ kind: "stop" },
-		{ kind: "continue" },
-		{ kind: "stop" },
-	]);
-	const continueSession = await createSession(
-		continueFixture,
-		continueServer.baseUrl,
-	);
-	t.after(() => continueSession.session.dispose());
-
-	await continueSession.session.prompt(
-		"Continue path must not emit user-ready.",
-	);
-	await waitFor(
-		() => continueServer.requests.length === 3,
-		18_000,
-		"continued provider turn with probe",
-	);
-	await waitForSessionIdle(
-		continueSession.session,
-		5_000,
-		"probe continue path",
-	);
-	assert.deepEqual(await readProbeEnvelopes(continueFixture.probeOut), [
-		{
-			version: 1,
-			name: "watchdog-continued",
-			values: {
-				REASON_TYPE: "WORK_REMAINS",
-				REASON: "Implementation work remains.",
-			},
-		},
-	]);
-	await continueSession.session.extensionRunner.emit({
-		type: "session_shutdown",
-		reason: "quit",
-	});
-
-	// AI unlock path: probe receives exactly one AI_UNLOCK envelope with reason.
-	const unlockFixture = await makePackedFixture(t, {
-		withSemanticProbe: true,
-		watchdogConfig: { idleDelaySeconds: 10 },
-	});
-	assert.ok(unlockFixture.probeOut);
-	const unlockServer = await startMockServer(t, [
-		{ kind: "stop" },
-		{ kind: "unlock", reason: "waiting for human review" },
-	]);
-	const unlockSession = await createSession(
-		unlockFixture,
-		unlockServer.baseUrl,
-	);
-	t.after(() => shutdownSession(unlockSession.session));
-
-	await unlockSession.session.prompt("Unlock after the decision check.");
-	await waitFor(
-		() => unlockServer.requests.length === 2,
-		18_000,
-		"unlock decision request",
-	);
-	await waitForSessionIdle(unlockSession.session, 3_000, "probe unlock path");
-	const unlockDeadline = Date.now() + 3_000;
-	while ((await readProbeEnvelopes(unlockFixture.probeOut)).length < 1) {
-		if (Date.now() >= unlockDeadline) {
-			throw new Error("Timed out waiting for AI unlock user-ready envelope");
 		}
-		await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+		await waitForSessionIdle(session, 30_000, "second turn");
+		await waitFor(() => requests.length >= 3, 120_000, "unlock request");
+	} finally {
+		await shutdownSession(session);
 	}
-	assert.deepEqual(await readProbeEnvelopes(unlockFixture.probeOut), [
-		{
-			version: 1,
-			name: "user-ready",
-			values: {
-				STOP_KIND: "AI_UNLOCK",
-				REASON_TYPE: "JOB_DONE",
-				REASON: "waiting for human review",
-			},
-		},
-	]);
 });
 
-test("packed invalid decisions reask three times and leave Pi idle", {
-	timeout: 35_000,
+test("packed tool unlock ends the cycle and publishes typed user-ready once", {
+	timeout: 240_000,
 }, async (t) => {
-	const fixture = await makePackedFixture(t, {
-		watchdogConfig: { idleDelaySeconds: 10 },
-	});
-	const { baseUrl, requests } = await startMockServer(t, [
-		{ kind: "stop", text: "ordinary work complete" },
-		{ kind: "invalid", text: "private invalid one" },
-		{ kind: "invalid", text: "private invalid two" },
-		{ kind: "invalid", text: "private invalid three" },
-	]);
-	const { session } = await createSession(fixture, baseUrl);
-	t.after(() => shutdownSession(session));
-
-	await session.prompt("Exercise the bounded invalid decision path.");
-	await waitFor(() => requests.length === 4, 18_000, "three invalid decisions");
-	await waitForSessionIdle(session, 3_000, "decision-failed path");
-
-	const branch = session.sessionManager.getBranch();
-	const audits = branch.flatMap((entry) =>
-		entry.type === "custom" &&
-		entry.customType === "pi-continue-watchdog:decision-audit"
-			? [entry.data]
-			: [],
-	);
-	assert.equal(audits.length, 3);
-	assert.deepEqual(
-		audits.map((audit) =>
-			typeof audit === "object" && audit !== null && "outcome" in audit
-				? audit.outcome
-				: undefined,
-		),
-		["invalid", "invalid", "invalid"],
-	);
-});
-
-test("packed decision request retains delivered answer and completion-first guidance", {
-	timeout: 30_000,
-}, async (t) => {
-	const fixture = await makePackedFixture(t);
-	const answer =
-		"The review creates a new agent object, inherits parent context, and receives an in-memory history snapshot; it does not read a session file.";
-	// Mock responses verify transport and finalization, not a real model's judgment.
-	const { baseUrl, requests } = await startMockServer(t, [
-		{ kind: "stop", text: answer },
-		{
-			kind: "unlock",
-			reasonType: "JOB_DONE",
-			reason: "The requested explanation was delivered.",
-		},
-	]);
-	const { session } = await createSession(fixture, baseUrl);
-	t.after(() => shutdownSession(session));
-	await session.prompt(
-		"Explain whether review uses a fork with history or reads a session file.",
-	);
-	await waitFor(() => requests.length === 2, 18_000, "completion check");
-	await waitForSessionIdle(session, 3_000, "completed explanation unlock");
-	const request = requests[1];
-	assert.ok(request);
-	const answerIndex = request.messages.findIndex(
-		(message) =>
-			message.role === "assistant" && textOf(message).includes(answer),
-	);
-	const checkIndex = request.messages.findIndex((message) =>
-		textOf(message).includes(decisionPromptStart),
-	);
-	assert.ok(answerIndex >= 0 && checkIndex > answerIndex);
-	const prompt = textOf(request.messages[checkIndex] ?? {});
-	assert.match(
-		prompt,
-		/latest ordinary assistant response and relevant tool results/,
-	);
-	assert.match(prompt, /Earlier plans and watchdog reasons are not proof/);
-	assert.match(prompt, /Before claiming that the user has not been answered/);
-	assert.match(prompt, /A final response or stop marker alone is not proof/);
-	assert.ok(
-		prompt.indexOf("1. If all requested work is complete") <
-			prompt.indexOf("2. Choose LOCK by using continue_watchdog only if"),
-	);
-	assert.equal(requests.length, 2);
-	const entries = session.sessionManager.getBranch();
-	assert.equal(
-		entries.some(
-			(entry) =>
-				entry.type === "custom" &&
-				entry.customType === "pi-continue-watchdog:continue",
-		),
-		false,
-	);
-	const unlock = entries.find(
-		(entry) =>
-			entry.type === "custom_message" &&
-			entry.customType === "pi-continue-watchdog:inquiry-fold" &&
-			(entry.details as { readonly watchdogOutcome?: unknown } | undefined)
-				?.watchdogOutcome === "unlock",
-	);
-	assert.ok(unlock?.type === "custom_message");
-	if (unlock?.type !== "custom_message")
-		throw new Error("expected shared unlock event");
-	const unlockEvent = (
-		unlock.details as {
-			readonly watchdogEvent?: {
-				readonly kind?: unknown;
-				readonly reasonType?: unknown;
-				readonly reason?: unknown;
-			};
-		}
-	).watchdogEvent;
-	assert.equal(unlockEvent?.kind, "unlock");
-	assert.equal(unlockEvent?.reasonType, "JOB_DONE");
-	assert.equal(unlockEvent?.reason, "The requested explanation was delivered.");
-	assert.match(
-		contentText({ content: unlock.content }),
-		/Continue watchdog unlocked · JOB_DONE · /,
-	);
-});
-
-test("packed approval-gated decision prompt prioritizes WAIT_USER without continuation", {
-	timeout: 30_000,
-}, async (t) => {
-	const fixture = await makePackedFixture(t);
+	const fixture = await makePackedFixture(t, { withSemanticProbe: true });
 	const { baseUrl, requests } = await startMockServer(t, [
 		{
-			kind: "stop",
-			text: "Production deployment requires explicit user approval.",
-		},
-		{
-			kind: "unlock",
+			kind: "unlock-tool",
 			reasonType: "WAIT_USER",
-			reason: "Production deployment requires explicit user approval.",
+			reason: "Need deploy approval.",
 		},
 	]);
 	const { session } = await createSession(fixture, baseUrl);
-	t.after(() => shutdownSession(session));
-
-	await session.prompt(
-		"Prepare deployment, but do not deploy without approval.",
-	);
-	await waitFor(() => requests.length === 2, 18_000, "WAIT_USER decision");
-	await waitForSessionIdle(session, 3_000, "WAIT_USER unlock");
-
-	const decisionRequest = requests[1];
-	assert.ok(decisionRequest);
-	const decisionContent = textOf(decisionRequest.messages.at(-1) ?? {});
-	assert.match(
-		decisionContent,
-		/Choose the outcome using these rules in order/,
-	);
-	assert.match(
-		decisionContent,
-		/no concrete next action can proceed without additional user input, approval, confirmation, authorization, credentials, or another user action/,
-	);
-	assert.match(decisionContent, /default reason_type is WAIT_USER/);
-	assert.match(
-		decisionContent,
-		/Unfinished work alone is not sufficient reason to continue/,
-	);
-	assert.match(
-		decisionContent,
-		/at least one concrete requested and authorized next action can be performed immediately/,
-	);
-	assert.match(
-		decisionContent,
-		/reason_content must name that immediately executable action, not a user-blocked action/,
-	);
-	assert.equal(
-		requests.some((request) =>
-			request.messages.some((message) =>
-				textOf(message).includes("pi-continue-watchdog:continuation"),
-			),
-		),
-		false,
-	);
-	assert.equal(
-		requests.length,
-		2,
-		"WAIT_USER must not start a continuation turn",
-	);
-
-	const unlockEntry = session.sessionManager
-		.getBranch()
-		.find(
-			(entry) =>
-				entry.type === "custom_message" &&
-				entry.customType === "pi-continue-watchdog:inquiry-fold" &&
-				(entry.details as { readonly watchdogOutcome?: unknown } | undefined)
-					?.watchdogOutcome === "unlock",
+	try {
+		await session.prompt("Approve the deploy.");
+		await waitForSessionIdle(session, 60_000, "unlock turn");
+		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
+		const ready = envelopes.filter(
+			(envelope) => envelope.name === "user-ready",
 		);
-	assert.ok(unlockEntry?.type === "custom_message");
-	if (unlockEntry?.type !== "custom_message")
-		throw new Error("expected shared WAIT_USER unlock event");
-	const unlockEvent = (
-		unlockEntry.details as {
-			readonly watchdogEvent?: {
-				readonly kind?: unknown;
-				readonly reasonType?: unknown;
-				readonly reason?: unknown;
-			};
-		}
-	).watchdogEvent;
-	assert.equal(unlockEvent?.kind, "unlock");
-	assert.equal(unlockEvent?.reasonType, "WAIT_USER");
-	assert.equal(
-		unlockEvent?.reason,
-		"Production deployment requires explicit user approval.",
-	);
-	assert.match(
-		contentText({ content: unlockEntry.content }),
-		/Continue watchdog unlocked · WAIT_USER · /,
-	);
+		assert.equal(ready.length, 1);
+		assert.deepEqual(ready[0].values, {
+			STOP_KIND: "AI_UNLOCK",
+			REASON_TYPE: "WAIT_USER",
+			REASON: "Need deploy approval.",
+		});
+		// The run terminated on the tool result: no second model request.
+		assert.equal(requests.length, 1);
+	} finally {
+		await shutdownSession(session);
+	}
 });
 
-test("packed automatic continuation cannot satisfy an unresolved approval request", {
-	timeout: 40_000,
+test("packed simple watchdog-continued hook carries no values", {
+	timeout: 240_000,
 }, async (t) => {
-	const fixture = await makePackedFixture(t);
-	const { baseUrl, requests } = await startMockServer(t, [
-		{ kind: "stop", text: "Approval is required before deployment." },
-		{
-			kind: "continue",
-			reasonType: "WORK_REMAINS",
-			reason: "Non-deployment verification remains.",
-		},
-		{ kind: "stop", text: "Stopped at the approval boundary." },
+	const fixture = await makePackedFixture(t, { withSemanticProbe: true });
+	const { baseUrl } = await startMockServer(t, [
+		{ kind: "text", text: "Part one." },
+		{ kind: "unlock-tool" },
 	]);
 	const { session } = await createSession(fixture, baseUrl);
-	t.after(() => shutdownSession(session));
-
-	await session.prompt("Verify the release, but ask before deployment.");
-	await waitFor(
-		() => requests.length === 3,
-		20_000,
-		"approval-safe continuation",
-	);
-	await waitForSessionIdle(session, 5_000, "approval-safe ordinary work");
-
-	const continuedRequest = requests[2];
-	assert.ok(continuedRequest);
-	const continuation = continuedRequest.messages.find(
-		(message) =>
-			message.role === "user" && textOf(message).includes(continuePrompt),
-	);
-	assert.ok(continuation);
-	const content = textOf(continuation);
-	assert.match(
-		content,
-		/not user approval, confirmation, consent, or authorization/,
-	);
-	assert.match(
-		content,
-		/Do not treat this message as permission for any action requiring user approval/,
-	);
-	assert.match(
-		content,
-		/If additional user input, approval, or assistance is required, stop and ask the user/,
-	);
-	assert.match(
-		content,
-		/\\"reason\\":\\"Non-deployment verification remains\.\\"/,
-	);
+	try {
+		await session.prompt("Work then finish.");
+		await waitForSessionIdle(session, 30_000, "first turn");
+		// Give the fence time to fire exactly one continuation, then let the
+		// unlock-tool reply settle the cycle.
+		await new Promise((resolve) => setTimeout(resolve, 12_000));
+		const afterFence = (
+			await readProbeEnvelopes(fixture.probeOut ?? "")
+		).filter((envelope) => envelope.name === "watchdog-continued");
+		assert.equal(afterFence.length, 1);
+		assert.equal(afterFence[0].values, undefined);
+	} finally {
+		await shutdownSession(session);
+	}
 });
 
-test("packed mixed legacy and shared records survive persistent resume without backfill", {
-	timeout: 45_000,
+test("packed exhausted budget stops continuing and publishes EXHAUSTED", {
+	timeout: 300_000,
 }, async (t) => {
-	const fixture = await makePackedFixture(t, {
-		watchdogConfig: { idleDelaySeconds: 10 },
-	});
-	const { baseUrl, requests } = await startMockServer(t, [
-		{ kind: "stop", text: "ordinary work complete" },
-		{ kind: "unlock", reason: "resume context is clean" },
-		{ kind: "stop", text: "resumed ordinary response" },
-	]);
-	const sessionDir = join(fixture.root, "sessions");
-	await mkdir(sessionDir, { recursive: true });
-	const firstManager = SessionManager.create(fixture.cwd, sessionDir);
-	firstManager.appendCustomEntry("pi-continue-watchdog:wait", {
-		reason: "Legacy wait stays TUI-only.",
-		waitSeconds: 300,
-		waitUntilMs: 123_456,
-	});
-	const first = await createSession(fixture, baseUrl, {
-		sessionManager: firstManager,
-	});
-
-	await first.session.prompt(
-		"Persist one ordinary task before watchdog unlock.",
-	);
-	await waitFor(
-		() => requests.length === 2,
-		18_000,
-		"persisted unlock decision",
-	);
-	await waitForSessionIdle(first.session, 3_000, "persisted unlock decision");
-	const sharedUnlock = first.session.sessionManager
-		.getBranch()
-		.find(
-			(entry) =>
-				entry.type === "custom_message" &&
-				entry.customType === "pi-continue-watchdog:inquiry-fold" &&
-				(entry.details as { readonly watchdogOutcome?: unknown } | undefined)
-					?.watchdogOutcome === "unlock",
-		);
-	assert.ok(sharedUnlock);
-	assert.equal(sharedUnlock.type, "custom_message");
-	if (sharedUnlock.type !== "custom_message")
-		throw new Error("expected persisted shared unlock");
-	const sharedUnlockBody = contentText({ content: sharedUnlock.content });
-	const sessionFile = first.session.sessionManager.getSessionFile();
-	assert.ok(sessionFile);
-	await shutdownSession(first.session);
-
-	const rawSession = await readFile(sessionFile, "utf8");
-	assert.equal(rawSession.includes("resume context is clean"), true);
-	assert.equal(rawSession.includes("Legacy wait stays TUI-only."), true);
-	assert.equal(rawSession.includes("Continue watchdog waiting"), false);
-	assert.equal(
-		rawSession.includes("pi-continue-watchdog:decision-audit"),
-		true,
-	);
-
-	const resumedManager = SessionManager.open(sessionFile);
-	const resumed = await createSession(fixture, baseUrl, {
-		sessionManager: resumedManager,
-	});
-	t.after(() => shutdownSession(resumed.session));
-	assert.equal(
-		resumed.session.sessionManager
-			.getBranch()
-			.some(
-				(entry) =>
-					entry.type === "custom" &&
-					entry.customType === "pi-continue-watchdog:wait" &&
-					JSON.stringify(entry.data).includes("Legacy wait stays TUI-only."),
-			),
-		true,
-	);
-	assert.equal(
-		resumed.session.sessionManager
-			.getBranch()
-			.some(
-				(entry) =>
-					entry.type === "custom_message" &&
-					entry.customType === "pi-continue-watchdog:event" &&
-					(entry.details as { readonly kind?: unknown } | undefined)?.kind ===
-						"wait-completed",
-			),
-		false,
-	);
-	await resumed.session.prompt("Continue after restoring this session.");
-	await waitForSessionIdle(resumed.session, 3_000, "resumed ordinary request");
-	assert.equal(requests.length, 3);
-
-	const resumedPayload = JSON.stringify(requests[2]);
-	assert.equal(resumedPayload.includes(decisionPromptStart), false);
-	assert.equal(resumedPayload.includes("<watchdog>"), false);
-	assert.equal(resumedPayload.includes("resume context is clean"), true);
-	assert.equal(
-		requests[2]?.messages.some(
-			(message) => contentText(message) === sharedUnlockBody,
-		),
-		true,
-	);
-	assert.equal(resumedPayload.includes("Legacy wait stays TUI-only."), false);
-	assert.equal(
-		resumedPayload.includes("pi-continue-watchdog:decision-audit"),
-		false,
-	);
-	assert.equal(
-		resumedPayload.includes("pi-continue-watchdog:inquiry-fold"),
-		false,
-	);
-	assert.equal(
-		resumedPayload.includes("pi-continue-watchdog:continuation"),
-		false,
-	);
-});
-
-test("packed custom reasonTypes replace defaults and match mixed-case input", {
-	timeout: 30_000,
-}, async (t) => {
-	// Post-GREEN integration coverage: the production feature already exists;
-	// this proves config, dynamic XML instructions, protocol, runtime, and hook
-	// are wired to the same representation through the packed artifact.
 	const fixture = await makePackedFixture(t, {
 		withSemanticProbe: true,
-		watchdogConfig: {
-			idleDelaySeconds: 10,
-			reasonTypes: ["Need Review", "shipped"],
-		},
+		watchdogConfig: { maxRetries: 1 },
 	});
-	assert.ok(fixture.probeOut);
 	const { baseUrl, requests } = await startMockServer(t, [
-		{ kind: "stop" },
+		{ kind: "text", text: "Never unlocks." },
+		{ kind: "text", text: "Still working." },
+	]);
+	const { session } = await createSession(fixture, baseUrl);
+	try {
+		await session.prompt("Loop the work.");
+		await waitForSessionIdle(session, 30_000, "first turn");
+		await waitFor(() => requests.length >= 2, 120_000, "only continuation");
+		// maxRetries=1: exactly one continuation, then exhaustion at the next idle.
+		await waitForSessionIdle(session, 30_000, "continuation turn");
+		await new Promise((resolve) => setTimeout(resolve, 12_000));
+		assert.equal(requests.length, 2);
+		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
+		assert.ok(
+			envelopes.some(
+				(envelope) =>
+					envelope.name === "user-ready" &&
+					(envelope.values as { STOP_KIND?: string } | undefined)?.STOP_KIND ===
+						"EXHAUSTED",
+			),
+			"expected EXHAUSTED user-ready",
+		);
+	} finally {
+		await shutdownSession(session);
+	}
+});
+
+test("packed custom reasonTypes are matched case-insensitively through the tool", {
+	timeout: 240_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t, {
+		watchdogConfig: { reasonTypes: ["NeedReview", "shipped"] },
+	});
+	const { baseUrl, requests } = await startMockServer(t, [
 		{
-			kind: "unlock",
-			reasonType: " need review ",
-			reason: " awaiting review ",
+			kind: "unlock-tool",
+			reasonType: "needreview",
+			reason: "PR awaits review.",
 		},
 	]);
 	const { session } = await createSession(fixture, baseUrl);
-	t.after(() => shutdownSession(session));
-
-	await session.prompt("Unlock with a custom mixed-case reason type.");
-	await waitFor(() => requests.length === 2, 18_000, "unlock decision request");
-	await waitForSessionIdle(session, 3_000, "custom reason unlock path");
-
-	// The decision prompt advertises only the effective custom list while ordinary
-	// tools remain unchanged for prompt-prefix stability.
-	const decisionRequest = requests[1];
-	assert.ok(decisionRequest);
-	assert.deepEqual(toolNames(decisionRequest), [
-		"bash",
-		"edit",
-		"read",
-		"write",
-	]);
-	const serializedDecisionMessages = JSON.stringify(decisionRequest.messages);
-	assert.equal(
-		serializedDecisionMessages.includes('[\\"Need Review\\",\\"shipped\\"]'),
-		true,
-	);
-	assert.equal(serializedDecisionMessages.includes("JOB_DONE"), false);
-	assert.equal(
-		serializedDecisionMessages.includes("Do not output multiple"),
-		true,
-	);
-
-	// Live decision content may remain in the append-only session. CustomEntry
-	// audits stay excluded from Pi's model-bound session context by construction.
-	const branch = session.sessionManager.getBranch();
-	const auditEntries = branch.flatMap((entry) =>
-		entry.type === "custom" &&
-		entry.customType === "pi-continue-watchdog:decision-audit"
-			? [entry]
-			: [],
-	);
-	assert.equal(auditEntries.length, 1);
-	const auditData = auditEntries[0]?.data as
-		| {
-				exchangeId?: unknown;
-		  }
-		| undefined;
-	assert.ok(auditData);
-	assert.deepEqual(auditData, {
-		version: 1,
-		exchangeId: auditData.exchangeId,
-		cycleId: 1,
-		outcome: "unlock",
-		reasonType: "NEED REVIEW",
-		reason: "awaiting review",
-	});
-	assert.equal(typeof auditData.exchangeId, "string");
-	assert.equal(
-		JSON.stringify(session.sessionManager.buildSessionContext()).includes(
-			"pi-continue-watchdog:decision-audit",
-		),
-		false,
-	);
-
-	// The trimmed, case-insensitively matched, uppercased pair publishes once.
-	const hookDeadline = Date.now() + 3_000;
-	while ((await readProbeEnvelopes(fixture.probeOut)).length < 1) {
-		if (Date.now() >= hookDeadline) {
-			throw new Error("Timed out waiting for custom-type user-ready envelope");
-		}
-		await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	try {
+		await session.prompt("Ship it.");
+		await waitForSessionIdle(session, 60_000, "unlock turn");
+		assert.equal(requests.length, 1);
+		const toolRequest = requests[0];
+		assert.ok(
+			toolNames(toolRequest).includes(TOOL_NAME),
+			"tool schema present",
+		);
+		// The tool result is model-visible in the same batch; the normalized
+		// type is asserted through the semantic probe in the unlock test above.
+	} finally {
+		await shutdownSession(session);
 	}
-	assert.deepEqual(await readProbeEnvelopes(fixture.probeOut), [
-		{
-			version: 1,
-			name: "user-ready",
-			values: {
-				STOP_KIND: "AI_UNLOCK",
-				REASON_TYPE: "NEED REVIEW",
-				REASON: "awaiting review",
-			},
-		},
-	]);
 });

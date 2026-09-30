@@ -11,17 +11,10 @@ export const SEMANTIC_HOOK_CHANNEL = "pi:semantic-hook:v1";
 /** Semantic name published by this producer when the watchdog will not auto-wake. */
 export const USER_READY_HOOK_NAME = "user-ready";
 
-/** Semantic name published after an accepted wait is durably recorded. */
-export const WATCHDOG_WAITING_HOOK_NAME = "watchdog-waiting";
-
-/** Semantic name published after an accepted continue is durably recorded. */
+/** Semantic name published after an automatic continuation is durably recorded. */
 export const WATCHDOG_CONTINUED_HOOK_NAME = "watchdog-continued";
 
-export type UserReadyStopKind =
-	| "AI_UNLOCK"
-	| "ERROR_UNLOCK"
-	| "EXHAUSTED"
-	| "DECISION_FAILED";
+export type UserReadyStopKind = "AI_UNLOCK" | "ERROR_UNLOCK" | "EXHAUSTED";
 
 export type SemanticHookValues = Readonly<Record<string, string>>;
 
@@ -33,20 +26,10 @@ export interface SemanticHookEnvelope {
 
 export interface UserReadyValues {
 	readonly STOP_KIND: UserReadyStopKind;
-	/** Present only for AI decision unlock; matched configured type uppercased. */
+	/** Present only for AI unlock; matched configured type uppercased. */
 	readonly REASON_TYPE?: string;
-	/** Present only for AI decision unlock; validated trimmed reason. */
+	/** Present only for AI unlock; validated trimmed reason. */
 	readonly REASON?: string;
-}
-
-export interface WatchdogWaitingValues {
-	readonly REASON: string;
-	readonly WAIT_SECONDS: string;
-}
-
-export interface WatchdogContinuedValues {
-	readonly REASON_TYPE: string;
-	readonly REASON: string;
 }
 
 /** Minimal Pi public bus surface used for emission. */
@@ -82,31 +65,11 @@ export function createUserReadyEnvelope(
 	});
 }
 
-/** Build a fresh plain-data accepted-wait envelope. */
-export function createWatchdogWaitingEnvelope(
-	values: WatchdogWaitingValues,
-): SemanticHookEnvelope {
-	return Object.freeze({
-		version: 1 as const,
-		name: WATCHDOG_WAITING_HOOK_NAME,
-		values: freezeValues({
-			REASON: values.REASON,
-			WAIT_SECONDS: values.WAIT_SECONDS,
-		}),
-	});
-}
-
-/** Build a fresh plain-data accepted-continue envelope. */
-export function createWatchdogContinuedEnvelope(
-	values: WatchdogContinuedValues,
-): SemanticHookEnvelope {
+/** Build a fresh plain-data continuation envelope. It carries no values. */
+export function createWatchdogContinuedEnvelope(): SemanticHookEnvelope {
 	return Object.freeze({
 		version: 1 as const,
 		name: WATCHDOG_CONTINUED_HOOK_NAME,
-		values: freezeValues({
-			REASON_TYPE: values.REASON_TYPE,
-			REASON: values.REASON,
-		}),
 	});
 }
 

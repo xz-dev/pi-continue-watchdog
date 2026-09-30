@@ -7,6 +7,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
+import { validateConfig } from "../src/config.js";
 import type { LoadedConfig } from "../src/config-loader.js";
 import { createContinueWatchdogExtension } from "../src/extension.js";
 import { createObservableAgentHub } from "../src/hub.js";
@@ -136,10 +137,8 @@ const CONFIG: LoadedConfig = {
 	config: {
 		idleDelaySeconds: 3,
 		maxRetries: 2,
-		decisionPrompt: "Decide now.",
 		continuePrompt: "Continue now.",
 		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
-		continueReasonTypes: ["WORK_REMAINS", "VERIFYING"],
 		unlockShortcut: "alt+u",
 	},
 	diagnostics: [],
@@ -149,6 +148,30 @@ async function flushAsyncWork(): Promise<void> {
 	await Promise.resolve();
 	await Promise.resolve();
 }
+
+test("removed config keys surface as error notifications on the main", async () => {
+	const hub = createObservableAgentHub();
+	const main = createAttachmentHarness({ sessionId: "main", hasUI: true });
+	const removed = validateConfig("global", {
+		decisionPrompt: "old",
+		maxRetries: 5,
+	});
+	assert.equal(removed.config.maxRetries, 5);
+	createContinueWatchdogExtension({
+		hub,
+		clock: main.clock,
+		loadConfig: async () => ({
+			...CONFIG,
+			diagnostics: removed.diagnostics,
+		}),
+	})(main.pi);
+
+	await main.fire("session_start");
+
+	const errors = main.notifications.filter((entry) => entry.level === "error");
+	assert.equal(errors.length, 1);
+	assert.match(errors[0].message, /decisionPrompt was removed/);
+});
 
 test("UI main alone loads effective config; a shared-hub headless observer does not", async () => {
 	const hub = createObservableAgentHub();
@@ -173,7 +196,11 @@ test("UI main alone loads effective config; a shared-hub headless observer does 
 			return {
 				...CONFIG,
 				diagnostics: [
-					{ source: "child", message: "observer config must stay unread" },
+					{
+						source: "child",
+						message: "observer config must stay unread",
+						severity: "warning" as const,
+					},
 				],
 			};
 		},
@@ -296,7 +323,11 @@ test("config completion after demotion or shutdown is discarded without effects"
 		resolveHeadless?.({
 			...CONFIG,
 			diagnostics: [
-				{ source: "stale", message: "must not escape after demotion" },
+				{
+					source: "stale",
+					message: "must not escape after demotion",
+					severity: "warning" as const,
+				},
 			],
 		});
 		await pendingStart;
@@ -331,7 +362,11 @@ test("config completion after demotion or shutdown is discarded without effects"
 		resolveConfig?.({
 			...CONFIG,
 			diagnostics: [
-				{ source: "stale", message: "must not escape after shutdown" },
+				{
+					source: "stale",
+					message: "must not escape after shutdown",
+					severity: "warning" as const,
+				},
 			],
 		});
 		await pendingStart;
@@ -379,8 +414,16 @@ test("first config diagnostic notify demotion drops control before later diagnos
 		loadConfig: async () => ({
 			...CONFIG,
 			diagnostics: [
-				{ source: "global", message: "first diagnostic" },
-				{ source: "project", message: "second diagnostic" },
+				{
+					source: "global",
+					message: "first diagnostic",
+					severity: "warning" as const,
+				},
+				{
+					source: "project",
+					message: "second diagnostic",
+					severity: "warning" as const,
+				},
 			],
 		}),
 	})(headless.pi);
@@ -393,7 +436,10 @@ test("first config diagnostic notify demotion drops control before later diagnos
 	assert.deepEqual(headless.notifications, [
 		{ message: "first diagnostic", level: "warning" },
 	]);
-	assert.deepEqual(headless.registeredTools, []);
+	// The unlock tool is session-scoped (registered once at config commit in a
+	// root process); a synchronous demotion afterwards keeps the inert tool
+	// registered but stops every further control-plane effect.
+	assert.deepEqual(headless.registeredTools, ["unlock_continue_watchdog"]);
 	assert.deepEqual(headless.activeToolSets, []);
 	assert.deepEqual(headless.sentMessages, []);
 	assert.equal(headless.clock.records.length, 0);
