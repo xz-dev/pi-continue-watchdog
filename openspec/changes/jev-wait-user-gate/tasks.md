@@ -23,4 +23,4 @@
 ## 5. Verification
 
 - [x] 5.1 Run `npm run check` (lint, typecheck, test, build) and confirm it passes.
-- [ ] 5.2 Manual smoke with a real TypeSafe key: end a turn with a clear question and see the Pi Wait notification with the jev reason. End a turn with a status report and see the normal continuation.
+- [x] 5.2 Manual smoke with a real TypeSafe key: end a turn with a clear question and see the Pi Wait notification with the jev reason. End a turn with a status report and see the normal continuation.
