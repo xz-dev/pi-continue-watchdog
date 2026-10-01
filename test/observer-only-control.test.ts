@@ -138,7 +138,7 @@ const CONFIG: LoadedConfig = {
 		idleDelaySeconds: 3,
 		maxRetries: 2,
 		continuePrompt: "Continue now.",
-		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
+		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED", "WAIT_CALLBACK"],
 		unlockShortcut: "alt+u",
 	},
 	diagnostics: [],

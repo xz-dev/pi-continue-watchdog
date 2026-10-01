@@ -31,7 +31,7 @@ import {
 	validateUnlockToolArguments,
 } from "../src/unlock-tool.js";
 
-const DEFAULT_TYPES = ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"];
+const DEFAULT_TYPES = ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED", "WAIT_CALLBACK"];
 
 test("tool name and description state the contract", () => {
 	assert.equal(UNLOCK_CONTINUE_WATCHDOG_TOOL_NAME, "unlock_continue_watchdog");
@@ -51,7 +51,7 @@ test("tool name and description state the contract", () => {
 test("reason_type and reason descriptions explain each value", () => {
 	assert.equal(
 		unlockReasonTypeDescription(DEFAULT_TYPES),
-		"Why work stops: JOB_DONE = all requested work is complete; WAIT_USER = user input, approval, or other user action is required; JOB_BLOCKED = work is blocked by something other than a user action. Matched case-insensitively after trimming.",
+		"Why work stops: JOB_DONE = all requested work is complete; WAIT_USER = user input, approval, or other user action is required; JOB_BLOCKED = work is blocked by something other than a user action; WAIT_CALLBACK = waiting for another agent or program to call back and wake you. Matched case-insensitively after trimming.",
 	);
 	// Custom types are listed by name only; built-ins keep their meaning.
 	assert.equal(
@@ -86,6 +86,7 @@ test("tool is listed in the system prompt with stable guidelines", () => {
 	assert.match(joined, /call unlock_continue_watchdog/);
 	assert.match(joined, /automatically continues your work/);
 	assert.match(joined, /sleep for your estimated duration/);
+	assert.match(joined, /call back and wake you.*reason_type WAIT_CALLBACK/);
 	assert.match(joined, /blocked without a user action/);
 	assert.match(joined, /including earlier requests, is still missing/);
 	// Deterministic: two definitions produce identical prompt contributions.
@@ -185,7 +186,10 @@ test("validateUnlockToolArguments returns the normalized call or named error", (
 	assert.ok("error" in badType);
 	assert.equal(badType.error, invalidReasonTypeToolError(DEFAULT_TYPES));
 	assert.ok(badType.error.startsWith(INVALID_REASON_TYPE_TOOL_ERROR));
-	assert.match(badType.error, /JOB_DONE, WAIT_USER, JOB_BLOCKED/);
+	assert.match(
+		badType.error,
+		/JOB_DONE, WAIT_USER, JOB_BLOCKED, WAIT_CALLBACK/,
+	);
 
 	const badReason = validateUnlockToolArguments(
 		{ reason_type: "JOB_DONE", reason: "" },

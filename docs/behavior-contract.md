@@ -52,7 +52,7 @@ Any acceptance text, test name, README, or implementation that still requires th
 | Status command | `/status-continue-watchdog` | Human (TUI); read-only trigger diagnosis |
 | Unlock tool | `unlock_continue_watchdog` with `reason_type` and `reason` | Model-visible tool, registered once per root process; never unregistered |
 | Default `continuePrompt` | `Continue until user assistance is required.` | Configurable guidance embedded verbatim in the fixed model-visible continuation body |
-| Default `reasonTypes` | `JOB_DONE`, `WAIT_USER`, `JOB_BLOCKED` | Built-in allowed unlock-tool type list; a valid configured list **replaces** this default |
+| Default `reasonTypes` | `JOB_DONE`, `WAIT_USER`, `JOB_BLOCKED`, `WAIT_CALLBACK` | Built-in allowed unlock-tool type list; a valid configured list **replaces** this default |
 | Shared continuation event heading | `Continue watchdog continued · <RFC3339 timestamp>` | One persistent canonical body for human history and model context; durable before semantic publication and continuation dispatch |
 | Shared exhausted event heading | `Continue watchdog exhausted · <RFC3339 timestamp>` | One canonical terminal-idle body; starts no work turn |
 | Continued semantic hook | `watchdog-continued` with no values | Neutral plain-data best-effort hook after durable continuation evidence |
@@ -72,6 +72,7 @@ Correct all accidental `cointinue` spellings; public names use `continue` only.
 | `JOB_DONE` | All work is complete |
 | `WAIT_USER` | User input, approval, or action is required |
 | `JOB_BLOCKED` | Work remains unfinished and cannot proceed for a non-`WAIT_USER` blocker |
+| `WAIT_CALLBACK` | Waiting for another agent or program to call back and wake the agent (for example an async subagent completion) |
 
 Configured type lists may use ordinary nonblank UTF-8 text. Trust sane user config; do **not** impose identifier-format regexes, artificial length/count caps, or collision hardening beyond the validation rules below.
 
@@ -111,7 +112,7 @@ Continue until user assistance is required.
 | `idleDelaySeconds` | `10` | Deprecated compatibility key. It remains accepted/preserved, but runtime ignores it; the idle fence is exactly 10 seconds. |
 | `maxRetries` | `10` | Automatic continuations per lock cycle; safe integer in `[1, 10]` |
 | `continuePrompt` | exact default above | Guidance embedded verbatim in the fixed continuation body; nonblank and at most 16,384 Unicode code points |
-| `reasonTypes` | `["JOB_DONE","WAIT_USER","JOB_BLOCKED"]` | Allowed unlock-tool types. A valid configured list **replaces** the default. |
+| `reasonTypes` | `["JOB_DONE","WAIT_USER","JOB_BLOCKED","WAIT_CALLBACK"]` | Allowed unlock-tool types. A valid configured list **replaces** the default. |
 | `jevWaitCheck` | `{enabled: true, model: "jev-latest", confidenceThreshold: 0.8, timeoutMs: 15000}` | jev wait gate (see below). Fields merge individually; `apiUrl` optional and must be an http(s) URL; `apiKey` is global-only and a project value is ignored with a diagnostic. |
 
 The removed keys `decisionPrompt` and `continueReasonTypes` are **errors**: when present, the extension reports a named error diagnostic and the key has no effect.
@@ -188,7 +189,7 @@ Unlock first makes `locked=false`, then invalidates the current aggregate grace 
 - `reason_type`: a string matched case-insensitively after trimming against the effective `reasonTypes`; the matched configured value is emitted uppercase
 - `reason`: trimmed, non-empty, at most 1000 Unicode code points
 
-The tool description states that the agent must call this tool to signal that all requested work is complete, that user input, approval, or other user action is required, or that work is blocked without a user action, and that ending a turn without calling it causes the work to be continued automatically. It carries the completeness check shared with the continuation body: before calling, compare every task the user requested in the session, including earlier requests and not only the latest one, with what was actually delivered (delivered, cancelled, or superseded work is not remaining), and keep working instead while requested and authorized work can still proceed. The `reason_type` schema enumerates the effective values and its description explains each built-in one (`JOB_DONE` complete, `WAIT_USER` user action required, `JOB_BLOCKED` non-user blocker); custom values are listed by name. The `reason` description asks for one concise sentence on what was delivered, what the user must do, or what blocks the work. The tool is never unregistered, so the active tool list and system-prompt prefix stay stable. Child Pi processes in the watchdog process domain never register it.
+The tool description states that the agent must call this tool to signal that all requested work is complete, that user input, approval, or other user action is required, or that work is blocked without a user action, or that it is waiting for another agent or program to call back and wake it, and that ending a turn without calling it causes the work to be continued automatically. It carries the completeness check shared with the continuation body: before calling, compare every task the user requested in the session, including earlier requests and not only the latest one, with what was actually delivered (delivered, cancelled, or superseded work is not remaining), and keep working instead while requested and authorized work can still proceed. The `reason_type` schema enumerates the effective values and its description explains each built-in one (`JOB_DONE` complete, `WAIT_USER` user action required, `JOB_BLOCKED` non-user blocker); custom values are listed by name. The `reason` description asks for one concise sentence on what was delivered, what the user must do, or what blocks the work. The tool is never unregistered, so the active tool list and system-prompt prefix stay stable. Child Pi processes in the watchdog process domain never register it.
 
 ### Execution
 
@@ -203,7 +204,7 @@ The tool description states that the agent must call this tool to signal that al
 
 ### Waiting
 
-When the agent needs some work to finish, the continuation body instructs it to block on or monitor that task directly, or sleep for the estimated duration, inside its own turn. There is no watchdog wait outcome, deadline, or completed-wait event.
+When the agent needs to wait for work that will call back and wake it (an async subagent, another program), the guideline and continuation body instruct it to call the unlock tool with `WAIT_CALLBACK`. For any other work, they instruct it to block on or monitor that task directly, or sleep for the estimated duration, inside its own turn. There is no watchdog wait outcome, deadline, or completed-wait event.
 
 ---
 

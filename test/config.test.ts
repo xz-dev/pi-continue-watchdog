@@ -40,6 +40,7 @@ test("built-in defaults match the effective configuration keys", () => {
 		"JOB_DONE",
 		"WAIT_USER",
 		"JOB_BLOCKED",
+		"WAIT_CALLBACK",
 	]);
 	assert.deepEqual(DEFAULT_REASON_TYPES, BUILT_IN_CONFIG.reasonTypes);
 	assert.equal(BUILT_IN_CONFIG.unlockShortcut, "alt+u");

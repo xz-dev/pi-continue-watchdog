@@ -26,7 +26,7 @@ export const UNLOCK_COMPLETENESS_CHECK =
 export const UNLOCK_DELIVERY_BOUNDARY =
 	"This tool only stops the automatic continuation; it is not a delivery channel. Write every answer, result, question, or report for the user in your normal reply text before calling it, and do not rely on the user seeing this tool's arguments.";
 
-export const UNLOCK_TOOL_DESCRIPTION = `Signal that your work should stop and control returns to the user. Call this tool when all requested work is complete, or when user input, approval, or other user action is required, or work is blocked without a user action. ${UNLOCK_COMPLETENESS_CHECK} If you end your turn without calling this tool, the pi-continue-watchdog extension will automatically continue your work. This tool belongs to the pi-continue-watchdog extension; calling it is your decision, not a user request. ${UNLOCK_DELIVERY_BOUNDARY} Provide reason_type (one of the allowed values for this project) and a concise reason.`;
+export const UNLOCK_TOOL_DESCRIPTION = `Signal that your work should stop and control returns to the user. Call this tool when all requested work is complete, or when user input, approval, or other user action is required, or work is blocked without a user action, or you are waiting for another agent or program to call back and wake you. ${UNLOCK_COMPLETENESS_CHECK} If you end your turn without calling this tool, the pi-continue-watchdog extension will automatically continue your work. This tool belongs to the pi-continue-watchdog extension; calling it is your decision, not a user request. ${UNLOCK_DELIVERY_BOUNDARY} Provide reason_type (one of the allowed values for this project) and a concise reason.`;
 
 /** One-line entry for the system prompt's available-tools section. */
 export const UNLOCK_TOOL_PROMPT_SNIPPET =
@@ -35,7 +35,7 @@ export const UNLOCK_TOOL_PROMPT_SNIPPET =
 /** Session-stable system prompt guidelines; never change during a lock cycle. */
 export const UNLOCK_TOOL_PROMPT_GUIDELINES: readonly string[] = Object.freeze([
 	`Before ending a turn because all requested work is complete, because you need user input, approval, or other user action, or because work is blocked without a user action, call unlock_continue_watchdog with a reason_type and a concise reason. First confirm that no task the user requested in this session, including earlier requests, is still missing and can proceed now. If you end a turn without calling it, the pi-continue-watchdog extension automatically continues your work. ${UNLOCK_DELIVERY_BOUNDARY}`,
-	"If you need to wait for some work to finish, do not end the turn to wait: block on or monitor that task directly, or sleep for your estimated duration.",
+	"If you need to wait for some work to finish and that work will call back and wake you (for example an async subagent or another program), call unlock_continue_watchdog with reason_type WAIT_CALLBACK. Otherwise do not end the turn to wait: block on or monitor that task directly, or sleep for your estimated duration.",
 ]);
 
 export const INVALID_REASON_TYPE_TOOL_ERROR =
@@ -115,6 +115,8 @@ const KNOWN_REASON_TYPE_MEANINGS: Readonly<Record<string, string>> = {
 	JOB_DONE: "all requested work is complete",
 	WAIT_USER: "user input, approval, or other user action is required",
 	JOB_BLOCKED: "work is blocked by something other than a user action",
+	WAIT_CALLBACK:
+		"waiting for another agent or program to call back and wake you",
 };
 
 /** Model-facing reason_type description for the effective reason types. */

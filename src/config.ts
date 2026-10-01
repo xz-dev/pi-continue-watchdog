@@ -24,6 +24,7 @@ export const DEFAULT_REASON_TYPES: readonly string[] = Object.freeze([
 	"JOB_DONE",
 	"WAIT_USER",
 	"JOB_BLOCKED",
+	"WAIT_CALLBACK",
 ]);
 
 /** Maximum prompt size, measured in Unicode code points, accepted from config. */

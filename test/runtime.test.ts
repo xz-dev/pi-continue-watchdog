@@ -163,7 +163,7 @@ function createHarness(options?: {
 		idleDelaySeconds: 10,
 		maxRetries: options?.maxRetries ?? 3,
 		continuePrompt: "Continue compactly.",
-		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
+		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED", "WAIT_CALLBACK"],
 		unlockShortcut: "alt+u",
 		...options?.config,
 	};
@@ -372,6 +372,10 @@ test("idle continuation: direct message, no inquiry", async () => {
 	assert.match(
 		body,
 		/monitor that task until it ends, or sleep for your estimated duration/,
+	);
+	assert.match(
+		body,
+		/call back and wake you, call unlock_continue_watchdog with reason_type WAIT_CALLBACK/,
 	);
 	assert.match(
 		body,
