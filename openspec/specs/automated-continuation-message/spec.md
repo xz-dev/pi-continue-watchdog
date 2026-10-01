@@ -12,20 +12,6 @@ The system SHALL identify every automatic continuation message as originating fr
 - **THEN** the continuation content identifies the pi-continue-watchdog extension as its source
 - **AND** the continuation content states that it is not a user message or request
 
-### Requirement: Continue reason propagation
-The system SHALL include the normalized accepted continue reason type and reason content in the automatic continuation message as a model-generated watchdog result. The continuation SHALL be a shared timestamped event whose canonical body is the same text shown in human conversation history and supplied to the model. The accepted reason SHALL NOT be repeated in a separate TUI-only result plus an independently assembled model-only history summary.
-
-#### Scenario: Accepted typed continue result
-- **WHEN** a continue decision is accepted with a normalized reason type and non-empty reason content
-- **THEN** the next continuation message contains that reason type and reason content
-- **AND** labels them as originating from the automated watchdog check rather than the user
-- **AND** both human and model receive the same canonical body with a runtime-authored acceptance timestamp and explicit time-zone offset
-
-#### Scenario: Full accepted reason remains visible to both readers
-- **WHEN** a valid reason exceeds the prompt's guidance length but remains within the enforced 1000-code-point limit
-- **THEN** the shared event contains the entire accepted reason for both readers
-- **AND** no secondary history-specific length limit drops or shortens it
-
 ### Requirement: No implied user authorization
 The system SHALL state that an automatic continuation message is not user approval, confirmation, consent, or authorization and SHALL NOT represent it as permission for an action that requires user approval.
 
@@ -36,23 +22,28 @@ The system SHALL state that an automatic continuation message is not user approv
 - **AND** instructs the agent to stop and ask the user before performing the approval-gated action
 
 ### Requirement: Bounded resumed work
-The system SHALL instruct the agent to resume only work already requested and authorized by the user and to stop when additional user input, approval, or assistance is required.
+The system SHALL instruct the agent to resume only work already requested and authorized by the user and to stop, by calling `unlock_continue_watchdog`, when additional user input, approval, or assistance is required.
 
 #### Scenario: Remaining work needs no new approval
-- **WHEN** the watchdog reason identifies actionable remaining work that is already within the user's request and authorization
+- **WHEN** actionable remaining work is already within the user's request and authorization
 - **THEN** the continuation message directs the agent to resume that work
 
 #### Scenario: Remaining work reaches user boundary
 - **WHEN** resumed work reaches a step requiring new user input, approval, or assistance
-- **THEN** the continuation message requires the agent to stop and ask the user
+- **THEN** the continuation message requires the agent to stop and ask the user, and to call `unlock_continue_watchdog`
+
+#### Scenario: Earlier request still missing
+- **WHEN** an automatic continuation is published
+- **THEN** its body tells the agent to check every task requested in the session, including earlier requests and not only the latest one, against what was actually delivered
+- **AND** to continue any requested and authorized work that can still proceed, and otherwise call `unlock_continue_watchdog`, including when work is blocked without a user action
 
 ### Requirement: Configurable guidance preservation
-The system SHALL retain the effective configured continuation guidance inside the fixed automated attribution and authorization-boundary wrapper. This complete body, including guidance and wrapper, SHALL be available to both the human and the model; rendering SHALL NOT substitute a reason-only summary. An old continuation event SHALL retain the guidance that was effective when it was accepted.
+The system SHALL retain the effective configured continuation guidance inside the fixed automated attribution, unlock and waiting guidance, and authorization-boundary wrapper. This complete body SHALL be available to both the human and the model, and rendering SHALL NOT substitute a summary. An old continuation event SHALL retain the guidance that was effective when it was published.
 
 #### Scenario: Custom continuation guidance is configured
-- **WHEN** a valid custom continuation prompt is active and the watchdog accepts a continue decision
-- **THEN** the automatic continuation includes the custom guidance
-- **AND** the fixed source attribution, model-generated reason, and non-authorization statements remain present
+- **WHEN** a valid custom continuation prompt is active and an automatic continuation is published
+- **THEN** the continuation includes the custom guidance
+- **AND** the fixed source attribution, unlock and waiting guidance, and non-authorization statements remain present
 - **AND** the human-visible event contains that same complete text
 
 #### Scenario: Guidance changes after acceptance
@@ -68,15 +59,47 @@ The system SHALL preserve the attribution and authorization-boundary text after 
 - **AND** the message body still denies user approval, confirmation, consent, or authorization
 - **AND** its canonical event text matches the human-visible body after presentation-only styling is removed
 
-### Requirement: Shared event is not additional authority
-New shared wait, completed-wait, AI-unlock, decision-failure, and exhaustion bodies SHALL identify the extension as their source and SHALL explicitly deny being a user message, request, approval, confirmation, consent, or authorization. Model-generated reasons SHALL be identified as such and SHALL NOT be promoted into runtime-verified task facts.
+### Requirement: Direct continuation without inquiry
+When the locked current main agent qualifies at the existing post-idle check and the retry budget allows another attempt, the watchdog SHALL directly publish one automatic continuation message that starts the next turn and SHALL consume one retry attempt. No decision question, model answer, or validation step SHALL precede it. When the budget is already spent, the existing exhaustion behavior SHALL apply instead.
 
-#### Scenario: Wait reason claims a background task is healthy
-- **WHEN** a model-generated wait reason describes a background import as healthy
-- **THEN** the shared event labels that explanation as the model's reason
-- **AND** runtime timing facts do not validate that health claim or authorize additional operations
+#### Scenario: Agent ends a turn without unlocking
+- **GIVEN** the watchdog is locked with retry budget remaining
+- **WHEN** the main agent ends its run without calling `unlock_continue_watchdog` and the aggregate-idle fence elapses
+- **THEN** one continuation message is published and starts the next turn
+- **AND** no hidden decision prompt is sent
 
-#### Scenario: Time passes while approval remains pending
-- **WHEN** a completed-wait event appears while existing conversation contains an unresolved approval request
+#### Scenario: Agent unlocked before settlement
+- **WHEN** the agent called `unlock_continue_watchdog` during the run
+- **THEN** no continuation message is published at the following idle
+
+### Requirement: Continuation body without model reason
+The automatic continuation message SHALL NOT contain a model-generated reason or reason type, because the model does not select continuation. The continuation SHALL be a shared timestamped event whose canonical body is the same text shown in human conversation history and supplied to the model. That body SHALL NOT be duplicated in a separate TUI-only result plus an independently assembled model-only history summary.
+
+#### Scenario: Continuation body content
+- **WHEN** an automatic continuation is published
+- **THEN** its body contains the runtime timestamp, attribution, unlock and waiting guidance, configured guidance, and authorization boundary
+- **AND** contains no model-generated reason text
+- **AND** both human and model receive the same canonical body
+
+### Requirement: Unlock and waiting guidance
+The continuation message SHALL state that the agent ended its turn without calling `unlock_continue_watchdog`. It SHALL instruct the agent to call that tool now if all requested work is complete or user input, approval, or other user action is required, and otherwise to continue the remaining work. It SHALL instruct that, when the agent needs some work to finish, it block on or monitor that task directly, or sleep for its estimated duration, instead of ending the turn.
+
+#### Scenario: Agent must wait for CI
+- **WHEN** the continuation message is delivered while CI is still running
+- **THEN** the message directs the agent to monitor CI or sleep for an estimated duration within its turn
+- **AND** it offers no separate watchdog wait outcome
+
+### Requirement: Visible extension event block
+The continuation SHALL be published as an extension-owned custom message rendered as a distinct watchdog event block in conversation history. It SHALL NOT be sent as a user-authored message. Its heading SHALL include a runtime-authored RFC 3339 timestamp with explicit offset.
+
+#### Scenario: Human views history
+- **WHEN** the user scrolls conversation history after an automatic continuation
+- **THEN** the continuation appears as a pi-continue-watchdog event block, not as a user message bubble
+
+### Requirement: Watchdog events are not additional authority
+New shared continuation and exhaustion bodies SHALL identify the extension as their source and SHALL explicitly deny being a user message, request, approval, confirmation, consent, or authorization.
+
+#### Scenario: Continuation while approval remains pending
+- **WHEN** a continuation event appears while existing conversation contains an unresolved approval request
 - **THEN** the event explicitly provides no approval or authorization
 - **AND** the existing user-boundary rules remain in effect
