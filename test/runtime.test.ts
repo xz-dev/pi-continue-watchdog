@@ -5,6 +5,7 @@ import type {
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
+import { registerMainUserAutoLock } from "../src/auto-lock.js";
 import type { ContinueWatchdogConfig } from "../src/config.js";
 import { CONTINUATION_MESSAGE_TYPE } from "../src/context-fold.js";
 import { createLockDecisionController } from "../src/controller.js";
@@ -267,6 +268,11 @@ function createHarness(options?: {
 				throw new Error("unexpected jev request");
 			},
 		},
+	});
+	registerMainUserAutoLock(pi as never, {
+		isCurrentMain: runtime.isCurrentMain,
+		onMainUserMessageStart: () =>
+			runtime.restartLockCycle(undefined, { notifyLocked: false }),
 	});
 	runtime.registerLifecycle();
 	harness.runtime = runtime;
@@ -737,6 +743,208 @@ function jevHarness(
 	});
 	return { harness, calls };
 }
+
+function reviewResponse(probability = 0.95, choice = "contradicted"): Response {
+	return new Response(
+		JSON.stringify({
+			answers: {
+				stop_review: {
+					choice,
+					confidence: 0.75,
+					probabilities: { contradicted: probability },
+				},
+			},
+		}),
+	);
+}
+
+function authorizedBranch() {
+	return [
+		{
+			type: "message",
+			id: "user-authorized",
+			message: {
+				role: "user",
+				content: "继续，不用再问。Implement the already approved change.",
+			},
+		},
+		assistantEntry("ask-again", "May I implement the approved change now?"),
+	];
+}
+
+test("unlock review: rejection preserves lock, attempts and publication; real user start resets cap", async () => {
+	const { harness } = jevHarness(() => reviewResponse());
+	harness.branch = authorizedBranch();
+	await harness.fire("session_start", {});
+	await harness.fire("agent_start", {});
+	for (const n of [1, 2]) {
+		await assert.rejects(
+			harness.invokeUnlockTool({
+				reason_type: "WAIT_USER",
+				reason: "Need permission to implement the approved change",
+			}),
+			new RegExp(`Unlock refused \\(${n}/3\\)`),
+		);
+		assert.equal(harness.controller.snapshot.locked, true);
+		assert.equal(harness.controller.snapshot.attempt, 0);
+		assert.equal(
+			harness.hooks.some((hook) => hook.name === "user-ready"),
+			false,
+		);
+	}
+	await harness.fire(
+		"message_start",
+		{ message: { role: "user", content: "Continue" } },
+		{ idle: false },
+	);
+	await assert.rejects(
+		harness.invokeUnlockTool({
+			reason_type: "WAIT_USER",
+			reason: "Need permission again",
+		}),
+		/1\/3/,
+	);
+});
+
+test("unlock review: shutdown aborts without accepting or rejecting", async () => {
+	let observed: AbortSignal | undefined;
+	const harness = createHarness({
+		jevWait: {
+			env: { TYPESAFE_API_KEY: "test-key" },
+			fetchFn: (_url, init) =>
+				new Promise((_resolve, reject) => {
+					observed = init.signal ?? undefined;
+					init.signal?.addEventListener(
+						"abort",
+						() => reject(new Error("cancelled")),
+						{ once: true },
+					);
+				}),
+		},
+	});
+	harness.branch = authorizedBranch();
+	await harness.fire("session_start", {});
+	await harness.fire("agent_start", {});
+	const pending = harness.invokeUnlockTool({
+		reason_type: "WAIT_USER",
+		reason: "Need permission",
+	});
+	await flush();
+	assert.ok(observed);
+	await harness.runtime.shutdown(harness.ctx);
+	assert.equal(observed.aborted, true);
+	assert.equal((await pending).terminate, undefined);
+	assert.equal(
+		harness.hooks.some((hook) => hook.name === "user-ready"),
+		false,
+	);
+});
+
+test("unlock review: old wait gate cannot bypass refusal and shares the three-rejection cap", async () => {
+	let reviews = 0;
+	let waitChecks = 0;
+	const harness = createHarness({
+		jevWait: {
+			env: { TYPESAFE_API_KEY: "test-key" },
+			fetchFn: async (_url, init) => {
+				const request = JSON.parse(String(init.body));
+				if (request.questions.stop_review) {
+					reviews++;
+					return reviewResponse();
+				}
+				waitChecks++;
+				return jevResponse("waiting_user", 0.99);
+			},
+		},
+	});
+	harness.branch = authorizedBranch();
+	await harness.fire("session_start", {});
+	await harness.fire("agent_start", {});
+	await assert.rejects(
+		harness.invokeUnlockTool({
+			reason_type: "WAIT_USER",
+			reason: "Need permission",
+		}),
+		/1\/3/,
+	);
+	await harness.settle();
+	await harness.advanceFence(10_000);
+	await flush();
+	assert.equal(reviews, 2);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(continuationCount(harness), 1);
+	assert.equal(harness.controller.snapshot.attempt, 1);
+	assert.equal(
+		harness.hooks.some((hook) => hook.name === "user-ready"),
+		false,
+	);
+	await harness.startContinuation();
+	harness.branch.push(assistantEntry("third-stop", "May I implement now?"));
+	await harness.settle();
+	await harness.advanceFence(10_000);
+	await flush();
+	assert.equal(reviews, 3);
+	assert.equal(continuationCount(harness), 2);
+	assert.equal(harness.controller.snapshot.locked, true);
+	await harness.startContinuation();
+	harness.branch.push(assistantEntry("fourth-stop", "May I implement now?"));
+	await harness.settle();
+	await harness.advanceFence(10_000);
+	await flush();
+	assert.equal(reviews, 3);
+	assert.equal(waitChecks, 3);
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(
+		harness.hooks.filter((hook) => hook.name === "user-ready").length,
+		1,
+	);
+});
+
+test("unlock review: activity during guarded automatic review cannot consume a refusal", async () => {
+	let reviews = 0;
+	let pendingAutomatic = true;
+	let release: (response: Response) => void = () => {};
+	const harness = createHarness({
+		jevWait: {
+			env: { TYPESAFE_API_KEY: "test-key" },
+			fetchFn: async (_url, init) => {
+				if (!JSON.parse(String(init.body)).questions.stop_review)
+					return jevResponse("waiting_user", 0.99);
+				if (++reviews === 1 || !pendingAutomatic) return reviewResponse();
+				return new Promise<Response>((resolve) => {
+					release = resolve;
+				});
+			},
+		},
+	});
+	harness.branch = authorizedBranch();
+	await harness.fire("session_start", {});
+	await harness.fire("agent_start", {});
+	await assert.rejects(
+		harness.invokeUnlockTool({
+			reason_type: "WAIT_USER",
+			reason: "Need permission",
+		}),
+		/1\/3/,
+	);
+	await harness.settle();
+	await harness.advanceFence(10_000);
+	await flush();
+	assert.equal(reviews, 2);
+	await harness.fire("agent_start", {}, { idle: false });
+	release(reviewResponse());
+	await flush();
+	assert.equal(continuationCount(harness), 0);
+	assert.equal(harness.controller.snapshot.locked, true);
+	pendingAutomatic = false;
+	await assert.rejects(
+		harness.invokeUnlockTool({
+			reason_type: "WAIT_USER",
+			reason: "Need permission",
+		}),
+		/2\/3/,
+	);
+});
 
 const continuationCount = (harness: Harness): number =>
 	harness.sent.filter(

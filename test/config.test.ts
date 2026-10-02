@@ -391,10 +391,12 @@ test("invalid unlockShortcut values fall back to the default with one bounded di
 
 test("jevWaitCheck defaults apply when unset", () => {
 	const merged = mergeConfig({}, {});
+	assert.equal(merged.config.jevWaitCheck?.unlockReviewThreshold, 0.8);
 	assert.deepEqual(merged.config.jevWaitCheck, {
 		enabled: true,
 		model: "jev-latest",
 		confidenceThreshold: 0.8,
+		unlockReviewThreshold: 0.8,
 		timeoutMs: 15_000,
 	});
 	assert.deepEqual(merged.diagnostics, []);
@@ -409,6 +411,7 @@ test("jevWaitCheck merges per field across layers", () => {
 		enabled: false,
 		model: "jev-custom",
 		confidenceThreshold: 0.8,
+		unlockReviewThreshold: 0.8,
 		timeoutMs: 5000,
 		apiKey: "global-key",
 	});
@@ -426,6 +429,21 @@ test("invalid jevWaitCheck threshold keeps the lower-precedence value", () => {
 		messages.some((message) => message.includes("confidenceThreshold")),
 	);
 	assert.ok(messages.some((message) => message.includes("timeoutMs")));
+});
+
+test("invalid unlock review threshold keeps the lower layer", () => {
+	for (const invalid of [-0.1, 1.1, Number.NaN, "0.8", null]) {
+		const merged = mergeConfig(
+			{ jevWaitCheck: { unlockReviewThreshold: 0.9 } },
+			{ jevWaitCheck: { unlockReviewThreshold: invalid } },
+		);
+		assert.equal(merged.config.jevWaitCheck?.unlockReviewThreshold, 0.9);
+		assert.ok(
+			merged.diagnostics.some((item) =>
+				item.message.includes("jevWaitCheck.unlockReviewThreshold"),
+			),
+		);
+	}
 });
 
 test("project jevWaitCheck.apiKey is ignored with a diagnostic naming it", () => {

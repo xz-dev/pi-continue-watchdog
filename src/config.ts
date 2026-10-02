@@ -52,6 +52,7 @@ export interface JevWaitCheckConfig {
 	apiUrl?: string;
 	model: string;
 	confidenceThreshold: number;
+	unlockReviewThreshold: number;
 	timeoutMs: number;
 	/** Global-only fallback key. */
 	apiKey?: string;
@@ -62,6 +63,7 @@ export const BUILT_IN_JEV_WAIT_CHECK: Readonly<JevWaitCheckConfig> =
 		enabled: true,
 		model: "jev-latest",
 		confidenceThreshold: 0.8,
+		unlockReviewThreshold: 0.8,
 		timeoutMs: 15_000,
 	});
 
@@ -129,6 +131,7 @@ const JEV_KEYS = new Set([
 	"apiUrl",
 	"model",
 	"confidenceThreshold",
+	"unlockReviewThreshold",
 	"timeoutMs",
 	"apiKey",
 ]);
@@ -198,17 +201,21 @@ function validateJevWaitCheck(
 		if (nonBlank(input.model)) out.model = input.model.trim();
 		else reject("model must be a non-empty string");
 	}
-	if (Object.hasOwn(input, "confidenceThreshold")) {
-		const threshold = input.confidenceThreshold;
+	for (const field of [
+		"confidenceThreshold",
+		"unlockReviewThreshold",
+	] as const) {
+		if (!Object.hasOwn(input, field)) continue;
+		const threshold = input[field];
 		if (
 			typeof threshold === "number" &&
 			Number.isFinite(threshold) &&
 			threshold >= 0 &&
 			threshold <= 1
 		) {
-			out.confidenceThreshold = threshold;
+			out[field] = threshold;
 		} else {
-			reject("confidenceThreshold must be a number between 0 and 1");
+			reject(`${field} must be a number between 0 and 1`);
 		}
 	}
 	if (Object.hasOwn(input, "timeoutMs")) {

@@ -5,8 +5,15 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
 import { type TSchema, Type } from "typebox";
-import type { ContinueWatchdogConfig } from "./config.js";
+import type { ContinueWatchdogConfig, JevWaitCheckConfig } from "./config.js";
 import { hasAtMostUnicodeCodePoints } from "./config.js";
+import {
+	buildUnlockReviewState,
+	type JevFetch,
+	type JevKeyRegistry,
+	resolveJevEndpoint,
+	reviewUnlockReason,
+} from "./jev-wait-gate.js";
 import type { UserReadyValues } from "./semantic-hook.js";
 
 /** Public model-visible tool name. Always registered in root processes. */
@@ -191,6 +198,110 @@ export interface UnlockToolHost {
 	 * continuation. Returns false when it could not be applied.
 	 */
 	readonly applyAiUnlock: (call: UnlockToolCall) => boolean;
+	readonly reviewState?: () => {
+		readonly cycleId: number;
+		readonly rejections: number;
+	} | null;
+	readonly recordReviewRejection?: (cycleId: number) => number | null;
+	readonly jev?: {
+		config: JevWaitCheckConfig;
+		registry?: JevKeyRegistry;
+		env?: Readonly<Record<string, string | undefined>>;
+		fetchFn?: JevFetch;
+		signal?: AbortSignal;
+	};
+}
+
+export const MAX_UNLOCK_REVIEW_REJECTIONS = 3;
+
+export type UnlockReviewResult =
+	| { readonly outcome: "accepted" | "stale" }
+	| { readonly outcome: "rejected"; readonly count: number };
+
+/** Shared by direct tool unlock and the guarded automatic wait-gate unlock. */
+export async function reviewUnlockAttempt(
+	host: UnlockToolHost,
+	ctx: Pick<
+		import("@earendil-works/pi-coding-agent").ExtensionContext,
+		"sessionManager" | "modelRegistry"
+	>,
+	call: UnlockToolCall,
+	signal?: AbortSignal,
+	stillCurrent: () => boolean = () => true,
+): Promise<UnlockReviewResult> {
+	const jev = host.jev;
+	const captured = host.reviewState?.();
+	if (
+		call.reasonType !== "WAIT_USER" ||
+		!jev?.config.enabled ||
+		captured == null ||
+		captured.rejections >= MAX_UNLOCK_REVIEW_REJECTIONS ||
+		!host.recordReviewRejection
+	)
+		return { outcome: "accepted" };
+	const leaf = ctx.sessionManager.getLeafId();
+	const signals = [signal, jev.signal].filter(
+		(item): item is AbortSignal => item !== undefined,
+	);
+	const combined = signals.length > 0 ? AbortSignal.any(signals) : undefined;
+	const current = () =>
+		stillCurrent() &&
+		!combined?.aborted &&
+		host.isCurrentMain() &&
+		host.isLocked() &&
+		host.reviewState?.()?.cycleId === captured.cycleId &&
+		ctx.sessionManager.getLeafId() === leaf;
+	if (!current()) return { outcome: "stale" };
+	const endpoint = await resolveJevEndpoint(
+		jev.config,
+		jev.registry ?? ctx.modelRegistry,
+		jev.env,
+	);
+	if (!current()) return { outcome: "stale" };
+	if (endpoint === undefined) return { outcome: "accepted" };
+	const state = buildUnlockReviewState(
+		ctx.sessionManager.getBranch(),
+		call,
+		endpoint.apiKey,
+	);
+	if (state === null) return { outcome: "accepted" };
+	const verdict = await reviewUnlockReason(state, {
+		...endpoint,
+		model: jev.config.model,
+		timeoutMs: jev.config.timeoutMs,
+		fetchFn: jev.fetchFn,
+		signal: combined,
+	});
+	if (!current()) return { outcome: "stale" };
+	if (
+		!verdict?.contradicted ||
+		verdict.probability < jev.config.unlockReviewThreshold
+	)
+		return { outcome: "accepted" };
+	const count = host.recordReviewRejection(captured.cycleId);
+	if (count !== null) return { outcome: "rejected", count };
+	return { outcome: current() ? "accepted" : "stale" };
+}
+
+/** Snapshot before any await, including a skipped review's promise boundary. */
+function captureUnlockFreshness(
+	host: UnlockToolHost,
+	ctx: Pick<
+		import("@earendil-works/pi-coding-agent").ExtensionContext,
+		"sessionManager"
+	>,
+	signal?: AbortSignal,
+): () => boolean {
+	const cycleId = host.reviewState?.()?.cycleId;
+	const leaf = ctx.sessionManager?.getLeafId?.();
+	const lifecycleSignal = host.jev?.signal;
+	return () =>
+		!signal?.aborted &&
+		!lifecycleSignal?.aborted &&
+		host.isCurrentMain() &&
+		host.isLocked() &&
+		host.reviewState?.()?.cycleId === cycleId &&
+		ctx.sessionManager?.getLeafId?.() === leaf;
 }
 
 function informationalResult(
@@ -222,7 +333,7 @@ export function createUnlockToolDefinition(
 		prepareArguments: (args: unknown) =>
 			prepareUnlockToolArguments(args, config.reasonTypes),
 		renderShell: "self",
-		async execute(_toolCallId, args) {
+		async execute(_toolCallId, args, signal, _onUpdate, ctx) {
 			const validated = validateUnlockToolArguments(args, config.reasonTypes);
 			if ("error" in validated) {
 				throw new Error(validated.error);
@@ -230,6 +341,18 @@ export function createUnlockToolDefinition(
 			if (!host.isCurrentMain() || !host.isLocked()) {
 				return informationalResult(
 					"The continue watchdog is not locked for the current main session; no unlock was needed.",
+				);
+			}
+			const current = captureUnlockFreshness(host, ctx, signal);
+			const review = await reviewUnlockAttempt(host, ctx, validated, signal);
+			if (review.outcome === "stale" || !current()) {
+				return informationalResult(
+					"The continue watchdog lock changed before this call; no unlock was applied.",
+				);
+			}
+			if (review.outcome === "rejected") {
+				throw new Error(
+					`Unlock refused (${review.count}/3): the WAIT_USER review found the requested permission already granted this turn. Continue the authorized work instead of asking again.`,
 				);
 			}
 			const applied = host.applyAiUnlock(validated);

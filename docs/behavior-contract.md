@@ -113,7 +113,7 @@ Continue until user assistance is required.
 | `maxRetries` | `10` | Automatic continuations per lock cycle; safe integer in `[1, 10]` |
 | `continuePrompt` | exact default above | Guidance embedded verbatim in the fixed continuation body; nonblank and at most 16,384 Unicode code points |
 | `reasonTypes` | `["JOB_DONE","WAIT_USER","JOB_BLOCKED","WAIT_CALLBACK"]` | Allowed unlock-tool types. A valid configured list **replaces** the default. |
-| `jevWaitCheck` | `{enabled: true, model: "jev-latest", confidenceThreshold: 0.8, timeoutMs: 15000}` | jev wait gate (see below). Fields merge individually; `apiUrl` optional and must be an http(s) URL; `apiKey` is global-only and a project value is ignored with a diagnostic. |
+| `jevWaitCheck` | `{enabled: true, model: "jev-latest", confidenceThreshold: 0.8, unlockReviewThreshold: 0.8, timeoutMs: 15000}` | jev wait gate (see below). Fields merge individually; `apiUrl` optional and must be an http(s) URL; `apiKey` is global-only and a project value is ignored with a diagnostic. |
 
 The removed keys `decisionPrompt` and `continueReasonTypes` are **errors**: when present, the extension reports a named error diagnostic and the key has no effect.
 
@@ -194,13 +194,34 @@ The tool description states that the agent must call this tool to signal that al
 ### Execution
 
 **Given** the current main agent calls the tool with valid arguments while the cycle is locked
-**When** the call executes
+**When** the call passes or skips the WAIT_USER review below
 **Then** the plugin:
 1. Unlocks through the same controller unlock semantics as other unlocks, clearing any pending continuation.
 2. Returns a short successful result and requests run termination without a follow-up model request.
 3. Retains a `user-ready` `AI_UNLOCK` intent with the normalized `REASON_TYPE` and trimmed `REASON`, published once at the terminal aggregate-idle state (publication waits for busy children and process-domain idle confirmation).
 
 **Given** invalid arguments, the tool result is a named constraint error; lock state, attempt accounting, and pending continuation are unchanged, and the model may retry naturally. **Given** a call while unlocked or from a non-main session, the result is informational and publishes nothing. **Given** the tool is called in the same batch as other tools, the unlock still applies and Pi's ordinary batch semantics decide the follow-up.
+
+### WAIT_USER permission review (confirmed 2026-10-02)
+
+Only `WAIT_USER` calls with valid arguments from the locked current main are reviewed, when a key resolves, the shared Jev gate is enabled and fewer than three refusals occurred in this cycle. `JOB_DONE`, `JOB_BLOCKED`, `WAIT_CALLBACK`, custom reasons and human/abort/error paths are unchanged.
+
+The review asks whether this turn's user evidence explicitly grants the exact permission the stop claim is waiting for. It sends four bounded evidence sections from the active branch only: claim; latest real user message plus successful questionnaire answers; visible assistant replies of this turn; tool-name/short-argument trace with result received, error or pending status. Ordinary tool outputs, earlier turns, thinking, system prompt and automated continuation entries are excluded. The resolved key is redacted. Hard 24k Unicode characters: oldest trace dropped first, then assistant and user/answer head/tail truncation with markers. State content is evidence, never reviewer instructions.
+
+**Given** the user said “继续，不用再问” and explicitly authorized implementing the change
+**When** the agent calls WAIT_USER to request that same permission and Jev returns `contradicted` with P=0.84
+**Then** an ordinary tool error reports `Unlock refused (1/3)`, the lock and continuation attempt count stay unchanged, no `user-ready` or termination is requested, and Pi can follow up to execute the authorized work.
+
+**Given** the user has not selected Postgres or SQLite
+**When** a WAIT_USER claim asks for that genuine choice and Jev returns `supported`
+**Then** the normal unlock and terminal publication apply.
+
+**Given** three shared refusals in this cycle
+**When** a subsequent WAIT_USER tool call or guarded automatic stop occurs
+**Then** it passes without another review. A new real user message or lock-cycle restart resets the count. Tool refusals do not spend automatic-continuation attempts; a refused automatic stop spends only the ordinary dispatched continuation attempt.
+
+**When** the answer is uncertain, probability is missing/invalid or below threshold, credentials are absent, the service fails or times out
+**Then** accept the stop; never substitute confidence for probability and never retry. Lifecycle/tool cancellation, ownership/cycle/branch changes during the request instead discard it without unlocking or refusing.
 
 ### Waiting
 
@@ -222,13 +243,13 @@ When the agent needs to wait for work that will call back and wake it (an async 
 
 When the budget is already spent, the existing exhaustion behavior applies instead: one shared exhaustion event and one `user-ready` `EXHAUSTED` envelope, no work turn.
 
-### jev wait gate (the only pre-continuation check)
+### jev wait gate
 
 After the wake-time guards pass and before step 1, when `jevWaitCheck.enabled` is true, the latest branch entry of the settled run is an assistant message with `stopReason: "stop"` and non-blank visible text, and a key resolves (Pi `typesafe`/`openrouter` credentials, then `TYPESAFE_API_KEY`/`OPENROUTER_API_KEY`, then global `jevWaitCheck.apiKey`; TypeSafe first unless `apiUrl` selects one):
 
 1. Only that text, with the key redacted, is sent as one jev Choice question (`waiting_user` / `not_waiting` / `unclear`). Each assistant entry id is classified at most once per session (revisiting it reuses the same request); a qualification with no resolvable key sends nothing and caches nothing, so a key that appears later still enables the gate.
 2. The exact qualified generation (ownership, aggregate activity, grace phase, local activity), a fresh idle probe, the lock, and the classified entry being the branch's latest assistant entry must still hold both after the credential lookup (else no request is sent) and after the request. Tree navigation re-arms the fence without probing idle, because Pi emits `session_tree` while its branch-summary state still reads busy. If any check fails, the verdict is discarded and neither unlock nor continuation follows from it.
-3. `waiting_user` with confidence ≥ `confidenceThreshold`: AI unlock without consuming an attempt, one TUI notify, and one `user-ready` with `STOP_KIND=AI_UNLOCK`, `REASON_TYPE=WAIT_USER`, `REASON="jev model judged the final output to be a question for the user: " + last paragraph` (≤ 1000 code points, tail kept behind `…`). No model-visible message is added.
+3. `waiting_user` with confidence ≥ `confidenceThreshold`: proposes AI unlock. If a tool review refused a stop in this cycle and fewer than three total refusals occurred, this proposal must pass the same WAIT_USER permission review and all live qualification guards again; refusal increments the shared count and dispatches the ordinary continuation, not `user-ready`. Acceptance performs AI unlock without consuming an attempt, one TUI notify, and one `user-ready` with `STOP_KIND=AI_UNLOCK`, `REASON_TYPE=WAIT_USER`, `REASON="jev model judged the final output to be a question for the user: " + last paragraph` (≤ 1000 code points, tail kept behind `…`). No model-visible message is added.
 4. Anything else (no key, no text, HTTP/network error, timeout, malformed answer, `not_waiting`, `unclear`, low confidence) proceeds to step 1 unchanged. No retry; shutdown aborts the request.
 
 The gate never runs on the exhaustion, terminal-error, abort, or unlocked paths and adds no fixed delay.

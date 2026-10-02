@@ -73,6 +73,7 @@ structure RuntimeState where
   fence : Option IdleFence
   pendingContinuation : Option PendingContinuation
   exhaustionEventPublished : Bool
+  reviewRejections : Nat := 0
   deriving DecidableEq, Repr
 
 def initialState (enabled : Bool) : RuntimeState :=
@@ -210,13 +211,16 @@ def buildContinuationEnvelope (guidance : String) : ContinuationEnvelope :=
 ## Unlock tool
 
 One always-registered tool. Invalid arguments are ordinary tool errors; a valid
-call from the locked current main unlocks and terminates the run.
+locked-main call terminates only when permission review is absent, inconclusive,
+or below its threshold. `reviewContradicted` abstracts a valid probability
+meeting the configured threshold; missing probability is false.
 -/
 
 inductive UnlockToolOutcome where
   | unlocked
   | alreadyUnlocked
   | invalidArguments
+  | reviewRejected
   deriving DecidableEq, Repr
 
 structure UnlockToolCall where
@@ -238,12 +242,18 @@ def validReasonType (call : UnlockToolCall)
 
 def executeUnlockTool (call : UnlockToolCall)
     (allowed : List String)
-    (state : UnlockToolState) :
+    (state : UnlockToolState)
+    (reviewContradicted : Bool := false) :
     UnlockToolOutcome × UnlockToolState :=
   if !validReasonType call allowed then
     (.invalidArguments, state)
   else if !state.lockState.enabled then
     (.alreadyUnlocked, state)
+  else if equalsIgnoreCase call.reasonType "WAIT_USER" &&
+      state.lockState.reviewRejections < 3 && reviewContradicted then
+    (.reviewRejected,
+      { state with lockState := { state.lockState with
+          reviewRejections := state.lockState.reviewRejections + 1 } })
   else
     (.unlocked,
       { state with
@@ -404,6 +414,7 @@ def freshLockCycle (state : RuntimeState) : RuntimeState :=
       enabled := true
       attempt := 0
       exhaustionEventPublished := false
+      reviewRejections := 0
       fence := none
       pendingContinuation := none }
 
@@ -413,8 +424,10 @@ def freshLockCycle (state : RuntimeState) : RuntimeState :=
 After the fence qualifies and before dispatch, an optional jev verdict on the
 final assistant text is awaited. The verdict applies only when the exact
 qualified state is unchanged after the request (`stale = false`). A confident
-`waiting_user` unlocks without consuming an attempt; every other outcome,
-including no key or any failure (`none`), dispatches as before.
+`waiting_user` proposes an unlock without consuming an attempt; when a prior
+tool refusal occurred, a further contradiction uses the shared cap and continues
+instead. Otherwise ordinary wait failure still dispatches as before. The review
+predicate abstracts validated reviewer output, not the correctness of Jev itself.
 -/
 
 inductive JevChoice where
@@ -440,9 +453,14 @@ def jevWaits (verdict : Option JevVerdict) : Bool :=
   | none => false
 
 def applyJevGate (exchangeId : Nat) (verdict : Option JevVerdict)
-    (stale : Bool) (state : RuntimeState) : GateOutcome × RuntimeState :=
+    (stale : Bool) (state : RuntimeState)
+    (reviewContradicted : Bool := false) : GateOutcome × RuntimeState :=
   if stale || !continuationEligible state then (.dropped, state)
-  else if jevWaits verdict then (.waitUserUnlocked, unlock state)
+  else if jevWaits verdict then
+    if 0 < state.reviewRejections && state.reviewRejections < 3 && reviewContradicted then
+      (.continued, dispatchContinuation exchangeId
+        { state with reviewRejections := state.reviewRejections + 1 })
+    else (.waitUserUnlocked, unlock state)
   else (.continued, dispatchContinuation exchangeId state)
 
 /-- Gate-aware fence expiry: the runtime's actual path. With no verdict and a
@@ -450,11 +468,11 @@ fresh state it equals the plain `timerTick` dispatch (see
 `gated_tick_without_verdict_is_timer_tick`). A branch change or any other
 activity during the request is `stale`. -/
 def gatedTimerTick (verdict : Option JevVerdict) (stale : Bool)
-    (state : RuntimeState) : GateOutcome × RuntimeState :=
+    (state : RuntimeState) (reviewContradicted : Bool := false) : GateOutcome × RuntimeState :=
   match state.fence with
   | some fence =>
       if fence.armed ∧ fence.remainingSeconds ≤ 1 then
-        applyJevGate fence.token verdict stale state
+        applyJevGate fence.token verdict stale state reviewContradicted
       else (.continued, timerTick state)
   | none => (.continued, state)
 
@@ -604,7 +622,9 @@ theorem unlock_tool_stays_registered
   simp only [executeUnlockTool]
   split
   · rfl
-  · split <;> rfl
+  · split
+    · rfl
+    · simp
 
 theorem invalid_arguments_keep_lock
     (call : UnlockToolCall) (allowed : List String)
@@ -893,6 +913,116 @@ theorem process_is_correct :
    gated_tick_without_verdict_is_timer_tick,
    fun verdict state fence => stale_gated_tick_is_inert verdict state fence⟩
 
+-- Stale review transitions preserve every field; fresh permission refusals are ordinary tool outcomes.
+def staleReviewedUnlock (stale : Bool) (call : UnlockToolCall)
+    (allowed : List String) (state : UnlockToolState) (contradicted : Bool) :
+    UnlockToolOutcome × UnlockToolState :=
+  if stale then (.alreadyUnlocked, state)
+  else executeUnlockTool call allowed state contradicted
+
+-- The bounded counter belongs to a lock cycle, not the automatic continuation attempt budget.
+def reviewStateInvariant (state : RuntimeState) : Prop :=
+  state.reviewRejections ≤ 3
+
+-- Permission refusal preserves the work trajectory and increments only the shared review count.
+theorem reviewed_tool_rejection_preserves_work
+    (call : UnlockToolCall) (allowed : List String) (state : UnlockToolState)
+    (valid : validReasonType call allowed = true)
+    (locked : state.lockState.enabled = true)
+    (waiting : equalsIgnoreCase call.reasonType "WAIT_USER" = true)
+    (budget : state.lockState.reviewRejections < 3) :
+    let result := executeUnlockTool call allowed state true
+    result.1 = .reviewRejected ∧ result.2.lockState.enabled = true ∧
+      result.2.lockState.attempt = state.lockState.attempt ∧
+      result.2.lockState.pendingContinuation = state.lockState.pendingContinuation ∧
+      result.2.lockState.reviewRejections = state.lockState.reviewRejections + 1 := by
+  simp [executeUnlockTool, valid, locked, waiting, budget]
+
+-- Exhaustion and fresh cycles bound refusal loops; stale results have no operational effect.
+theorem review_budget_exhaustion_accepts
+    (call : UnlockToolCall) (allowed : List String) (state : UnlockToolState)
+    (valid : validReasonType call allowed = true)
+    (locked : state.lockState.enabled = true)
+    (budget : 3 ≤ state.lockState.reviewRejections) :
+    (executeUnlockTool call allowed state true).1 = .unlocked := by
+  have h : ¬ state.lockState.reviewRejections < 3 := by omega
+  simp [executeUnlockTool, valid, locked, h]
+
+theorem fresh_cycle_resets_review_count (state : RuntimeState) :
+    (freshLockCycle state).reviewRejections = 0 := by
+  rfl
+
+theorem stale_review_is_inert
+    (call : UnlockToolCall) (allowed : List String) (state : UnlockToolState)
+    (contradicted : Bool) :
+    staleReviewedUnlock true call allowed state contradicted = (.alreadyUnlocked, state) := by
+  rfl
+
+-- The second automatic guard cannot undo a tool refusal; it consumes only the ordinary continuation attempt.
+theorem automatic_gate_cannot_bypass_rejection
+    (exchangeId : Nat) (state : RuntimeState)
+    (eligible : continuationEligible state = true)
+    (priorRejection : 0 < state.reviewRejections)
+    (budget : state.reviewRejections < 3) :
+    let result := applyJevGate exchangeId
+      (some { choice := .waitingUser, confident := true }) false state true
+    result.1 = .continued ∧ result.2.enabled = state.enabled ∧
+      result.2.reviewRejections = state.reviewRejections + 1 ∧
+      result.2.attempt = state.attempt + 1 := by
+  have nextEligible : continuationEligible { state with reviewRejections := state.reviewRejections + 1 } = true := eligible
+  simp [applyJevGate, eligible, jevWaits, priorRejection, budget, dispatchContinuation, nextEligible]
+
+-- Every modeled tool transition preserves the maximum of three refusals from a bounded initial state.
+theorem review_counter_invariant
+    (call : UnlockToolCall) (allowed : List String) (state : UnlockToolState)
+    (contradicted : Bool) (bounded : reviewStateInvariant state.lockState) :
+    reviewStateInvariant (executeUnlockTool call allowed state contradicted).2.lockState := by
+  unfold executeUnlockTool
+  split
+  · exact bounded
+  · split
+    · exact bounded
+    · split
+      · rename_i h
+        simp only [Bool.and_eq_true, decide_eq_true_eq] at h
+        dsimp [reviewStateInvariant]
+        omega
+      · exact bounded
+
+-- This bundle proves review policy safety and bounded progress, assuming the parsed contradiction predicate.
+-- It does not prove network availability, context extraction fidelity, or model accuracy.
+theorem unlock_review_process_is_correct :
+    (∀ call allowed state, validReasonType call allowed = true →
+      state.lockState.enabled = true → equalsIgnoreCase call.reasonType "WAIT_USER" = true →
+      state.lockState.reviewRejections < 3 →
+      let result := executeUnlockTool call allowed state true
+      result.1 = .reviewRejected ∧ result.2.lockState.enabled = true ∧
+        result.2.lockState.attempt = state.lockState.attempt ∧
+        result.2.lockState.pendingContinuation = state.lockState.pendingContinuation ∧
+        result.2.lockState.reviewRejections = state.lockState.reviewRejections + 1) ∧
+    (∀ call allowed state, validReasonType call allowed = true →
+      state.lockState.enabled = true → 3 ≤ state.lockState.reviewRejections →
+      (executeUnlockTool call allowed state true).1 = .unlocked) ∧
+    (∀ state, (freshLockCycle state).reviewRejections = 0) ∧
+    (∀ call allowed state contradicted,
+      staleReviewedUnlock true call allowed state contradicted = (.alreadyUnlocked, state)) ∧
+    (∀ exchangeId state, continuationEligible state = true →
+      0 < state.reviewRejections → state.reviewRejections < 3 →
+      let result := applyJevGate exchangeId
+        (some { choice := .waitingUser, confident := true }) false state true
+      result.1 = .continued ∧ result.2.enabled = state.enabled ∧
+        result.2.reviewRejections = state.reviewRejections + 1 ∧ result.2.attempt = state.attempt + 1) ∧
+    (∀ call allowed state contradicted, reviewStateInvariant state.lockState →
+      reviewStateInvariant (executeUnlockTool call allowed state contradicted).2.lockState) :=
+  ⟨reviewed_tool_rejection_preserves_work, review_budget_exhaustion_accepts,
+   fresh_cycle_resets_review_count, stale_review_is_inert,
+   automatic_gate_cannot_bypass_rejection, review_counter_invariant⟩
+
 end OfficialPiIdleInquiry
 
 #print axioms OfficialPiIdleInquiry.process_is_correct
+#print axioms OfficialPiIdleInquiry.unlock_review_process_is_correct
+
+-- Deterministic stdout is the only effect of the executable process-document summary.
+def main : IO Unit :=
+  IO.println "Unlock review model: permission refusals preserve work, share a cap of three, cannot be bypassed by the automatic gate, and stale reviews are inert."

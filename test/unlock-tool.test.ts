@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { stripVTControlCharacters } from "node:util";
-
 import {
 	initTheme,
 	ToolExecutionComponent,
 } from "@earendil-works/pi-coding-agent";
+import { BUILT_IN_JEV_WAIT_CHECK } from "../src/config.js";
 
 import {
 	buildUnlockToolParameters,
@@ -274,6 +274,264 @@ test("execute: invalid arguments throw and never touch the host", async () => {
 		/reason_type/,
 	);
 	assert.deepEqual(applied, []);
+});
+
+function reviewFixture(
+	answer: unknown = {
+		choice: "contradicted",
+		confidence: 0.7,
+		probabilities: { contradicted: 0.84 },
+	},
+) {
+	let cycleId = 1;
+	let rejections = 0;
+	let locked = true;
+	let fetches = 0;
+	let applied = 0;
+	let leaf = "stop";
+	let respond = async () =>
+		new Response(JSON.stringify({ answers: { stop_review: answer } }));
+	const host: UnlockToolHost = {
+		isCurrentMain: () => true,
+		isLocked: () => locked,
+		applyAiUnlock: () => {
+			applied += 1;
+			locked = false;
+			return true;
+		},
+		reviewState: () => ({ cycleId, rejections }),
+		recordReviewRejection: (token) =>
+			token === cycleId && rejections < 3 ? ++rejections : null,
+		jev: {
+			config: BUILT_IN_JEV_WAIT_CHECK,
+			env: { TYPESAFE_API_KEY: "test-key" },
+			fetchFn: async () => {
+				fetches += 1;
+				return respond();
+			},
+		},
+	};
+	const tool = createUnlockToolDefinition({ reasonTypes: DEFAULT_TYPES }, host);
+	const ctx = {
+		sessionManager: {
+			getLeafId: () => leaf,
+			getBranch: () => [
+				{
+					type: "message",
+					id: "user",
+					message: { role: "user", content: "Continue without asking again" },
+				},
+				{
+					type: "message",
+					id: "stop",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "May I proceed?" }],
+					},
+				},
+			],
+		},
+	};
+	return {
+		host,
+		call: (reasonType = "WAIT_USER", signal?: AbortSignal) =>
+			tool.execute(
+				"review-call",
+				{
+					reason_type: reasonType,
+					reason: "Waiting for permission to proceed",
+				} as never,
+				signal,
+				undefined,
+				ctx as never,
+			),
+		get fetches() {
+			return fetches;
+		},
+		get applied() {
+			return applied;
+		},
+		get rejections() {
+			return rejections;
+		},
+		unlock: () => {
+			locked = false;
+		},
+		restart: () => {
+			cycleId += 1;
+			rejections = 0;
+		},
+		navigate: () => {
+			leaf = "other-branch";
+		},
+		respond: (fn: typeof respond) => {
+			respond = fn;
+		},
+	};
+}
+
+test("execute: review rejects three times, fourth passes, without touching unlock early", async () => {
+	const fixture = reviewFixture();
+	for (let n = 1; n <= 3; n++) {
+		await assert.rejects(
+			fixture.call(),
+			new RegExp(`Unlock refused \\(${n}/3\\)`),
+		);
+		assert.equal(fixture.applied, 0);
+	}
+	assert.equal((await fixture.call()).terminate, true);
+	assert.equal(fixture.fetches, 3);
+	assert.equal(fixture.rejections, 3);
+	assert.equal(fixture.applied, 1);
+});
+
+test("execute: nonreviewed reasons, no key and disabled review preserve unlock", async () => {
+	for (const reasonType of ["JOB_DONE", "JOB_BLOCKED", "WAIT_CALLBACK"]) {
+		const fixture = reviewFixture();
+		assert.equal((await fixture.call(reasonType)).terminate, true);
+		assert.equal(fixture.fetches, 0);
+	}
+	for (const disabled of [false, true]) {
+		const fixture = reviewFixture();
+		assert.ok(fixture.host.jev);
+		fixture.host.jev.env = {};
+		if (disabled)
+			fixture.host.jev.config = { ...BUILT_IN_JEV_WAIT_CHECK, enabled: false };
+		assert.equal((await fixture.call()).terminate, true);
+		assert.equal(fixture.fetches, 0);
+	}
+});
+
+test("execute: uncertainty, probability missing and service failure accept", async () => {
+	for (const answer of [
+		{
+			choice: "supported",
+			confidence: 0.99,
+			probabilities: { contradicted: 0.01 },
+		},
+		{
+			choice: "contradicted",
+			confidence: 0.99,
+			probabilities: { contradicted: 0.53 },
+		},
+		{ choice: "contradicted", confidence: 0.99 },
+		null,
+	]) {
+		const fixture = reviewFixture(answer);
+		assert.equal((await fixture.call()).terminate, true);
+		assert.equal(fixture.applied, 1);
+		assert.equal(fixture.rejections, 0);
+	}
+	const fixture = reviewFixture();
+	fixture.respond(async () => new Response("failure", { status: 500 }));
+	assert.equal((await fixture.call()).terminate, true);
+});
+
+test("execute: timeout accepts once and concurrent refusals stay bounded", async () => {
+	const timeout = reviewFixture();
+	assert.ok(timeout.host.jev);
+	timeout.host.jev.config = { ...BUILT_IN_JEV_WAIT_CHECK, timeoutMs: 20 };
+	timeout.host.jev.fetchFn = (_url, init) =>
+		new Promise((_resolve, reject) => {
+			init.signal?.addEventListener(
+				"abort",
+				() => reject(new Error("timeout")),
+				{ once: true },
+			);
+		});
+	const keepAlive = setInterval(() => {}, 100);
+	try {
+		assert.equal((await timeout.call()).terminate, true);
+	} finally {
+		clearInterval(keepAlive);
+	}
+	const parallel = reviewFixture();
+	const results = await Promise.allSettled(
+		Array.from({ length: 6 }, () => parallel.call()),
+	);
+	assert.equal(
+		results.filter((result) => result.status === "rejected").length,
+		3,
+	);
+	assert.equal(parallel.rejections, 3);
+});
+
+test("execute: no request while unlocked and no request after stale credential lookup", async () => {
+	const unlocked = reviewFixture();
+	unlocked.unlock();
+	assert.equal((await unlocked.call()).terminate, undefined);
+	assert.equal(unlocked.fetches, 0);
+	const stale = reviewFixture();
+	assert.ok(stale.host.jev);
+	stale.host.jev.registry = {
+		async getApiKeyForProvider() {
+			stale.restart();
+			return "resolved-key";
+		},
+	};
+	assert.equal((await stale.call()).terminate, undefined);
+	assert.equal(stale.fetches, 0);
+	assert.equal(stale.applied, 0);
+});
+
+test("execute: skipped-review async gaps cannot unlock a stale cycle, branch or cancelled call", async () => {
+	for (const mode of ["cap", "disabled", "nonreviewed"] as const) {
+		for (const interrupt of ["restart", "navigate", "abort"] as const) {
+			const fixture = reviewFixture();
+			if (mode === "cap")
+				for (let n = 0; n < 3; n++)
+					await assert.rejects(fixture.call(), /Unlock refused/);
+			if (mode === "disabled") {
+				assert.ok(fixture.host.jev);
+				fixture.host.jev.config = {
+					...BUILT_IN_JEV_WAIT_CHECK,
+					enabled: false,
+				};
+			}
+			const abort = new AbortController();
+			const pending = fixture.call(
+				mode === "nonreviewed" ? "JOB_DONE" : "WAIT_USER",
+				abort.signal,
+			);
+			if (interrupt === "abort") abort.abort();
+			else fixture[interrupt]();
+			assert.equal(
+				(await pending).terminate,
+				undefined,
+				`${mode}/${interrupt}`,
+			);
+			assert.equal(fixture.applied, 0, `${mode}/${interrupt}`);
+			assert.equal(fixture.fetches, mode === "cap" ? 3 : 0);
+		}
+	}
+});
+
+test("execute: manual unlock, restart, navigation and cancellation discard verdict", async () => {
+	for (const interrupt of ["unlock", "restart", "navigate", "abort"] as const) {
+		const fixture = reviewFixture();
+		const abort = new AbortController();
+		fixture.respond(async () => {
+			if (interrupt === "abort") abort.abort();
+			else fixture[interrupt]();
+			return new Response(
+				JSON.stringify({
+					answers: {
+						stop_review: {
+							choice: "contradicted",
+							confidence: 0.9,
+							probabilities: { contradicted: 0.99 },
+						},
+					},
+				}),
+			);
+		});
+		assert.equal(
+			(await fixture.call("WAIT_USER", abort.signal)).terminate,
+			undefined,
+		);
+		assert.equal(fixture.applied, 0);
+		assert.equal(fixture.rejections, 0);
+	}
 });
 
 test("unlockToolUserReadyValues carries type and reason", () => {

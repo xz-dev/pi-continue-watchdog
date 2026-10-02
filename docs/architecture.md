@@ -34,14 +34,16 @@ replace timer and wait one fixed 10-second fence
 qualify the same generation and re-check ownership/auth
           │
           ├─ locked, budget left ─► jev wait gate (only with a key and final text)
-          │     ├─ confident waiting_user, state unchanged ─► AI unlock → user-ready WAIT_USER
+          │     ├─ confident waiting_user, state unchanged ─► permission review if a tool stop was refused this cycle → accepted AI unlock / refused continuation
           │     ├─ state changed during the request ─────────► drop verdict, do nothing
           │     └─ otherwise (incl. no key / failure) ───────► one direct continuation → next turn
           └─ locked, exhausted ───► one exhaustion event → user-ready EXHAUSTED
 
 anytime: main agent calls unlock_continue_watchdog(reason_type, reason)
           │
-          └─► controller unlock → run terminates → user-ready AI_UNLOCK
+          └─► validate → WAIT_USER permission review → accepted controller unlock / ordinary tool error
+                         │
+                         └─► accepted: run terminates → user-ready AI_UNLOCK
 ```
 
 ## Module map
@@ -53,8 +55,8 @@ anytime: main agent calls unlock_continue_watchdog(reason_type, reason)
 | `src/controller.ts` | Pure lock, continuation-attempt, and exhaustion accounting |
 | `src/runtime.ts` | Aggregate generation wiring, ownership/auth fencing, unlock-tool registration, direct continuation publication, scheduling, and hook publication |
 | `src/watchdog-event.ts` | Versioned event metadata, local-offset RFC 3339 timestamps, legacy-tolerant parsing, and canonical immutable human/model bodies |
-| `src/jev-wait-gate.ts` | jev key/endpoint resolution, the one-question Choice request, final-assistant-text extraction, and the `WAIT_USER` reason text; every failure is `null` so the runtime fails open |
-| `src/unlock-tool.ts` | The `unlock_continue_watchdog` tool: schema, argument validation, AI-unlock application, and rendering |
+| `src/jev-wait-gate.ts` | Shared Choice transport, endpoint/key resolution, bounded four-section branch state, permission review, wait classification and reason text |
+| `src/unlock-tool.ts` | Schema, validation, shared stop-review orchestration and stale guard, AI-unlock application, and rendering |
 | `src/context-fold.ts` | Read-only legacy decision-exchange folding plus cancelled-continuation removal before provider requests |
 | `src/abort-outcome.ts` | Detect canonical main-run `stopReason: "aborted"` outcomes |
 | `src/auto-lock.ts` | Start a fresh lock cycle when a real main user message begins processing |
@@ -153,15 +155,19 @@ The AI-to-extension channel is one always-registered tool, `unlock_continue_watc
 - `reason_type` is trimmed and matched case-insensitively against the effective configured `reasonTypes`; the matched configured value is used in uppercase. The schema enumerates the canonical uppercase values, and its description explains each built-in value. `prepareArguments` canonicalizes a recognized value (trim, case-insensitive) before Pi's schema validation, so a differently-cased configured value is still accepted; an unknown value fails with an error that lists the allowed values.
 - `reason` is trimmed, non-blank, and at most 1000 Unicode code points.
 - Invalid arguments throw a named constraint error and become an ordinary failed tool result; the model can retry naturally. There is no re-ask protocol and no separate invalid-response accounting.
-- A valid call from the locked current main agent unlocks through the same controller unlock semantics as other unlocks, clears any pending continuation, returns a short successful result with `terminate: true` (no follow-up model request), and retains the `user-ready` `AI_UNLOCK` intent with `REASON_TYPE` and `REASON` for deferred aggregate-idle publication.
+- A valid, accepted call from the locked current main agent unlocks through the same controller unlock semantics as other unlocks, clears any pending continuation, returns a short successful result with `terminate: true` (no follow-up model request), and retains the `user-ready` `AI_UNLOCK` intent with `REASON_TYPE` and `REASON` for deferred aggregate-idle publication.
 - A call while unlocked, from a non-main session, or after a lost race returns a harmless informational result and publishes nothing.
 - The tool call and its result are the only model-visible record of the unlock; no separate unlock event message is published.
+
+The runtime additionally owns a shared rejection count and stale-review token. A `WAIT_USER` tool call with a key is reviewed against the latest real user turn on the active branch: stop claim, user/questionnaire answers, visible assistant replies and short tool trace. The hard 24k Unicode-character budget drops oldest trace lines first, then shortens assistant and user/answer sections retaining head/tail with markers. Only a confident contradiction probability can reject; missing probability never falls back to confidence. Ordinary review failures accept, while lifecycle/tool cancellation or changed main, cycle, branch leaf or automatic qualification discards the verdict before any mutation.
+
+A tool rejection throws a normal tool error without termination or `user-ready`. Its count is atomically recorded only under the captured token and the shared limit of three. Following any tool rejection in the cycle, confident automatic wait-gate stops call the same review helper, with an additional live qualification predicate checked after every await and before counting. A rejected automatic stop dispatches a normal continuation; after three total rejections further stops pass without review. Real main user messages and fresh locks reset the count; ordinary continuation turns preserve it. Manual unlock, abort and terminal error never consult this review.
 
 The extension-to-AI channel is a direct continuation. Where an inquiry used to be sent, the runtime consumes one attempt with `recordAutomaticContinue()`, builds the canonical continuation body (a timestamped `continue` event carrying the configured `continuePrompt` and the unlock-and-wait guidance), sends it as a visible `pi-continue-watchdog:continuation` custom message with `triggerTurn`, correlates the watchdog-owned run through the message's exchange identity for manual-unlock cancellation, and publishes the `watchdog-continued` hook with empty values. On a send failure or ownership loss the attempt is rolled back and retried at a later qualified idle; the hook publishes only after the durable send.
 
 ## Stable tools and blocked execution
 
-The extension deliberately keeps the ordinary active tool list and tool-dependent system-prompt prefix unchanged at all times. The one watchdog tool is registered permanently in root processes; no lock, continuation, or unlock changes the tool set, so prompt-cache reuse is preserved. Tool execution is never blocked by the watchdog.
+The extension deliberately keeps the ordinary active tool list and tool-dependent system-prompt prefix unchanged at all times. The one watchdog tool is registered permanently in root processes; no lock, continuation, or unlock changes the tool set, so prompt-cache reuse is preserved. Other tool execution is never blocked by the watchdog; only a confidently contradicted `WAIT_USER` unlock is refused as an ordinary tool error.
 
 ## Context-excluded records
 
@@ -199,7 +205,8 @@ Packed E2E covers persistent sessions, confirming old records stay readable and 
 ### Unlock tool call
 
 - validate type and reason;
-- assign unlocked before cleanup;
+- review WAIT_USER permission when enabled and under the shared cap; on contradiction return a tool error without changing the lock or attempt count;
+- for accepted calls, assign unlocked before cleanup;
 - cancel timers and pending continuation work;
 - do not start another work turn (tool result terminates the run);
 - remain unlocked even if the deferred `user-ready` publication is delayed;
@@ -218,7 +225,7 @@ Manual unlock is ownership-aware. Before ordinary unlock cleanup erases operatio
 
 ## Avoiding a persistent `working` state
 
-The runtime never starts nested agent work from inside an unfinished run. The unlock tool's own result terminates the run without a follow-up request, and continuations are dispatched only from the idle-fence callback after aggregate-idle confirmation.
+The runtime never starts nested agent work from inside an unfinished run. Accepted unlock results terminate the run; refused unlocks use Pi's ordinary tool-error follow-up. Automatic continuations are dispatched only from the idle-fence callback after aggregate-idle confirmation.
 
 Packed E2E uses bounded idle assertions against both `session.isIdle` and `session.waitForIdle()` for continuations, unlock-tool turns, exhaustion, abort, compaction recovery, multi-attachment coordination, and persisted resume. These checks fail if Pi remains in `working` beyond the accepted deadline.
 

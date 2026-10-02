@@ -62,7 +62,10 @@ import {
 } from "./semantic-hook.js";
 import {
 	createUnlockToolDefinition,
+	MAX_UNLOCK_REVIEW_REJECTIONS,
 	registerUnlockTool,
+	reviewUnlockAttempt,
+	type UnlockToolHost,
 	unlockToolUserReadyValues,
 } from "./unlock-tool.js";
 import {
@@ -272,6 +275,8 @@ export function createDecisionRuntime(
 	let configReady = options.injectedController === true;
 	let lifecycleGeneration = 0;
 	let localActivityGeneration = 0;
+	let reviewCycleId = 0;
+	let reviewRejections = 0;
 	/** Binary AI lifecycle state: agent_start = busy, true agent_settled = idle. */
 	let localAiBusy = true;
 	let stopped = false;
@@ -550,6 +555,7 @@ export function createDecisionRuntime(
 	 * Does not change controller lock/cycle accounting.
 	 */
 	const clearOperationalPendingWork = (): void => {
+		reviewCycleId += 1;
 		localActivityGeneration += 1;
 		continuationDispatchPending = false;
 		if (manualCancellation === null) decisionAssistantToSplice = null;
@@ -871,7 +877,34 @@ export function createDecisionRuntime(
 				verdict?.choice === "waiting_user" &&
 				verdict.confidence >= jevConfig.confidenceThreshold
 			) {
-				applyJevUnlock(ctx, claim, buildJevReason(entry.text));
+				const reason = buildJevReason(entry.text);
+				if (
+					reviewRejections > 0 &&
+					reviewRejections < MAX_UNLOCK_REVIEW_REJECTIONS
+				) {
+					const review = await reviewUnlockAttempt(
+						unlockToolHost,
+						ctx,
+						{ reasonType: "WAIT_USER", reason },
+						undefined,
+						() =>
+							stillQualified(ctx, generation) !== null &&
+							owns(claim) &&
+							latestAssistantEntry(ctx)?.id === entry.id,
+					);
+					if (
+						review.outcome === "stale" ||
+						stillQualified(ctx, generation) === null ||
+						!owns(claim) ||
+						latestAssistantEntry(ctx)?.id !== entry.id
+					)
+						return;
+					if (review.outcome === "rejected") {
+						dispatchContinuation(claim);
+						return;
+					}
+				}
+				applyJevUnlock(ctx, claim, reason);
 				return;
 			}
 			dispatchContinuation(claim);
@@ -1087,6 +1120,7 @@ export function createDecisionRuntime(
 
 		const lockTransition = controller.lock();
 		if (stopIfStale(claim)) return;
+		reviewRejections = 0;
 		applyTransition(lockTransition, ctx, {
 			suppressNotify: restartOptions?.notifyLocked !== true,
 			claim,
@@ -1257,6 +1291,35 @@ export function createDecisionRuntime(
 		return true;
 	};
 
+	const unlockToolHost: UnlockToolHost = {
+		isCurrentMain,
+		isLocked: () => currentController()?.snapshot.locked === true,
+		applyAiUnlock: applyAiUnlockFromTool,
+		reviewState: () =>
+			isCurrentMain() && currentController()?.snapshot.locked === true
+				? { cycleId: reviewCycleId, rejections: reviewRejections }
+				: null,
+		recordReviewRejection: (cycleId) => {
+			if (
+				cycleId !== reviewCycleId ||
+				!isCurrentMain() ||
+				currentController()?.snapshot.locked !== true ||
+				reviewRejections >= MAX_UNLOCK_REVIEW_REJECTIONS
+			)
+				return null;
+			return ++reviewRejections;
+		},
+		get jev() {
+			return {
+				config: config.jevWaitCheck ?? BUILT_IN_JEV_WAIT_CHECK,
+				registry: sessionContext?.modelRegistry,
+				env: options.jevWait?.env,
+				fetchFn: options.jevWait?.fetchFn,
+				signal: jevAbort.signal,
+			};
+		},
+	};
+
 	const acquireControl = (claim: HubMainClaim): void => {
 		if (stopped || !options.hub.isCurrentMain(claim)) return;
 		ownedClaim = claim;
@@ -1334,11 +1397,7 @@ export function createDecisionRuntime(
 		unlockToolRegistered = true;
 		registerUnlockTool(
 			options.pi,
-			createUnlockToolDefinition(config, {
-				isCurrentMain,
-				isLocked: () => currentController()?.snapshot.locked === true,
-				applyAiUnlock: (call) => applyAiUnlockFromTool(call),
-			}),
+			createUnlockToolDefinition(config, unlockToolHost),
 		);
 	};
 
@@ -1554,6 +1613,7 @@ export function createDecisionRuntime(
 			if (claim !== null && controller !== null) {
 				const transition = controller.ensureLocked();
 				if (transition.applied) {
+					reviewRejections = 0;
 					// Fresh silent lock: controller first, then operational cleanup.
 					clearOperationalPendingWork();
 					applyTransition(transition, undefined, {
@@ -1574,6 +1634,7 @@ export function createDecisionRuntime(
 		// Pi emits session_tree while its branch-summary controller is still set, so
 		// ctx.isIdle() reads busy here; do not probe. The fence expiry re-probes.
 		options.pi.on("session_tree", () => {
+			reviewCycleId += 1;
 			localActivityGeneration += 1;
 			observeAggregate();
 		});
