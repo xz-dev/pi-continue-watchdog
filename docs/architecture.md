@@ -4,12 +4,18 @@ This document explains how `pi-continue-watchdog` observes agent activity, decid
 
 For externally observable requirements, see [`behavior-contract.md`](behavior-contract.md). This document describes the current implementation and its boundaries; it does not replace the behavior contract.
 
+## Current verification boundary
+
+The approved contract is plugin-only: exact owned-run metadata and the plugin's local `context` observation confirm the inquiry phase. A later handler can remove or replace that inquiry before provider dispatch; final payload certification is not supplied by this plugin, stable tool metadata, or Lean proofs. Pi may also reject ordinary non-object `cw` arguments before plugin authorization. These two observed host boundaries are now explicit contract limits, not repaired host behavior. See the [change verification record](../openspec/changes/align-unlock-tool-with-reflection-contract/verification.md) for the earlier strict-contract BLOCK and the revised acceptance evidence.
+
+Owned malformed transports stop at `message_end` without executable calls; admissible singleton calls retain their tool/thinking blocks. Shared publication is acknowledged by a new correlated public branch entry, not by a void send return. This applies to continue, wait, unlock, decision failure, exhaustion, and completed-wait records. Continuation notification waits for a later context/settlement observation. Terminal records and completed-wait bodies retain their original metadata while awaiting confirmation; subsequent eligible lifecycle observations can retry a confirmed missing append. An unreadable receipt is retained without a duplicate send, refund, or terminal signal. Reset, cancellation, or ownership loss invalidates its authority. These safeguards are not a proof of every publication interleaving. “Consumed” below denotes local phase confirmation, not final network-request consumption.
+
 ## System overview
 
 The extension has three layers:
 
 1. **Observation** — determine whether the elected root main, every same-process attachment, and every authenticated watchdog-loaded child process are idle.
-2. **State machine** — decide when to fence, continue, exhaust, or accept an unlock-tool stop.
+2. **State machine** — decide when to fence, open a decision inquiry, accept a verdict, wait, exhaust, or decision-fail.
 3. **Pi adapter** — connect the state machine to Pi lifecycle, session, provider-context, TUI, and semantic-hook APIs.
 
 ```text
@@ -19,7 +25,7 @@ real main user message starts
 silent cleanup → fresh watchdog lock
           │
           ▼
-main agent works; ends turn without calling unlock_continue_watchdog
+main agent works; ends its ordinary turn
           │
           ▼
 observe main, same-process attachments, and authenticated child processes
@@ -33,15 +39,17 @@ replace timer and wait one fixed 10-second fence
           ▼
 qualify the same generation and re-check ownership/auth
           │
-          ├─ locked, budget left ─► jev wait gate (only with a key and final text)
-          │     ├─ confident waiting_user, state unchanged ─► permission review if a tool stop was refused this cycle → accepted AI unlock / refused continuation
-          │     ├─ state changed during the request ─────────► drop verdict, do nothing
-          │     └─ otherwise (incl. no key / failure) ───────► one direct continuation → next turn
+          ├─ locked, budget left ─► one hidden decision inquiry (continue / wait / unlock)
+          │     ├─ prompt consumed → exactly one cw call → continue: one continuation → next turn
+          │     ├─ wait: arm the deadline, publish the shared wait event and waiting hook
+          │     ├─ unlock: shared unlock outcome event → user-ready AI_UNLOCK
+          │     ├─ invalid ×3 → decision-failed terminal state → user-ready DECISION_FAILED
+          │     └─ deferred / stale / cancelled ───────────► no accounting, retry at next idle
           └─ locked, exhausted ───► one exhaustion event → user-ready EXHAUSTED
 
-anytime: main agent calls unlock_continue_watchdog(reason_type, reason)
+during a consumed decision attempt only: model submits cw(action, …)
           │
-          └─► validate → WAIT_USER permission review → accepted controller unlock / ordinary tool error
+          └─► authorize → preflight the whole batch → stage verdict or error → terminate
                          │
                          └─► accepted: run terminates → user-ready AI_UNLOCK
 ```
@@ -52,12 +60,12 @@ anytime: main agent calls unlock_continue_watchdog(reason_type, reason)
 |---|---|
 | `src/hub.ts` | Process-wide attachment registration, main election, and aggregate busy/idle state |
 | `src/activity-grace.ts` | One replaceable fixed 10-second fence; every observation replaces it and stale callbacks are inert |
-| `src/controller.ts` | Pure lock, continuation-attempt, and exhaustion accounting |
-| `src/runtime.ts` | Aggregate generation wiring, ownership/auth fencing, unlock-tool registration, direct continuation publication, scheduling, and hook publication |
+| `src/controller.ts` | Pure lock, decision-window, wait-deadline, invalid-attempt, and exhaustion accounting |
+| `src/runtime.ts` | Aggregate generation wiring, ownership/auth fencing, reserved-function registration, decision inquiry lifecycle, verdict finalization, scheduling, and hook publication |
+| `src/decision-protocol.ts` | Decision/wait JSON payload validation, fixed decision and correction prompts, and the per-inquiry response collector |
+| `src/decision-tool.ts` | Reserved `cw` declaration, shared runtime authorization seam, and terminating result staging |
 | `src/watchdog-event.ts` | Versioned event metadata, local-offset RFC 3339 timestamps, legacy-tolerant parsing, and canonical immutable human/model bodies |
-| `src/jev-wait-gate.ts` | Shared Choice transport, endpoint/key resolution, bounded four-section branch state, permission review, wait classification and reason text |
-| `src/unlock-tool.ts` | Schema, validation, shared stop-review orchestration and stale guard, AI-unlock application, and rendering |
-| `src/context-fold.ts` | Read-only legacy decision-exchange folding plus cancelled-continuation removal before provider requests |
+| `src/context-fold.ts` | Exact-exchange folding of completed function inquiries plus read-only legacy folding and cancelled-run removal |
 | `src/abort-outcome.ts` | Detect canonical main-run `stopReason: "aborted"` outcomes |
 | `src/auto-lock.ts` | Start a fresh lock cycle when a real main user message begins processing |
 | `src/commands.ts` | Human lock/unlock commands plus status and timeline rendering across new shared events and legacy TUI-only entries |
@@ -97,8 +105,12 @@ The controller tracks:
 
 ```text
 locked
-attempt
-exhausted
+attempt                      accepted continue/wait verdicts this cycle
+exhausted                    shared budget spent
+decisionOpen / decisionId    the currently open inquiry
+invalidDecisionAttempts      invalid responses of the current inquiry (max 3)
+decisionFailed               locked terminal state after the third invalid response
+waitUntilMs                  earliest absolute time another automatic decision may open
 ```
 
 ### Fresh cycle
@@ -107,13 +119,13 @@ A real main user message and `/lock-continue-watchdog` both start a fresh cycle:
 
 ```text
 silent unlock cleanup
-→ cancel timer and pending continuation work
-→ clear exhausted / attempt accounting
+→ cancel timer, pending decision, wait, and continuation work
+→ clear exhausted / attempt / decision accounting
 → fresh lock
 → reconcile aggregate idle
 ```
 
-The cleanup happens before locking so stale timers or finalizations from an earlier task cannot act on the new task.
+The cleanup happens before locking so stale timers, verdicts, or finalizations from an earlier task cannot act on the new task.
 
 An ordinary non-user `agent_start` only performs `ensureLocked()`:
 
@@ -128,9 +140,9 @@ Unlock first assigns `locked = false`, then cancels operational timer and contin
 
 Every relevant live-state observation cancels and replaces the current candidate. If the newly observed state is eligible, the root starts one event-loop `setTimeout` for a complete 10,000 ms idle fence from that observation. Otherwise it remains blocked. Equal old/new observations are still replacements. The callback captures an identity token so cleared or already-queued stale callbacks are inert.
 
-At expiry the root rechecks enabled/locked eligibility, exact timer generation, empty busy-child set, current ownership, pending messages, and a fresh public `ctx.isIdle()` value before dispatching the continuation. A rejected confirm remains consumed until a later real event/report; runtime code never self-rearms by internally observing the same facts. There is no periodic polling, stale-timeout inference, or business-level uncertain state.
+At expiry the root rechecks enabled/locked eligibility, exact timer generation, empty busy-child set, current ownership, pending messages, and a fresh public `ctx.isIdle()` value before opening the decision inquiry. A rejected confirm remains consumed until a later real event/report; runtime code never self-rearms by internally observing the same facts. There is no periodic polling, stale-timeout inference, or business-level uncertain state.
 
-A continuation that consumes the final attempt sets controller exhaustion immediately. The exhausted idle epoch then publishes `EXHAUSTED`; there is no separate terminal deadline timer.
+An accepted continue or wait that consumes the final attempt sets controller exhaustion immediately, but a final wait keeps its own deadline: the exhausted idle epoch can publish `EXHAUSTED` only after that deadline plus fresh aggregate-idle qualification, using one terminal deadline timer.
 
 ## Ownership and stale-work fencing
 
@@ -143,39 +155,37 @@ Timers and asynchronous callbacks are not trusted merely because they fired. Run
 
 Before and after re-entrant Pi calls, the runtime verifies that the original claim still owns main. Old timers, demoted attachments, replaced mains, restarted lock cycles, and shutdown runtimes become inert instead of continuing stale work.
 
-## Unlock tool and direct continuation
+## Reserved decision function and watchdog-owned inquiry
 
-The AI-to-extension channel is one always-registered tool, `unlock_continue_watchdog`:
+The AI-to-extension channel is one reserved root-only function, `cw`:
 
 ```json
-{ "reason_type": "JOB_DONE", "reason": "All requested work is complete." }
+{ "action": "unlock", "reason_type": "JOB_DONE", "reason_content": "All requested work is complete." }
 ```
 
-- Registration happens once per root-process session when the effective config is committed (the same `onConfigReady` path as the unlock shortcut). Child Pi processes in the domain never register it, and the tool is never deactivated, so the provider tool list and prompt prefix stay stable across every lock, continuation, and unlock.
-- `reason_type` is trimmed and matched case-insensitively against the effective configured `reasonTypes`; the matched configured value is used in uppercase. The schema enumerates the canonical uppercase values, and its description explains each built-in value. `prepareArguments` canonicalizes a recognized value (trim, case-insensitive) before Pi's schema validation, so a differently-cased configured value is still accepted; an unknown value fails with an error that lists the allowed values.
-- `reason` is trimmed, non-blank, and at most 1000 Unicode code points.
-- Invalid arguments throw a named constraint error and become an ordinary failed tool result; the model can retry naturally. There is no re-ask protocol and no separate invalid-response accounting.
-- A valid, accepted call from the locked current main agent unlocks through the same controller unlock semantics as other unlocks, clears any pending continuation, returns a short successful result with `terminate: true` (no follow-up model request), and retains the `user-ready` `AI_UNLOCK` intent with `REASON_TYPE` and `REASON` for deferred aggregate-idle publication.
-- A call while unlocked, from a non-main session, or after a lost race returns a harmless informational result and publishes nothing.
-- The tool call and its result are the only model-visible record of the unlock; no separate unlock event message is published.
+- Registration happens once per root-process session when the effective config is committed (the same `onConfigReady` path as the unlock shortcut). Child Pi processes in the domain never register it, and the declaration and active membership never change, so the provider tool list and prompt prefix stay stable across every lock, decision, wait, and unlock.
+- The public declaration is fixed and minimal: description exactly `don't use unless ask`, an open empty-object parameter schema, no prompt snippet or guidelines, and no reason enums. Full usage and configured allowed values appear only in authorized decision and correction prompts; runtime validation enforces the contract despite the minimal schema.
+- Authorization lives in the runtime, checked before plugin action/reason validation in both the `tool_call` gate and `execute`: only the exact current main attachment's locally confirmed attempt and recorded submitting call identity may stage a result. Other calls reaching the plugin return `This function is reserved for the plugin. Please try another function.` without state changes or termination. Pi may reject non-object containers first; that native rejection cannot change watchdog accounting or block unrelated ordinary tools.
+- Payloads: `action` is `continue`, `wait`, or `unlock` (case-insensitive after trimming). Continue and unlock additionally require a `reason_type` matched case-insensitively against `continueReasonTypes` or `reasonTypes`, normalized uppercase. Wait requires an integer `wait_seconds` from 1 through 1800 and rejects a `reason_type`. `reason_content` is trimmed, non-empty, at most 1000 Unicode code points (500 stated as prompt guidance). XML and prose are never parsed as a result.
+- The complete owned batch is preflighted at `message_end` before any tool runs. Malformed batches are projected to a normal stop with no executable calls and count once as invalid; suppressed calls need no per-call result. An admissible singleton keeps its call/thinking blocks, stages its validated verdict or named error, and returns a terminating result. Neither path permits work-tool effects or unbudgeted native follow-ups.
+- An accepted `unlock` verdict unlocks through the same controller unlock semantics as other unlocks, clears pending work and wait state, ends its decision without an acknowledgement-only model request, and retains the `user-ready` `AI_UNLOCK` intent with normalized `REASON_TYPE` and trimmed `REASON` for deferred aggregate-idle publication. The shared unlock outcome event is the model-visible record; the raw inquiry traffic folds away.
+- Invalid responses follow bounded correction: at most three consumed responses per inquiry, corrections re-teach the same function contract, invalid responses never consume the continue/wait budget, and the third failure enters a decision-failed terminal state eligible for `STOP_KIND=DECISION_FAILED` at terminal idle.
 
-The runtime additionally owns a shared rejection count and stale-review token. A `WAIT_USER` tool call with a key is reviewed against the latest real user turn on the active branch: stop claim, user/questionnaire answers, visible assistant replies and short tool trace. The hard 24k Unicode-character budget drops oldest trace lines first, then shortens assistant and user/answer sections retaining head/tail with markers. Only a confident contradiction probability can reject; missing probability never falls back to confidence. Ordinary review failures accept, while lifecycle/tool cancellation or changed main, cycle, branch leaf or automatic qualification discards the verdict before any mutation.
+The extension-to-AI control channel is a watchdog-owned inquiry. After the fixed ten-second aggregate-idle fence qualifies and fresh idle, ownership, and process-domain guards pass, the runtime opens one hidden decision inquiry: the configured `decisionPrompt` plus the fixed outcome and function contract, sent as a trigger-turn custom message through the shared inquiry handle. Only after the exact prompt is observed in the corresponding run and plugin-local context — correlated through host metadata, never prompt-text matching — can a result act. The runtime, not Pi's ordinary tool-error follow-up, schedules at most two corrective re-asks; dispatch deferral, cancellation, or stale ownership is not an invalid model answer. Terminal `stopReason: "error"` and human abort keep their separate paths.
 
-A tool rejection throws a normal tool error without termination or `user-ready`. Its count is atomically recorded only under the captured token and the shared limit of three. Following any tool rejection in the cycle, confident automatic wait-gate stops call the same review helper, with an additional live qualification predicate checked after every await and before counting. A rejected automatic stop dispatches a normal continuation; after three total rejections further stops pass without review. Real main user messages and fresh locks reset the count; ordinary continuation turns preserve it. Manual unlock, abort and terminal error never consult this review.
-
-The extension-to-AI channel is a direct continuation. Where an inquiry used to be sent, the runtime consumes one attempt with `recordAutomaticContinue()`, builds the canonical continuation body (a timestamped `continue` event carrying the configured `continuePrompt` and the unlock-and-wait guidance), sends it as a visible `pi-continue-watchdog:continuation` custom message with `triggerTurn`, correlates the watchdog-owned run through the message's exchange identity for manual-unlock cancellation, and publishes the `watchdog-continued` hook with empty values. On a send failure or ownership loss the attempt is rolled back and retried at a later qualified idle; the hook publishes only after the durable send.
+Accepted verdicts map to controller transitions: `continue` and `wait` each consume one shared `maxRetries` attempt (`recordValidContinue` / `recordValidWait`), `unlock` consumes none (`recordValidUnlock`), and the third invalid response enters `decisionFailed` without charging the budget. A wait records one acceptance timestamp and deadline; activity defers eligibility without restarting the duration, and the first qualified inquiry after the deadline begins with the same completed-wait body visible to the human, reused unchanged by corrections. `WAIT_CALLBACK` stays an unlock reason and arms no timer.
 
 ## Stable tools and blocked execution
 
-The extension deliberately keeps the ordinary active tool list and tool-dependent system-prompt prefix unchanged at all times. The one watchdog tool is registered permanently in root processes; no lock, continuation, or unlock changes the tool set, so prompt-cache reuse is preserved. Other tool execution is never blocked by the watchdog; only a confidently contradicted `WAIT_USER` unlock is refused as an ordinary tool error.
+The extension deliberately keeps the ordinary active tool list and tool-dependent system-prompt prefix unchanged at all times. The one reserved function is registered permanently in root processes; no lock, decision, wait, or unlock changes the tool set. This avoids tool-list churn, not all possible provider cache misses. During a confirmed decision only `cw` may execute: malformed batches are suppressed before dispatch so no work tool runs and no unbudgeted native follow-up follows. Outside the decision window ordinary tools run normally.
 
 ## Context-excluded records
 
-The extension appends no decision audit entries in new flows. The unlock tool call/result and the visible continuation message are ordinary context-bearing messages by design. Legacy session files may contain pre-upgrade inquiry markers, decision prompts, folds, and audits; those remain readable but are never rewritten or consulted.
+The extension appends context-excluded decision audit entries recording each response's validated verdict or named error; raw response text is never retained. Legacy session files may contain pre-upgrade inquiry markers, decision prompts, folds, and audits; those remain readable but are never rewritten or consulted.
 
-## Legacy exchange folding
+## Exact-exchange folding and legacy compatibility
 
-`registerDecisionContextFolding` stays registered read-only: `foldInquiryContext` still folds complete legacy inquiry exchanges (prompt, assistant, re-asks, tool-result metadata) out of provider context and keeps their stored replacements, so resumed pre-upgrade sessions remain clean. The cancelled-continuation filter additionally removes an assistant carrying the `pi-continue-watchdog:cancelled` marker for a manually cancelled watchdog-owned continuation run. New code generates no inquiry prompts, markers, folds, or audits.
+`registerDecisionContextFolding` folds complete function-based inquiry exchanges — prompts, corrections, executable result calls, matching tool results, and provider-required thinking — out of later ordinary provider requests through exact exchange ownership, retaining the one shared outcome event in normal conversation order. The same `foldInquiryContext` pass keeps legacy XML inquiry records excluded from provider context, so resumed pre-upgrade sessions remain clean without reinterpreting them as decisions. The cancelled-run filter additionally removes an assistant carrying the `pi-continue-watchdog:cancelled` marker for a manually cancelled watchdog-owned run. Ordinary-request folding does not erase persisted function-call arguments and guarantees nothing about native compaction or branch summaries; the extension never rewrites history.
 
 ## Resume behavior
 
@@ -183,51 +193,63 @@ On normal `pi -c` recovery:
 
 1. `SessionManager` restores the append-only session and its active branch;
 2. legacy plain custom entries remain readable state records but are not Agent messages;
-3. uncompacted continuation and exhaustion event messages retain their exact stored body;
+3. uncompacted continuation, wait, completed-wait, unlock, decision-failure, and exhaustion event messages retain their exact stored body;
 4. the extension reloads and registers its context transform;
-5. before the next provider request, internal legacy decision protocol entries are folded again while the retained shared results remain ordinary context.
+5. before the next provider request, completed decision exchanges (prompts, corrections, result calls, results) and internal legacy decision protocol entries are folded again while the retained shared outcome events remain ordinary context.
 
-Runtime lock state and timers are not restored. No shared event is fabricated from legacy entries. Pi's normal branch selection and compaction decide which new shared events remain exact context; the extension does not scan discarded or sibling history to resurrect them.
+Runtime lock state, timers, and wait deadlines are not restored; reopening history never rearms a timer or fabricates a completed-wait observation. No shared event is fabricated from legacy entries, and legacy XML records are never reinterpreted as control submissions. Pi's normal branch selection and compaction decide which new shared events remain exact context; the extension does not scan discarded or sibling history to resurrect them.
 
-Packed E2E covers persistent sessions, confirming old records stay readable and context-excluded, new bodies survive resume unchanged, and later provider payloads contain neither raw XML nor a reconstructed watchdog-history block.
+The behavior above is the intended resume contract. The current seven packed cases do not establish persistent-session resume coverage; source folding tests alone cannot certify host resume payloads.
 
-## Unlock, tool-unlock, and abort outcomes
+## Verdict outcomes and abort
 
-### Automatic continuation
+### Accepted continue
 
-- commit one continuation attempt and increment the shared attempt budget;
-- create one canonical timestamped continuation body and publish it as the visible continuation message;
-- if publication fails, roll the attempt back and fail closed without hook or turn dispatch; this covers a synchronous throw, ownership loss across the send, and an asynchronous Pi send failure, which is detected when the run settles while the continuation is still pending-start;
-- publish `watchdog-continued` best-effort, with no values, only after the message is durable, meaning its correlated `message_start` is observed while the claim is still owned, since Pi's `sendMessage` returns before persistence;
+- commit one shared continue/wait attempt and increment the budget;
+- create one canonical timestamped continuation body carrying the accepted verdict's normalized reason type and reason, and publish it as the visible continuation message;
+- confirmed publication failure can refund the current attempt; tested subcases include rejected append and later settlement with no correlated branch entry. An unreadable receipt is not evidence of absence, and the complete ownership/publication matrix remains unverified;
+- publish `watchdog-continued` best-effort, with the normalized `REASON_TYPE` and trimmed `REASON`, only after a new correlated public branch entry is observed under the current claim. Neither `message_start` nor the void send return establishes persistence;
 - use that same body and correlation identity for the next ordinary turn;
 - wait one fixed grace for the next authoritative all-idle generation if still locked.
 
-### Unlock tool call
+### Accepted wait
 
-- validate type and reason;
-- review WAIT_USER permission when enabled and under the shared cap; on contradiction return a tool error without changing the lock or attempt count;
-- for accepted calls, assign unlocked before cleanup;
-- cancel timers and pending continuation work;
-- do not start another work turn (tool result terminates the run);
+- commit one shared continue/wait attempt and record one acceptance timestamp and deadline; renewed activity defers eligibility without restarting the duration;
+- publish one shared wait event (requested seconds, acceptance time, deadline, asserting nothing about external task progress) and one `watchdog-waiting` hook with the trimmed `REASON` and decimal `WAIT_SECONDS`;
+- retain an unreadable publication receipt with the original exchange, cycle, acceptance time, and deadline. Later lifecycle/deadline observations retry it (at one-second intervals after an overdue deadline), without refunding on uncertainty or restarting the wait. Unlock or ownership loss invalidates the pending receipt and its wake authority;
+- start no ordinary work turn; when the attempt was the final one, exhaustion eligibility waits for the deadline plus aggregate-idle qualification;
+- at the first qualified inquiry after the deadline, publish at most one completed-wait event reporting requested seconds, observed elapsed whole seconds, and start/observation times with explicit offsets, then reuse those facts unchanged in corrections.
+
+### Accepted unlock
+
+- for accepted verdicts, assign unlocked before cleanup;
+- cancel timers, pending continuation, and wait state;
+- do not start another work turn (the staged result terminates the run);
 - remain unlocked even if the deferred `user-ready` publication is delayed;
-- publish terminal `user-ready` with `AI_UNLOCK`, `REASON_TYPE`, and `REASON` at aggregate idle.
+- publish terminal `user-ready` with `AI_UNLOCK`, normalized `REASON_TYPE`, and trimmed `REASON` at aggregate idle only after the correlated shared unlock record is confirmed. Missing or unreadable publication leaves the controller unlocked and requests no acknowledgement turn.
+
+### Invalid responses and decision failure
+
+- each invalid response counts once against the fixed three-response budget and never consumes a continue/wait attempt;
+- the runtime schedules at most two corrective re-asks, each with a fresh owned and consumed attempt; dispatch deferral, cancellation, or stale ownership is not an invalid model answer;
+- the third invalid response enters the decision-failed terminal state: stay locked, stop automatic requests for the cycle, publish one shared failure event, and make `user-ready` `DECISION_FAILED` eligible under the existing idle rules; manual unlock and a fresh lock cycle retain normal recovery.
 
 ### Exhaustion
 
-- when the final permitted continuation has been consumed and the agent again settles without unlocking, publish one timestamped exhaustion event and one `user-ready` `EXHAUSTED` envelope;
-- start no ordinary work turn; stay locked until a fresh cycle.
+- when the final permitted continue/wait verdict has been consumed and the agent again settles, publish one timestamped exhaustion event and one `user-ready` `EXHAUSTED` envelope after any accepted wait's deadline;
+- start no ordinary work turn; stay locked until a fresh cycle. Mark the exhaustion record published only after its new branch receipt is confirmed, then permit the terminal hook. Completed-wait timing is likewise consumed only after its matching record is confirmed.
 
 ### Main abort, manual cancellation, and user takeover
 
 Abort detection uses Pi's persisted canonical assistant outcome `stopReason: "aborted"`, not raw keyboard guesses. A main abort that is not an internally cancelled watchdog run unlocks reasonlessly and cancels watchdog work.
 
-Manual unlock is ownership-aware. Before ordinary unlock cleanup erases operational state, the runtime captures an exact current-main cancellation target only for an accepted continuation whose public `message_start` matched the continuation message's exchange identity. The controller becomes unlocked first; the runtime then calls public `ctx.abort()` only when that target is current. A genuine user or foreign custom `message_start` can occur inside the same Pi agent lifecycle as a continuation; that event transfers ownership away from the watchdog before any later unlock. Uninterruptible `message_end` neutralizes the target assistant with the `pi-continue-watchdog:cancelled` marker and `piContinuation` correlation; context transformation drops the marked assistant; and an idle best-effort splice removes the exact settled entry. No model cleanup turn is sent, the extension does not inspect, copy, replay, or explicitly clear Pi's private steering/follow-up queues, and an ordinary uncorrelated run is never adopted by timing or lock-state inference. User input arriving during a continuation run simply steers Pi normally: the next real user message starts a fresh lock cycle. Child abort causes are not inspected and do not unlock main. Cancellation cannot roll back completed tool effects or guarantee termination of detached/background work that no longer obeys the active run signal.
+Manual unlock is ownership-aware. Before ordinary unlock cleanup erases operational state, the runtime captures an exact current-main cancellation target only for an accepted decision, correction, or continuation whose public `message_start` matched the correlated exchange identity. The controller becomes unlocked first; the runtime then calls public `ctx.abort()` only when that target is current. A genuine user or foreign custom `message_start` can occur inside the same Pi agent lifecycle as a watchdog-owned run; that event transfers ownership away from the watchdog before any later unlock. Uninterruptible `message_end` neutralizes the target assistant with the `pi-continue-watchdog:cancelled` marker and correlation; context transformation drops the marked assistant; and an idle best-effort splice removes the exact settled entry. Unlock immediately revokes queued and active result-submission authority and invalidates any pending wait deadline: later calls, tool results, or settlement callbacks from the cancelled exchange cannot restart it or affect a later cycle. No model cleanup turn is sent, the extension does not inspect, copy, replay, or explicitly clear Pi's private steering/follow-up queues, and an ordinary uncorrelated run is never adopted by timing or lock-state inference. User input arriving during a watchdog decision preempts it: the complete text and image payload is captured and re-issued once as a fresh user turn after the internal run settles. Child abort causes are not inspected and do not unlock main. Cancellation cannot roll back completed tool effects or guarantee termination of detached/background work that no longer obeys the active run signal.
 
 ## Avoiding a persistent `working` state
 
-The runtime never starts nested agent work from inside an unfinished run. Accepted unlock results terminate the run; refused unlocks use Pi's ordinary tool-error follow-up. Automatic continuations are dispatched only from the idle-fence callback after aggregate-idle confirmation.
+The runtime never starts nested agent work from inside an unfinished run. Authorized decision results and malformed decision batches terminate the run; unauthorized out-of-phase calls return the reserved-function error without terminating ordinary work. Decision inquiries and automatic continuations are dispatched only from the idle-fence callback after aggregate-idle confirmation, and corrections are scheduled by the runtime within the fixed three-response budget.
 
-Packed E2E uses bounded idle assertions against both `session.isIdle` and `session.waitForIdle()` for continuations, unlock-tool turns, exhaustion, abort, compaction recovery, multi-attachment coordination, and persisted resume. These checks fail if Pi remains in `working` beyond the accepted deadline.
+The seven packed cases cover declaration stability, ordinary object-shaped rejection, continue, wait, unlock, invalid-object corrections, and custom reasons, with bounded idle checks. The cross-process case covers child coordination and authentication. Separate source-checkout probes exercise image takeover, native malformed-batch paths, and publication ordering/failure. Packed provisional/stale submissions, mixed batches, manual owned-run cancellation, compaction recovery, and persisted resume are not established by those seven cases; the coverage ledger must identify their actual runtime/SDK test layer rather than label them packed coverage.
 
 ## Semantic `user-ready` publication
 
@@ -239,9 +261,10 @@ pi:semantic-hook:v1
 
 for terminal automatic idle outcomes:
 
-- `AI_UNLOCK`, with the validated tool reason type and reason;
+- `AI_UNLOCK`, with the accepted decision verdict's normalized reason type and trimmed reason;
 - `ERROR_UNLOCK`, for the terminal-error automatic unlock;
-- `EXHAUSTED`.
+- `EXHAUSTED`, after any accepted final wait's deadline;
+- `DECISION_FAILED`, after the third invalid response of one inquiry.
 
 The producer is unaware of any consumer plugin. Delivery is best-effort, current-listener-only, with no acknowledgement, retry, or replay.
 
@@ -255,7 +278,7 @@ built-in defaults
 < trusted <cwd>/.pi/pi-continue-watchdog.json
 ```
 
-Project configuration is ignored when Pi does not trust the project. Invalid fields fall back to the next lower valid value and produce bounded warnings. The removed keys `decisionPrompt` and `continueReasonTypes` produce error diagnostics naming the key and have no effect. Prompt strings have the 16,384-code-point ceiling. Reason-type list entries are trimmed and required to be nonblank but otherwise retain the existing no-regex, no-artificial-length contract. The unlock tool's `reason` keeps the 1000-code-point limit.
+Project configuration is ignored when Pi does not trust the project. Invalid fields fall back to the next lower valid value and produce bounded warnings. The removed key `jevWaitCheck` produces an error diagnostic naming the key only and has no effect. Prompt strings have the 16,384-code-point ceiling. Reason-type list entries are trimmed and required to be nonblank but otherwise retain the existing no-regex, no-artificial-length contract. Decision `reason_content` keeps the 1000-code-point limit.
 
 Lock state, aggregate grace, ownership, and pending continuations are runtime-only. They are not restored across reload, new session, resume, restart, or shutdown. A later real main user message starts a fresh lock cycle.
 
@@ -263,27 +286,28 @@ Lock state, aggregate grace, ownership, and pending continuations are runtime-on
 
 ### Guaranteed in normal completed flows
 
-- there is no hidden decision question in model context: continuation messages are visible by design and the unlock tool is a normal tool call; the optional jev wait gate is an out-of-band HTTP request whose verdict adds no model-visible message;
+- completed decision inquiries, corrections, result calls, and results are folded out of later ordinary provider requests while their one shared outcome event remains ordinary context; executable calls and provider-required thinking survive until dispatch;
 - new automatic result messages use the same immutable canonical body in human history and Agent/provider context;
-- a manually cancelled watchdog-owned continuation assistant is folded out of later provider context;
+- a manually cancelled watchdog-owned decision or continuation assistant is folded out of later provider context;
 - legacy decision internals in resumed sessions stay folded out of provider context;
 - normal persistent-session resume re-applies folding without restoring timers or fabricating shared events from legacy records;
 - all paths return to idle within bounded E2E deadlines.
 
 ### Deliberate limits
 
-The session file is append-only. Legacy pre-upgrade entries (inquiry markers, prompts, folds) remain as Pi-recognizable records. Context folding removes complete legacy exchanges before later provider requests, but cannot provide the same guarantee if the extension fails to load during recovery or correlation metadata is manually damaged. The folder fails closed in those cases to avoid deleting genuine user conversation. The current design therefore provides normal-run and normal-resume provider-context isolation while keeping the extension bounded and reviewable; it is not destructive session-file erasure.
+The session file is append-only. Persisted decision result-call arguments and legacy pre-upgrade entries (inquiry markers, prompts, folds) remain as Pi-recognizable records. Context folding removes complete exchanges — both function-based and legacy XML — before later ordinary provider requests, but cannot provide the same guarantee if the extension fails to load during recovery or correlation metadata is manually damaged; it also does not erase persisted arguments from native compaction summaries or branch summaries, and it never rewrites history. The folder fails closed in those cases to avoid deleting genuine user conversation. The current design therefore provides normal-run and normal-resume ordinary-request isolation while keeping the extension bounded and reviewable; it is not destructive session-file erasure.
 
 ## Verification
 
-`npm run check` covers lint, type checking, unit tests, and build. Focused unit/runtime coverage includes unlock-tool argument validation and case-insensitive type normalization, tool registration scope (root-only, once, stable list), attempt accounting and exhaustion, shared-publication rollback, unlock cleanup, manual-unlock cancellation of watchdog-owned continuation runs, stale callbacks, legacy context folding, and shared human/provider body equality. `npm run test:e2e` installs the packed source artifact against stock Pi and verifies:
+`npm run check` covers lint, type checking, unit tests, and build. Focused unit/runtime coverage includes decision argument validation and case-insensitive type normalization, decision prompt construction, reserved-function registration scope (root-only, once, stable declaration and active list), authorization phases (ordinary/provisional/stale/duplicate/mixed batches), attempt accounting and exhaustion, shared continue/wait budget, bounded correction and decision-failed, wait deadlines and completed-wait facts, shared-publication rollback, unlock cleanup, manual-unlock cancellation of watchdog-owned decision and continuation runs, stale callbacks, legacy and function-based context folding, and shared human/provider body equality. `npm run test:e2e` installs the packed source artifact against stock Pi and verifies:
 
-- the unlock tool is advertised on every provider request;
-- the direct continuation path with no hidden inquiry;
-- a tool unlock publishing typed `user-ready` exactly once;
-- the simple `watchdog-continued` hook with no values;
-- exhaustion after `maxRetries` with one `EXHAUSTED` envelope;
-- custom reason types matched case-insensitively through the tool;
+- the reserved `cw` function is advertised on every provider request with its minimal declaration and no usage guidance;
+- one hidden decision inquiry precedes any ordinary continuation, and completed inquiry internals are folded out of later provider requests;
+- an out-of-phase proactive call returns the reserved-function error while the run continues;
+- a decision unlock publishing typed `user-ready` exactly once with no acknowledgement-only request;
+- a bounded final wait publishing `watchdog-waiting` and deferring `EXHAUSTED` until its deadline;
+- three invalid responses ending in `DECISION_FAILED` with exact provider-request counts;
+- custom reason types matched case-insensitively in the decision;
 - cross-process busy-child coordination across disconnect, reconnect, and child-idle fences;
 - canonical abort behavior;
 - bounded return from `working` to idle across covered paths.

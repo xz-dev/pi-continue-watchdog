@@ -462,7 +462,7 @@ theorem inquiry_marker_is_correct : InquiryMarkerGuarantees := by
     assistantMarker := unmarked_assistant_is_not_spliced
   }
 
--- Typed continue evidence models independent type authorization, bounded reasons, durable visibility, neutral publication, and dispatch ordering.
+-- Continue evidence expresses conditional snapshot consistency, not configured authorization or temporal I/O ordering.
 inductive ContinueReasonType where
   | workRemains
   | verifying
@@ -698,6 +698,59 @@ theorem takeover_process_is_correct
     postcondition := postcondition environment assumptions streamWasVisible
   }
 
+-- Payload flow is coupled to the lifecycle: capture text and opaque image blocks at takeover,
+-- then move the complete value exactly once when the aborted decision settles.
+structure UserPayload where
+  text : String
+  images : List (String × String)
+  deriving DecidableEq, Repr
+
+structure PayloadState where
+  lifecycle : ProcessState
+  input : UserPayload
+  pending : Option UserPayload
+  delivered : Option UserPayload
+  deriving DecidableEq, Repr
+
+def initialPayloadState (visible : Bool) (payload : UserPayload) : PayloadState :=
+  ⟨decisionState visible, payload, none, none⟩
+
+def finishedPayloadState (payload : UserPayload) : PayloadState :=
+  ⟨completedUserWorkState, payload, none, some payload⟩
+
+def payloadStep (environment : EnvironmentAssumptions) (state : PayloadState) : PayloadState :=
+  let next := takeoverStep environment state.lifecycle
+  match state.lifecycle.phase, next.phase with
+  | .decisionStreaming, .takeoverPending =>
+      { state with lifecycle := next, pending := some state.input }
+  | .takeoverPending, .userWork =>
+      { state with lifecycle := next, pending := none, delivered := state.pending }
+  | _, _ => { state with lifecycle := next }
+
+def iteratePayload (environment : EnvironmentAssumptions) : Nat → PayloadState → PayloadState
+  | 0, state => state
+  | n + 1, state => payloadStep environment (iteratePayload environment n state)
+
+def PayloadGuarantees (environment : EnvironmentAssumptions) : Prop :=
+  ∀ visible payload count,
+    iteratePayload environment (3 + count) (initialPayloadState visible payload) =
+      finishedPayloadState payload
+
+-- Three admitted steps deliver the original payload; every subsequent completed-state step
+-- preserves both that payload and the lifecycle's single-delivery count.
+theorem payload_flow_is_correct
+    (environment : EnvironmentAssumptions)
+    (assumptions : environmentAdmitted environment) : PayloadGuarantees environment := by
+  intro visible payload count
+  induction count with
+  | zero =>
+      simp [iteratePayload, payloadStep, initialPayloadState, finishedPayloadState,
+        takeoverStep, decisionState, takeoverPendingState, userWorkState,
+        assumptions.1, assumptions.2.1, assumptions.2.2]
+  | succ count ih =>
+      simp [iteratePayload, ih, payloadStep, finishedPayloadState,
+        completedUserWorkState, takeoverStep]
+
 theorem process_is_correct
     (environment : EnvironmentAssumptions)
     (assumptions : environmentAdmitted environment)
@@ -705,11 +758,13 @@ theorem process_is_correct
     TakeoverGuarantees environment streamWasVisible ∧
       InquiryMarkerGuarantees ∧
       ContinueGuarantees ∧
-      ManualCancellationGuarantees := by
+      ManualCancellationGuarantees ∧
+      PayloadGuarantees environment := by
   exact ⟨takeover_process_is_correct environment assumptions streamWasVisible,
     inquiry_marker_is_correct,
     typed_continue_is_correct,
-    manual_cancellation_is_correct⟩
+    manual_cancellation_is_correct,
+    payload_flow_is_correct environment assumptions⟩
 
 -- Executable projections expose deterministic summaries of immediate cleanup and clean exactly-once completion.
 def takeoverPostconditionBool (state : ProcessState) : Bool :=
@@ -765,7 +820,7 @@ end WatchdogUserTakeover
 
 #print axioms WatchdogUserTakeover.process_is_correct
 
--- The executable summary demonstrates the accepted visible-stream boundary, cleanup milestones, and typed continue ordering.
+-- The executable summary illustrates constructed lifecycle states and conditional evidence predicates, not live host execution.
 def acceptedContinue : WatchdogUserTakeover.ContinueEvidence :=
   {
     reasonType := .verifying
@@ -787,6 +842,10 @@ def main : IO Unit := do
   let takeover := WatchdogUserTakeover.takeoverStep environment visibleDecision
   let completed := WatchdogUserTakeover.iterate
     (WatchdogUserTakeover.takeoverStep environment) 3 visibleDecision
+  let payload : WatchdogUserTakeover.UserPayload := ⟨"Inspect image", [("image/png", "opaque bytes")]⟩
+  let delivered := WatchdogUserTakeover.iteratePayload environment 3
+    (WatchdogUserTakeover.initialPayloadState true payload)
+  IO.println s!"Text and image payload reissued once: {delivered.delivered == some payload && delivered.lifecycle.userMessageDeliveryCount == 1}"
   IO.println s!"Decision stream may be visible before takeover: {visibleDecision.decisionStreamVisible}"
   IO.println s!"Takeover immediately clears decision residue: {WatchdogUserTakeover.takeoverPostconditionBool takeover}"
   IO.println s!"User work completes once with clean context: {WatchdogUserTakeover.outputPostconditionBool completed}"
@@ -794,7 +853,7 @@ def main : IO Unit := do
     WatchdogUserTakeover.runManualCancellation .continuation
   let ordinaryUnlock := WatchdogUserTakeover.runManualCancellation .ordinary
   let foreignUserUnlock := WatchdogUserTakeover.runContinuationAfterForeignInput
-  IO.println s!"Typed continue avoids user decisions and persists one shared human/model event before hook and dispatch: {WatchdogUserTakeover.continueEvidenceOrderedBool acceptedContinue}"
+  IO.println s!"Constructed continue evidence satisfies stored-event implications: {WatchdogUserTakeover.continueEvidenceOrderedBool acceptedContinue}"
   IO.println s!"Manual unlock cancels an owned continuation without residue: {WatchdogUserTakeover.manualCancellationPostconditionBool true cancelledContinuation}"
-  IO.println s!"Manual unlock preserves an ordinary run: {WatchdogUserTakeover.manualCancellationPostconditionBool false ordinaryUnlock}"
+  IO.println s!"Manual unlock requests no abort for the constructed ordinary-run case: {WatchdogUserTakeover.manualCancellationPostconditionBool false ordinaryUnlock}"
   IO.println s!"Foreign user work clears continuation ownership: {WatchdogUserTakeover.manualCancellationPostconditionBool false foreignUserUnlock}"
