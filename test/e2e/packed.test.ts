@@ -28,7 +28,7 @@ import {
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const continuePrompt = "Continue until user assistance is required.";
-const TOOL_NAME = "unlock_continue_watchdog";
+const TOOL_NAME = "cw";
 
 interface RequestRecord {
 	readonly receivedAt: number;
@@ -36,11 +36,26 @@ interface RequestRecord {
 		readonly role?: string;
 		readonly content?: unknown;
 	}>;
-	readonly tools?: Array<{ readonly function?: { readonly name?: string } }>;
+	readonly tools?: Array<{
+		readonly function?: {
+			readonly name?: string;
+			readonly description?: string;
+			readonly parameters?: unknown;
+		};
+	}>;
 }
 
 interface MockReply {
-	readonly kind: "text" | "unlock-tool" | "delayed" | "connection-error";
+	readonly kind:
+		| "text"
+		| "cw"
+		| "cw-invalid"
+		| "cw-mixed"
+		| "delayed"
+		| "connection-error";
+	readonly action?: "continue" | "wait" | "unlock";
+	readonly waitSeconds?: number;
+	readonly mixedToolName?: string;
 	readonly reasonType?: string;
 	readonly reason?: string;
 	readonly started?: () => void;
@@ -210,13 +225,6 @@ async function readProbeEnvelopes(
 		.map((record) => record.data ?? {});
 }
 
-function toolNames(request: RequestRecord): string[] {
-	return (request.tools ?? [])
-		.map((tool) => tool.function?.name)
-		.filter((name): name is string => typeof name === "string")
-		.sort();
-}
-
 function contentText(message: RequestRecord["messages"][number]): string {
 	if (typeof message.content === "string") return message.content;
 	if (!Array.isArray(message.content)) return "";
@@ -280,10 +288,61 @@ async function startMockServer(
 				);
 				return;
 			}
-			if (reply.kind === "unlock-tool") {
+			if (reply.kind === "cw" || reply.kind === "cw-invalid") {
+				const argumentsJson =
+					reply.kind === "cw-invalid"
+						? (reply.text ?? "{}")
+						: JSON.stringify({
+								action: reply.action ?? "unlock",
+								...(reply.action === "wait"
+									? {
+											reason_content: reply.reason ?? "Waiting for automation.",
+											wait_seconds: reply.waitSeconds ?? 60,
+										}
+									: {
+											reason_type: reply.reasonType ?? "JOB_DONE",
+											reason_content:
+												reply.reason ?? "All requested work is complete.",
+										}),
+							});
+				sendSse(response, [
+					{
+						id,
+						model: "watchdog-e2e",
+						choices: [
+							{
+								index: 0,
+								delta: {
+									content: reply.text ?? "",
+									tool_calls: [
+										{
+											index: 0,
+											id: `call-${requests.length}`,
+											type: "function",
+											function: {
+												name: TOOL_NAME,
+												arguments: argumentsJson,
+											},
+										},
+									],
+								},
+								finish_reason: null,
+							},
+						],
+					},
+					{
+						id,
+						model: "watchdog-e2e",
+						choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+					},
+				]);
+				return;
+			}
+			if (reply.kind === "cw-mixed") {
 				const argumentsJson = JSON.stringify({
+					action: "unlock",
 					reason_type: reply.reasonType ?? "JOB_DONE",
-					reason: reply.reason ?? "All requested work is complete.",
+					reason_content: reply.reason ?? "Mixed batch result.",
 				});
 				sendSse(response, [
 					{
@@ -302,6 +361,15 @@ async function startMockServer(
 											function: {
 												name: TOOL_NAME,
 												arguments: argumentsJson,
+											},
+										},
+										{
+											index: 1,
+											id: `bash-${requests.length}`,
+											type: "function",
+											function: {
+												name: reply.mixedToolName ?? "bash",
+												arguments: '{"command":"echo side-effect"}',
 											},
 										},
 									],
@@ -528,24 +596,106 @@ function createRpcUiContext(notifications?: string[]): ExtensionUIContext {
 	} as unknown as ExtensionUIContext;
 }
 
-test("packed tool is advertised to every provider request", {
+const DECISION_PROMPT_MARKER =
+	"automated continuation check from the pi-continue-watchdog";
+
+function isDecisionRequest(request: RequestRecord): boolean {
+	return request.messages.some((message) =>
+		contentText(message).includes(DECISION_PROMPT_MARKER),
+	);
+}
+
+test("packed reserved function is advertised with minimal metadata to every request", {
 	timeout: 180_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t);
 	const { baseUrl, requests } = await startMockServer(t, [
 		{ kind: "text", text: "Working." },
-		{ kind: "unlock-tool" },
+		{ kind: "cw", action: "unlock" },
 	]);
 	const { session } = await createSession(fixture, baseUrl);
 	try {
 		await session.prompt("Do the work.");
 		await waitForSessionIdle(session, 30_000, "first turn");
-		// The unlock tool settles the run; wait for the second request.
-		await waitFor(() => requests.length >= 2, 60_000, "unlock request");
+		await waitFor(() => requests.length >= 2, 120_000, "decision request");
 		for (const request of requests) {
-			assert.ok(
-				toolNames(request).includes(TOOL_NAME),
-				`expected ${TOOL_NAME} in ${JSON.stringify(toolNames(request))}`,
+			const declared = (request.tools ?? []).find(
+				(tool) => tool.function?.name === TOOL_NAME,
+			);
+			assert.ok(declared, `expected ${TOOL_NAME} in request tools`);
+			assert.equal(declared.function?.description, "don't use unless ask");
+			const parameters = JSON.stringify(declared.function?.parameters);
+			assert.equal(parameters.includes("reason_type"), false);
+			assert.equal(parameters.includes("action"), false);
+		}
+		// No startup usage guidance advertises the protocol in ordinary requests.
+		for (const request of requests) {
+			for (const message of request.messages) {
+				assert.doesNotMatch(
+					contentText(message),
+					/call cw now|Submit exactly one cw function call/,
+				);
+			}
+		}
+	} finally {
+		await shutdownSession(session);
+	}
+});
+
+test("packed idle settlement opens one inquiry before continuation", {
+	timeout: 300_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t);
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "text", text: "First ordinary answer." },
+		{ kind: "cw", action: "continue", reasonType: "WORK_REMAINS" },
+		{ kind: "text", text: "Continued answer." },
+		{ kind: "cw", action: "unlock" },
+	]);
+	const { session } = await createSession(fixture, baseUrl);
+	try {
+		await session.prompt("Start the task.");
+		await waitForSessionIdle(session, 30_000, "first turn");
+		await waitFor(() => requests.length >= 2, 120_000, "decision request");
+		const decisionRequest = requests[1];
+		assert.ok(isDecisionRequest(decisionRequest), "request 2 is the inquiry");
+		assert.match(
+			contentText(decisionRequest.messages.at(-1) ?? ({ role: "" } as never)),
+			new RegExp(DECISION_PROMPT_MARKER),
+		);
+		await waitForSessionIdle(session, 30_000, "decision turn");
+		// The accepted continue publishes one ordinary continuation turn.
+		await waitFor(() => requests.length >= 3, 120_000, "continuation request");
+		const continuationRequest = requests[2];
+		const continuationMessage = continuationRequest.messages.find(
+			(message) =>
+				message.role === "user" &&
+				contentText(message).includes("Continue watchdog continued ·"),
+		);
+		assert.ok(continuationMessage, "expected continuation body in request 3");
+		const body = contentText(continuationMessage);
+		assert.match(body, new RegExp(continuePrompt));
+		assert.match(body, /WORK_REMAINS/);
+		// Later ordinary requests contain one canonical continuation event and
+		// no raw decision instructions or result calls.
+		await waitForSessionIdle(session, 30_000, "second ordinary turn");
+		await waitFor(() => requests.length >= 4, 120_000, "next decision");
+		// The continuation request (3) contains no decision internals, and later
+		// inquiry requests carry only their own newest prompt: completed
+		// exchanges fold into the one shared outcome event.
+		for (const request of requests.slice(2)) {
+			const joined = JSON.stringify(request.messages);
+			assert.equal(joined.includes("pi-continue-watchdog:inquiry-fold"), false);
+			assert.equal(
+				joined.includes("pi-continue-watchdog:decision-audit"),
+				false,
+			);
+			const markerCount = joined.split(DECISION_PROMPT_MARKER).length - 1;
+			const isOwnInquiry = isDecisionRequest(request);
+			assert.equal(
+				markerCount,
+				isOwnInquiry ? 1 : 0,
+				`request carried ${markerCount} inquiry bodies`,
 			);
 		}
 	} finally {
@@ -553,58 +703,45 @@ test("packed tool is advertised to every provider request", {
 	}
 });
 
-test("packed idle continuation directly continues without an inquiry", {
-	timeout: 240_000,
+test("packed unauthorized proactive call returns the reserved error and continues", {
+	timeout: 300_000,
 }, async (t) => {
-	const fixture = await makePackedFixture(t);
+	const fixture = await makePackedFixture(t, { withSemanticProbe: true });
 	const { baseUrl, requests } = await startMockServer(t, [
-		{ kind: "text", text: "First ordinary answer." },
-		{ kind: "text", text: "Continued answer after nudge." },
-		{ kind: "unlock-tool" },
+		// Ordinary run tries to stop through cw before any decision exists.
+		{ kind: "cw", action: "unlock", reason: "Stopping proactively." },
+		// The run continues after the reserved error; the next turn settles.
+		{ kind: "text", text: "Continued ordinary work." },
+		{ kind: "cw", action: "unlock" },
 	]);
 	const { session } = await createSession(fixture, baseUrl);
 	try {
-		await session.prompt("Start the task.");
-		await waitForSessionIdle(session, 30_000, "first turn");
-		// After the fixed 10s fence the watchdog sends one direct continuation.
-		await waitFor(() => requests.length >= 2, 120_000, "continuation request");
-		const continuationRequest = requests[1];
-		const continuationMessage = continuationRequest.messages.find(
-			(message) =>
-				message.role === "user" &&
-				contentText(message).includes("Continue watchdog continued ·"),
-		);
-		assert.ok(continuationMessage, "expected continuation body in request 2");
-		const body = contentText(continuationMessage);
-		assert.match(
-			body,
-			/You ended your turn without calling unlock_continue_watchdog\./,
-		);
-		assert.match(body, new RegExp(continuePrompt));
-		assert.match(body, /monitor that task until it ends/);
-		// No hidden decision prompt ever reached the provider.
-		for (const request of requests) {
-			for (const message of request.messages) {
-				assert.doesNotMatch(
-					contentText(message),
-					/automated continuation check from the pi-continue-watchdog/,
-				);
-			}
-		}
+		await session.prompt("Try to stop early.");
+		await waitForSessionIdle(session, 60_000, "first turn");
+		// The reserved error does not terminate the run: Pi follows up normally.
+		await waitFor(() => requests.length >= 2, 120_000, "follow-up request");
 		await waitForSessionIdle(session, 30_000, "second turn");
-		await waitFor(() => requests.length >= 3, 120_000, "unlock request");
+		// No unlock hook fired for the out-of-phase call.
+		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
+		assert.equal(
+			envelopes.some((envelope) => envelope.name === "user-ready"),
+			false,
+			"no user-ready before any authorized decision",
+		);
 	} finally {
 		await shutdownSession(session);
 	}
 });
 
-test("packed tool unlock ends the cycle and publishes typed user-ready once", {
-	timeout: 240_000,
+test("packed decision unlock ends the cycle and publishes typed user-ready once", {
+	timeout: 300_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t, { withSemanticProbe: true });
 	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "text", text: "Ordinary work done." },
 		{
-			kind: "unlock-tool",
+			kind: "cw",
+			action: "unlock",
 			reasonType: "WAIT_USER",
 			reason: "Need deploy approval.",
 		},
@@ -612,7 +749,9 @@ test("packed tool unlock ends the cycle and publishes typed user-ready once", {
 	const { session } = await createSession(fixture, baseUrl);
 	try {
 		await session.prompt("Approve the deploy.");
-		await waitForSessionIdle(session, 60_000, "unlock turn");
+		await waitForSessionIdle(session, 60_000, "first turn");
+		await waitFor(() => requests.length >= 2, 120_000, "decision request");
+		await waitForSessionIdle(session, 60_000, "decision turn");
 		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
 		const ready = envelopes.filter(
 			(envelope) => envelope.name === "user-ready",
@@ -623,82 +762,111 @@ test("packed tool unlock ends the cycle and publishes typed user-ready once", {
 			REASON_TYPE: "WAIT_USER",
 			REASON: "Need deploy approval.",
 		});
-		// The run terminated on the tool result: no second model request.
-		assert.equal(requests.length, 1);
-	} finally {
-		await shutdownSession(session);
-	}
-});
-
-test("packed simple watchdog-continued hook carries no values", {
-	timeout: 240_000,
-}, async (t) => {
-	const fixture = await makePackedFixture(t, { withSemanticProbe: true });
-	const { baseUrl } = await startMockServer(t, [
-		{ kind: "text", text: "Part one." },
-		{ kind: "unlock-tool" },
-	]);
-	const { session } = await createSession(fixture, baseUrl);
-	try {
-		await session.prompt("Work then finish.");
-		await waitForSessionIdle(session, 30_000, "first turn");
-		// Give the fence time to fire exactly one continuation, then let the
-		// unlock-tool reply settle the cycle.
+		// The decision turn terminated on the tool result: no extra request.
+		assert.equal(requests.length, 2);
 		await new Promise((resolve) => setTimeout(resolve, 12_000));
-		const afterFence = (
-			await readProbeEnvelopes(fixture.probeOut ?? "")
-		).filter((envelope) => envelope.name === "watchdog-continued");
-		assert.equal(afterFence.length, 1);
-		assert.equal(afterFence[0].values, undefined);
+		assert.equal(requests.length, 2);
 	} finally {
 		await shutdownSession(session);
 	}
 });
 
-test("packed exhausted budget stops continuing and publishes EXHAUSTED", {
-	timeout: 300_000,
+test("packed bounded wait defers exhaustion until its deadline", {
+	timeout: 360_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t, {
 		withSemanticProbe: true,
 		watchdogConfig: { maxRetries: 1 },
 	});
 	const { baseUrl, requests } = await startMockServer(t, [
-		{ kind: "text", text: "Never unlocks." },
-		{ kind: "text", text: "Still working." },
+		{ kind: "text", text: "External job pending." },
+		{ kind: "cw", action: "wait", waitSeconds: 30 },
 	]);
 	const { session } = await createSession(fixture, baseUrl);
 	try {
-		await session.prompt("Loop the work.");
-		await waitForSessionIdle(session, 30_000, "first turn");
-		await waitFor(() => requests.length >= 2, 120_000, "only continuation");
-		// maxRetries=1: exactly one continuation, then exhaustion at the next idle.
-		await waitForSessionIdle(session, 30_000, "continuation turn");
+		await session.prompt("Wait for the job.");
+		await waitForSessionIdle(session, 60_000, "first turn");
+		await waitFor(() => requests.length >= 2, 120_000, "decision request");
+		await waitForSessionIdle(session, 60_000, "decision turn");
+		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
+		const waiting = envelopes.filter(
+			(envelope) => envelope.name === "watchdog-waiting",
+		);
+		assert.equal(waiting.length, 1);
+		assert.deepEqual(waiting[0].values, {
+			REASON: "Waiting for automation.",
+			WAIT_SECONDS: "30",
+		});
+		// No new provider request before the 30s wait deadline elapses.
 		await new Promise((resolve) => setTimeout(resolve, 12_000));
 		assert.equal(requests.length, 2);
+		// After the deadline and idle qualification, EXHAUSTED becomes eligible.
+		await new Promise((resolve) => setTimeout(resolve, 25_000));
+		const finalEnvelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
+		assert.ok(
+			finalEnvelopes.some(
+				(envelope) =>
+					envelope.name === "user-ready" &&
+					(envelope.values as { STOP_KIND?: string } | undefined)?.STOP_KIND ===
+						"EXHAUSTED",
+			),
+			"expected EXHAUSTED user-ready after the wait deadline",
+		);
+		assert.equal(requests.length, 2);
+	} finally {
+		await shutdownSession(session);
+	}
+});
+
+test("packed invalid decisions correct twice then decision-fail", {
+	timeout: 360_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t, { withSemanticProbe: true });
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "text", text: "Work settles." },
+		{ kind: "cw-invalid", text: "" },
+		{ kind: "cw-invalid", text: "" },
+		{ kind: "cw-invalid", text: "" },
+	]);
+	const { session } = await createSession(fixture, baseUrl);
+	try {
+		await session.prompt("Do the work.");
+		await waitForSessionIdle(session, 30_000, "first turn");
+		await waitFor(() => requests.length >= 2, 120_000, "first decision");
+		await waitFor(() => requests.length >= 4, 240_000, "corrections");
+		await waitForSessionIdle(session, 60_000, "final decision turn");
+		const decisionRequests = requests.filter((r) => isDecisionRequest(r));
+		assert.equal(decisionRequests.length, 3);
 		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
 		assert.ok(
 			envelopes.some(
 				(envelope) =>
 					envelope.name === "user-ready" &&
 					(envelope.values as { STOP_KIND?: string } | undefined)?.STOP_KIND ===
-						"EXHAUSTED",
+						"DECISION_FAILED",
 			),
-			"expected EXHAUSTED user-ready",
+			"expected DECISION_FAILED user-ready",
 		);
+		// The fourth invalid response is never requested.
+		await new Promise((resolve) => setTimeout(resolve, 12_000));
+		assert.equal(requests.length, 4);
 	} finally {
 		await shutdownSession(session);
 	}
 });
 
-test("packed custom reasonTypes are matched case-insensitively through the tool", {
-	timeout: 240_000,
+test("packed custom reasonTypes are matched case-insensitively in the decision", {
+	timeout: 300_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t, {
+		withSemanticProbe: true,
 		watchdogConfig: { reasonTypes: ["NeedReview", "shipped"] },
 	});
 	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "text", text: "PR ready." },
 		{
-			kind: "unlock-tool",
+			kind: "cw",
+			action: "unlock",
 			reasonType: "needreview",
 			reason: "PR awaits review.",
 		},
@@ -706,15 +874,18 @@ test("packed custom reasonTypes are matched case-insensitively through the tool"
 	const { session } = await createSession(fixture, baseUrl);
 	try {
 		await session.prompt("Ship it.");
-		await waitForSessionIdle(session, 60_000, "unlock turn");
-		assert.equal(requests.length, 1);
-		const toolRequest = requests[0];
-		assert.ok(
-			toolNames(toolRequest).includes(TOOL_NAME),
-			"tool schema present",
+		await waitForSessionIdle(session, 30_000, "first turn");
+		await waitFor(() => requests.length >= 2, 120_000, "decision request");
+		await waitForSessionIdle(session, 60_000, "decision turn");
+		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
+		const ready = envelopes.filter(
+			(envelope) => envelope.name === "user-ready",
 		);
-		// The tool result is model-visible in the same batch; the normalized
-		// type is asserted through the semantic probe in the unlock test above.
+		assert.equal(ready.length, 1);
+		assert.equal(
+			(ready[0].values as { REASON_TYPE?: string }).REASON_TYPE,
+			"NEEDREVIEW",
+		);
 	} finally {
 		await shutdownSession(session);
 	}

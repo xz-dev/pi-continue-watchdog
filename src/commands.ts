@@ -12,11 +12,11 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import {
-	CONTINUATION_MESSAGE_TYPE,
 	DECISION_FOLD_MESSAGE_TYPE,
 	parseDecisionFoldDetails,
 } from "./context-fold.js";
 import type { ControllerEffect, LockDecisionController } from "./controller.js";
+import { MAX_WAIT_SECONDS } from "./decision-protocol.js";
 import type { HubMainClaim } from "./hub.js";
 import type {
 	WatchdogTriggerBlocker,
@@ -40,13 +40,10 @@ export const UNLOCK_COMMAND_DESCRIPTION =
 export const STATUS_COMMAND_DESCRIPTION =
 	"Show why the continue watchdog is waiting.";
 
-/** Persisted TUI-only entry for every accepted automatic continue (legacy). */
+/** Persisted TUI-only entry for every accepted automatic continue. */
 export const CONTINUE_ENTRY_TYPE = "pi-continue-watchdog:continue";
 export const CONTINUE_ENTRY_TEXT = "Continue watchdog continued";
 export const WAIT_ENTRY_TYPE = "pi-continue-watchdog:wait";
-
-/** Historical upper bound for legacy wait entries. */
-const MAX_LEGACY_WAIT_SECONDS = 30 * 60;
 
 export interface ManualLockEntry {
 	readonly timestamp: string;
@@ -66,7 +63,11 @@ export interface WaitEntry {
 /** Persistent lifecycle event rendered as a standard colored Pi-TUI box. */
 export const WATCHDOG_STATUS_ENTRY_TYPE = "pi-continue-watchdog:status";
 
-export type WatchdogStatusKind = "other-error";
+export type WatchdogStatusKind =
+	| "checking"
+	| "validation-error"
+	| "other-error"
+	| "decision-failed";
 
 export interface WatchdogStatusEntry {
 	readonly kind: WatchdogStatusKind;
@@ -92,8 +93,10 @@ export interface HumanUnlockEntry {
  * unlock reason can be included in the exact user-visible notification. Every
  * other controller effect remains available to runtime wiring in source order.
  */
-/** Effect re-export kept for the runtime seam; only notify effects exist now. */
-export type CommandRuntimeEffect = ControllerEffect;
+export type CommandRuntimeEffect = Exclude<
+	ControllerEffect,
+	{ readonly kind: "notify" }
+>;
 
 /**
  * Runtime seam owned by later lifecycle/timer wiring. Commands do not interpret
@@ -240,27 +243,21 @@ export function formatUnlockEntryText(
  * Render a persisted custom entry. Pi custom entries are TUI-only and are not
  * added to LLM context; this renderer intentionally has no model-facing path.
  */
-const STATUS_ENTRY_KINDS = new Set([
-	"other-error",
-	"checking",
-	"validation-error",
-	"decision-failed",
-]);
-
 function getWatchdogStatusEntry(entry: unknown): WatchdogStatusEntry | null {
 	if (typeof entry !== "object" || entry === null) return null;
 	const data = (entry as { readonly data?: unknown }).data;
 	if (typeof data !== "object" || data === null) return null;
 	const value = data as Partial<WatchdogStatusEntry>;
-	// New entries only use other-error; legacy decision-window kinds stay
-	// renderable for old sessions.
 	if (
-		typeof value.kind !== "string" ||
-		!STATUS_ENTRY_KINDS.has(value.kind) ||
+		(value.kind !== "checking" &&
+			value.kind !== "validation-error" &&
+			value.kind !== "other-error" &&
+			value.kind !== "decision-failed") ||
 		typeof value.exchangeId !== "string" ||
 		value.exchangeId.length === 0 ||
 		typeof value.cycleId !== "number" ||
 		!Number.isSafeInteger(value.cycleId) ||
+		value.cycleId < 1 ||
 		typeof value.message !== "string" ||
 		value.message.length === 0
 	) {
@@ -273,14 +270,13 @@ export function createWatchdogStatusEntryRenderer(): EntryRenderer<WatchdogStatu
 	return (entry, _options, theme) => {
 		const status = getWatchdogStatusEntry(entry);
 		if (status === null) return undefined;
-		const kind = status.kind as string;
-		const error = kind !== "checking";
+		const error = status.kind !== "checking";
 		const title =
-			kind === "checking"
+			status.kind === "checking"
 				? `Continue watchdog · Checking ${status.cycleId}`
-				: kind === "validation-error"
+				: status.kind === "validation-error"
 					? `Continue watchdog · Decision re-ask ${status.cycleId}`
-					: kind === "decision-failed"
+					: status.kind === "decision-failed"
 						? "Continue watchdog · Decision failed"
 						: "Continue watchdog · Other error";
 		const box = new Box(1, 1, (text) =>
@@ -316,7 +312,7 @@ export function createWaitEntryRenderer(): EntryRenderer<WaitEntry> {
 			reason.length === 0 ||
 			!Number.isSafeInteger(waitSeconds) ||
 			waitSeconds < 1 ||
-			waitSeconds > MAX_LEGACY_WAIT_SECONDS
+			waitSeconds > MAX_WAIT_SECONDS
 		) {
 			return undefined;
 		}
@@ -558,10 +554,12 @@ const BLOCKER_TEXT: Readonly<Record<WatchdogTriggerBlocker, string>> = {
 	"config-loading": "config loading",
 	unlocked: "unlocked",
 	exhausted: "retry limit exhausted",
+	"decision-failed": "decision failed",
 	"observable-agent-busy": "observable agent busy",
 	"local-agent-busy": "local agent busy",
 	"pending-messages": "pending messages",
-	"continuation-in-flight": "continuation in flight",
+	"decision-open": "decision open",
+	"decision-finalizing": "decision finalizing",
 };
 
 export function formatWatchdogTriggerStatus(
@@ -678,10 +676,6 @@ export function createMainCommands(
 	);
 	pi.registerMessageRenderer(
 		WATCHDOG_EVENT_MESSAGE_TYPE,
-		createWatchdogEventMessageRenderer(),
-	);
-	pi.registerMessageRenderer(
-		CONTINUATION_MESSAGE_TYPE,
 		createWatchdogEventMessageRenderer(),
 	);
 	pi.registerEntryRenderer<WatchdogStatusEntry>(

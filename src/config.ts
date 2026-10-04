@@ -5,16 +5,18 @@
  *
  * Validation:
  * - idleDelaySeconds remains accepted for configuration compatibility only;
- *   the idle fence is fixed at ten seconds.
+ *   automatic inquiries always use the fixed ten-second runtime fence.
  * - maxRetries remains a safe integer in [1, 10].
- * - reasonTypes is a nonempty array of trim-nonblank strings; a valid list
- *   replaces the default.
- * - decisionPrompt and continueReasonTypes are removed keys: each occurrence
- *   reports a named error diagnostic and has no effect.
- * - jevWaitCheck is validated per field; its apiKey is global-only and a
- *   project-layer apiKey is ignored with a diagnostic.
+ * - reasonTypes and continueReasonTypes are nonempty arrays of trim-nonblank
+ *   strings; valid lists replace the defaults.
+ * - decisionPrompt and continuePrompt are non-blank bounded Unicode strings.
+ * - jevWaitCheck is a removed key: each occurrence reports a named error
+ *   diagnostic naming the key only (never nested values) and has no effect.
  * Invalid values are rejected (no silent clamp).
  */
+
+export const DEFAULT_DECISION_PROMPT =
+	"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. It does not represent any decision by the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one.";
 
 export const DEFAULT_CONTINUE_PROMPT =
 	"Continue until user assistance is required.";
@@ -25,6 +27,12 @@ export const DEFAULT_REASON_TYPES: readonly string[] = Object.freeze([
 	"WAIT_USER",
 	"JOB_BLOCKED",
 	"WAIT_CALLBACK",
+]);
+
+/** Built-in allowed automatic-continue reason types; configured values replace. */
+export const DEFAULT_CONTINUE_REASON_TYPES: readonly string[] = Object.freeze([
+	"WORK_REMAINS",
+	"VERIFYING",
 ]);
 
 /** Maximum prompt size, measured in Unicode code points, accepted from config. */
@@ -42,58 +50,26 @@ export const MIN_RETRIES = 1;
  */
 export const MAX_RETRIES = 10;
 
-/** Minimum accepted jevWaitCheck.timeoutMs (inclusive). */
-export const MIN_JEV_TIMEOUT_MS = 1_000;
-
-/** jev classification of the final assistant output before a continuation. */
-export interface JevWaitCheckConfig {
-	enabled: boolean;
-	/** TypeSafe or OpenRouter System One endpoint; unset = automatic selection. */
-	apiUrl?: string;
-	model: string;
-	confidenceThreshold: number;
-	unlockReviewThreshold: number;
-	timeoutMs: number;
-	/** Global-only fallback key. */
-	apiKey?: string;
-}
-
-export const BUILT_IN_JEV_WAIT_CHECK: Readonly<JevWaitCheckConfig> =
-	Object.freeze({
-		enabled: true,
-		model: "jev-latest",
-		confidenceThreshold: 0.8,
-		unlockReviewThreshold: 0.8,
-		timeoutMs: 15_000,
-	});
-
 export interface ContinueWatchdogConfig {
-	/** @deprecated Accepted and preserved, but the idle fence is fixed at 10s. */
+	/** @deprecated Accepted and preserved, but the inquiry fence is fixed at 10s. */
 	idleDelaySeconds: number;
 	maxRetries: number;
+	/** Configurable guidance embedded in the fixed watchdog decision prompt. */
+	decisionPrompt: string;
 	/** Configurable guidance embedded in the fixed automated continuation envelope. */
 	continuePrompt: string;
 	reasonTypes: readonly string[];
+	continueReasonTypes: readonly string[];
 	/** Key binding for the human unlock shortcut, or false to disable it. */
 	unlockShortcut: string | false;
-	/** Omitted = built-in defaults. */
-	jevWaitCheck?: JevWaitCheckConfig;
 }
 
-/** One validated layer; nested jevWaitCheck fields merge individually. */
-export type ConfigLayer = Partial<
-	Omit<ContinueWatchdogConfig, "jevWaitCheck">
-> & {
-	jevWaitCheck?: Partial<JevWaitCheckConfig>;
-};
-
-export type ConfigDiagnosticSeverity = "warning" | "error";
+export type ConfigLayer = Partial<ContinueWatchdogConfig>;
 
 export interface ConfigDiagnostic {
 	source: string;
 	message: string;
-	/** Removed-key diagnostics are errors; everything else stays a warning. */
-	severity: ConfigDiagnosticSeverity;
+	severity: "warning" | "error";
 }
 
 export interface ConfigResult {
@@ -109,10 +85,11 @@ export interface MergeConfigResult {
 export const BUILT_IN_CONFIG: Readonly<ContinueWatchdogConfig> = Object.freeze({
 	idleDelaySeconds: 10,
 	maxRetries: 10,
+	decisionPrompt: DEFAULT_DECISION_PROMPT,
 	continuePrompt: DEFAULT_CONTINUE_PROMPT,
 	reasonTypes: DEFAULT_REASON_TYPES,
+	continueReasonTypes: DEFAULT_CONTINUE_REASON_TYPES,
 	unlockShortcut: "alt+u",
-	jevWaitCheck: BUILT_IN_JEV_WAIT_CHECK,
 });
 
 const MAX_DIAGNOSTIC_LENGTH = 240;
@@ -120,32 +97,20 @@ const MAX_DIAGNOSTIC_LENGTH = 240;
 const KNOWN_KEYS = new Set([
 	"idleDelaySeconds",
 	"maxRetries",
+	"decisionPrompt",
 	"continuePrompt",
 	"reasonTypes",
-	"unlockShortcut",
-	"jevWaitCheck",
-]);
-
-const JEV_KEYS = new Set([
-	"enabled",
-	"apiUrl",
-	"model",
-	"confidenceThreshold",
-	"unlockReviewThreshold",
-	"timeoutMs",
-	"apiKey",
-]);
-
-/** Keys removed by the unlock-tool change; configured values have no effect. */
-const REMOVED_KEYS: ReadonlySet<string> = new Set([
-	"decisionPrompt",
 	"continueReasonTypes",
+	"unlockShortcut",
 ]);
+
+/** Keys removed with the retired jev integration; values never load. */
+const REMOVED_KEYS: ReadonlySet<string> = new Set(["jevWaitCheck"]);
 
 function diagnostic(
 	source: string,
 	message: string,
-	severity: ConfigDiagnosticSeverity = "warning",
+	severity: "warning" | "error" = "warning",
 ): ConfigDiagnostic {
 	return { source, message: message.slice(0, MAX_DIAGNOSTIC_LENGTH), severity };
 }
@@ -154,94 +119,12 @@ function copyBuiltIn(): ContinueWatchdogConfig {
 	return {
 		idleDelaySeconds: BUILT_IN_CONFIG.idleDelaySeconds,
 		maxRetries: BUILT_IN_CONFIG.maxRetries,
+		decisionPrompt: BUILT_IN_CONFIG.decisionPrompt,
 		continuePrompt: BUILT_IN_CONFIG.continuePrompt,
 		reasonTypes: [...BUILT_IN_CONFIG.reasonTypes],
+		continueReasonTypes: [...BUILT_IN_CONFIG.continueReasonTypes],
 		unlockShortcut: BUILT_IN_CONFIG.unlockShortcut,
-		jevWaitCheck: { ...BUILT_IN_JEV_WAIT_CHECK },
 	};
-}
-
-const nonBlank = (value: unknown): value is string =>
-	typeof value === "string" && value.trim().length > 0;
-
-function isHttpUrl(value: unknown): value is string {
-	if (!nonBlank(value)) return false;
-	try {
-		const { protocol } = new URL(value.trim());
-		return protocol === "https:" || protocol === "http:";
-	} catch {
-		return false;
-	}
-}
-
-/** Per-field jevWaitCheck validation; project layers cannot set apiKey. */
-function validateJevWaitCheck(
-	source: string,
-	value: unknown,
-	diagnostics: ConfigDiagnostic[],
-): Partial<JevWaitCheckConfig> {
-	if (value === null || typeof value !== "object" || Array.isArray(value)) {
-		diagnostics.push(diagnostic(source, "jevWaitCheck must be an object"));
-		return {};
-	}
-	const input = value as Record<string, unknown>;
-	const out: Partial<JevWaitCheckConfig> = {};
-	const reject = (message: string): void => {
-		diagnostics.push(diagnostic(source, `jevWaitCheck.${message}`));
-	};
-	if (Object.hasOwn(input, "enabled")) {
-		if (typeof input.enabled === "boolean") out.enabled = input.enabled;
-		else reject("enabled must be a boolean");
-	}
-	if (Object.hasOwn(input, "apiUrl")) {
-		if (isHttpUrl(input.apiUrl)) out.apiUrl = input.apiUrl.trim();
-		else reject("apiUrl must be an http(s) URL");
-	}
-	if (Object.hasOwn(input, "model")) {
-		if (nonBlank(input.model)) out.model = input.model.trim();
-		else reject("model must be a non-empty string");
-	}
-	for (const field of [
-		"confidenceThreshold",
-		"unlockReviewThreshold",
-	] as const) {
-		if (!Object.hasOwn(input, field)) continue;
-		const threshold = input[field];
-		if (
-			typeof threshold === "number" &&
-			Number.isFinite(threshold) &&
-			threshold >= 0 &&
-			threshold <= 1
-		) {
-			out[field] = threshold;
-		} else {
-			reject(`${field} must be a number between 0 and 1`);
-		}
-	}
-	if (Object.hasOwn(input, "timeoutMs")) {
-		const timeout = input.timeoutMs;
-		if (
-			Number.isSafeInteger(timeout) &&
-			(timeout as number) >= MIN_JEV_TIMEOUT_MS
-		) {
-			out.timeoutMs = timeout as number;
-		} else {
-			reject(`timeoutMs must be an integer of at least ${MIN_JEV_TIMEOUT_MS}`);
-		}
-	}
-	if (Object.hasOwn(input, "apiKey")) {
-		if (source === "project") {
-			reject("apiKey is ignored in project configuration; set it globally");
-		} else if (nonBlank(input.apiKey)) {
-			out.apiKey = input.apiKey.trim();
-		} else {
-			reject("apiKey must be a non-empty string");
-		}
-	}
-	if (Object.keys(input).some((key) => !JEV_KEYS.has(key))) {
-		reject("contains unsupported keys that are ignored");
-	}
-	return out;
 }
 
 function validIdleDelaySeconds(value: unknown): value is number {
@@ -363,29 +246,31 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 		);
 	}
 
-	if (Object.hasOwn(input, "continuePrompt")) {
-		const cont = input.continuePrompt;
-		if (isValidPrompt(cont)) {
-			config.continuePrompt = cont;
+	for (const field of ["decisionPrompt", "continuePrompt"] as const) {
+		if (!Object.hasOwn(input, field)) continue;
+		const prompt = input[field];
+		if (isValidPrompt(prompt)) {
+			config[field] = prompt;
 		} else {
 			diagnostics.push(
 				diagnostic(
 					source,
-					`continuePrompt must be a non-empty string of at most ${MAX_PROMPT_CHARACTERS} Unicode characters`,
+					`${field} must be a non-empty string of at most ${MAX_PROMPT_CHARACTERS} Unicode characters`,
 				),
 			);
 		}
 	}
 
-	if (Object.hasOwn(input, "reasonTypes")) {
-		const reasonTypes = normalizeReasonTypes(input.reasonTypes);
+	for (const field of ["reasonTypes", "continueReasonTypes"] as const) {
+		if (!Object.hasOwn(input, field)) continue;
+		const reasonTypes = normalizeReasonTypes(input[field]);
 		if (reasonTypes !== null) {
-			config.reasonTypes = reasonTypes;
+			config[field] = reasonTypes;
 		} else {
 			diagnostics.push(
 				diagnostic(
 					source,
-					"reasonTypes must be a non-empty array of non-blank strings",
+					`${field} must be a non-empty array of non-blank strings`,
 				),
 			);
 		}
@@ -406,11 +291,6 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 				),
 			);
 		}
-	}
-
-	if (Object.hasOwn(input, "jevWaitCheck")) {
-		const jev = validateJevWaitCheck(source, input.jevWaitCheck, diagnostics);
-		if (Object.keys(jev).length > 0) config.jevWaitCheck = jev;
 	}
 
 	for (const key of Object.keys(input)) {
@@ -453,21 +333,20 @@ export function mergeConfig(
 		if (partial.maxRetries !== undefined) {
 			config.maxRetries = partial.maxRetries;
 		}
+		if (partial.decisionPrompt !== undefined) {
+			config.decisionPrompt = partial.decisionPrompt;
+		}
 		if (partial.continuePrompt !== undefined) {
 			config.continuePrompt = partial.continuePrompt;
 		}
 		if (partial.reasonTypes !== undefined) {
 			config.reasonTypes = [...partial.reasonTypes];
 		}
+		if (partial.continueReasonTypes !== undefined) {
+			config.continueReasonTypes = [...partial.continueReasonTypes];
+		}
 		if (partial.unlockShortcut !== undefined) {
 			config.unlockShortcut = partial.unlockShortcut;
-		}
-		if (partial.jevWaitCheck !== undefined) {
-			const jev = { ...(config.jevWaitCheck ?? BUILT_IN_JEV_WAIT_CHECK) };
-			for (const [key, value] of Object.entries(partial.jevWaitCheck)) {
-				if (value !== undefined) Object.assign(jev, { [key]: value });
-			}
-			config.jevWaitCheck = jev;
 		}
 	}
 

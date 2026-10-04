@@ -137,8 +137,11 @@ const CONFIG: LoadedConfig = {
 	config: {
 		idleDelaySeconds: 3,
 		maxRetries: 2,
+		decisionPrompt:
+			"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. It does not represent any decision by the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one.",
 		continuePrompt: "Continue now.",
 		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED", "WAIT_CALLBACK"],
+		continueReasonTypes: ["WORK_REMAINS", "VERIFYING"],
 		unlockShortcut: "alt+u",
 	},
 	diagnostics: [],
@@ -153,10 +156,14 @@ test("removed config keys surface as error notifications on the main", async () 
 	const hub = createObservableAgentHub();
 	const main = createAttachmentHarness({ sessionId: "main", hasUI: true });
 	const removed = validateConfig("global", {
-		decisionPrompt: "old",
+		jevWaitCheck: { enabled: true, apiKey: "secret-value" },
 		maxRetries: 5,
 	});
 	assert.equal(removed.config.maxRetries, 5);
+	assert.equal(
+		removed.diagnostics.some((item) => item.message.includes("secret-value")),
+		false,
+	);
 	createContinueWatchdogExtension({
 		hub,
 		clock: main.clock,
@@ -170,7 +177,7 @@ test("removed config keys surface as error notifications on the main", async () 
 
 	const errors = main.notifications.filter((entry) => entry.level === "error");
 	assert.equal(errors.length, 1);
-	assert.match(errors[0].message, /decisionPrompt was removed/);
+	assert.match(errors[0].message, /jevWaitCheck was removed/);
 });
 
 test("UI main alone loads effective config; a shared-hub headless observer does not", async () => {
@@ -436,10 +443,10 @@ test("first config diagnostic notify demotion drops control before later diagnos
 	assert.deepEqual(headless.notifications, [
 		{ message: "first diagnostic", level: "warning" },
 	]);
-	// The unlock tool is session-scoped (registered once at config commit in a
+	// The reserved decision function is session-scoped (registered once at config commit in a
 	// root process); a synchronous demotion afterwards keeps the inert tool
 	// registered but stops every further control-plane effect.
-	assert.deepEqual(headless.registeredTools, ["unlock_continue_watchdog"]);
+	assert.deepEqual(headless.registeredTools, ["cw"]);
 	assert.deepEqual(headless.activeToolSets, []);
 	assert.deepEqual(headless.sentMessages, []);
 	assert.equal(headless.clock.records.length, 0);

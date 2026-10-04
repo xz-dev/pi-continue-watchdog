@@ -118,6 +118,14 @@ function makeController(): LockDecisionController {
 	return createLockDecisionController({ maxRetries: 2 });
 }
 
+function decisionId(controller: LockDecisionController): number {
+	const decision = controller
+		.beginDecision(Number.MAX_SAFE_INTEGER)
+		.effects.find((effect) => effect.kind === "openDecisionWindow");
+	assert.ok(decision);
+	return decision.decisionId;
+}
+
 interface AbortHarness {
 	readonly hub: ObservableAgentHub;
 	readonly controller: LockDecisionController;
@@ -349,26 +357,31 @@ test("aborted terminal unlock restores tools then notifies bare text", async () 
 	const harness = createAbortHarness({ locked: true });
 	harness.append(user("u0"));
 	await harness.start();
-	harness.controller.recordAutomaticContinue();
+	const continued = decisionId(harness.controller);
+	harness.controller.recordValidContinue(continued);
 	assert.equal(harness.controller.snapshot.attempt, 1);
+	decisionId(harness.controller);
+	assert.equal(harness.controller.snapshot.decisionOpen, true);
 
 	harness.append(assistant("a1", "aborted"));
 	await harness.settle();
 
 	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
 	assert.equal(harness.controller.snapshot.attempt, 1);
 	assert.deepEqual(harness.notifications, ["Continue watchdog unlocked"]);
 	assert.deepEqual(
 		harness.effects.map((effect) => effect.kind),
-		[],
+		["restoreDecisionTools"],
 	);
 	assert.deepEqual(harness.timeline, [
 		"cleanup:locked=false",
+		"restoreDecisionTools",
 		"notify:Continue watchdog unlocked",
 	]);
 });
 
-test("every aborted main run unlocks; repeated settles do not notify twice", async () => {
+test("user-preempted decision abort does not unlock or notify", async () => {
 	const hub = createObservableAgentHub();
 	const controller = makeController();
 	controller.lock();
@@ -381,6 +394,7 @@ test("every aborted main run unlocks; repeated settles do not notify twice", asy
 	const handlers = new Map<string, LifecycleHandler[]>();
 	const notifications: string[] = [];
 	const sessionManager = createSessionManager();
+	let remainingSuppressions = 1;
 	registerMainAbortUnlock(multiOn(handlers), {
 		isCurrentMain() {
 			const claim = hub.mainClaimFor(bound.attachment);
@@ -394,17 +408,33 @@ test("every aborted main run unlocks; repeated settles do not notify twice", asy
 		},
 		controller,
 		retainErrorUnlock() {},
-		clearOperationalPendingWork() {},
-		applyEffect() {},
+		clearOperationalPendingWork() {
+			if (remainingSuppressions > 0) {
+				throw new Error("preempted abort must not unlock");
+			}
+		},
+		applyEffect() {
+			if (remainingSuppressions > 0) {
+				throw new Error("preempted abort must not apply effects");
+			}
+		},
+		consumeDecisionAbortSuppression() {
+			if (remainingSuppressions === 0) return false;
+			remainingSuppressions -= 1;
+			return true;
+		},
 	});
 	const ctx = notifyCtx(sessionManager, notifications);
 	await fireHandlers(handlers, "agent_start", { type: "agent_start" }, ctx);
 	sessionManager.append(assistant("a1", "aborted"));
 	await fireHandlers(handlers, "agent_settled", { type: "agent_settled" }, ctx);
-	assert.equal(controller.snapshot.locked, false);
-	assert.deepEqual(notifications, ["Continue watchdog unlocked"]);
+	assert.equal(controller.snapshot.locked, true);
+	assert.deepEqual(notifications, []);
 
+	await fireHandlers(handlers, "agent_start", { type: "agent_start" }, ctx);
+	sessionManager.append(assistant("a2", "aborted"));
 	await fireHandlers(handlers, "agent_settled", { type: "agent_settled" }, ctx);
+	assert.equal(controller.snapshot.locked, false);
 	assert.deepEqual(notifications, ["Continue watchdog unlocked"]);
 });
 
@@ -421,15 +451,19 @@ test("terminal error settle auto-unlocks with a distinct record and no decision"
 	const harness = createAbortHarness({ locked: true });
 	harness.append(user("u0"));
 	await harness.start();
-	harness.controller.recordAutomaticContinue();
+	const continued = decisionId(harness.controller);
+	harness.controller.recordValidContinue(continued);
 	assert.equal(harness.controller.snapshot.attempt, 1);
+	decisionId(harness.controller);
+	assert.equal(harness.controller.snapshot.decisionOpen, true);
 
 	harness.append(assistant("a1", "error"));
 	await harness.settle();
 
-	// Auto unlock: attempt accounting preserved, one distinct notification,
-	// and a human-unlock-style entry marked automatic.
+	// Auto unlock: decision cleared, attempt accounting preserved, one
+	// distinct notification, and a human-unlock-style entry marked automatic.
 	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
 	assert.equal(harness.controller.snapshot.attempt, 1);
 	assert.deepEqual(harness.notifications, [
 		"Continue watchdog unlocked · run ended in error",
@@ -442,6 +476,7 @@ test("terminal error settle auto-unlocks with a distinct record and no decision"
 	]);
 	assert.deepEqual(harness.timeline, [
 		"cleanup:locked=false",
+		"restoreDecisionTools",
 		"notify:Continue watchdog unlocked · run ended in error",
 	]);
 });

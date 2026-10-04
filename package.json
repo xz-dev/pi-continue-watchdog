@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "type": "module",
   "private": true,
-  "description": "Continue-watchdog extension for Pi with an unlock tool and automatic continuation.",
+  "description": "Continue-watchdog extension for Pi with a watchdog-owned continue/wait/unlock decision inquiry and automatic continuation.",
   "license": "BSD-3-Clause",
   "repository": {
     "type": "git",

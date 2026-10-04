@@ -175,6 +175,16 @@ function createHarness(): CommandHarness {
 	};
 }
 
+function armDecision(
+	controller: ReturnType<typeof createLockDecisionController>,
+): number {
+	const decision = controller
+		.beginDecision(Number.MAX_SAFE_INTEGER)
+		.effects.find((effect) => effect.kind === "openDecisionWindow");
+	assert.ok(decision, "expected a decision window");
+	return decision.decisionId;
+}
+
 const entryThemeColors: string[] = [];
 const ENTRY_THEME = {
 	fg(color: string, text: string): string {
@@ -292,7 +302,7 @@ test("watchdog status entries render standard colored Pi-TUI boxes", () => {
 				exchangeId: "exchange-1",
 				cycleId: 2,
 				message: "Invalid watchdog XML.",
-			} as never,
+			},
 		},
 		{} as never,
 		{
@@ -435,19 +445,28 @@ test("Examples 2-3 RED: same-state human lock/unlock are unconditional and notif
 	);
 });
 
-test("Examples 2-3 RED: command transitions reset exhausted state and dispatch every pending effect before notification", async () => {
+test("Examples 2-3 RED: command transitions reset exhausted or decision-failed state and dispatch every pending effect before notification", async () => {
 	const harness = createHarness();
 
 	await harness.invoke(LOCK_CONTINUE_WATCHDOG_COMMAND);
-	harness.controller.recordAutomaticContinue();
-	harness.controller.recordAutomaticContinue();
+	harness.controller.recordValidContinue(armDecision(harness.controller));
+	harness.controller.recordValidContinue(armDecision(harness.controller));
 	assert.equal(harness.controller.snapshot.exhausted, true);
 	await harness.invoke(LOCK_CONTINUE_WATCHDOG_COMMAND);
 	assert.equal(harness.controller.snapshot.attempt, 0);
 	assert.equal(harness.controller.snapshot.exhausted, false);
 
+	const failedDecision = armDecision(harness.controller);
+	harness.controller.recordInvalidDecision(failedDecision, "first");
+	harness.controller.recordInvalidDecision(failedDecision, "second");
+	harness.controller.recordInvalidDecision(failedDecision, "third");
+	assert.equal(harness.controller.snapshot.decisionFailed, true);
+	await harness.invoke(LOCK_CONTINUE_WATCHDOG_COMMAND);
+	assert.equal(harness.controller.snapshot.decisionFailed, false);
+
 	// Advance attempt so unlock must preserve cycle accounting.
-	harness.controller.recordAutomaticContinue();
+	const continued = armDecision(harness.controller);
+	harness.controller.recordValidContinue(continued);
 	assert.equal(harness.controller.snapshot.attempt, 1);
 	harness.timeline.splice(0);
 	harness.effects.splice(0);
@@ -462,12 +481,16 @@ test("Examples 2-3 RED: command transitions reset exhausted state and dispatch e
 
 	await harness.invoke(LOCK_CONTINUE_WATCHDOG_COMMAND);
 	assert.equal(harness.controller.snapshot.attempt, 0);
+	const openDecisionId = armDecision(harness.controller);
 	harness.timeline.splice(0);
 	harness.effects.splice(0);
 	await harness.invoke(UNLOCK_CONTINUE_WATCHDOG_COMMAND);
-	assert.deepEqual(harness.effects, []);
+	assert.deepEqual(harness.effects, [
+		{ kind: "restoreDecisionTools", decisionId: openDecisionId },
+	]);
 	assert.deepEqual(harness.timeline, [
 		"cleanup:locked=false",
+		"restoreDecisionTools",
 		"notify:Continue watchdog unlocked",
 	]);
 
@@ -693,6 +716,8 @@ test("continue timeline includes shared bodies once and retains legacy readers",
 	const event = createContinueWatchdogEvent({
 		occurredAtMs: 0,
 		offsetMinutes: 0,
+		reasonType: "WORK_REMAINS",
+		reason: "Shared timeline reason.",
 	});
 	const body = formatContinueWatchdogEvent(event, "Continue guidance.");
 	const fold = createDecisionFoldMessage({

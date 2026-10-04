@@ -48,10 +48,7 @@ function decisionTools(): string[] {
 		session?.extensionRunner
 			.getAllRegisteredTools()
 			.map((tool) => tool.definition.name)
-			.filter(
-				(name) =>
-					name === "continue_watchdog" || name === "unlock_continue_watchdog",
-			)
+			.filter((name) => name === "cw" || name === "unlock_continue_watchdog")
 			.sort() ?? []
 	);
 }

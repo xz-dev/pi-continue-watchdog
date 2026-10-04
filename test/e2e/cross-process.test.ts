@@ -29,8 +29,7 @@ import {
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const continuationBodyStart = "Continue watchdog continued ·";
-const TOOL_NAME = "unlock_continue_watchdog";
+const TOOL_NAME = "cw";
 
 interface RequestRecord {
 	readonly receivedAt: number;
@@ -230,18 +229,15 @@ function textOf(message: RequestRecord["messages"][number]): string {
 	return JSON.stringify(message.content);
 }
 
-/**
- * True only when the request was *triggered* by a direct continuation: its
- * final user-role message is the continuation body. Later requests retain
- * earlier bodies in history, so scanning every message would overcount.
- */
-function isContinuationRequest(request: RequestRecord): boolean {
-	for (let index = request.messages.length - 1; index >= 0; index -= 1) {
-		const message = request.messages[index];
-		if (message.role !== "user") continue;
-		return textOf(message).includes(continuationBodyStart);
-	}
-	return false;
+/** True when the request was triggered by the hidden watchdog decision inquiry. */
+function isDecisionRequest(request: RequestRecord): boolean {
+	const last = request.messages.at(-1);
+	return (
+		last?.role === "user" &&
+		textOf(last).includes(
+			"automated continuation check from the pi-continue-watchdog",
+		)
+	);
 }
 
 function sendSse(
@@ -321,8 +317,9 @@ async function startMockServer(
 			}
 			if (reply.kind === "unlock") {
 				const argumentsJson = JSON.stringify({
+					action: "unlock",
 					reason_type: reply.reasonType ?? "JOB_DONE",
-					reason: reply.reason ?? "finished",
+					reason_content: reply.reason ?? "finished",
 				});
 				sendSse(response, [
 					{
@@ -843,15 +840,15 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		{ kind: "delayed" },
 		// 2: root's first ordinary turn.
 		{ kind: "stop", text: "root first epoch settled" },
-		// 3: answers continuation A (disconnect epoch) with the unlock tool.
+		// 3: answers the first child-idle decision inquiry with an unlock verdict.
 		{ kind: "unlock", reason: "first cross-process epoch complete" },
-		// 4: answers continuation B (child idle after reconnect).
+		// 4: answers the reconnect decision inquiry with an unlock verdict.
 		{ kind: "unlock", reason: "heartbeat recovery complete" },
 		// 5: child's second held turn (streamed, never completes until abort).
 		{ kind: "delayed" },
 		// 6: root's second ordinary turn keeps the lock.
 		{ kind: "stop", text: "root second epoch settled without unlocking" },
-		// 7: answers the final child-idle continuation with the unlock tool.
+		// 7: answers the final child-idle decision inquiry with an unlock verdict.
 		{ kind: "unlock", reason: "final child-idle epoch complete" },
 	]);
 	const root = await createSession(fixture, baseUrl, {
@@ -921,7 +918,7 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 	await waitForSessionIdle(root.session, 3_000, "root first ordinary work");
 	await new Promise((resolvePromise) => setTimeout(resolvePromise, 10_300));
 	assert.equal(
-		requests.filter(isContinuationRequest).length,
+		requests.filter(isDecisionRequest).length,
 		0,
 		"root must not continue through a complete fixed fence while the OS child is busy",
 	);
@@ -932,12 +929,12 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 	// removes its busy ID and starts a fresh fixed inquiry fence.
 	await new Promise((resolvePromise) => setTimeout(resolvePromise, 6_500));
 	await waitFor(
-		() => requests.filter(isContinuationRequest).length === 1,
+		() => requests.filter(isDecisionRequest).length === 1,
 		15_000,
 		"busy-child disconnect continuation",
 	);
 	await waitForSessionIdle(root.session, 3_000, "disconnect root unlock");
-	const firstContinuation = requests.find(isContinuationRequest);
+	const firstContinuation = requests.find(isDecisionRequest);
 	assert.ok(firstContinuation);
 	assert.equal(firstContinuation.model, "root-process-model");
 	assert.ok(
@@ -947,8 +944,7 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 	assert.equal(
 		requests.filter(
 			(request) =>
-				request.model === "child-process-model" &&
-				isContinuationRequest(request),
+				request.model === "child-process-model" && isDecisionRequest(request),
 		).length,
 		0,
 	);
@@ -994,12 +990,12 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 	const childIdleAt = Date.now();
 	await child.command("abort");
 	await waitFor(
-		() => requests.filter(isContinuationRequest).length === 2,
+		() => requests.filter(isDecisionRequest).length === 2,
 		15_000,
 		"reconnected child live-idle continuation",
 	);
 	await waitForSessionIdle(root.session, 5_000, "reconnect recovery unlock");
-	const reconnectContinuation = requests.filter(isContinuationRequest)[1];
+	const reconnectContinuation = requests.filter(isDecisionRequest)[1];
 	assert.ok(reconnectContinuation);
 	assert.equal(reconnectContinuation.model, "root-process-model");
 	assert.ok(
@@ -1034,7 +1030,7 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 	});
 	await new Promise((resolvePromise) => setTimeout(resolvePromise, 10_300));
 	assert.equal(
-		requests.filter(isContinuationRequest).length,
+		requests.filter(isDecisionRequest).length,
 		2,
 		"busy child must keep blocking continuation after reconnect",
 	);
@@ -1042,12 +1038,12 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 	const finalChildIdleAt = Date.now();
 	await child.command("abort");
 	await waitFor(
-		() => requests.filter(isContinuationRequest).length === 3,
+		() => requests.filter(isDecisionRequest).length === 3,
 		15_000,
 		"final child-idle continuation",
 	);
 	await waitForSessionIdle(root.session, 5_000, "final continuation unlock");
-	const continuations = requests.filter(isContinuationRequest);
+	const continuations = requests.filter(isDecisionRequest);
 	assert.equal(continuations.length, 3);
 	assert.ok(
 		(continuations[2]?.receivedAt ?? 0) - finalChildIdleAt >= 9_800,
