@@ -659,6 +659,90 @@ structure ManualCancellationGuarantees : Prop where
     foreignUserPreserved := foreign_user_work_clears_continuation_ownership
   }
 
+-- Finalized abort text is independent of the host's unchanged aborted outcome; live streaming frames and blank spacing are outside this model.
+-- Current ownership/claim and branch-boundary inputs stand for the runtime's correlation checks, not a proof of those checks.
+structure NativeAbortState where
+  hostAborted : Bool
+  currentOwned : Bool
+  claimCurrent : Bool
+  boundaryPresent : Bool
+  noticeVisible : Bool
+  partialOutput : String
+  locked : Bool
+  unlockCount : Nat
+  abortRequests : Nat
+  settled : Bool
+  deriving DecidableEq, Repr
+
+def nativeAbortInitial (owned : Bool) (output : String) : NativeAbortState :=
+  { hostAborted := true, currentOwned := owned, claimCurrent := true,
+    boundaryPresent := true, noticeVisible := true,
+    partialOutput := output, locked := true, unlockCount := 0,
+    abortRequests := 0, settled := false }
+
+-- Presentation leaves the host abort guard intact; the existing settlement gate uses that same outcome, never display visibility.
+def projectNativeAbort (state : NativeAbortState) : NativeAbortState :=
+  { state with noticeVisible := state.hostAborted &&
+      !(state.currentOwned && state.claimCurrent) }
+
+def hostMayContinueAfterMessage (state : NativeAbortState) : Bool :=
+  !state.hostAborted
+
+def settleNativeAbort (state : NativeAbortState) : NativeAbortState :=
+  if state.settled then state else
+    let unlock := state.claimCurrent && state.boundaryPresent && state.hostAborted
+    { state with
+      settled := true
+      locked := if unlock then false else state.locked
+      unlockCount := state.unlockCount + (if unlock then 1 else 0) }
+
+def completeNativeAbort (owned : Bool) (output : String) : NativeAbortState :=
+  settleNativeAbort (projectNativeAbort (nativeAbortInitial owned output))
+
+-- These guarantees cover quiet final presentation, unchanged host guard/output, idempotent replay and once-only fenced unlock in this model.
+structure NativeAbortGuarantees : Prop where
+  completion : ∀ owned output,
+    (completeNativeAbort owned output).settled = true ∧
+      (completeNativeAbort owned output).locked = false ∧
+      (completeNativeAbort owned output).unlockCount = 1 ∧
+      (completeNativeAbort owned output).noticeVisible = !owned ∧
+      (completeNativeAbort owned output).hostAborted = true ∧
+      (completeNativeAbort owned output).partialOutput = output ∧
+      (completeNativeAbort owned output).abortRequests = 0
+  hostControlPreserved : ∀ state,
+    hostMayContinueAfterMessage (projectNativeAbort state) =
+      hostMayContinueAfterMessage state
+  replaySafe : ∀ state,
+    projectNativeAbort (projectNativeAbort state) = projectNativeAbort state
+  exactlyOnce : ∀ state,
+    settleNativeAbort (settleNativeAbort state) = settleNativeAbort state
+  outputPreserved : ∀ state,
+    (settleNativeAbort (projectNativeAbort state)).partialOutput = state.partialOutput
+  fencedSettlement : ∀ state,
+    state.claimCurrent = false ∨ state.boundaryPresent = false ∨ state.hostAborted = false →
+    (settleNativeAbort state).unlockCount = state.unlockCount
+
+theorem native_abort_presentation_is_correct : NativeAbortGuarantees := by
+  constructor
+  · intro owned output
+    cases owned <;> simp [completeNativeAbort, settleNativeAbort,
+      projectNativeAbort, nativeAbortInitial]
+  · intro state
+    rfl
+  · intro state
+    rfl
+  · intro state
+    by_cases settled : state.settled = true <;>
+      simp [settleNativeAbort, settled]
+  · intro state
+    by_cases settled : state.settled = true <;>
+      simp [settleNativeAbort, projectNativeAbort, settled]
+  · intro state fence
+    by_cases settled : state.settled = true
+    · simp [settleNativeAbort, settled]
+    · rcases fence with claim | boundary | outcome <;>
+        simp_all [settleNativeAbort]
+
 -- The guarantee record gathers all whole-process obligations under abort-safe cleanup and the two explicit host-settlement assumptions.
 structure TakeoverGuarantees
     (environment : EnvironmentAssumptions)
@@ -759,12 +843,14 @@ theorem process_is_correct
       InquiryMarkerGuarantees ∧
       ContinueGuarantees ∧
       ManualCancellationGuarantees ∧
-      PayloadGuarantees environment := by
+      PayloadGuarantees environment ∧
+      NativeAbortGuarantees := by
   exact ⟨takeover_process_is_correct environment assumptions streamWasVisible,
     inquiry_marker_is_correct,
     typed_continue_is_correct,
     manual_cancellation_is_correct,
-    payload_flow_is_correct environment assumptions⟩
+    payload_flow_is_correct environment assumptions,
+    native_abort_presentation_is_correct⟩
 
 -- Executable projections expose deterministic summaries of immediate cleanup and clean exactly-once completion.
 def takeoverPostconditionBool (state : ProcessState) : Bool :=
@@ -857,3 +943,5 @@ def main : IO Unit := do
   IO.println s!"Manual unlock cancels an owned continuation without residue: {WatchdogUserTakeover.manualCancellationPostconditionBool true cancelledContinuation}"
   IO.println s!"Manual unlock requests no abort for the constructed ordinary-run case: {WatchdogUserTakeover.manualCancellationPostconditionBool false ordinaryUnlock}"
   IO.println s!"Foreign user work clears continuation ownership: {WatchdogUserTakeover.manualCancellationPostconditionBool false foreignUserUnlock}"
+  let native := WatchdogUserTakeover.completeNativeAbort true "Partial continuation"
+  IO.println s!"Native abort: final notice hidden, output kept, unlocked once: {!native.noticeVisible && native.hostAborted && native.partialOutput == "Partial continuation" && !native.locked && native.unlockCount == 1}"
