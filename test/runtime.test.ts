@@ -1,12 +1,20 @@
 import assert from "node:assert/strict";
+import { createRequire } from "node:module";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
+import { stripVTControlCharacters } from "node:util";
 
-import type {
-	ExtensionAPI,
-	ExtensionContext,
+import {
+	AgentSession,
+	AssistantMessageComponent,
+	type ExtensionAPI,
+	type ExtensionContext,
+	initTheme,
+	type MessageEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 
+import { registerMainAbortUnlock } from "../src/abort-outcome.js";
 import {
 	HUMAN_UNLOCK_ENTRY_TYPE,
 	type HumanUnlockEntry,
@@ -359,6 +367,7 @@ function createFenceHarness(options?: { readonly rejectReport?: boolean }) {
 }
 
 function createHarness(options?: {
+	readonly nativeAbortGate?: boolean;
 	readonly config?: Partial<ContinueWatchdogConfig>;
 	readonly sendThrows?: boolean;
 	readonly omitPersistedEvent?: (kind: string) => boolean;
@@ -564,6 +573,7 @@ function createHarness(options?: {
 		isProjectTrusted: () => true,
 		sessionManager: {
 			getSessionId: () => "main",
+			getLeafId: () => branch.at(-1)?.id ?? null,
 			getBranch: () => {
 				options?.onReadBranch?.();
 				if (options?.branchThrows) throw new Error("branch failed");
@@ -603,6 +613,18 @@ function createHarness(options?: {
 		clock,
 		createExchangeId: () => "exchange-1",
 	});
+	if (options?.nativeAbortGate) {
+		registerMainAbortUnlock(pi, {
+			isCurrentMain: runtime.isCurrentMain,
+			getMainClaim: runtime.getMainClaim,
+			isCurrentMainClaim: runtime.isCurrentMainClaim,
+			controller,
+			clearOperationalPendingWork: runtime.clearOperationalPendingWork,
+			retainErrorUnlock: runtime.retainErrorUnlock,
+			consumeDecisionAbortSuppression: runtime.consumeDecisionAbortSuppression,
+			applyEffect: runtime.applyEffect,
+		});
+	}
 	runtime.registerLifecycle();
 
 	harness.ctx = ctx;
@@ -961,6 +983,229 @@ async function startAcceptedContinuation(
 		});
 	}
 	return fold;
+}
+
+for (const kind of ["decision", "continuation"] as const) {
+	test(`native ${kind} abort keeps unlock and output without Pi's abort notice`, async () => {
+		initTheme("dark", false);
+		const harness = createHarness({ nativeAbortGate: true });
+		await startIdle(harness);
+		if (kind === "decision") await harness.openDecision();
+		else await startAcceptedContinuation(harness);
+		const turnsBefore = harness.triggeredTurns;
+		const attemptBefore = harness.controller.snapshot.attempt;
+		const aborted = assistant([text("partial native output")], "aborted");
+		const result = (await harness.endDecisionMessage(aborted)) as
+			| DecisionMessageReplacement
+			| undefined;
+		const message = (result?.message ??
+			aborted) as DecisionMessageReplacement["message"];
+		const persisted = harness.branch.at(-1);
+		assert.ok(persisted?.type === "message");
+		(persisted as { message: unknown }).message = message;
+		const rendered = new AssistantMessageComponent(message as never)
+			.render(100)
+			.join("\n");
+
+		assert.equal(
+			message.stopReason,
+			"aborted",
+			"Pi must still see a real abort",
+		);
+		await harness.fire("message_end", { type: "message_end", message });
+		await harness.fire("agent_end", { type: "agent_end", messages: [message] });
+		harness.streaming = false;
+		await settleOnly(harness);
+		await settleOnly(harness);
+		assert.equal(harness.controller.snapshot.locked, false);
+		assert.deepEqual(harness.notifications, [
+			{ message: "Continue watchdog unlocked", level: undefined },
+		]);
+		assert.equal(harness.aborts, 0, "an observed abort is not requested again");
+		assert.equal(harness.triggeredTurns, turnsBefore);
+		assert.equal(harness.controller.snapshot.attempt, attemptBefore);
+		assert.deepEqual(harness.spliceAttempts, []);
+		if (kind === "continuation")
+			assert.match(rendered, /partial native output/);
+		else assert.doesNotMatch(rendered, /partial native output/);
+		assert.doesNotMatch(rendered, /Operation aborted/);
+		assert.deepEqual(
+			stripVTControlCharacters(rendered)
+				.split("\n")
+				.map((line) => line.trim())
+				.filter(Boolean),
+			kind === "continuation" ? ["partial native output"] : [],
+		);
+	});
+}
+
+for (const scenario of [
+	"tool-call",
+	"steering",
+	"follow-up",
+	"compaction",
+] as const) {
+	test(`native continuation abort preserves Pi host control with ${scenario}`, async () => {
+		// Resolve the exact agent-core used by the installed test host, not another copy.
+		const hostRequire = createRequire(
+			import.meta.resolve("@earendil-works/pi-coding-agent"),
+		);
+		const coreEntry = hostRequire.resolve(
+			"@earendil-works/pi-agent-core/package.json",
+		);
+		const { runAgentLoop } = await import(
+			new URL("./dist/agent-loop.js", pathToFileURL(coreEntry)).href
+		);
+		const harness = createHarness({ nativeAbortGate: true });
+		await startIdle(harness);
+		await startAcceptedContinuation(harness);
+		const signal = new AbortController();
+		signal.abort();
+		let streams = 0;
+		let turns = 0;
+		let steeringPolls = 0;
+		let dequeued = 0;
+		let compactions = 0;
+		const queued = { role: "user", content: "queued user work", timestamp: 1 };
+		const message: Extract<MessageEndEvent["message"], { role: "assistant" }> =
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "partial native output" }],
+				stopReason: "aborted",
+				errorMessage: "Request was aborted",
+				api: "openai-completions",
+				provider: "local",
+				model: "local",
+				timestamp: 1,
+				usage: {
+					input: 95,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 95,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+			};
+		if (scenario === "tool-call")
+			message.content.push({
+				type: "toolCall",
+				id: "partial-call",
+				name: "probe",
+				arguments: {},
+			});
+		const model = {
+			id: "local",
+			provider: "local",
+			api: "openai-completions",
+			contextWindow: 100,
+			maxTokens: 10,
+		};
+		const result = await runAgentLoop(
+			[],
+			{ systemPrompt: "", messages: [], tools: [] },
+			{
+				model,
+				convertToLlm: (messages: unknown[]) => messages,
+				getSteeringMessages: async () => {
+					if (++steeringPolls === 2 && scenario === "steering") {
+						dequeued++;
+						return [queued];
+					}
+					return [];
+				},
+				getFollowUpMessages: async () => {
+					if (scenario === "follow-up" && dequeued === 0) {
+						dequeued++;
+						return [queued];
+					}
+					return [];
+				},
+			},
+			async (event: { type: string; message?: MessageEndEvent["message"] }) => {
+				if (event.type === "turn_start") turns++;
+				if (event.type === "message_start")
+					await harness.fire("message_start", event);
+				if (
+					event.type === "message_end" &&
+					event.message?.role === "assistant"
+				) {
+					const replacement = (await harness.endDecisionMessage(
+						event.message,
+					)) as DecisionMessageReplacement | undefined;
+					if (replacement) Object.assign(event.message, replacement.message);
+					const persisted = harness.branch.at(-1);
+					assert.ok(persisted);
+					(persisted as { message: unknown }).message = event.message;
+				}
+				if (event.type === "agent_end") await harness.fire("agent_end", event);
+			},
+			signal.signal,
+			() => {
+				const next = streams++ === 0 ? message : { ...message, content: [] };
+				return {
+					async *[Symbol.asyncIterator]() {
+						yield { type: "error", error: next };
+					},
+					result: async () => next,
+				};
+			},
+		);
+		assert.equal(streams, 1, "abort must not open another provider stream");
+		assert.equal(turns, 1, "abort must not open another host turn");
+		assert.equal(dequeued, 0, "abort must not consume queued user work");
+		assert.deepEqual(
+			result,
+			[message],
+			"abort must not append tool results or queued messages",
+		);
+		if (scenario === "compaction") {
+			const host = AgentSession.prototype as unknown as {
+				_checkCompaction(this: unknown, message: unknown): Promise<boolean>;
+			};
+			const context = {
+				settingsManager: {
+					getCompactionSettings: () => ({
+						enabled: true,
+						reserveTokens: 10,
+						keepRecentTokens: 5,
+					}),
+				},
+				model,
+				sessionManager: { getBranch: () => [] },
+				agent: { state: { messages: [] } },
+				_runAutoCompaction: async () => {
+					compactions++;
+					return false;
+				},
+			};
+			await host._checkCompaction.call(context, message);
+			assert.equal(
+				compactions,
+				0,
+				"abort must skip post-run threshold compaction",
+			);
+			await host._checkCompaction.call(context, {
+				...message,
+				stopReason: "stop",
+			});
+			assert.equal(
+				compactions,
+				1,
+				"control: this usage crosses the compaction threshold",
+			);
+		}
+		harness.streaming = false;
+		await settleOnly(harness);
+		await settleOnly(harness);
+		assert.equal(harness.controller.snapshot.locked, false);
+		assert.equal(harness.notifications.length, 1);
+		assert.equal(
+			harness.notifications[0]?.message,
+			"Continue watchdog unlocked",
+		);
+		assert.equal(harness.aborts, 0);
+		assert.deepEqual(harness.spliceAttempts, []);
+	});
 }
 
 test("manual unlock aborts an exact active watchdog decision and leaves no abort presentation", async () => {
@@ -4589,7 +4834,7 @@ test("preempted decision cleanup stays idempotent after another handler tags the
 	);
 });
 
-test("ordinary aborted decision assistant is cleared without being reclassified as user takeover", async () => {
+test("native aborted decision assistant is quiet without being reclassified as user takeover", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
 	await harness.openDecision();
@@ -4599,7 +4844,7 @@ test("ordinary aborted decision assistant is cleared without being reclassified 
 	)) as DecisionMessageReplacement;
 	assert.deepEqual(replacement.message.content, []);
 	assert.equal(replacement.message.stopReason, "aborted");
-	assert.equal(replacement.message.errorMessage, undefined);
+	assert.equal(replacement.message.errorMessage, " ");
 	assert.equal(harness.runtime.consumeDecisionAbortSuppression(), false);
 	assert.equal(harness.aborts, 0);
 	assert.equal(harness.controller.snapshot.locked, true);

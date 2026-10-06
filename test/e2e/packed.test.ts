@@ -18,9 +18,11 @@ import { promisify } from "node:util";
 
 import {
 	type AgentSession,
+	AssistantMessageComponent,
 	createAgentSession,
 	DefaultResourceLoader,
 	type ExtensionUIContext,
+	initTheme,
 	ModelRuntime,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
@@ -136,6 +138,9 @@ async function makePackedFixture(
 		cwd: installRoot,
 		timeout: 30_000,
 	});
+	const manifest = JSON.parse(
+		await readFile(join(repoRoot, "package.json"), "utf8"),
+	) as { name: string; devDependencies: Record<string, string> };
 	await execFileAsync(
 		"npm",
 		[
@@ -150,13 +155,14 @@ async function makePackedFixture(
 			// narrower `allow-git=root` policy verified separately in CI.
 			"--allow-git=all",
 			tarball,
+			// Pin only the fixture host; production peer ranges remain unchanged.
+			...["@earendil-works/pi-coding-agent", "@earendil-works/pi-tui"].map(
+				(name) => `${name}@${manifest.devDependencies[name]}`,
+			),
 		],
 		{ cwd: installRoot, timeout: 120_000, maxBuffer: 8 * 1024 * 1024 },
 	);
 
-	const manifest = JSON.parse(
-		await readFile(join(repoRoot, "package.json"), "utf8"),
-	) as { name: string };
 	const packageDir = join(installRoot, "node_modules", manifest.name);
 	const installedManifest = JSON.parse(
 		await readFile(join(packageDir, "package.json"), "utf8"),
@@ -287,7 +293,7 @@ async function startMockServer(
 					connection: "keep-alive",
 				});
 				response.write(
-					`data: ${JSON.stringify({ id, model: "watchdog-e2e", choices: [{ index: 0, delta: { content: "partial" }, finish_reason: null }] })}\n\n`,
+					`data: ${JSON.stringify({ id, model: "watchdog-e2e", choices: [{ index: 0, delta: { content: reply.text ?? "partial" }, finish_reason: null }] })}\n\n`,
 					() => reply.started?.(),
 				);
 				return;
@@ -605,6 +611,143 @@ function isDecisionRequest(request: RequestRecord): boolean {
 		contentText(message).includes(DECISION_PROMPT_MARKER),
 	);
 }
+
+test("packed native abort hides only the owned assistant notice through real Pi rendering", {
+	timeout: 180_000,
+}, async (t) => {
+	initTheme("dark", false);
+	const fixture = await makePackedFixture(t);
+	for (const kind of [
+		"decision",
+		"correction",
+		"continuation",
+		"empty-decision",
+		"ordinary",
+	] as const) {
+		await t.test(kind, { timeout: 35_000 }, async (sub) => {
+			const replies: MockReply[] = [];
+			if (kind !== "ordinary")
+				replies.push({ kind: "text", text: "Initial work." });
+			if (kind === "correction")
+				replies.push({ kind: "cw-invalid", text: "{}" });
+			if (kind === "continuation")
+				replies.push({
+					kind: "cw",
+					action: "continue",
+					reasonType: "WORK_REMAINS",
+					reason: "Finish the work.",
+				});
+			replies.push({
+				kind: "delayed",
+				text: kind === "empty-decision" ? "" : "partial native output",
+			});
+			const { baseUrl, requests } = await startMockServer(sub, replies);
+			const notifications: string[] = [];
+			const { session } = await createSession(fixture, baseUrl, {
+				uiContext: createRpcUiContext(notifications),
+			});
+			const rendered: string[] = [];
+			const abortFrames: Array<{
+				event: string;
+				streamEvent?: string;
+				stopReason: string;
+			}> = [];
+			const terminal: string[] = [];
+			const terminalOutcomes: string[] = [];
+			const unsubscribe = session.subscribe((event) => {
+				if (
+					(event.type === "message_start" ||
+						event.type === "message_update" ||
+						event.type === "message_end") &&
+					event.message.role === "assistant"
+				) {
+					const component = new AssistantMessageComponent();
+					component.updateContent(event.message, event.type !== "message_end");
+					const view = component.render(100).join("\n");
+					rendered.push(view);
+					if (view.includes("Operation aborted"))
+						abortFrames.push({
+							event: event.type,
+							streamEvent:
+								event.type === "message_update"
+									? event.assistantMessageEvent.type
+									: undefined,
+							stopReason: event.message.stopReason,
+						});
+					if (event.type === "message_end") {
+						terminal.push(view);
+						terminalOutcomes.push(event.message.stopReason);
+					}
+				}
+			});
+			try {
+				const prompt = session.prompt("Do the work.");
+				if (kind !== "ordinary") await prompt;
+				await waitFor(
+					() => requests.length === replies.length,
+					25_000,
+					`${kind} target request`,
+				);
+				if (kind !== "empty-decision") {
+					await waitFor(
+						() =>
+							rendered.some((view) => view.includes("partial native output")),
+						5_000,
+						"partial rendering",
+					);
+				}
+				await session.abort();
+				await prompt;
+				await waitForSessionIdle(session, 5_000, `${kind} abort`);
+				assert.equal(
+					requests.length,
+					replies.length,
+					"abort must not start a replacement request",
+				);
+				assert.equal(
+					notifications.filter(
+						(value) => value === "Continue watchdog unlocked",
+					).length,
+					1,
+				);
+				assert.equal(
+					terminal.length,
+					replies.length,
+					"each response must reach final rendering",
+				);
+				assert.equal(
+					terminalOutcomes.at(-1),
+					"aborted",
+					"host outcome stays aborted",
+				);
+				const finalView = terminal.at(-1) ?? "";
+				if (kind === "ordinary") assert.match(finalView, /Operation aborted/);
+				else
+					assert.doesNotMatch(
+						finalView,
+						/Operation aborted/,
+						"the finalized owned assistant must not retain an abort footer",
+					);
+				// The user accepts transient streaming notices; preserve evidence
+				// instead of treating a quiet final view as proof of zero flashes.
+				sub.diagnostic(
+					`Pi 0.85.1 abort frames: ${JSON.stringify(abortFrames)}`,
+				);
+				if (kind === "continuation" || kind === "ordinary")
+					assert.match(finalView, /partial native output/);
+				else assert.doesNotMatch(finalView, /partial native output/);
+				await session.prompt("/status-continue-watchdog");
+				assert.match(notifications.at(-1) ?? "", /Lock: unlocked/);
+				assert.match(notifications.at(-1) ?? "", /Trigger: blocked · unlocked/);
+				assert.equal(requests.length, replies.length);
+			} finally {
+				unsubscribe();
+				await session.abort();
+				await shutdownSession(session);
+			}
+		});
+	}
+});
 
 test("packed reserved function is advertised with minimal metadata to every request", {
 	timeout: 180_000,

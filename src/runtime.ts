@@ -1033,6 +1033,21 @@ export function createDecisionRuntime(
 		selfDecisionRun.exchangeId === active.exchangeId &&
 		selfDecisionRun.cycleId === active.protocol.currentCycleId;
 
+	/** Exact submitted decision or running continuation, excluding other cancellation paths. */
+	const isCurrentWatchdogOwnedRun = (): boolean => {
+		if (stopped || quarantinedDecision !== null || suppressDecisionAbort)
+			return false;
+		return (
+			(activeDecision !== null &&
+				!activeDecision.invalidated &&
+				activeDecision.submitted &&
+				owns(activeDecision.claim)) ||
+			(watchdogOwnedRun?.phase === "running" &&
+				!watchdogOwnedRun.cancelRequested &&
+				owns(watchdogOwnedRun.claim))
+		);
+	};
+
 	/**
 	 * Local guard. Final-request authority itself rests on the accepted
 	 * production seams: correlated-run matching plus the recorded batch
@@ -2783,6 +2798,22 @@ export function createDecisionRuntime(
 					decisionAssistantToSplice.exchangeId,
 					decisionAssistantToSplice.cycleId,
 				),
+			};
+		}
+		if (
+			event.message.role === "assistant" &&
+			isAbortedAssistant(event.message) &&
+			isCurrentWatchdogOwnedRun()
+		) {
+			// Preserve Pi's abort control (tools, queues and compaction) and the
+			// existing unlock gate. Empty text falls back to `Operation aborted`;
+			// a nonempty blank renders no text, leaving only the host's spacing.
+			return {
+				message: {
+					...event.message,
+					content: activeDecision === null ? event.message.content : [],
+					errorMessage: " ",
+				},
 			};
 		}
 		const active = currentConsumedDecision();
