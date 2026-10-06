@@ -19,9 +19,6 @@ def equalsIgnoreCase (a b : String) : Bool :=
 
 def fixedIdleDelaySeconds : Nat := 10
 def invalidDecisionLimit : Nat := 3
-def minWaitSeconds : Nat := 1
-def maxWaitSeconds : Nat := 1800
-def msPerSecond : Nat := 1000
 def maxReasonLength : Nat := 1000
 
 inductive PiPublicEvent where
@@ -36,19 +33,17 @@ inductive PiPublicEvent where
   deriving DecidableEq, Repr
 
 -- Verdicts and response blocks abstract decoded input; JSON shape, trimming, and configured
--- type admission remain transport obligations. The model checks reason and wait bounds explicitly.
+-- type admission remain transport obligations. The model checks reason bounds explicitly.
+-- The timed-wait verdict is retired: an old wait submission is one invalid response, never
+-- an accepted outcome, and WAIT_CALLBACK is an unlock reason that arms no timer.
 inductive Verdict where
   | cont (reasonType : String) (reason : String)
-  | wait (reason : String) (seconds : Nat)
   | unlock (reasonType : String) (reason : String)
   deriving DecidableEq, Repr
 
 def validVerdict (v : Verdict) : Bool :=
   match v with
   | .cont _ r => 0 < r.length && r.length ≤ maxReasonLength
-  | .wait r seconds =>
-      0 < r.length && r.length ≤ maxReasonLength &&
-        minWaitSeconds ≤ seconds && seconds ≤ maxWaitSeconds
   | .unlock _ r => 0 < r.length && r.length ≤ maxReasonLength
 
 def normalizeDecisionReasonType (supplied : String)
@@ -85,7 +80,6 @@ inductive GateDecision where
 
 inductive FinalOutcome where
   | continued
-  | waited
   | unlocked
   | reask
   | decisionFailed
@@ -133,14 +127,30 @@ def toolCallIds (blocks : List ResponseBlock) : List ToolCallId :=
     | _ => none
 
 -- Human and model consumers receive one shared event body in the same append order.
+-- New timelines carry no waited/completedWait events; legacy persisted records stay readable.
+-- An accepted unlock publishes no shared model-bound body at all: its human outcome is one
+-- quiet UI-only status record excluded from model-bound conversation and native summaries.
 inductive SharedEventKind where
   | continued
-  | waited
-  | completedWait
-  | unlocked
   | decisionFailed
   | exhausted
   deriving DecidableEq, Repr
+
+-- The quiet AI-unlock status: human-only, typed, one per accepted unlock.
+structure UnlockStatusRecord where
+  reasonType : String
+  reason : String
+  humanOnly : Bool
+  modelBound : Bool
+  carriesTimestampBoxOrDisclaimer : Bool
+  deriving DecidableEq, Repr
+
+def buildUnlockStatus (reasonType reason : String) : UnlockStatusRecord :=
+  { reasonType
+    reason
+    humanOnly := true
+    modelBound := false
+    carriesTimestampBoxOrDisclaimer := false }
 
 structure RuntimeTimestamp where
   wallClockMs : Nat
@@ -162,7 +172,10 @@ def appendSharedEvent
     (event : SharedEvent) :
     List SharedEvent := timeline ++ [event]
 
--- Continuation is extension guidance, never user permission or instructions for proactive function use.
+-- Continuation is attributed plugin next-action guidance: the accepted reason appears once as
+-- the suggested next step, never as a quoted prior-result JSON object, never as user permission,
+-- and never teaching proactive control-function use. The notice preserves already-granted
+-- permission instead of resetting it.
 structure ContinuationEnvelope where
   guidance : String
   reasonType : String
@@ -172,6 +185,10 @@ structure ContinuationEnvelope where
   conveysUserAuthorization : Bool
   stopAtUserBoundary : Bool
   checksEveryRequestedTask : Bool
+  checksLatestDelivery : Bool
+  preservesGrantedPermission : Bool
+  presentsReasonAsNextStep : Bool
+  duplicatesReasonAsHistory : Bool
   teachesReservedFunctionUse : Bool
   deriving DecidableEq, Repr
 
@@ -185,7 +202,33 @@ def buildContinuationEnvelope (guidance reasonType reason : String) :
     conveysUserAuthorization := false
     stopAtUserBoundary := true
     checksEveryRequestedTask := true
+    checksLatestDelivery := true
+    preservesGrantedPermission := true
+    presentsReasonAsNextStep := true
+    duplicatesReasonAsHistory := false
     teachesReservedFunctionUse := false }
+
+-- Native summary projection: the same exact-exchange fold governs the host's compaction and
+-- branch-summary preparations. Owned finalized exchanges, invalidated exchanges, recognizable
+-- legacy control replacements, and quiet unlock statuses never enter summarized model input;
+-- accepted continuations survive at their selected fold positions; unowned records pass through.
+-- The projection covers watchdog-owned records on supported native request paths only: it does
+-- not erase raw storage, old summaries, user quotations, or content another extension
+-- independently reintroduces, and it never mutates stored entries.
+inductive ProjectionInput where
+  | ownedFinalizedExchange (correlation : String)
+  | ownedInvalidatedExchange (correlation : String)
+  | legacyControlReplacement (correlation : String)
+  | unlockStatus
+  | continuationFold (correlation : String)
+  | unownedRecord (kind : String)
+  deriving DecidableEq, Repr
+
+def summarizeKeeps (input : ProjectionInput) : Bool :=
+  match input with
+  | .continuationFold _ => true
+  | .unownedRecord _ => true
+  | _ => false
 
 -- The reserved root function has a stable minimal declaration; its arguments are taught only by an inquiry.
 structure ReservedFunctionDeclaration where
@@ -203,7 +246,7 @@ def reservedFunctionDeclaration : ReservedFunctionDeclaration :=
     exposesReasonEnums := false
     rootOnly := true }
 
--- State separates the idle fence, attempt consumption, staged response, shared retry budget, and wait deadline.
+-- State separates the idle fence, attempt consumption, staged response, and the continuation budget.
 -- Prompt booleans abstract exact current run/claim/attempt correlation checked by the host adapter.
 structure IdleFence where
   token : FenceToken
@@ -231,7 +274,6 @@ structure RuntimeState where
   maxRetries : Nat
   invalidAttempts : Nat
   decisionFailed : Bool
-  waitUntilMs : NowMs
   nextDecisionId : DecisionId
   mainIdle : Bool
   busyChildren : List AgentId
@@ -241,14 +283,13 @@ structure RuntimeState where
   exhaustionPublished : Bool
   deriving DecidableEq, Repr
 
--- Entry requires an idle locked cycle with capacity and an elapsed wait; authority additionally requires consumption.
+-- Entry requires an idle locked cycle with capacity; authority additionally requires consumption.
 def initialState (maxRetries : Nat) : RuntimeState :=
   { locked := true
     attempt := 0
     maxRetries
     invalidAttempts := 0
     decisionFailed := false
-    waitUntilMs := 0
     nextDecisionId := 1
     mainIdle := true
     busyChildren := []
@@ -268,11 +309,8 @@ def fenceEligible (state : RuntimeState) : Bool :=
   aggregateIdle state && !exhausted state && !state.decisionFailed &&
     state.active.isNone
 
-def waitElapsed (state : RuntimeState) (now : NowMs) : Bool :=
-  now ≥ state.waitUntilMs
-
-def decisionEligibleAt (state : RuntimeState) (now : NowMs) : Bool :=
-  fenceEligible state && waitElapsed state now
+def decisionEligibleAt (state : RuntimeState) (_now : NowMs) : Bool :=
+  fenceEligible state
 
 def consumedEvidence (attempt : ActiveDecision) : Bool :=
   attempt.promptSeenInRun && attempt.promptInProviderContext
@@ -507,8 +545,13 @@ def NativeTransportSafety : Prop :=
   (∀ state, state.active = none → ∀ nativeShape blocks,
     projectOwnedTransport nativeShape blocks state = ⟨blocks, false, state⟩)
 
--- These local projection guarantees assume authentic consumption metadata. Pi 0.85.1's
--- intermediate context hook does not establish that premise; source acceptance remains blocked.
+-- These local projection guarantees are conditional on authentic consumption metadata.
+-- Pi 0.85.1's intermediate context hook alone does not establish that premise: the runtime
+-- additionally requires the exact correlated run observation and the recorded batch identity
+-- before a submission is authorized, and final provider-bound isolation is enforced by the
+-- exact-exchange fold over ordinary requests and the native summary projection over the
+-- host's compaction/branch-summary preparations. Scheduling, parser transport, metadata
+-- authenticity, and durable I/O remain explicit external assumptions.
 theorem native_transport_is_guarded : NativeTransportSafety := by
   constructor
   · intro state attempt active authorized openWindow blocks
@@ -538,76 +581,9 @@ theorem unreadable_receipt_preserves_budget (current : Bool) (attempt : Nat) :
     receiptAccount current .unreadable attempt = attempt := by
   cases current <;> rfl
 
--- Wait receipts retain exchange/cycle identity and immutable acceptance/deadline facts while unreadable.
-structure WaitReceipt where
-  exchangeId : DecisionId
-  cycleId : CycleId
-  acceptedAtMs : NowMs
-  deadlineMs : NowMs
-  deriving DecidableEq, Repr
-
-structure WaitReceiptState where
-  pending : Option WaitReceipt
-  confirmed : Option WaitReceipt
-  attempt : Nat
-  notifications : Nat
-  deriving DecidableEq, Repr
-
--- Reconciliation requires current ownership and idle state; confirmation transfers the same wait once.
--- These guards and authentic receipt observations are inputs, not a proof about a live host adapter.
-def reconcileWaitReceipt (current idle : Bool) (receipt : ReceiptObservation)
-    (state : WaitReceiptState) : WaitReceiptState :=
-  match state.pending with
-  | none => state
-  | some wait =>
-      if !current then { state with pending := none }
-      else if !idle then state
-      else match receipt with
-      | .unreadable => state
-      | .absent => { state with pending := none, attempt := state.attempt - 1 }
-      | .confirmed => { state with pending := none, confirmed := some wait, notifications := state.notifications + 1 }
-
--- Invalidation removes wake authority; an overdue unreadable receipt is retried without changing its deadline.
-def invalidateWaitReceipt (state : WaitReceiptState) : WaitReceiptState :=
-  { state with pending := none, confirmed := none }
-
-def waitReceiptWakeAt (now : NowMs) (state : WaitReceiptState) : Option NowMs :=
-  state.pending.map fun wait =>
-    if now < wait.deadlineMs then wait.deadlineMs else now + 1000
-
--- A failed read preserves the pending value and budget. Later confirmation recovers it once,
--- while cancellation or loss of ownership cannot publish a stale wait notification.
-def WaitReceiptRecovery : Prop :=
-  (∀ state, reconcileWaitReceipt true true .unreadable state = state) ∧
-  (∀ state wait, state.pending = some wait →
-    reconcileWaitReceipt true true .confirmed
-      (reconcileWaitReceipt true true .unreadable state) =
-        { state with pending := none, confirmed := some wait, notifications := state.notifications + 1 }) ∧
-  (∀ state, reconcileWaitReceipt true true .confirmed
-    (invalidateWaitReceipt state) = invalidateWaitReceipt state) ∧
-  (∀ state, (reconcileWaitReceipt false true .confirmed state).notifications =
-    state.notifications) ∧
-  (∀ state wait, state.pending = some wait →
-    waitReceiptWakeAt wait.deadlineMs state = some (wait.deadlineMs + 1000)) ∧
-  (∀ state, reconcileWaitReceipt true true .confirmed
-    (reconcileWaitReceipt true true .confirmed state) =
-      reconcileWaitReceipt true true .confirmed state)
-
-theorem wait_receipt_recovers : WaitReceiptRecovery := by
-  have unknown (state : WaitReceiptState) :
-      reconcileWaitReceipt true true .unreadable state = state := by
-    cases h : state.pending <;> simp [reconcileWaitReceipt, h]
-  refine ⟨unknown, ?_, ?_, ?_, ?_, ?_⟩
-  · intro state wait pending
-    simp [reconcileWaitReceipt, pending]
-  · intro state
-    simp [invalidateWaitReceipt, reconcileWaitReceipt]
-  · intro state
-    cases h : state.pending <;> simp [reconcileWaitReceipt, h]
-  · intro state wait pending
-    simp [waitReceiptWakeAt, pending]
-  · intro state
-    cases h : state.pending <;> simp [reconcileWaitReceipt, h]
+-- Timed waits are retired. The three-valued receipt rule still governs continuation
+-- publication accounting: only confirmed absence on the current attempt permits a refund,
+-- and an unreadable receipt leaves the budget unchanged.
 
 def toolGate (callId : ToolCallId) (state : RuntimeState) : GateDecision :=
   match state.active with
@@ -665,7 +641,7 @@ def captureSettlement (state : RuntimeState) : RuntimeState :=
         state
   | none => state
 
-def finalizeDecision (now : NowMs) (stillQualified : Bool)
+def finalizeDecision (_now : NowMs) (stillQualified : Bool)
     (state : RuntimeState) : FinalOutcome × RuntimeState :=
   match state.active with
   | none => (.deferred, state)
@@ -680,20 +656,12 @@ def finalizeDecision (now : NowMs) (stillQualified : Bool)
             (.continued,
               { state with
                   active := none
-                  attempt := state.attempt + 1
-                  waitUntilMs := 0 })
-        | .verdict (.wait _ seconds) =>
-            (.waited,
-              { state with
-                  active := none
-                  attempt := state.attempt + 1
-                  waitUntilMs := now + seconds * msPerSecond })
+                  attempt := state.attempt + 1 })
         | .verdict (.unlock _ _) =>
             (.unlocked,
               { state with
                   active := none
-                  locked := false
-                  waitUntilMs := 0 })
+                  locked := false })
         | .invalid =>
             if state.invalidAttempts + 1 < invalidDecisionLimit then
               (.reask,
@@ -726,15 +694,6 @@ def rollbackContinue (state : RuntimeState) : RuntimeState :=
   else
     state
 
-def rollbackWait (previousWaitUntil : NowMs) (state : RuntimeState) :
-    RuntimeState :=
-  if state.active.isNone && 0 < state.attempt then
-    { state with
-        attempt := state.attempt - 1
-        waitUntilMs := previousWaitUntil }
-  else
-    state
-
 def preemptActiveDecision (state : RuntimeState) : RuntimeState :=
   match state.active with
   | some _ => { state with active := none }
@@ -743,8 +702,7 @@ def preemptActiveDecision (state : RuntimeState) : RuntimeState :=
 def manualUnlock (state : RuntimeState) : RuntimeState :=
   { preemptActiveDecision state with
       locked := false
-      fence := none
-      waitUntilMs := 0 }
+      fence := none }
 
 def freshLockCycle (state : RuntimeState) : RuntimeState :=
   { state with
@@ -752,12 +710,11 @@ def freshLockCycle (state : RuntimeState) : RuntimeState :=
       attempt := 0
       invalidAttempts := 0
       decisionFailed := false
-      waitUntilMs := 0
       fence := none
       active := none
       exhaustionPublished := false }
 
--- Timer expiry is separate from idle qualification; exhaustion cannot precede a pending wait deadline.
+-- Timer expiry is separate from idle qualification; the fixed fence is the only timer.
 def timerTick (now : NowMs) (state : RuntimeState) : RuntimeState :=
   match state.fence with
   | some fence =>
@@ -777,9 +734,8 @@ def advanceTimer (now : Nat) (seconds : Nat) (state : RuntimeState) :
   | 0 => state
   | n + 1 => advanceTimer now n (timerTick now state)
 
-def exhaustionEligible (state : RuntimeState) (now : NowMs) : Bool :=
-  state.locked && exhausted state && aggregateIdle state &&
-    waitElapsed state now
+def exhaustionEligible (state : RuntimeState) : Bool :=
+  state.locked && exhausted state && aggregateIdle state
 
 def decisionFailedEligible (state : RuntimeState) : Bool :=
   state.locked && state.decisionFailed && aggregateIdle state
@@ -1166,22 +1122,6 @@ theorem accepted_continue_consumes_one_attempt
     (planned : attempt.planned = .verdict (.cont reasonType reason)) :
     (finalizeDecision now true state).1 = .continued ∧
       (finalizeDecision now true state).2.attempt = state.attempt + 1 ∧
-      (finalizeDecision now true state).2.active.isNone = true ∧
-      (finalizeDecision now true state).2.waitUntilMs = 0 := by
-  simp [finalizeDecision, decisionAuthorized, consumed, h, captured, notInvalid, planned]
-
-theorem accepted_wait_consumes_one_attempt_and_arms_deadline
-    (now : NowMs) (state : RuntimeState) (attempt : ActiveDecision)
-    {reason : String} {seconds : Nat}
-    (h : state.active = some attempt)
-    (consumed : consumedEvidence attempt = true)
-    (captured : attempt.captured = true)
-    (notInvalid : attempt.invalidated = false)
-    (planned : attempt.planned = .verdict (.wait reason seconds)) :
-    (finalizeDecision now true state).1 = .waited ∧
-      (finalizeDecision now true state).2.attempt = state.attempt + 1 ∧
-      (finalizeDecision now true state).2.waitUntilMs =
-        now + seconds * msPerSecond ∧
       (finalizeDecision now true state).2.active.isNone = true := by
   simp [finalizeDecision, decisionAuthorized, consumed, h, captured, notInvalid, planned]
 
@@ -1196,8 +1136,7 @@ theorem accepted_unlock_unlocks_without_attempt
     (finalizeDecision now true state).1 = .unlocked ∧
       (finalizeDecision now true state).2.locked = false ∧
       (finalizeDecision now true state).2.attempt = state.attempt ∧
-      (finalizeDecision now true state).2.active.isNone = true ∧
-      (finalizeDecision now true state).2.waitUntilMs = 0 := by
+      (finalizeDecision now true state).2.active.isNone = true := by
   simp [finalizeDecision, decisionAuthorized, consumed, h, captured, notInvalid, planned]
 
 theorem early_invalid_reasks_with_fresh_evidence
@@ -1238,7 +1177,7 @@ theorem third_invalid_fails_the_decision
   have hnot : ¬ (state.invalidAttempts + 1 < invalidDecisionLimit) := by omega
   simp [finalizeDecision, decisionAuthorized, consumed, h, captured, notInvalid, planned, hnot]
 
--- Recovery and postcondition lemmas preserve publication rollback, wait deadlines, and takeover cancellation.
+-- Recovery and postcondition lemmas preserve publication rollback and takeover cancellation.
 theorem rollback_restores_failed_publication
     (state : RuntimeState)
     (windowClosed : state.active.isNone = true)
@@ -1246,25 +1185,17 @@ theorem rollback_restores_failed_publication
     (rollbackContinue state).attempt = state.attempt - 1 := by
   simp [rollbackContinue, windowClosed, spent]
 
-theorem rollback_wait_restores_deadline
-    (previousWaitUntil : NowMs) (state : RuntimeState)
-    (windowClosed : state.active.isNone = true)
-    (spent : 0 < state.attempt) :
-    (rollbackWait previousWaitUntil state).attempt = state.attempt - 1 ∧
-      (rollbackWait previousWaitUntil state).waitUntilMs = previousWaitUntil := by
-  simp [rollbackWait, windowClosed, spent]
-
-theorem exhaustion_waits_for_deadline
-    (state : RuntimeState) (now : NowMs)
-    (beforeDeadline : now < state.waitUntilMs) :
-    exhaustionEligible state now = false := by
-  have h : ¬ now ≥ state.waitUntilMs := Nat.not_le_of_gt beforeDeadline
-  simp [exhaustionEligible, waitElapsed, h]
+-- Exhaustion eligibility uses aggregate idle only; no retired wait deadline defers it.
+theorem exhaustion_eligibility_ignores_retired_waits
+    (state : RuntimeState) :
+    exhaustionEligible state =
+      (state.locked && exhausted state && aggregateIdle state) := by
+  rfl
 
 theorem busy_children_block_terminal_publication
-    (state : RuntimeState) (now : NowMs)
+    (state : RuntimeState)
     (busy : state.busyChildren ≠ []) :
-    exhaustionEligible state now = false ∧
+    exhaustionEligible state = false ∧
       decisionFailedEligible state = false := by
   have h : state.busyChildren.isEmpty = false := by
     cases hc : state.busyChildren with
@@ -1292,12 +1223,11 @@ theorem late_submission_after_preempt_is_unauthorized
   | none => simp [submitDecisionResult, h]
   | some attempt => simp [submitDecisionResult]
 
-theorem manual_unlock_cancels_window_and_deadline
+theorem manual_unlock_cancels_window_and_fence
     (state : RuntimeState) :
     (manualUnlock state).locked = false ∧
       (manualUnlock state).active.isNone = true ∧
       (manualUnlock state).fence = none ∧
-      (manualUnlock state).waitUntilMs = 0 ∧
       (manualUnlock state).attempt = state.attempt := by
   cases h : state.active with
   | none => simp [manualUnlock, preemptActiveDecision, h]
@@ -1374,19 +1304,10 @@ theorem normalized_type_comes_from_configuration
     exact ⟨entry, (List.mem_filter.mp hm).1, (List.mem_filter.mp hm).2,
       Option.some.inj h⟩
 
-theorem wait_seconds_out_of_bounds_are_invalid
-    (reason : String) (seconds : Nat)
-    (outOfBounds : seconds < minWaitSeconds ∨ maxWaitSeconds < seconds) :
-    validVerdict (.wait reason seconds) = false := by
-  rcases outOfBounds with low | high
-  · simp [validVerdict, Nat.not_le_of_gt low]
-  · simp [validVerdict, Nat.not_le_of_gt high]
-
 theorem oversized_reason_is_invalid
     (reason : String)
     (oversized : maxReasonLength < reason.length) :
     validVerdict (.cont "WORK_REMAINS" reason) = false ∧
-      validVerdict (.wait reason 60) = false ∧
       validVerdict (.unlock "JOB_DONE" reason) = false := by
   simp [validVerdict, Nat.not_le_of_gt oversized]
 
@@ -1451,6 +1372,54 @@ theorem continuation_carries_accepted_reason
         guidance := by
   simp [buildContinuationEnvelope]
 
+theorem continuation_presents_reason_once_as_next_step
+    (guidance reasonType reason : String) :
+    (buildContinuationEnvelope guidance reasonType reason).presentsReasonAsNextStep =
+      true ∧
+      (buildContinuationEnvelope guidance reasonType reason).duplicatesReasonAsHistory =
+        false ∧
+      (buildContinuationEnvelope guidance reasonType reason).checksLatestDelivery =
+        true ∧
+      (buildContinuationEnvelope guidance reasonType reason).preservesGrantedPermission =
+        true := by
+  simp [buildContinuationEnvelope]
+
+theorem continuation_envelope_shape
+    (guidance reasonType reason : String) :
+    let envelope := buildContinuationEnvelope guidance reasonType reason
+    envelope.extensionAuthored = true ∧
+      envelope.userAuthored = false ∧
+      envelope.conveysUserAuthorization = false ∧
+      envelope.teachesReservedFunctionUse = false ∧
+      envelope.presentsReasonAsNextStep = true ∧
+      envelope.duplicatesReasonAsHistory = false ∧
+      envelope.checksLatestDelivery = true ∧
+      envelope.preservesGrantedPermission = true ∧
+      envelope.reasonType = reasonType ∧
+      envelope.reason = reason ∧
+      envelope.guidance = guidance := by
+  simp [buildContinuationEnvelope]
+
+theorem unlock_status_is_quiet_and_human_only
+    (reasonType reason : String) :
+    (buildUnlockStatus reasonType reason).humanOnly = true ∧
+      (buildUnlockStatus reasonType reason).modelBound = false ∧
+      (buildUnlockStatus reasonType reason).carriesTimestampBoxOrDisclaimer =
+        false := by
+  simp [buildUnlockStatus]
+
+-- Native summary projection keeps exactly continuations and unowned records.
+theorem summary_projection_keeps_continuations_and_unowned_only :
+    (∀ correlation,
+      summarizeKeeps (.continuationFold correlation) = true ∧
+        summarizeKeeps (.unownedRecord "user") = true) ∧
+    (∀ correlation,
+      summarizeKeeps (.ownedFinalizedExchange correlation) = false ∧
+        summarizeKeeps (.ownedInvalidatedExchange correlation) = false ∧
+        summarizeKeeps (.legacyControlReplacement correlation) = false ∧
+        summarizeKeeps .unlockStatus = false) := by
+  refine ⟨fun _ => ⟨rfl, rfl⟩, fun _ => ⟨rfl, rfl, rfl, rfl⟩⟩
+
 theorem reserved_function_declaration_is_minimal :
     reservedFunctionDeclaration.name = "cw" ∧
       reservedFunctionDeclaration.description = "don't use unless ask" ∧
@@ -1480,31 +1449,6 @@ theorem guarded_continue_cycle_reaches_outcome
     validResponseBatch, cwBlockCount, otherToolCount, hasDisallowedContent,
     verdictOf, toolCallIds]
 
-theorem guarded_wait_cycle_reaches_outcome
-    (environment : EnvironmentAssumptions)
-    (admitted : environmentAdmitted environment)
-    (now : NowMs) (state : RuntimeState) (reason : String) (seconds : Nat)
-    (eligible : decisionEligibleAt state now = true)
-    (valid : validVerdict (.wait reason seconds) = true) :
-    (runGuardedInquiry environment now (.wait reason seconds) state).1 =
-      .waited ∧
-      (runGuardedInquiry environment now (.wait reason seconds) state).2.attempt =
-        state.attempt + 1 ∧
-      (runGuardedInquiry environment now (.wait reason seconds) state).2.waitUntilMs =
-        now + seconds * msPerSecond ∧
-      (runGuardedInquiry environment now (.wait reason seconds) state).2.locked =
-        true := by
-  obtain ⟨h1, h2, h3, h4, h5, h6⟩ := admitted
-  simp [runGuardedInquiry, h1, h2, h3, h4, h5, h6, beginDecision, eligible,
-    dispatchPrompt, observeRunStart, observeProviderContext, preflightResponse,
-    singleCallBatch, provisionalPlan, submitDecisionResult, captureSettlement,
-    finalizeDecision, valid, freshAttempt, consumedEvidence, decisionAuthorized,
-    validResponseBatch, cwBlockCount, otherToolCount, hasDisallowedContent,
-    verdictOf, toolCallIds]
-  cases hl : state.locked
-  · simp [decisionEligibleAt, fenceEligible, aggregateIdle, hl] at eligible
-  · rfl
-
 theorem guarded_unlock_cycle_reaches_outcome
     (environment : EnvironmentAssumptions)
     (admitted : environmentAdmitted environment)
@@ -1516,9 +1460,7 @@ theorem guarded_unlock_cycle_reaches_outcome
       (runGuardedInquiry environment now (.unlock reasonType reason) state).2.locked =
         false ∧
       (runGuardedInquiry environment now (.unlock reasonType reason) state).2.attempt =
-        state.attempt ∧
-      (runGuardedInquiry environment now (.unlock reasonType reason) state).2.waitUntilMs =
-        0 := by
+        state.attempt := by
   obtain ⟨h1, h2, h3, h4, h5, h6⟩ := admitted
   simp [runGuardedInquiry, h1, h2, h3, h4, h5, h6, beginDecision, eligible,
     dispatchPrompt, observeRunStart, observeProviderContext, preflightResponse,
@@ -1558,26 +1500,6 @@ theorem three_invalid_responses_fail_the_decision
     finalizeDecision, freshAttempt, consumedEvidence, decisionAuthorized,
     validResponseBatch, cwBlockCount, otherToolCount, hasDisallowedContent,
     decisionEligibleAt, fenceEligible, invalidDecisionLimit]
-
-theorem final_wait_defers_exhaustion_past_deadline
-    (environment : EnvironmentAssumptions)
-    (admitted : environmentAdmitted environment)
-    (now : NowMs) (state : RuntimeState) (reason : String) (seconds : Nat)
-    (eligible : decisionEligibleAt state now = true)
-    (valid : validVerdict (.wait reason seconds) = true)
-    (later : NowMs)
-    (beforeDeadline : later < now + seconds * msPerSecond) :
-    exhaustionEligible
-      (runGuardedInquiry environment now (.wait reason seconds) state).2
-      later = false := by
-  have opened :=
-    guarded_wait_cycle_reaches_outcome environment admitted now state reason
-      seconds eligible valid
-  have hWait :
-    (runGuardedInquiry environment now (.wait reason seconds) state).2.waitUntilMs =
-      now + seconds * msPerSecond := opened.2.2.1
-  have h : ¬ later ≥ now + seconds * msPerSecond := Nat.not_le_of_gt beforeDeadline
-  simp [exhaustionEligible, waitElapsed, hWait, h]
 
 -- This bundle keeps the established transition-level obligations visible without claiming a live-host proof.
 def ProcessSafety : Prop :=
@@ -1638,14 +1560,6 @@ def ProcessSafety : Prop :=
       (finalizeDecision now true state).1 = .continued ∧
         (finalizeDecision now true state).2.attempt = state.attempt + 1 ∧
         (finalizeDecision now true state).2.active.isNone = true) ∧
-    (∀ now state attempt reason seconds, state.active = some attempt →
-      consumedEvidence attempt = true →
-      attempt.captured = true → attempt.invalidated = false →
-      attempt.planned = .verdict (.wait reason seconds) →
-      (finalizeDecision now true state).1 = .waited ∧
-        (finalizeDecision now true state).2.attempt = state.attempt + 1 ∧
-        (finalizeDecision now true state).2.waitUntilMs =
-          now + seconds * msPerSecond) ∧
     (∀ now state attempt reasonType reason, state.active = some attempt →
       consumedEvidence attempt = true →
       attempt.captured = true → attempt.invalidated = false →
@@ -1673,14 +1587,10 @@ def ProcessSafety : Prop :=
         (finalizeDecision now true state).2.active.isNone = true) ∧
     (∀ state, state.active.isNone = true → 0 < state.attempt →
       (rollbackContinue state).attempt = state.attempt - 1) ∧
-    (∀ previousWaitUntil state, state.active.isNone = true →
-      0 < state.attempt →
-      (rollbackWait previousWaitUntil state).attempt = state.attempt - 1 ∧
-        (rollbackWait previousWaitUntil state).waitUntilMs = previousWaitUntil) ∧
-    (∀ state now, now < state.waitUntilMs →
-      exhaustionEligible state now = false) ∧
-    (∀ state now, state.busyChildren ≠ [] →
-      exhaustionEligible state now = false ∧
+    (∀ state, exhaustionEligible state =
+      (state.locked && exhausted state && aggregateIdle state)) ∧
+    (∀ state, state.busyChildren ≠ [] →
+      exhaustionEligible state = false ∧
         decisionFailedEligible state = false) ∧
     (∀ state, (preemptActiveDecision state).active.isNone = true ∧
       (preemptActiveDecision state).attempt = state.attempt) ∧
@@ -1715,7 +1625,33 @@ def ProcessSafety : Prop :=
       reservedFunctionDeclaration.description = "don't use unless ask" ∧
       reservedFunctionDeclaration.declaresArguments = false ∧
       reservedFunctionDeclaration.exposesReasonEnums = false ∧
-      reservedFunctionDeclaration.rootOnly = true)
+      reservedFunctionDeclaration.rootOnly = true) ∧
+    (∀ guidance reasonType reason,
+      let envelope := buildContinuationEnvelope guidance reasonType reason
+      envelope.extensionAuthored = true ∧
+        envelope.userAuthored = false ∧
+        envelope.conveysUserAuthorization = false ∧
+        envelope.teachesReservedFunctionUse = false ∧
+        envelope.presentsReasonAsNextStep = true ∧
+        envelope.duplicatesReasonAsHistory = false ∧
+        envelope.checksLatestDelivery = true ∧
+        envelope.preservesGrantedPermission = true ∧
+        envelope.reasonType = reasonType ∧
+        envelope.reason = reason ∧
+        envelope.guidance = guidance) ∧
+    (∀ reasonType reason,
+      let status := buildUnlockStatus reasonType reason
+      status.humanOnly = true ∧
+        status.modelBound = false ∧
+        status.carriesTimestampBoxOrDisclaimer = false) ∧
+    ((∀ correlation,
+        summarizeKeeps (.continuationFold correlation) = true ∧
+          summarizeKeeps (.unownedRecord "user") = true) ∧
+      (∀ correlation,
+        summarizeKeeps (.ownedFinalizedExchange correlation) = false ∧
+          summarizeKeeps (.ownedInvalidatedExchange correlation) = false ∧
+          summarizeKeeps (.legacyControlReplacement correlation) = false ∧
+          summarizeKeeps .unlockStatus = false))
 
 -- The unchanged observation/recovery guarantees and corrected consumption guards jointly satisfy the bundle.
 theorem transition_invariants : ProcessSafety := by
@@ -1728,25 +1664,25 @@ theorem transition_invariants : ProcessSafety := by
     second_submission_is_duplicate, mixed_batch_is_rejected,
     duplicate_reserved_calls_are_rejected, visible_text_is_rejected,
     rejected_batch_plans_invalid, foreign_tool_call_is_blocked,
-    ordinary_work_keeps_tool_access, ?_, ?_, ?_, ?_, ?_,
-    rollback_restores_failed_publication, rollback_wait_restores_deadline,
-    exhaustion_waits_for_deadline, busy_children_block_terminal_publication,
+    ordinary_work_keeps_tool_access, ?_, ?_, ?_, ?_,
+    rollback_restores_failed_publication,
+    exhaustion_eligibility_ignores_retired_waits,
+    busy_children_block_terminal_publication,
     ?_, late_submission_after_preempt_is_unauthorized, ?_,
     finalized_window_grants_no_submission_authority,
     invalid_attempts_stay_bounded, ?_, shared_event_body_is_identical,
-    reserved_function_declaration_is_minimal⟩
+    ⟨reserved_function_declaration_is_minimal,
+      @continuation_envelope_shape,
+      @unlock_status_is_quiet_and_human_only,
+      summary_projection_keeps_continuations_and_unowned_only⟩⟩
   · intro now state attempt reasonType reason h consumed captured notInvalid planned
     have p := accepted_continue_consumes_one_attempt now state attempt h consumed
       captured notInvalid planned
-    exact ⟨p.1, p.2.1, p.2.2.1⟩
-  · intro now state attempt reason seconds h consumed captured notInvalid planned
-    have p := accepted_wait_consumes_one_attempt_and_arms_deadline now state attempt h
-      consumed captured notInvalid planned
-    exact ⟨p.1, p.2.1, p.2.2.1⟩
+    exact ⟨p.1, p.2.1, p.2.2⟩
   · intro now state attempt reasonType reason h consumed captured notInvalid planned
     have p := accepted_unlock_unlocks_without_attempt now state attempt h consumed
       captured notInvalid planned
-    exact ⟨p.1, p.2.1, p.2.2.1, p.2.2.2.1⟩
+    exact ⟨p.1, p.2.1, p.2.2.1, p.2.2.2⟩
   · intro now state attempt h consumed captured notInvalid planned withinBudget
     have p := early_invalid_reasks_with_fresh_evidence now state attempt h consumed
       captured notInvalid planned withinBudget
@@ -1760,8 +1696,8 @@ theorem transition_invariants : ProcessSafety := by
     have p := takeover_closes_window_without_budget state
     exact ⟨p.1, p.2.1⟩
   · intro state
-    have p := manual_unlock_cancels_window_and_deadline state
-    exact ⟨p.1, p.2.1, p.2.2.2.2⟩
+    have p := manual_unlock_cancels_window_and_fence state
+    exact ⟨p.1, p.2.1, p.2.2.2⟩
   · intro guidance reasonType reason
     simp [buildContinuationEnvelope]
 
@@ -1785,7 +1721,6 @@ theorem unconsumed_pipeline_is_inert
 -- Required outcomes make conditional end-to-end termination explicit rather than relying on example execution.
 def requiredOutcome : Verdict → FinalOutcome
   | .cont .. => .continued
-  | .wait .. => .waited
   | .unlock .. => .unlocked
 
 theorem guarded_inquiry_terminates
@@ -1799,9 +1734,6 @@ theorem guarded_inquiry_terminates
   | cont reasonType reason =>
       exact (guarded_continue_cycle_reaches_outcome environment admitted now state
         reasonType reason eligible valid).1
-  | wait reason seconds =>
-      exact (guarded_wait_cycle_reaches_outcome environment admitted now state
-        reason seconds eligible valid).1
   | unlock reasonType reason =>
       exact (guarded_unlock_cycle_reaches_outcome environment admitted now state
         reasonType reason eligible valid).1
@@ -1836,12 +1768,10 @@ theorem process_is_correct : ProcessSafety ∧
           (runGuardedInvalidResponse environment now2
             (runGuardedInvalidResponse environment now1 state).2).2).2.decisionFailed = true) ∧
     NativeTransportSafety ∧ stagedResultIsError .stagedInvalid = true ∧
-    (∀ current attempt, receiptAccount current .unreadable attempt = attempt) ∧
-    WaitReceiptRecovery :=
+    (∀ current attempt, receiptAccount current .unreadable attempt = attempt) :=
   ⟨transition_invariants, unconsumed_pipeline_is_inert, foreign_context_does_not_confirm,
     guarded_inquiry_terminates, three_invalid_responses_fail_the_decision,
-    native_transport_is_guarded, staged_validation_is_error, unreadable_receipt_preserves_budget,
-    wait_receipt_recovers⟩
+    native_transport_is_guarded, staged_validation_is_error, unreadable_receipt_preserves_budget⟩
 
 end OfficialPiIdleInquiry
 
@@ -1854,13 +1784,13 @@ def main : IO Unit := do
   let initial := OfficialPiIdleInquiry.initialState 2
   let continued := OfficialPiIdleInquiry.runGuardedInquiry environment 0
     (.cont "WORK_REMAINS" "Verification remains.") initial
-  let waited := OfficialPiIdleInquiry.runGuardedInquiry environment 0
-    (.wait "Waiting for automation." 60) continued.2
+  let callback := OfficialPiIdleInquiry.runGuardedInquiry environment 0
+    (.unlock "WAIT_CALLBACK" "Waiting for the subagent callback.") continued.2
   let unlocked := OfficialPiIdleInquiry.runGuardedInquiry environment 0
     (.unlock "JOB_DONE" "Work is complete.") initial
   let invalid1 := OfficialPiIdleInquiry.runGuardedInvalidResponse environment 0 initial
   let invalid2 := OfficialPiIdleInquiry.runGuardedInvalidResponse environment 0 invalid1.2
   let invalid3 := OfficialPiIdleInquiry.runGuardedInvalidResponse environment 0 invalid2.2
-  IO.println s!"continue: attempt={continued.2.attempt}; wait: attempt={waited.2.attempt}, deadline={waited.2.waitUntilMs}ms"
+  IO.println s!"continue: attempt={continued.2.attempt}; callback unlock: locked={callback.2.locked}, attempt={callback.2.attempt}"
   IO.println s!"unlock: locked={unlocked.2.locked}, attempt={unlocked.2.attempt}; three invalid: failed={invalid3.2.decisionFailed}, attempt={invalid3.2.attempt}"
   IO.println "process_is_correct: consumption-gated safety and conditional inquiry termination; external scheduling and durable publication are assumptions."

@@ -16,7 +16,6 @@ import {
 	parseWatchdogEvent,
 	type UnlockWatchdogEvent,
 	WATCHDOG_EVENT_MESSAGE_TYPE,
-	type WaitWatchdogEvent,
 	type WatchdogEvent,
 } from "./watchdog-event.js";
 
@@ -66,11 +65,6 @@ export type DecisionFoldMessageInput =
 			readonly outcome: "continue";
 			readonly continuePrompt: string;
 			readonly watchdogEvent?: ContinueWatchdogEvent;
-	  })
-	| (DecisionFoldMessageBase & {
-			readonly outcome: "wait";
-			readonly eventContent?: string;
-			readonly watchdogEvent?: WaitWatchdogEvent;
 	  })
 	| (DecisionFoldMessageBase & {
 			readonly outcome: "unlock";
@@ -400,6 +394,18 @@ export function createDecisionPromptMessage(
 export function createDecisionFoldMessage(
 	input: DecisionFoldMessageInput,
 ): DecisionCustomMessage {
+	// The timed-wait outcome is retired from the supported writer surface: no
+	// new wait/elapsed-wait records can be manufactured. A wait input is a
+	// type error at compile time and is rejected here at runtime for untyped
+	// callers, using the same validation boundary as every other invalid input.
+	if (
+		(input as { readonly outcome?: unknown }).outcome === "wait" ||
+		(input as { readonly outcome?: unknown }).outcome === "wait-completed"
+	) {
+		throw new TypeError(
+			"invalid decision fold message input: wait is a retired outcome",
+		);
+	}
 	const suppliedEvent =
 		"watchdogEvent" in input ? input.watchdogEvent : undefined;
 	const watchdogEvent = parseWatchdogEvent(suppliedEvent);
@@ -464,6 +470,131 @@ function decisionCorrelationKey(details: InquiryCorrelation): string {
 	return `${details.inquiryId}\u0000${details.attempt}`;
 }
 
+/**
+ * Legacy control replacements that must not reenter ordinary model context.
+ *
+ * A replace-fold's replacement carries a watchdog-event payload validated by
+ * parseDecisionFoldDetails. Legacy `unlock` folds re-emitted the unlock
+ * reason as a model-bound body — exactly the traffic the quiet status design
+ * removed — and legacy `wait`/`wait-completed` folds re-emitted retired
+ * control bodies. Both are recognized by exact replacement metadata
+ * (validated fold correlation plus a validated event kind), never by body
+ * text. Permitted shared events are untouched: `decision-failed`
+ * replacements are how the current runtime publishes its shared failure
+ * event, `exhausted` events are published directly rather than through
+ * folds, and `continue` replacements are folded by the library's own
+ * segment logic.
+ */
+function foldReplacementIsLegacyControl(details: DecisionFoldDetails): boolean {
+	if (details.outcome !== "replace") return false;
+	// The controlling event rides either on the fold details (watchdogEvent)
+	// or inside the replacement payload (replacement.details), matching both
+	// legacy writer generations. Either path is validated metadata, not text.
+	const event =
+		parseWatchdogEvent(details.watchdogEvent) ??
+		(isObject(details.replacement) && isObject(details.replacement.details)
+			? parseWatchdogEvent(details.replacement.details)
+			: undefined);
+	return (
+		event?.kind === "unlock" ||
+		event?.kind === "wait" ||
+		event?.kind === "wait-completed"
+	);
+}
+
+/**
+ * Terminal owned exchanges that `foldInquiryContext` failed closed on because
+ * a human takeover (or another preserved record) interleaved the prompt and
+ * the fold. Runs on foldInquiryContext's OUTPUT: exchanges the library
+ * already folded are gone, so what remains of a terminal exchange is exactly
+ * its un-folded residue. A remove-fold with a terminal watchdog outcome is
+ * durable proof the exchange ended with no replacement — the
+ * invalidated/preempted takeover shape. Identity is the exact exchange id of
+ * the terminal fold, matched against prompt and neutralized assistant
+ * records of the same exchange at any attempt. Nothing is removed when no
+ * such fold exists, so a live or malformed exchange still fails closed.
+ *
+ * Legacy control replace-folds (validated unlock/wait replacement bodies)
+ * close the same way: the exchange ended and its control body must not
+ * reenter ordinary model input.
+ */
+function stripTerminalOwnedExchanges<T extends object>(
+	folded: T[],
+	messages: readonly T[],
+): T[] {
+	// Exchange ids whose owned exchange provably ended, either through a
+	// terminal remove fold (invalidated/preempted/unlock/decision-failed —
+	// but never "wait", which was never terminal) or through a recognized
+	// legacy control replacement (unlock/wait bodies). Scanned on the ORIGINAL
+	// messages: the library may have already consumed prompt+fold and emitted
+	// the replacement, so the fold is not always present in `folded`.
+	const terminal = new Set<string>();
+	for (const message of messages) {
+		if (
+			!isObject(message) ||
+			message.customType !== DECISION_FOLD_MESSAGE_TYPE
+		) {
+			continue;
+		}
+		const details = parseDecisionFoldDetails(message.details);
+		if (details === undefined) continue;
+		if (details.outcome === "remove" && details.watchdogOutcome !== "wait") {
+			// Exchange-level key: a terminal remove fold ends the whole
+			// exchange, and any residue of the same exchange is internal.
+			terminal.add(details.inquiryId);
+		} else if (foldReplacementIsLegacyControl(details)) {
+			terminal.add(details.inquiryId);
+		}
+	}
+	if (terminal.size === 0) return folded;
+	return folded.filter((message) => {
+		if (!isObject(message)) return true;
+		if (message.customType === DECISION_MESSAGE_TYPE) {
+			const details = decisionDetails(message.details);
+			return !(details !== undefined && terminal.has(details.inquiryId));
+		}
+		if (message.customType === DECISION_FOLD_MESSAGE_TYPE) {
+			const details = parseDecisionFoldDetails(message.details);
+			return !(details !== undefined && terminal.has(details.inquiryId));
+		}
+		// A neutralized assistant of a stripped exchange is internal traffic.
+		if (
+			message.role === "assistant" &&
+			isObject(message.details) &&
+			isObject(message.details.piInquiry)
+		) {
+			const details = decisionDetails(message.details.piInquiry);
+			return !(details !== undefined && terminal.has(details.inquiryId));
+		}
+		// A fold's replacement message carries the fold exchange's
+		// correlation under details.piInquiry: recognized legacy control
+		// bodies are removed with their exchange. Standalone shared events
+		// (failure/exhaustion publications with no fold correlation) are
+		// untouched, and a replacement whose own validated event kind is a
+		// permitted shared event (decision-failed) survives even though its
+		// exchange had other terminal folds.
+		if (
+			message.role === "custom" &&
+			message.customType === WATCHDOG_EVENT_MESSAGE_TYPE
+		) {
+			const details = isObject(message.details)
+				? (message.details as { piInquiry?: unknown })
+				: undefined;
+			const correlation = decisionDetails(details?.piInquiry);
+			if (correlation === undefined) return true;
+			if (!terminal.has(correlation.inquiryId)) return true;
+			const event = parseWatchdogEvent(
+				(message.details as { kind?: unknown }).kind === undefined
+					? undefined
+					: message.details,
+			);
+			if (event?.kind === "decision-failed") return true;
+			return false;
+		}
+		return true;
+	});
+}
+
 function restoreDecisionFoldOrder<T extends object>(
 	messages: T[],
 	folded: T[],
@@ -513,7 +644,10 @@ function restoreDecisionFoldOrder<T extends object>(
 export function foldDecisionContext<T extends object>(messages: T[]): T[] {
 	const folded = restoreDecisionFoldOrder(
 		messages,
-		foldInquiryContext(messages, DECISION_INQUIRY_NAMESPACE),
+		stripTerminalOwnedExchanges(
+			foldInquiryContext(messages, DECISION_INQUIRY_NAMESPACE),
+			messages,
+		),
 	);
 	const filtered = folded.filter((message) => {
 		if (!isObject(message) || message.role !== "assistant") return true;

@@ -1,10 +1,4 @@
-# watchdog-semantic-hooks Specification
-
-## Purpose
-
-Defines the complete, optional set of `pi:semantic-hook:v1` notifications the continue watchdog publishes so consumers such as pi-notify can react without depending on internal state.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Published hook set
 The watchdog SHALL publish only these `pi:semantic-hook:v1` hooks:
@@ -33,19 +27,7 @@ Exactly one `watchdog-continued` hook SHALL follow durable publication of each c
 - **WHEN** publication fails or current ownership is lost
 - **THEN** no continuation hook is emitted
 
-### Requirement: Silent human and abort paths
-Manual unlock, the unlock shortcut, main-agent abort, ordinary unlocked idle, and cancelled or stale work SHALL publish no semantic hook.
-
-#### Scenario: Human unlock
-- **WHEN** the user runs `/unlock-continue-watchdog`
-- **THEN** no `user-ready` hook is published
-
-### Requirement: Consumers remain optional
-Hook publication SHALL be best-effort to current listeners only. The watchdog SHALL NOT depend on, identify, wait for, or import any consumer, and a throwing listener SHALL NOT change watchdog state.
-
-#### Scenario: Listener throws
-- **WHEN** a listener throws while receiving `watchdog-continued`
-- **THEN** the continuation turn and later watchdog behavior are unchanged
+## ADDED Requirements
 
 ### Requirement: Terminal signals retain aggregate-idle fencing
 AI unlock, terminal-error unlock, exhaustion, and decision failure SHALL emit `user-ready` only while that terminal state and main claim remain current and all existing local, child, process-domain, and stale-publication guards permit it. An AI unlock SHALL require confirmation of its human-only status and finalized internal-exchange cleanup rather than a shared model-bound unlock message. Repeated settlement SHALL not duplicate signals. No retired wait deadline SHALL defer exhaustion. Manual unlock, shortcuts, abort, ordinary unlocked idle, and stale or cancelled work SHALL remain silent.

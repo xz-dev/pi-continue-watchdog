@@ -24,6 +24,8 @@ import {
 	createActivityGraceCoordinator,
 } from "./activity-grace.js";
 import {
+	AI_UNLOCK_ENTRY_TYPE,
+	type AiUnlockEntry,
 	WATCHDOG_STATUS_ENTRY_TYPE,
 	type WatchdogStatusEntry,
 } from "./commands.js";
@@ -59,7 +61,6 @@ import {
 	type DecisionValidation,
 	formatDecisionFailedNotification,
 	MALFORMED_DECISION_RESPONSE_ERROR,
-	MAX_WAIT_SECONDS,
 	MISSING_DECISION_CALL_ERROR,
 	normalizeAssistantDecisionResponse,
 	validateDecisionArguments,
@@ -84,23 +85,16 @@ import {
 import {
 	createUserReadyEnvelope,
 	createWatchdogContinuedEnvelope,
-	createWatchdogWaitingEnvelope,
 	emitSemanticHook,
 	type UserReadyValues,
 } from "./semantic-hook.js";
 import {
-	createCompletedWaitWatchdogEvent,
 	createContinueWatchdogEvent,
 	createDecisionFailedWatchdogEvent,
 	createExhaustedWatchdogEvent,
-	createUnlockWatchdogEvent,
-	createWaitWatchdogEvent,
-	formatCompletedWaitWatchdogEvent,
 	formatContinueWatchdogEvent,
 	formatDecisionFailedWatchdogEvent,
 	formatExhaustedWatchdogEvent,
-	formatUnlockWatchdogEvent,
-	formatWaitWatchdogEvent,
 	WATCHDOG_EVENT_MESSAGE_TYPE,
 } from "./watchdog-event.js";
 
@@ -144,14 +138,6 @@ export type DecisionAuditEntry =
 			readonly version: 1;
 			readonly exchangeId: string;
 			readonly cycleId: number;
-			readonly outcome: "wait";
-			readonly reason: string;
-			readonly waitSeconds: number;
-	  }
-	| {
-			readonly version: 1;
-			readonly exchangeId: string;
-			readonly cycleId: number;
 			readonly outcome: "unlock";
 			readonly reasonType: string;
 			readonly reason: string;
@@ -169,7 +155,6 @@ interface ActiveDecision {
 	readonly exchangeId: string;
 	readonly claim: HubMainClaim;
 	protocol: DecisionProtocolSession;
-	readonly waitCompletionIdentity: string | null;
 	readonly domainFence: DomainFence;
 	inquiry: InquiryAttemptHandle;
 	aggregateGeneration: ActivityGeneration;
@@ -218,18 +203,6 @@ interface UninterruptibleMessageEndAPI {
 		) => { readonly message: MessageEndEvent["message"] } | undefined,
 		options: { readonly uninterruptible: true },
 	): void;
-}
-
-interface WaitCompletionSnapshot {
-	readonly identity: string;
-	readonly content: string;
-}
-
-interface WaitTimingSnapshot {
-	readonly identity: string;
-	readonly acceptedAtMs: number;
-	readonly waitSeconds: number;
-	readonly deadlineMs: number;
 }
 
 type SelfDecisionRun =
@@ -413,13 +386,6 @@ function assistantErrorMessage(message: unknown): string {
 function stagedVerdictArguments(validation: DecisionValidation): unknown {
 	if (!validation.valid) return null;
 	const decision = validation.decision;
-	if (decision.kind === "wait") {
-		return {
-			action: "wait",
-			reason_content: decision.reason,
-			wait_seconds: decision.waitSeconds,
-		};
-	}
 	return {
 		action: decision.kind,
 		reason_type: decision.reasonType,
@@ -499,23 +465,6 @@ export function createDecisionRuntime(
 	let pendingInquiryCleanup: InquiryFoldMessage | null = null;
 	/** Retained for automatic unlock until the next all-idle settle. */
 	let pendingUnlock: UserReadyValues | null = null;
-	/** Timing identity for the current accepted wait only. */
-	let pendingWaitTiming: WaitTimingSnapshot | null = null;
-	/** Keep an unreadable receipt and its original deadline until reconciliation. */
-	let pendingWaitPublication: {
-		readonly active: ActiveDecision;
-		readonly controller: LockDecisionController;
-		readonly attempt: number;
-		readonly cycleId: number;
-		readonly previousDeadlineMs: number;
-		readonly timing: WaitTimingSnapshot;
-		readonly body: string;
-		readonly reason: string;
-		readonly confirmed: () => boolean | undefined;
-		sendReturned: boolean;
-	} | null = null;
-	/** Completed wait retained until a correlated inquiry start confirms ownership. */
-	let pendingWaitCompletion: WaitCompletionSnapshot | null = null;
 	/** Shared non-triggering events require a correlated branch receipt. */
 	type SharedPublication = {
 		readonly claim: HubMainClaim;
@@ -526,23 +475,34 @@ export function createDecisionRuntime(
 		sending: boolean;
 	};
 	let publicationCycle = 0;
-	let pendingCompletedWaitPublication: {
-		readonly wait: WaitTimingSnapshot;
-		readonly content: string;
-		readonly publication: SharedPublication;
-	} | null = null;
 	let pendingTerminalPublication: {
 		readonly publication: SharedPublication;
 		readonly values: UserReadyValues;
 		readonly active?: ActiveDecision;
 		readonly content?: string;
+		/**
+		 * Quiet AI-unlock second artifact: the UI-only status entry. Publication
+		 * completes only after the correlated remove-fold receipt AND this new
+		 * branch entry are both confirmed; neither substitutes for the other.
+		 */
+		readonly statusEntry?: {
+			readonly data: AiUnlockEntry;
+			receipt: (() => boolean | undefined) | null;
+			/**
+			 * In-flight guard, mirroring SharedPublication.sending: a
+			 * synchronous reentry (for example a hub state report triggered
+			 * from inside appendEntry) must not create a second receipt or
+			 * append a second status while the current confirmation is still
+			 * executing.
+			 */
+			sending: boolean;
+		};
 	} | null = null;
 	/** At-most-once semantic publication guard for the current aggregate-idle epoch. */
 	let publishedForIdleEpoch = false;
 	/** Retry exhaustion is persisted once per lock cycle, even across re-entrant activity. */
 	let exhaustionEventPublished = false;
 	let exhaustionEventPublicationInFlight = false;
-	let terminalWaitTimer: RuntimeTimerHandle | null = null;
 	let activeStatus: WatchdogStatusEntry | null = null;
 	let statusTui: { requestRender(): void } | null = null;
 	let statusWidgetRegistered = false;
@@ -582,11 +542,6 @@ export function createDecisionRuntime(
 		return effectiveClaim !== null && options.hub.isCurrentMain(effectiveClaim)
 			? controller
 			: null;
-	};
-
-	const clearTerminalWaitTimer = (): void => {
-		if (terminalWaitTimer !== null) clock.clearTimeout(terminalWaitTimer);
-		terminalWaitTimer = null;
 	};
 
 	const stateStatusProjection = (): {
@@ -912,7 +867,6 @@ export function createDecisionRuntime(
 		publicationCycle += 1;
 		const terminalDecision = pendingTerminalPublication?.active;
 		pendingTerminalPublication = null;
-		pendingCompletedWaitPublication = null;
 		if (terminalDecision !== undefined) {
 			retainInquiryCleanup(terminalDecision);
 			retryInquiryCleanup();
@@ -930,7 +884,6 @@ export function createDecisionRuntime(
 		}
 		pendingContinuationPublication = null;
 		localActivityGeneration += 1;
-		clearTerminalWaitTimer();
 		if (activeDecision !== null) {
 			retainInquiryCleanup(activeDecision);
 			retryInquiryCleanup();
@@ -947,9 +900,6 @@ export function createDecisionRuntime(
 		clearLiveStatus();
 		// Human/abort unlock must not inherit automatic terminal publication intent.
 		pendingUnlock = null;
-		pendingWaitTiming = null;
-		pendingWaitPublication = null;
-		pendingWaitCompletion = null;
 		exhaustionEventPublished = false;
 		exhaustionEventPublicationInFlight = false;
 		observeAggregate();
@@ -1083,7 +1033,13 @@ export function createDecisionRuntime(
 		selfDecisionRun.exchangeId === active.exchangeId &&
 		selfDecisionRun.cycleId === active.protocol.currentCycleId;
 
-	/** Local guard; final-request authority remains blocked by the host projection gap. */
+	/**
+	 * Local guard. Final-request authority itself rests on the accepted
+	 * production seams: correlated-run matching plus the recorded batch
+	 * identity at message_end, enforced with the fold/projection pipeline.
+	 * External scheduling, authentic consumption metadata, and durable I/O
+	 * remain explicit external assumptions, not local guarantees.
+	 */
 	const currentConsumedDecision = (): ActiveDecision | null => {
 		const active = activeDecision;
 		return !stopped &&
@@ -1318,14 +1274,9 @@ export function createDecisionRuntime(
 		const stillOwns = (): boolean => owns(claim);
 
 		// Keep ordinary active tools and system prompt unchanged. Decision answers
-		// are final XML text, not temporary decision tools.
-		const waitCompletion = pendingWaitCompletion;
-		const decisionIntent =
-			waitCompletion === null
-				? config.decisionPrompt
-				: `${waitCompletion.content}\n\n${config.decisionPrompt}`;
+		// are final function-call text, not temporary decision tools.
 		const decisionPrompt = buildDecisionPrompt(
-			decisionIntent,
+			config.decisionPrompt,
 			config.reasonTypes,
 			config.continueReasonTypes,
 		);
@@ -1340,7 +1291,6 @@ export function createDecisionRuntime(
 			decisionPrompt,
 			reasonTypes: config.reasonTypes,
 			continueReasonTypes: config.continueReasonTypes,
-			now,
 		});
 		const active: ActiveDecision = {
 			decisionId,
@@ -1364,7 +1314,6 @@ export function createDecisionRuntime(
 			responseToolCallIds: new Set<string>(),
 			stagedResult: null,
 			protocol,
-			waitCompletionIdentity: waitCompletion?.identity ?? null,
 		};
 		activeDecision = active;
 		try {
@@ -1521,7 +1470,6 @@ export function createDecisionRuntime(
 		readonly generation: ActivityGeneration;
 		readonly claim: HubMainClaim | null;
 		readonly fence: DomainFence;
-		readonly waitUntilMs: number;
 	} => {
 		const claim = getMainClaim();
 		const controller = currentController(claim);
@@ -1550,7 +1498,6 @@ export function createDecisionRuntime(
 			controllerEligible &&
 			activeDecision === null &&
 			pendingFinalization === null &&
-			pendingWaitPublication === null &&
 			pendingInquiryCleanup === null &&
 			selfDecisionRun.kind === "none";
 		return {
@@ -1563,7 +1510,6 @@ export function createDecisionRuntime(
 			},
 			claim,
 			fence,
-			waitUntilMs: controller?.snapshot.waitUntilMs ?? 0,
 		};
 	};
 
@@ -1572,52 +1518,8 @@ export function createDecisionRuntime(
 		graceCoordinator.update({
 			allIdle: input.allIdle,
 			generation: input.generation,
-			notBeforeMs: input.waitUntilMs,
 		});
 		refreshStateStatus();
-	};
-
-	const publishCompletedWait = (
-		claim: HubMainClaim,
-		observedAtMs: number,
-	): string | null | undefined => {
-		const wait = pendingWaitTiming;
-		if (wait === null || observedAtMs < wait.deadlineMs) return null;
-		if (pendingCompletedWaitPublication === null) {
-			const event = createCompletedWaitWatchdogEvent({
-				waitIdentity: wait.identity,
-				acceptedAtMs: wait.acceptedAtMs,
-				observedAtMs,
-				waitSeconds: wait.waitSeconds,
-			});
-			const content = formatCompletedWaitWatchdogEvent(event);
-			pendingCompletedWaitPublication = {
-				wait,
-				content,
-				publication: createSharedPublication(claim, {
-					customType: WATCHDOG_EVENT_MESSAGE_TYPE,
-					content,
-					display: true,
-					details: event,
-				}),
-			};
-		}
-		const pending = pendingCompletedWaitPublication;
-		if (
-			pending.wait !== wait ||
-			!publishSharedMessage(pending.publication) ||
-			pendingCompletedWaitPublication !== pending ||
-			pendingWaitTiming !== wait
-		)
-			return undefined;
-		pendingCompletedWaitPublication = null;
-		pendingWaitCompletion = {
-			identity: wait.identity,
-			content: pending.content,
-		};
-		pendingWaitTiming = null;
-		if (!allIdleForClaim(claim)) return undefined;
-		return pending.content;
 	};
 
 	qualifyReady = (generation): void => {
@@ -1675,16 +1577,7 @@ export function createDecisionRuntime(
 			readyGeneration = generation;
 			const controller = currentController(after.claim);
 			if (controller !== null) {
-				const observedAtMs = now();
-				const completedWaitBody = publishCompletedWait(
-					after.claim,
-					observedAtMs,
-				);
-				if (completedWaitBody === undefined) {
-					readyGeneration = null;
-					return;
-				}
-				const transition = controller.beginDecision(observedAtMs);
+				const transition = controller.beginDecision(now());
 				if (!transition.applied) {
 					readyGeneration = null;
 					return;
@@ -1740,11 +1633,9 @@ export function createDecisionRuntime(
 	 * produce a signal. Ordinary unlocked idle never publishes by inference.
 	 */
 	const maybePublishUserReady = async (): Promise<void> => {
-		confirmWaitPublication();
 		confirmTerminalPublication();
 		if (
 			pendingTerminalPublication !== null ||
-			pendingWaitPublication !== null ||
 			stopped ||
 			!configReady ||
 			!isCurrentMain() ||
@@ -1760,7 +1651,6 @@ export function createDecisionRuntime(
 		const claim = getMainClaim();
 		const controller = currentController(claim);
 		if (claim === null || controller === null) return;
-		if (controller.snapshot.waitUntilMs > now()) return;
 
 		let envelope = null as ReturnType<typeof createUserReadyEnvelope> | null;
 		const unlockIntent = pendingUnlock;
@@ -1796,7 +1686,6 @@ export function createDecisionRuntime(
 				if (pendingUnlock !== unlockIntent) return;
 			} else {
 				const live = liveController.snapshot;
-				if (live.waitUntilMs > now()) return;
 				let liveEnvelope: ReturnType<typeof createUserReadyEnvelope> | null =
 					null;
 				if (live.locked && live.exhausted) {
@@ -1821,9 +1710,6 @@ export function createDecisionRuntime(
 				if (exhaustionEventPublicationInFlight) return;
 				exhaustionEventPublicationInFlight = true;
 				try {
-					const completedWaitBody = publishCompletedWait(claim, now());
-					if (completedWaitBody === undefined) return;
-					if (completedWaitBody !== null) pendingWaitCompletion = null;
 					const exhaustedEvent = createExhaustedWatchdogEvent({
 						occurredAtMs: now(),
 					});
@@ -1846,12 +1732,7 @@ export function createDecisionRuntime(
 			}
 			if (!allIdleForClaim(claim)) return;
 			const live = currentController(claim)?.snapshot;
-			if (
-				live === undefined ||
-				!live.locked ||
-				!live.exhausted ||
-				live.waitUntilMs > now()
-			) {
+			if (live === undefined || !live.locked || !live.exhausted) {
 				return;
 			}
 		}
@@ -1865,38 +1746,6 @@ export function createDecisionRuntime(
 		} catch {
 			// Listener failures are contained by Pi's bus; emission itself must
 			// never escape into controller/runtime control flow.
-		}
-	};
-
-	const scheduleTerminalWait = (waitUntilMs: number): void => {
-		clearTerminalWaitTimer();
-		const remainingMs = Math.ceil(waitUntilMs - now());
-		if (remainingMs <= 0 && pendingWaitPublication === null) {
-			void maybePublishUserReady();
-			return;
-		}
-		const handle = clock.setTimeout(
-			() => {
-				if (terminalWaitTimer !== handle) return;
-				terminalWaitTimer = null;
-				if (pendingWaitPublication !== null) {
-					confirmWaitPublication();
-					if (pendingWaitPublication !== null)
-						scheduleTerminalWait(waitUntilMs);
-					return;
-				}
-				if (waitUntilMs > now()) {
-					scheduleTerminalWait(waitUntilMs);
-					return;
-				}
-				refreshStateStatus();
-				void maybePublishUserReady();
-			},
-			remainingMs > 0 ? remainingMs : 1_000,
-		);
-		terminalWaitTimer = handle;
-		if ("unref" in handle && typeof handle.unref === "function") {
-			handle.unref();
 		}
 	};
 
@@ -1964,7 +1813,23 @@ export function createDecisionRuntime(
 		};
 	};
 
-	const decisionToolHost: DecisionToolHost = { submitDecisionResult };
+	// Presentation-only ownership evidence: exact recorded call identity of the
+	// current owned decision attempt. Renderers use this to hide owned internal
+	// traffic; unauthorized ordinary calls never match and stay visible.
+	const isOwnedDecisionCall = (toolCallId: string): boolean => {
+		const active = activeDecision;
+		return (
+			active !== null &&
+			!active.invalidated &&
+			owns(active.claim) &&
+			active.responseToolCallIds.has(toolCallId)
+		);
+	};
+
+	const decisionToolHost: DecisionToolHost = {
+		submitDecisionResult,
+		isOwnedDecisionCall,
+	};
 
 	/** Register the reserved decision function once per process, root only. */
 	let decisionToolRegistered = false;
@@ -2232,7 +2097,7 @@ export function createDecisionRuntime(
 				: snapshot?.locked === true &&
 					(pending.values.STOP_KIND === "DECISION_FAILED"
 						? snapshot.decisionFailed
-						: snapshot.exhausted && snapshot.waitUntilMs <= now());
+						: snapshot.exhausted);
 		if (!terminalCurrent || !sharedPublicationCurrent(pending.publication)) {
 			pendingTerminalPublication = null;
 			return;
@@ -2242,6 +2107,9 @@ export function createDecisionRuntime(
 			pendingTerminalPublication !== pending
 		)
 			return;
+		// The live inquiry completes with removal semantics: a quiet AI unlock
+		// has no model-bound replacement body. Exhaustion and decision failure
+		// keep their existing shared outcome events.
 		pending.active?.inquiry.complete(
 			pending.content === undefined
 				? undefined
@@ -2252,10 +2120,106 @@ export function createDecisionRuntime(
 			!sharedPublicationCurrent(pending.publication)
 		)
 			return;
+		// Second artifact: the UI-only unlock status entry. Confirm the remove
+		// fold first, then this entry; the terminal intent stays pending until
+		// both are durably observed, retrying only confirmed absence.
+		const status = pending.statusEntry;
+		if (status !== undefined) {
+			if (!confirmUnlockStatusEntry(pending, status)) return;
+			if (pendingTerminalPublication !== pending) return;
+		}
 		pendingTerminalPublication = null;
 		if (pending.values.STOP_KIND === "EXHAUSTED")
 			exhaustionEventPublished = true;
 		else pendingUnlock = pending.values;
+	};
+
+	/**
+	 * Publish and confirm the quiet AI-unlock status entry. Returns true only
+	 * when a new correlated branch entry of the exact kind is observed. A void
+	 * appendEntry return is not persistence evidence; retry only a confirmed
+	 * absence while the current claim and cycle still hold.
+	 */
+	const confirmUnlockStatusEntry = (
+		pending: NonNullable<typeof pendingTerminalPublication>,
+		status: NonNullable<
+			NonNullable<typeof pendingTerminalPublication>["statusEntry"]
+		>,
+	): boolean => {
+		const ctx = sessionContext;
+		if (
+			ctx === null ||
+			status.sending ||
+			!sharedPublicationCurrent(pending.publication)
+		)
+			return false;
+		status.sending = true;
+		try {
+			if (status.receipt !== null) {
+				const receipt = status.receipt();
+				if (!sharedPublicationCurrent(pending.publication)) return false;
+				if (receipt !== false) return receipt === true;
+			}
+			if (!allIdleForClaim(pending.publication.claim)) return false;
+			status.receipt = observeBranchEntryPublication(
+				ctx,
+				AI_UNLOCK_ENTRY_TYPE,
+				(entry) => {
+					if (typeof entry !== "object" || entry === null) return false;
+					const record = entry as {
+						readonly type?: unknown;
+						readonly data?: unknown;
+					};
+					return (
+						record.type === "custom" &&
+						record.data !== undefined &&
+						isDeepStrictEqual(record.data, status.data)
+					);
+				},
+			);
+			if (
+				!sharedPublicationCurrent(pending.publication) ||
+				!allIdleForClaim(pending.publication.claim)
+			)
+				return false;
+			options.pi.appendEntry<AiUnlockEntry>(AI_UNLOCK_ENTRY_TYPE, status.data);
+			const receipt = status.receipt();
+			return receipt === true && sharedPublicationCurrent(pending.publication);
+		} catch {
+			// Preserve any receipt: a thrown callback need not mean append failed.
+			const receipt = status.receipt?.();
+			return receipt === true && sharedPublicationCurrent(pending.publication);
+		} finally {
+			status.sending = false;
+		}
+	};
+
+	/** A new public branch entry of an exact custom-entry kind, observed on the
+	 * active branch, acknowledges TUI-only entry publication. */
+	const observeBranchEntryPublication = (
+		ctx: ExtensionContext,
+		customType: string,
+		matches: (entry: unknown) => boolean,
+	): (() => boolean | undefined) => {
+		const previousIds = new Set(
+			ctx.sessionManager.getBranch().map((entry) => entry.id),
+		);
+		return () => {
+			try {
+				return ctx.sessionManager
+					.getBranch()
+					.some(
+						(entry) =>
+							!previousIds.has(entry.id) &&
+							entry.type === "custom" &&
+							entry.customType === customType &&
+							matches(entry),
+					);
+			} catch {
+				// An unavailable read is not evidence that publication failed.
+				return undefined;
+			}
+		};
 	};
 
 	/** A new public branch entry, not sendMessage's void return, acknowledges publication. */
@@ -2299,63 +2263,6 @@ export function createDecisionRuntime(
 				isDeepStrictEqual(details.watchdogEvent, watchdogEvent)
 			);
 		});
-
-	const confirmWaitPublication = (): void => {
-		const pending = pendingWaitPublication;
-		if (pending === null || !pending.sendReturned) return;
-		const current = (): boolean => {
-			const snapshot = pending.controller.snapshot;
-			return (
-				owns(pending.active.claim) &&
-				options.controllerHolder.controller === pending.controller &&
-				pending.active.protocol.currentCycleId === pending.cycleId &&
-				snapshot.locked &&
-				!snapshot.decisionOpen &&
-				snapshot.attempt === pending.attempt &&
-				snapshot.waitUntilMs === pending.timing.deadlineMs
-			);
-		};
-		if (!current()) {
-			pendingWaitPublication = null;
-			clearTerminalWaitTimer();
-			return;
-		}
-		if (!allIdleForClaim(pending.active.claim)) return;
-		const confirmed = pending.confirmed();
-		if (pendingWaitPublication !== pending || !current()) return;
-		if (confirmed === undefined) return;
-		pendingWaitPublication = null;
-		clearTerminalWaitTimer();
-		if (confirmed === false) {
-			pending.controller.rollbackValidWait(pending.previousDeadlineMs);
-			retainInquiryCleanup(pending.active);
-			retryInquiryCleanup();
-			observeAggregate();
-			return;
-		}
-		pending.active.inquiry.complete({
-			customType: "pi-continue-watchdog:event",
-			content: pending.body,
-		});
-		if (!current()) return;
-		pendingWaitTiming = pending.timing;
-		pendingWaitCompletion = null;
-		try {
-			emitSemanticHook(
-				options.pi.events,
-				createWatchdogWaitingEnvelope({
-					REASON: pending.reason,
-					WAIT_SECONDS: String(pending.timing.waitSeconds),
-				}),
-			);
-		} catch {
-			// Listener failures cannot undo a confirmed wait.
-		}
-		if (!current() || pendingWaitTiming !== pending.timing) return;
-		observeAggregate();
-		if (pending.controller.snapshot.exhausted)
-			scheduleTerminalWait(pending.timing.deadlineMs);
-	};
 
 	const confirmContinuationPublication = (settled = false): void => {
 		const pending = pendingContinuationPublication;
@@ -2627,105 +2534,9 @@ export function createDecisionRuntime(
 
 		if (
 			(finalization.outcome !== "continue" &&
-				finalization.outcome !== "wait" &&
 				finalization.outcome !== "unlock") ||
 			finalization.cycleId === undefined
 		) {
-			return false;
-		}
-
-		if (finalization.outcome === "wait") {
-			activeDecision = null;
-			capturedDecisionResponse = null;
-			const finalCycleId = finalization.cycleId;
-			const reason = finalization.reason;
-			const waitSeconds = finalization.waitSeconds;
-			const acceptedAtMs = finalization.acceptedAtMs;
-			const waitUntilMs = finalization.waitUntilMs;
-			if (
-				typeof reason !== "string" ||
-				reason.length === 0 ||
-				typeof waitSeconds !== "number" ||
-				!Number.isSafeInteger(waitSeconds) ||
-				waitSeconds < 1 ||
-				waitSeconds > MAX_WAIT_SECONDS ||
-				typeof waitUntilMs !== "number" ||
-				!Number.isSafeInteger(waitUntilMs) ||
-				waitUntilMs < 0 ||
-				typeof acceptedAtMs !== "number" ||
-				!Number.isFinite(acceptedAtMs)
-			) {
-				return false;
-			}
-			if (stopIfStale(claim)) return false;
-			const watchdogEvent = createWaitWatchdogEvent({
-				occurredAtMs: acceptedAtMs,
-				reason,
-				waitSeconds,
-				deadlineMs: waitUntilMs,
-			});
-			const eventContent = formatWaitWatchdogEvent(watchdogEvent);
-			if (stopIfStale(claim)) return false;
-			const waitController = options.controllerHolder.controller;
-			if (waitController === null) return false;
-			try {
-				pendingWaitPublication = {
-					active,
-					controller: waitController,
-					attempt: finalization.transition.snapshot.attempt,
-					cycleId: finalCycleId,
-					previousDeadlineMs: controllerBeforeCommit?.waitUntilMs ?? 0,
-					timing: {
-						identity: `${active.exchangeId}:${finalCycleId}:${acceptedAtMs}:${waitUntilMs}`,
-						acceptedAtMs,
-						waitSeconds,
-						deadlineMs: waitUntilMs,
-					},
-					body: eventContent,
-					reason,
-					confirmed: observeOutcomePublication(
-						ctx,
-						active,
-						finalCycleId,
-						watchdogEvent,
-					),
-					sendReturned: false,
-				};
-				const publication = pendingWaitPublication;
-				selfDecisionRun = { kind: "none" };
-				options.pi.sendMessage(
-					createDecisionFoldMessage({
-						exchangeId: active.exchangeId,
-						cycleId: finalCycleId,
-						outcome: "wait",
-						eventContent,
-						watchdogEvent,
-					}),
-					{ triggerTurn: false, deliverAs: "steer" },
-				);
-				if (pendingWaitPublication !== publication) return false;
-				publication.sendReturned = true;
-				confirmWaitPublication();
-				if (pendingWaitPublication === publication)
-					scheduleTerminalWait(waitUntilMs);
-			} catch {
-				if (
-					owns(claim) &&
-					options.controllerHolder.controller === waitController &&
-					waitController.snapshot.locked &&
-					!waitController.snapshot.decisionOpen &&
-					waitController.snapshot.attempt ===
-						finalization.transition.snapshot.attempt &&
-					waitController.snapshot.waitUntilMs === waitUntilMs
-				) {
-					waitController.rollbackValidWait(
-						controllerBeforeCommit?.waitUntilMs ?? 0,
-					);
-					retainInquiryCleanup(active);
-					retryInquiryCleanup();
-					clearOperationalPendingWork();
-				}
-			}
 			return false;
 		}
 
@@ -2846,12 +2657,10 @@ export function createDecisionRuntime(
 			return false;
 		}
 		if (stopIfStale(claim)) return false;
-		const watchdogEvent = createUnlockWatchdogEvent({
-			occurredAtMs: now(),
-			reasonType,
-			reason,
-		});
-		const eventContent = formatUnlockWatchdogEvent(watchdogEvent);
+		// Quiet AI unlock: the persisted fold is remove-only (no model-bound
+		// replacement), and the human-visible outcome is one UI-only status
+		// entry excluded from model context by the host. No shared unlock body
+		// is sent to the model.
 		pendingTerminalPublication = {
 			publication: createSharedPublication(
 				claim,
@@ -2859,8 +2668,6 @@ export function createDecisionRuntime(
 					exchangeId: active.exchangeId,
 					cycleId: finalization.cycleId,
 					outcome: "unlock",
-					eventContent,
-					watchdogEvent,
 				}),
 			),
 			values: {
@@ -2869,11 +2676,20 @@ export function createDecisionRuntime(
 				REASON: reason,
 			},
 			active,
-			content: eventContent,
+			statusEntry: {
+				data: {
+					reasonType,
+					reason,
+					exchangeId: active.exchangeId,
+					cycleId: finalization.cycleId,
+				},
+				receipt: null,
+				sending: false,
+			},
 		};
 		confirmTerminalPublication();
 		stopIfStale(claim);
-		// The shared event is the sole visible reasoned automatic-unlock output.
+		// The quiet status is the sole visible reasoned automatic-unlock output.
 		return false;
 	};
 
@@ -3090,15 +2906,6 @@ export function createDecisionRuntime(
 				reasonType: plan.reasonType,
 				reason: plan.reason,
 			};
-		} else if (plan.outcome === "wait") {
-			audit = {
-				version: 1,
-				exchangeId: active.exchangeId,
-				cycleId,
-				outcome: "wait",
-				reason: plan.reason,
-				waitSeconds: plan.waitSeconds,
-			};
 		} else if (plan.outcome === "unlock") {
 			audit = {
 				version: 1,
@@ -3298,12 +3105,6 @@ export function createDecisionRuntime(
 		}
 		active.dispatchPending = false;
 		active.submitted = true;
-		if (
-			active.waitCompletionIdentity !== null &&
-			pendingWaitCompletion?.identity === active.waitCompletionIdentity
-		) {
-			pendingWaitCompletion = null;
-		}
 		selfDecisionRun = {
 			kind: "confirmed",
 			exchangeId: active.exchangeId,
@@ -3323,7 +3124,6 @@ export function createDecisionRuntime(
 	}): void => {
 		if (stopped) return;
 		confirmContinuationPublication();
-		confirmWaitPublication();
 		const active = activeDecision;
 		if (
 			active === null ||
@@ -3607,7 +3407,6 @@ export function createDecisionRuntime(
 			}
 			const preserveGeneration = selfDecisionRun.kind !== "none";
 			if (stopped || !observeLiveState(ctx, { preserveGeneration })) return;
-			confirmWaitPublication();
 
 			if (quarantinedDecision !== null) {
 				quarantinedDecision = null;

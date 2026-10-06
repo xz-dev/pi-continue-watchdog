@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "type": "module",
   "private": true,
-  "description": "Continue-watchdog extension for Pi with a watchdog-owned continue/wait/unlock decision inquiry and automatic continuation.",
+  "description": "Continue-watchdog extension for Pi with a watchdog-owned continue/unlock decision inquiry and automatic continuation.",
   "license": "BSD-3-Clause",
   "repository": {
     "type": "git",
@@ -44,7 +44,8 @@
     "check": "npm run lint && npm run typecheck && npm run test && npm run build",
     "test:e2e:packed": "tsx --test test/e2e/packed.test.ts",
     "test:e2e:cross-process": "tsx --test test/e2e/cross-process.test.ts",
-    "test:e2e": "npm run test:e2e:packed && npm run test:e2e:cross-process"
+    "test:e2e:native-summary": "tsx --test test/e2e/native-summary.test.ts",
+    "test:e2e": "npm run test:e2e:packed && npm run test:e2e:cross-process && npm run test:e2e:native-summary"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

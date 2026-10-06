@@ -11,15 +11,13 @@ export interface LockDecisionControllerConfig {
 
 export interface LockDecisionSnapshot {
 	readonly locked: boolean;
-	/** Number of valid continue-or-wait outcomes already consumed in this lock cycle. */
+	/** Number of accepted continue outcomes already consumed in this lock cycle. */
 	readonly attempt: number;
 	readonly exhausted: boolean;
 	readonly decisionFailed: boolean;
 	readonly invalidDecisionAttempts: number;
 	readonly lastInvalidDecisionError: string | null;
 	readonly decisionOpen: boolean;
-	/** Earliest absolute time when another automatic decision may open. */
-	readonly waitUntilMs: number;
 }
 
 export type ControllerEffect =
@@ -65,12 +63,6 @@ export interface LockDecisionController {
 	recordValidContinue(decisionId: number): ControllerTransition;
 	/** Undo a just-recorded continue when its send raced a newly busy Pi. */
 	rollbackValidContinue(): ControllerTransition;
-	recordValidWait(
-		decisionId: number,
-		waitUntilMs: number,
-	): ControllerTransition;
-	/** Undo a just-recorded wait when durable evidence cannot be written. */
-	rollbackValidWait(previousWaitUntilMs: number): ControllerTransition;
 	recordValidUnlock(decisionId: number): ControllerTransition;
 	/** Close a stale decision without consuming attempts or unlocking. */
 	invalidateDecision(decisionId: number): ControllerTransition;
@@ -88,7 +80,6 @@ interface MutableState {
 	lastInvalidDecisionError: string | null;
 	decisionOpen: boolean;
 	decisionId: number | null;
-	waitUntilMs: number;
 }
 
 function snapshotOf(state: MutableState): LockDecisionSnapshot {
@@ -100,7 +91,6 @@ function snapshotOf(state: MutableState): LockDecisionSnapshot {
 		invalidDecisionAttempts: state.invalidDecisionAttempts,
 		lastInvalidDecisionError: state.lastInvalidDecisionError,
 		decisionOpen: state.decisionOpen,
-		waitUntilMs: state.waitUntilMs,
 	};
 }
 
@@ -120,7 +110,6 @@ function initialState(): MutableState {
 		lastInvalidDecisionError: null,
 		decisionOpen: false,
 		decisionId: null,
-		waitUntilMs: 0,
 	};
 }
 
@@ -159,7 +148,6 @@ class PureLockDecisionController implements LockDecisionController {
 			locked: false,
 			decisionOpen: false,
 			decisionId: null,
-			waitUntilMs: 0,
 		};
 		effects.push({ kind: "notify", notification: "unlocked" });
 		return this.applied(effects);
@@ -252,7 +240,6 @@ class PureLockDecisionController implements LockDecisionController {
 			lastInvalidDecisionError: null,
 			decisionOpen: false,
 			decisionId: null,
-			waitUntilMs: 0,
 		};
 		return this.applied([{ kind: "restoreDecisionTools", decisionId }]);
 	}
@@ -263,49 +250,6 @@ class PureLockDecisionController implements LockDecisionController {
 			...this.state,
 			attempt: this.state.attempt - 1,
 			exhausted: false,
-		};
-		return this.applied([]);
-	}
-
-	public recordValidWait(
-		decisionId: number,
-		waitUntilMs: number,
-	): ControllerTransition {
-		if (
-			!this.isCurrentDecision(decisionId) ||
-			!Number.isSafeInteger(waitUntilMs) ||
-			waitUntilMs < 0
-		) {
-			return this.noop();
-		}
-		const attempt = this.state.attempt + 1;
-		this.state = {
-			...this.state,
-			attempt,
-			exhausted: attempt >= this.maxRetries,
-			invalidDecisionAttempts: 0,
-			lastInvalidDecisionError: null,
-			decisionOpen: false,
-			decisionId: null,
-			waitUntilMs,
-		};
-		return this.applied([{ kind: "restoreDecisionTools", decisionId }]);
-	}
-
-	public rollbackValidWait(previousWaitUntilMs: number): ControllerTransition {
-		if (
-			this.state.decisionOpen ||
-			this.state.attempt === 0 ||
-			!Number.isSafeInteger(previousWaitUntilMs) ||
-			previousWaitUntilMs < 0
-		) {
-			return this.noop();
-		}
-		this.state = {
-			...this.state,
-			attempt: this.state.attempt - 1,
-			exhausted: false,
-			waitUntilMs: previousWaitUntilMs,
 		};
 		return this.applied([]);
 	}
@@ -327,7 +271,6 @@ class PureLockDecisionController implements LockDecisionController {
 			locked: false,
 			decisionOpen: false,
 			decisionId: null,
-			waitUntilMs: 0,
 		};
 		return this.applied([
 			{ kind: "restoreDecisionTools", decisionId },
@@ -341,8 +284,7 @@ class PureLockDecisionController implements LockDecisionController {
 			this.state.locked &&
 			!this.state.exhausted &&
 			!this.state.decisionFailed &&
-			!this.state.decisionOpen &&
-			nowMs >= this.state.waitUntilMs
+			!this.state.decisionOpen
 		);
 	}
 

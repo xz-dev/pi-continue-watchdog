@@ -1,10 +1,4 @@
-# watchdog-configuration Specification
-
-## Purpose
-
-Defines which configuration keys the continue watchdog honors and how removed keys are reported, so a setting never appears accepted while having no effect.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Effective configuration keys
 The watchdog SHALL honor these configuration keys with existing per-field validation and precedence of built-ins, global, then trusted project:
@@ -53,11 +47,3 @@ A configuration layer containing `jevWaitCheck` SHALL produce an error-level dia
 - **WHEN** configuration loads
 - **THEN** an error diagnostic names `jevWaitCheck` as removed without displaying its values
 - **AND** `maxRetries` 5 applies, load succeeds, and no jev request occurs
-
-### Requirement: Removed integration does not resolve shared credentials
-The continue watchdog SHALL NOT resolve TypeSafe or OpenRouter credentials for a jev classifier or review, infer enablement from their availability, or make either kind of jev request. It SHALL NOT remove or modify credentials or integrations used by other providers or extensions.
-
-#### Scenario: Shared key remains available
-- **WHEN** Pi or the environment contains TypeSafe or OpenRouter credentials
-- **THEN** ordinary settlement and decision processing make no jev classification or review request
-- **AND** those credentials remain unchanged for unrelated users of them

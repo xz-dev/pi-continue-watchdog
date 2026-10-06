@@ -45,6 +45,13 @@ export interface DecisionToolHost {
 					| { readonly valid: true }
 					| { readonly valid: false; readonly error: string };
 		  };
+	/**
+	 * Presentation-only ownership evidence for renderers: true exactly when the
+	 * call id belongs to the current owned decision attempt's recorded batch.
+	 * Trusted identity only; arguments are never consulted. Optional so
+	 * focused tool tests without runtime wiring keep visible defaults.
+	 */
+	readonly isOwnedDecisionCall?: (toolCallId: string) => boolean;
 }
 
 function reservedFunctionResult(): AgentToolResult<DecisionToolDetails> {
@@ -104,31 +111,50 @@ export function createDecisionToolDefinition(
 				terminate: true,
 			};
 		},
-		renderCall(args, theme, context) {
-			// Pi renders call and result in the same row. Once a final result
-			// exists it states the outcome itself; reserved/invalid calls keep the
-			// header to show which call failed.
+		renderCall(_args, _theme, context) {
+			// Owned internal presentation is quiet: the accepted outcome states
+			// itself through the quiet unlock status or the continuation event.
+			// Hidden by trusted call-id ownership evidence, never by arguments,
+			// so unauthorized ordinary calls keep their visible rejection.
+			if (
+				typeof context?.toolCallId === "string" &&
+				host.isOwnedDecisionCall?.(context.toolCallId) === true
+			) {
+				return new Container();
+			}
 			if (context?.isPartial === false && !context.isError) {
 				return new Container();
 			}
-			const action =
-				typeof (args as { action?: unknown } | null)?.action === "string"
-					? ((args as { action: string }).action as string)
-					: "";
-			return new Text(
-				theme.fg(
-					"accent",
-					`Continue watchdog decision · ${action.trim().toUpperCase()}`,
-				),
-				0,
-				0,
-			);
+			return new Text("", 0, 0);
 		},
-		renderResult(result, _options, theme) {
+		renderResult(result, _options, _theme, _context) {
+			// Presentation provenance is positive trusted result identity, not
+			// live attempt state and not mere absence of a known marker:
+			// `received` and `invalid` details are authored only by an
+			// authorized staging of the exact current attempt (execute is the
+			// sole writer of those shapes), so an owned successful/corrected
+			// receipt stays quiet across completion, finalization,
+			// invalidation, redraw, and session resume long after the live
+			// ownership lookup turns false. Everything else is visible by
+			// default: `reserved` keeps unauthorized ordinary rejections (with
+			// copied arguments or reused call ids) visible, and host-authored
+			// error results (pinned createErrorToolResult: argument validation,
+			// pre-call blocking, aborts, thrown execute) carry empty details —
+			// hiding those would hide ordinary and owned host errors alike, so
+			// they render through the ordinary text path. Failing closed on
+			// visibility never widens execution authority: arguments, body
+			// text, and call ids are never consulted for ownership. A missing
+			// details object also renders visibly (host fallback masks a
+			// throw, but a visible default is strictly safer).
+			const outcome = result.details?.outcome;
+			if (outcome === "received" || outcome === "invalid") {
+				return new Container();
+			}
+			// Unauthorized ordinary calls and host errors keep a visible row.
 			const text = result.content
 				.map((block) => (block.type === "text" ? block.text : ""))
 				.join("");
-			return new Text(theme.fg("toolOutput", text), 0, 0);
+			return new Text(text, 0, 0);
 		},
 	} as ToolDefinition<TSchema, DecisionToolDetails>;
 }

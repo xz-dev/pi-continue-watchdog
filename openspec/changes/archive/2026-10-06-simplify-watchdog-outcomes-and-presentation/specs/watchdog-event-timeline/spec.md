@@ -1,10 +1,4 @@
-# watchdog-event-timeline Specification
-
-## Purpose
-
-Defines durable shared continuation, exhaustion, and safe failure events, quiet human-only unlock statuses, and exact-ownership projection of internal control traffic without rewriting stored history or inferring external-task progress.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Active-branch and upgrade compatibility
 The watchdog SHALL use Pi's normal active-branch and compaction boundaries without scanning sibling history to reconstruct its own timeline. Reopening retained continuation and UI-only unlock records SHALL preserve their published data without rerunning actions. Legacy wait, elapsed-wait, unlock, and failed-decision records SHALL remain readable without rewriting stored history or restoring timers. Existing summaries created before this change SHALL NOT be claimed to have been retroactively cleaned. New projection logic SHALL retain exact-exchange legacy cleanup without deleting unrelated user or extension messages.
@@ -80,6 +74,18 @@ A continuation SHALL start work and publish its hook only under the existing cur
 #### Scenario: User takes over during publication
 - **WHEN** a new user cycle invalidates a pending old unlock publication
 - **THEN** the old publication cannot create a status or terminal signal for that new cycle
+
+## REMOVED Requirements
+
+### Requirement: No decision internals in new sessions
+**Reason**: Guarded internal inquiries remain necessary, but their UI and later model projections must exclude protocol traffic rather than prohibit the inquiry itself.
+**Migration**: Retain exact owned exchanges and apply the explicit presentation and context boundaries below.
+
+#### Scenario: Internal inquiry executes
+- **WHEN** a qualified inquiry runs and completes
+- **THEN** its decision can act once without exposing a question, raw arguments, or receipt to the user
+
+## ADDED Requirements
 
 ### Requirement: Quiet human-only AI unlock status
 A newly accepted AI unlock SHALL persist one non-interactive, theme-muted gray status with the extension name, `unlocked`, normalized reason type, and trimmed reason. It SHALL not use a user-message bubble or prominent custom-message box, show the inquiry or tool protocol, print an acknowledgement or timestamp, or repeat the model-facing authorization disclaimer. Long text SHALL wrap safely at terminal width without executing terminal controls. Visual compaction SHALL not change the stored reason or notification payload. Actual user-facing answers and questions SHALL remain ordinary assistant output, not this control reason. Manual, shortcut, abort, and terminal-error presentation is otherwise unchanged.

@@ -19,6 +19,10 @@ import {
 	validateConfig,
 } from "../src/config.js";
 import { loadRuntimeConfig } from "../src/config-loader.js";
+import {
+	buildDecisionPrompt,
+	validateDecisionArguments,
+} from "../src/decision-protocol.js";
 
 /** Rejected direct-continuation reminder (must never be shipped as default). */
 const REJECTED_DIRECT_REMINDER =
@@ -524,4 +528,33 @@ test("invalid unlockShortcut values fall back to the default with one bounded di
 	// Invalid values merge as absent, preserving the built-in default.
 	const merged = mergeConfig({ unlockShortcut: 123 });
 	assert.equal(merged.config.unlockShortcut, "alt+u");
+});
+
+test("a stale custom decisionPrompt cannot restore the retired wait action", () => {
+	const stale = mergeConfig({
+		decisionPrompt:
+			'When automation needs time, answer with {"action":"wait","wait_seconds":300}.',
+	});
+	assert.equal(stale.diagnostics.length, 0);
+	const prompt = buildDecisionPrompt(
+		stale.config.decisionPrompt,
+		stale.config.reasonTypes,
+		stale.config.continueReasonTypes,
+	);
+	// The configured text is preserved verbatim, but the fixed contract tail
+	// still teaches only continue and unlock, and runtime rejects the wait action.
+	const fixedContract = prompt.slice(
+		prompt.indexOf("Use only the existing conversation context"),
+	);
+	assert.doesNotMatch(fixedContract, /To wait:/);
+	assert.doesNotMatch(fixedContract, /"action"\s*:\s*"wait"/);
+	assert.match(fixedContract, /There is no wait action and no watchdog timer/);
+	assert.equal(
+		validateDecisionArguments(
+			{ action: "wait", reason_content: "Stale guidance.", wait_seconds: 300 },
+			stale.config.reasonTypes,
+			stale.config.continueReasonTypes,
+		).valid,
+		false,
+	);
 });

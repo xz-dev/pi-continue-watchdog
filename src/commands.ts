@@ -16,7 +16,6 @@ import {
 	parseDecisionFoldDetails,
 } from "./context-fold.js";
 import type { ControllerEffect, LockDecisionController } from "./controller.js";
-import { MAX_WAIT_SECONDS } from "./decision-protocol.js";
 import type { HubMainClaim } from "./hub.js";
 import type {
 	WatchdogTriggerBlocker,
@@ -78,6 +77,23 @@ export interface WatchdogStatusEntry {
 
 /** Persisted custom-entry type for human-visible unlock reasons. */
 export const HUMAN_UNLOCK_ENTRY_TYPE = "pi-continue-watchdog:unlock";
+
+/**
+ * Persisted TUI-only entry for each accepted AI decision unlock. A custom
+ * entry is excluded from LLM context by the host, so this record is the
+ * quiet human-only unlock status: extension name, `unlocked`, normalized
+ * reason type, and trimmed reason. No timestamp box, inquiry protocol, or
+ * model-facing disclaimer.
+ */
+export const AI_UNLOCK_ENTRY_TYPE = "pi-continue-watchdog:ai-unlock";
+
+/** Typed AI-outcome metadata for the quiet unlock status record. */
+export interface AiUnlockEntry {
+	readonly reasonType: string;
+	readonly reason: string;
+	readonly exchangeId: string;
+	readonly cycleId: number;
+}
 
 /**
  * Shared TUI-only unlock entry. Human unlocks set only `reason`.
@@ -304,6 +320,14 @@ export function createContinueEntryRenderer(): EntryRenderer<ContinueEntry> {
 	};
 }
 
+/** Upper bound accepted by the legacy wait-entry reader below. */
+const LEGACY_MAX_WAIT_SECONDS = 30 * 60;
+
+/**
+ * Legacy record reader: renders persisted wait entries from versions that
+ * still produced them. No new wait entries are written, and reading one never
+ * rearms a timer or restores wait behavior.
+ */
 export function createWaitEntryRenderer(): EntryRenderer<WaitEntry> {
 	return (entry, _options, theme) => {
 		const reason = sanitizeTuiText(String(entry.data?.reason ?? ""));
@@ -312,7 +336,7 @@ export function createWaitEntryRenderer(): EntryRenderer<WaitEntry> {
 			reason.length === 0 ||
 			!Number.isSafeInteger(waitSeconds) ||
 			waitSeconds < 1 ||
-			waitSeconds > MAX_WAIT_SECONDS
+			waitSeconds > LEGACY_MAX_WAIT_SECONDS
 		) {
 			return undefined;
 		}
@@ -334,6 +358,38 @@ export function createHumanUnlockEntryRenderer(): EntryRenderer<HumanUnlockEntry
 	};
 }
 
+/** Render the quiet AI-unlock status from trusted typed metadata only. */
+export function createAiUnlockEntryRenderer(): EntryRenderer<AiUnlockEntry> {
+	return (entry, _options, theme) => {
+		const fields = getAiUnlockFields(entry);
+		if (fields === null) return undefined;
+		return createStaticTextComponent(
+			formatUnlockEntryText(fields.reason, fields.reasonType),
+			theme,
+		);
+	};
+}
+
+/** Validate persisted AI-unlock metadata; malformed records render nothing. */
+function getAiUnlockFields(entry: unknown): {
+	readonly reasonType: string;
+	readonly reason: string;
+} | null {
+	if (typeof entry !== "object" || entry === null) return null;
+	const data = (entry as { readonly data?: unknown }).data;
+	if (typeof data !== "object" || data === null) return null;
+	const fields = data as Partial<AiUnlockEntry>;
+	if (
+		typeof fields.reasonType !== "string" ||
+		fields.reasonType.length === 0 ||
+		typeof fields.reason !== "string" ||
+		fields.reason.length === 0
+	) {
+		return null;
+	}
+	return { reasonType: fields.reasonType, reason: fields.reason };
+}
+
 /**
  * Normalize the optional human command reason without applying AI decision-tool
  * validation. Human input may be multiline and is deliberately truncated rather
@@ -352,6 +408,7 @@ const TIMELINE_TYPES = new Set([
 	CONTINUE_ENTRY_TYPE,
 	WAIT_ENTRY_TYPE,
 	HUMAN_UNLOCK_ENTRY_TYPE,
+	AI_UNLOCK_ENTRY_TYPE,
 	WATCHDOG_STATUS_ENTRY_TYPE,
 ]);
 
@@ -403,6 +460,8 @@ function timelineLine(entry: TimelineBranchEntry): string | null {
 		return `wait · ${String(data?.waitSeconds ?? "")}s${data?.reason ? ` · ${String(data.reason)}` : ""}`;
 	if (entry.customType === HUMAN_UNLOCK_ENTRY_TYPE)
 		return `${data?.reasonType ? "AI unlock" : "human unlock"} · ${String(data?.reason ?? "")}`;
+	if (entry.customType === AI_UNLOCK_ENTRY_TYPE)
+		return `AI unlock · ${String(data?.reasonType ?? "")} · ${String(data?.reason ?? "")}`;
 	if (data?.kind === "decision-failed")
 		return `decision-failed · ${String(data.message ?? "")}`;
 	return null;
@@ -693,6 +752,10 @@ export function createMainCommands(
 	pi.registerEntryRenderer<HumanUnlockEntry>(
 		HUMAN_UNLOCK_ENTRY_TYPE,
 		createHumanUnlockEntryRenderer(),
+	);
+	pi.registerEntryRenderer<AiUnlockEntry>(
+		AI_UNLOCK_ENTRY_TYPE,
+		createAiUnlockEntryRenderer(),
 	);
 	pi.registerEntryRenderer<ManualLockEntry>(
 		MANUAL_LOCK_ENTRY_TYPE,

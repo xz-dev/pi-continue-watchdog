@@ -1,10 +1,4 @@
-# wait-callback-reason-type Specification
-
-## Purpose
-
-Gives the agent a typed way to end its turn while it waits for another agent or program to call back, so the watchdog does not continue it and notification consumers can tell this stop apart from one that needs the user.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Built-in WAIT_CALLBACK reason type
 Default `reasonTypes` SHALL remain `JOB_DONE`, `WAIT_USER`, `JOB_BLOCKED`, and `WAIT_CALLBACK`; a valid configured list SHALL replace those defaults. Only authorized decision guidance SHALL explain `WAIT_CALLBACK` as waiting for another agent or program to call back and wake the session. It SHALL remain an unlock reason accepted only in the current confirmed inquiry, not a timed wait or an ordinary-turn stopping function. Accepting it SHALL not create a watchdog timer, poll, fabricated callback, or retry charge.
@@ -19,6 +13,18 @@ Default `reasonTypes` SHALL remain `JOB_DONE`, `WAIT_USER`, `JOB_BLOCKED`, and `
 - **WHEN** a configured reason list omits `WAIT_CALLBACK`
 - **THEN** a submission using that value is rejected under normal decision validation
 - **AND** the plugin does not silently restore default enums or invent the meaning of a custom label
+
+## REMOVED Requirements
+
+### Requirement: Callback wait guidance
+**Reason**: Ordinary continuation must not advertise proactive callback-unlock calls, and timed watchdog waiting is retired.
+**Migration**: Teach callback outcome selection only inside the authorized inquiry under the replacement requirement below.
+
+#### Scenario: Old proactive callback guidance
+- **WHEN** an ordinary run follows previously stored proactive callback-unlock instructions
+- **THEN** the current phase guard rejects the call without changing watchdog state
+
+## ADDED Requirements
 
 ### Requirement: Decision-only callback wait guidance
 Callback selection guidance SHALL exist only inside the authorized inquiry. The public declaration, startup guidance, and fixed ordinary continuation body SHALL NOT teach proactive callback-unlock calls. Native callback-driven workflows SHALL not be converted to polling or watchdog sleeps. A callback unlock SHALL neither demand user action nor assert external-task completion. For non-callback work, decision guidance SHALL require an available authorized ordinary monitoring/task-owned waiting action for continue, or an appropriate actual blocker for unlock; it SHALL not offer a `wait_seconds` alternative.

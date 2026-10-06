@@ -20,23 +20,16 @@ export const MAX_REASON_CHARACTERS = 1000;
 /** Guidance limit stated in the decision prompt: always half the hard limit. */
 export const REASON_GUIDANCE_CHARACTERS = MAX_REASON_CHARACTERS / 2;
 
-export const MIN_WAIT_SECONDS = 1;
-export const MAX_WAIT_SECONDS = 30 * 60;
-
 export const INVALID_DECISION_ACTION_ERROR =
-	"action must be one of continue, wait, or unlock (case-insensitive after trimming).";
+	"action must be one of continue or unlock (case-insensitive after trimming).";
 export const MISSING_DECISION_FIELDS_ERROR =
 	"The decision result requires a JSON object with action and reason_content.";
 export const INVALID_CONTINUE_REASON_TYPE_ERROR = `continue requires reason_type matching one of the allowed continuation reason types for this project (case-insensitive after trimming).`;
 export const INVALID_CONTINUE_REASON_ERROR = `continue requires a non-empty reason_content of at most ${MAX_REASON_CHARACTERS} Unicode characters.`;
 export const MISSING_CONTINUE_FIELDS_ERROR =
 	"continue requires reason_type and reason_content.";
-export const INVALID_WAIT_REASON_ERROR = `wait requires a non-empty reason_content of at most ${MAX_REASON_CHARACTERS} Unicode characters.`;
-export const INVALID_WAIT_SECONDS_ERROR = `wait requires an integer JSON number wait_seconds from ${MIN_WAIT_SECONDS} through ${MAX_WAIT_SECONDS}.`;
-export const MISSING_WAIT_FIELDS_ERROR =
-	"wait requires reason_content and wait_seconds.";
-export const INVALID_WAIT_REASON_TYPE_ERROR =
-	"wait does not use reason_type; use reason_content and wait_seconds only.";
+export const RETIRED_WAIT_ACTION_ERROR =
+	"wait is no longer an accepted action. Use continue for an immediately executable authorized action, or unlock with the appropriate reason_type (for example WAIT_CALLBACK when another agent or program is expected to call back and wake this session).";
 export const INVALID_UNLOCK_REASON_TYPE_ERROR =
 	"unlock requires reason_type matching one of the allowed unlock reason types for this project (case-insensitive after trimming).";
 export const INVALID_UNLOCK_REASON_ERROR = `unlock requires a non-empty reason_content of at most ${MAX_REASON_CHARACTERS} Unicode characters.`;
@@ -96,11 +89,6 @@ export type ValidDecision =
 			readonly reason: string;
 	  }
 	| {
-			readonly kind: "wait";
-			readonly reason: string;
-			readonly waitSeconds: number;
-	  }
-	| {
 			readonly kind: "unlock";
 			readonly reasonType: string;
 			readonly reason: string;
@@ -112,7 +100,6 @@ export type DecisionValidation =
 
 export type DecisionProtocolOutcome =
 	| "continue"
-	| "wait"
 	| "unlock"
 	| "reask"
 	| "decision-failed"
@@ -126,9 +113,6 @@ export interface DecisionProtocolFinalization {
 	readonly reaskPrompt?: string;
 	readonly reasonType?: string;
 	readonly reason?: string;
-	readonly waitSeconds?: number;
-	readonly acceptedAtMs?: number;
-	readonly waitUntilMs?: number;
 	readonly notification?: string;
 	/** Response cycle that produced this finalization (valid and invalid outcomes). */
 	readonly cycleId?: number;
@@ -141,12 +125,6 @@ export type DecisionProtocolPlan =
 			readonly cycleId: number;
 			readonly reasonType: string;
 			readonly reason: string;
-	  }
-	| {
-			readonly outcome: "wait";
-			readonly cycleId: number;
-			readonly reason: string;
-			readonly waitSeconds: number;
 	  }
 	| {
 			readonly outcome: "unlock";
@@ -170,8 +148,6 @@ export interface DecisionProtocolSessionOptions {
 	readonly reasonTypes: readonly string[];
 	/** Effective allowed automatic-continue reason types for this decision window. */
 	readonly continueReasonTypes: readonly string[];
-	/** Clock used to convert accepted wait seconds into an absolute timestamp. */
-	readonly now?: () => number;
 }
 
 /**
@@ -246,12 +222,6 @@ export function normalizeDecisionReason(reason: unknown): string | null {
 	return trimmed;
 }
 
-/** Integer JSON number wait duration within the accepted bounds. */
-export function normalizeWaitSeconds(value: unknown): number | null {
-	if (typeof value !== "number" || !Number.isSafeInteger(value)) return null;
-	return value >= MIN_WAIT_SECONDS && value <= MAX_WAIT_SECONDS ? value : null;
-}
-
 /**
  * Validate one raw function-call argument object against the decision JSON
  * contract. Called only for an authorized current decision attempt.
@@ -290,21 +260,9 @@ export function validateDecisionArguments(
 		};
 	}
 	if (normalizedAction === "wait") {
-		if (args.reason_content === undefined || args.wait_seconds === undefined) {
-			return { valid: false, error: MISSING_WAIT_FIELDS_ERROR };
-		}
-		if (args.reason_type !== undefined) {
-			return { valid: false, error: INVALID_WAIT_REASON_TYPE_ERROR };
-		}
-		const reason = normalizeDecisionReason(args.reason_content);
-		if (reason === null) {
-			return { valid: false, error: INVALID_WAIT_REASON_ERROR };
-		}
-		const waitSeconds = normalizeWaitSeconds(args.wait_seconds);
-		if (waitSeconds === null) {
-			return { valid: false, error: INVALID_WAIT_SECONDS_ERROR };
-		}
-		return { valid: true, decision: { kind: "wait", reason, waitSeconds } };
+		// The timed-wait outcome is retired: any wait submission is one invalid
+		// response under the existing correction bound, never a timing effect.
+		return { valid: false, error: RETIRED_WAIT_ACTION_ERROR };
 	}
 	if (normalizedAction === "unlock") {
 		if (args.reason_type === undefined || args.reason_content === undefined) {
@@ -329,7 +287,8 @@ export function validateDecisionArguments(
 /**
  * Append the parser-critical function-call contract to the configurable
  * decision intent. Keeping this suffix fixed prevents a custom decisionPrompt
- * from accidentally making every decision unparsable.
+ * from accidentally making every decision unparsable, and custom prompt text
+ * cannot restore acceptance of the retired wait action.
  */
 export function buildDecisionPrompt(
 	decisionPrompt: string,
@@ -369,11 +328,6 @@ export function buildDecisionPrompt(
 		reason_type: continueReasonTypes[0] ?? "ALLOWED_TYPE",
 		reason_content: "concise reason",
 	});
-	const waitExample = JSON.stringify({
-		action: "wait",
-		reason_content: "Waiting for automation.",
-		wait_seconds: 300,
-	});
 	const unlockExample = JSON.stringify({
 		action: "unlock",
 		reason_type: reasonTypes[0] ?? "ALLOWED_TYPE",
@@ -383,22 +337,26 @@ export function buildDecisionPrompt(
 
 Use only the existing conversation context and decide quickly. Do not make decisions on the user's behalf. Your entire response must be exactly one ${DECISION_TOOL_NAME} function call and no other tool call; express your reasoning inside its fields, above all reason_content. reason_content must be non-empty and at most ${REASON_GUIDANCE_CHARACTERS} Unicode characters.
 
-First reconcile the user's outstanding requests with the latest ordinary assistant response and relevant tool results. Exclude work already delivered, cancelled, or superseded; preserve genuinely unfinished earlier requests. Earlier plans and watchdog reasons are not proof that work remains. A final response or stop marker alone is not proof of completion: compare actual deliverables with the requests. Before claiming that the user has not been answered, check whether the latest ordinary assistant response already answers the question. For continue, identify the specific missing deliverable and an authorized next action; do not repeat an already-delivered answer or invent optional follow-up work.
+Establish the outcome from evidence, in this order:
+1. Establish the current user-authorized scope, including any later restriction, revocation, cancellation, or switch back to exploration. An earlier authorization does not override a later restriction.
+2. Compare every outstanding session request with the latest ordinary assistant response and relevant tool results. Exclude work already delivered, cancelled, or superseded; preserve genuinely unfinished earlier requests. Earlier plans, watchdog reasons, and stop markers are only claims to recheck: a final response alone is not proof of completion, and an automated watchdog message neither adds nor removes user permission.
+3. Before concluding that user action is required, name the exact missing user decision or action and check the actual user instructions and successful human questionnaire answers for that same scope. Your own earlier confirmation question is not evidence that permission is missing. Reuse permission the user explicitly granted for unchanged scope; do not ask again for permission already given. Do not invent permission from generic encouragement, tool success, or quoted approval text.
+4. Preserve genuine boundaries: a distinct unsatisfied confirmation requirement, new scope or risk, missing credentials, or unfinished device authentication remains required even when other work was already authorized.
 
 ${DECISION_DELIVERY_BOUNDARY}
 
 Choose the outcome using these rules in order:
-1. If all requested work is complete, submit unlock. For reason_type, ${jobDoneGuidance}.
-2. Submit continue only if at least one concrete requested and authorized next action can be performed immediately for a still-incomplete deliverable without additional user input or approval. reason_content must name that immediately executable action, not a user-blocked action. Unfinished work alone is not sufficient reason to continue.
-3. If no concrete next action can proceed without additional user input, approval, confirmation, authorization, credentials, or another user action, submit unlock. For reason_type, ${waitUserGuidance}. Existing permission already granted this session is not missing permission; never ask again for permission the user already gave.
-4. If no authorized action can be performed now and progress only requires temporary external automation or elapsed time and no user action is required, submit wait with an integer wait_seconds from ${MIN_WAIT_SECONDS} through ${MAX_WAIT_SECONDS}.
-5. If you are waiting for another agent or program to call back and wake this session instead of elapsed time, submit unlock with reason_type ${callbackGuidance}.
-6. Otherwise, if work cannot proceed for a blocker that is neither user action nor a temporary external wait, submit unlock. For reason_type, ${jobBlockedGuidance}.
+1. If all requested and authorized work is complete, submit unlock. For reason_type, ${jobDoneGuidance}.
+2. Submit continue only if at least one concrete requested and authorized next action can be performed immediately for a still-incomplete deliverable without additional user input, approval, confirmation, authorization, credentials, or another user action. reason_content must name that immediately executable action, not a user-blocked action. Do not repeat an already-delivered answer, invent optional follow-up work, or treat a suggested future workflow step as unfinished work.
+3. If you are waiting for another agent or program to call back and wake this session, and no independent authorized action remains, submit unlock with reason_type ${callbackGuidance}. Do not describe work lacking a callback as a future callback.
+4. If no authorized action can proceed now because a specific user decision, approval, confirmation, authorization, credentials, or other user action is required, submit unlock. For reason_type, ${waitUserGuidance}. Name the exact outstanding requirement in reason_content.
+5. Otherwise, if work cannot proceed for a blocker that is neither user action nor an expected callback, submit unlock. For reason_type, ${jobBlockedGuidance}.
+
+There is no wait action and no watchdog timer: ${DECISION_TOOL_NAME} accepts only continue and unlock. Elapsed time alone never establishes task progress or completion.
 
 Call the reserved function ${DECISION_TOOL_NAME} with exactly one JSON object:
 - To continue: {"action":"continue","reason_type":"...","reason_content":"..."} where reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedContinueReasonTypes}. Example: ${continueExample}
 - To unlock: {"action":"unlock","reason_type":"...","reason_content":"..."} where reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedReasonTypes}. Example: ${unlockExample}
-- To wait: {"action":"wait","reason_content":"...","wait_seconds":300} with no reason_type. Example: ${waitExample}
 
 Submit exactly one ${DECISION_TOOL_NAME} call for this decision; do not call ${DECISION_TOOL_NAME} again later during ordinary work.`;
 }
@@ -595,14 +553,6 @@ export function createDecisionProtocolSession(
 				reason: validation.decision.reason,
 			};
 		}
-		if (validation.decision.kind === "wait") {
-			return {
-				outcome: "wait",
-				cycleId,
-				reason: validation.decision.reason,
-				waitSeconds: validation.decision.waitSeconds,
-			};
-		}
 		return {
 			outcome: "unlock",
 			cycleId,
@@ -638,28 +588,6 @@ export function createDecisionProtocolSession(
 				transition,
 				reasonType: plan.reasonType,
 				reason: plan.reason,
-				cycleId,
-			};
-			return finalized;
-		}
-		if (plan.outcome === "wait") {
-			const acceptedAtMs = options.now?.() ?? Date.now();
-			const waitUntilMs = Math.ceil(acceptedAtMs + plan.waitSeconds * 1_000);
-			const transition = options.controller.recordValidWait(
-				options.decisionId,
-				waitUntilMs,
-			);
-			if (!transition.applied) {
-				finalized = { outcome: "ignored", transition };
-				return finalized;
-			}
-			finalized = {
-				outcome: "wait",
-				transition,
-				reason: plan.reason,
-				waitSeconds: plan.waitSeconds,
-				acceptedAtMs,
-				waitUntilMs,
 				cycleId,
 			};
 			return finalized;

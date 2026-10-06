@@ -188,6 +188,7 @@ test("actual main user message_start locks without a command notification", () =
 		"pi-continue-watchdog:continue",
 		"pi-continue-watchdog:wait",
 		"pi-continue-watchdog:unlock",
+		"pi-continue-watchdog:ai-unlock",
 		"pi-continue-watchdog:manual-lock",
 	]);
 	// Folding owns one context handler; the runtime's decision-consumption
@@ -205,7 +206,6 @@ test("actual main user message_start locks without a command notification", () =
 		invalidDecisionAttempts: 0,
 		lastInvalidDecisionError: null,
 		decisionOpen: false,
-		waitUntilMs: 0,
 	});
 });
 

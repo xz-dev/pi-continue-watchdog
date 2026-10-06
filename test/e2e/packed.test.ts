@@ -35,6 +35,11 @@ interface RequestRecord {
 	readonly messages: Array<{
 		readonly role?: string;
 		readonly content?: unknown;
+		readonly tool_call_id?: string;
+		readonly tool_calls?: Array<{
+			readonly id?: string;
+			readonly function?: { readonly name?: string };
+		}>;
 	}>;
 	readonly tools?: Array<{
 		readonly function?: {
@@ -53,8 +58,7 @@ interface MockReply {
 		| "cw-mixed"
 		| "delayed"
 		| "connection-error";
-	readonly action?: "continue" | "wait" | "unlock";
-	readonly waitSeconds?: number;
+	readonly action?: "continue" | "unlock";
 	readonly mixedToolName?: string;
 	readonly reasonType?: string;
 	readonly reason?: string;
@@ -289,21 +293,18 @@ async function startMockServer(
 				return;
 			}
 			if (reply.kind === "cw" || reply.kind === "cw-invalid") {
+				// Visible text and function arguments are deliberately separate:
+				// a singleton cw call with empty visible content reaches payload
+				// validation instead of being rejected at batch preflight as
+				// visible prose.
 				const argumentsJson =
 					reply.kind === "cw-invalid"
 						? (reply.text ?? "{}")
 						: JSON.stringify({
 								action: reply.action ?? "unlock",
-								...(reply.action === "wait"
-									? {
-											reason_content: reply.reason ?? "Waiting for automation.",
-											wait_seconds: reply.waitSeconds ?? 60,
-										}
-									: {
-											reason_type: reply.reasonType ?? "JOB_DONE",
-											reason_content:
-												reply.reason ?? "All requested work is complete.",
-										}),
+								reason_type: reply.reasonType ?? "JOB_DONE",
+								reason_content:
+									reply.reason ?? "All requested work is complete.",
 							});
 				sendSse(response, [
 					{
@@ -313,7 +314,7 @@ async function startMockServer(
 							{
 								index: 0,
 								delta: {
-									content: reply.text ?? "",
+									content: "",
 									tool_calls: [
 										{
 											index: 0,
@@ -670,12 +671,25 @@ test("packed idle settlement opens one inquiry before continuation", {
 		const continuationMessage = continuationRequest.messages.find(
 			(message) =>
 				message.role === "user" &&
-				contentText(message).includes("Continue watchdog continued ·"),
+				contentText(message).includes("Continue watchdog · continue ·"),
 		);
 		assert.ok(continuationMessage, "expected continuation body in request 3");
 		const body = contentText(continuationMessage);
 		assert.match(body, new RegExp(continuePrompt));
-		assert.match(body, /WORK_REMAINS/);
+		// The accepted reason appears once as the attributed next-step hint in
+		// the SAME request that carries the controlling facts (user task and
+		// ordinary delivery), with no prior-result JSON duplication.
+		assert.match(body, /Continue watchdog · continue · WORK_REMAINS/);
+		assert.match(body, /Suggested next step: /);
+		assert.doesNotMatch(body, /"reasonType"/);
+		assert.doesNotMatch(body, /Previous automated watchdog result/);
+		assert.match(
+			body,
+			/does not revoke or reset permission the user already granted/,
+		);
+		const joinedRequest = JSON.stringify(continuationRequest.messages);
+		assert.match(joinedRequest, /Start the task\./);
+		assert.match(joinedRequest, /First ordinary answer\./);
 		// Later ordinary requests contain one canonical continuation event and
 		// no raw decision instructions or result calls.
 		await waitForSessionIdle(session, 30_000, "second ordinary turn");
@@ -771,7 +785,529 @@ test("packed decision unlock ends the cycle and publishes typed user-ready once"
 	}
 });
 
-test("packed bounded wait defers exhaustion until its deadline", {
+const ZERO_USAGE = {
+	input: 1,
+	output: 1,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 2,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+} as const;
+
+function seededUser(
+	manager: SessionManager,
+	text: string,
+	timestamp: number,
+): string {
+	return manager.appendMessage({
+		role: "user",
+		content: text,
+		timestamp,
+	});
+}
+
+function seededAssistant(
+	manager: SessionManager,
+	timestamp: number,
+	toolCalls: Array<{
+		readonly id: string;
+		readonly name: string;
+		readonly arguments: Record<string, unknown>;
+	}> = [],
+	text = `ordinary reply ${timestamp}`,
+): string {
+	return manager.appendMessage({
+		role: "assistant",
+		content: [
+			{ type: "text", text },
+			...toolCalls.map((call) => ({ type: "toolCall", ...call }) as never),
+		],
+		api: "openai-completions",
+		provider: "watchdog-e2e",
+		model: "watchdog-e2e",
+		usage: ZERO_USAGE,
+		stopReason: "stop",
+		timestamp,
+	});
+}
+
+function seededToolResult(
+	manager: SessionManager,
+	toolCallId: string,
+	toolName: string,
+	output: string,
+	timestamp: number,
+): string {
+	return manager.appendMessage({
+		role: "toolResult",
+		toolCallId,
+		toolName,
+		content: [{ type: "text", text: output }],
+		isError: false,
+		timestamp,
+	});
+}
+
+/**
+ * A13–A15 separate actual decision-request captures (offline, localhost mock
+ * provider only). Each case seeds its own session with genuine provenance —
+ * real user-role records, real assistant tool calls with fixture toolResult
+ * output, real plugin-attributed continuation custom messages — then captures
+ * the ONE actual serialized decision request and asserts the decisive facts
+ * AND the controlling fixed-guidance text appear in that same request.
+ *
+ * Expected outcomes recorded per case are input/boundary requirements, NOT
+ * model-judgment evidence: the scripted reply only ends the fixture. Model
+ * efficacy remains unmeasured; no live/paid provider is contacted.
+ */
+const FIXED_DELIVERY_GUIDANCE =
+	/Exclude work already delivered, cancelled, or superseded/;
+const FIXED_PERMISSION_GUIDANCE =
+	/Your own earlier confirmation question is not evidence/;
+
+async function captureDecisionRequest(
+	t: TestContext,
+	options: {
+		readonly label: string;
+		readonly seed: (manager: SessionManager) => void;
+	},
+): Promise<RequestRecord> {
+	const fixture = await makePackedFixture(t);
+	const { baseUrl, requests } = await startMockServer(t, [
+		// Ordinary settle turn; the decision prompt then opens after idle.
+		{ kind: "text", text: "Ordinary settle turn." },
+		// Fixture-ending reply only. Never treated as judgment evidence.
+		{ kind: "cw", action: "unlock", reason: "Fixture capture complete." },
+	]);
+	const sm = SessionManager.inMemory(fixture.cwd);
+	options.seed(sm);
+	const { session } = await createSession(fixture, baseUrl, {
+		sessionManager: sm,
+	});
+	try {
+		await session.prompt("Kick off the ordinary turn.");
+		await waitForSessionIdle(session, 60_000, "first turn");
+		await waitFor(() => requests.length >= 2, 180_000, "decision request");
+		const decisionRequest = requests.find((request) =>
+			isDecisionRequest(request),
+		);
+		assert.ok(decisionRequest, "expected a serialized decision request");
+		// Persist the raw capture before cleanup under a deterministic name.
+		const evidenceDir = "/var/tmp/two-outcome-lifecycle/evidence";
+		try {
+			await mkdir(evidenceDir, { recursive: true });
+			await writeFile(
+				`${evidenceDir}/${options.label}.json`,
+				JSON.stringify(
+					{
+						capturedAt: new Date().toISOString(),
+						expectedBoundary: options.label,
+						request: decisionRequest,
+					},
+					null,
+					2,
+				),
+				"utf8",
+			);
+		} catch {
+			// Evidence copy is best-effort; the in-test assertions are the gate.
+		}
+		return decisionRequest;
+	} finally {
+		await shutdownSession(session);
+	}
+}
+
+function requestPromptText(request: RequestRecord): string {
+	return request.messages.map((message) => contentText(message)).join("\n");
+}
+
+/** User-role records excluding plugin-attributed custom messages (decision
+ * prompt, continuation envelope) that the host serializes with user role. */
+function genuineUserInstructions(request: RequestRecord): string[] {
+	return request.messages
+		.filter((message) => message.role === "user")
+		.map((message) => contentText(message))
+		.filter(
+			(text) =>
+				!text.includes(DECISION_PROMPT_MARKER) &&
+				!text.includes("Continue watchdog · continue ·"),
+		);
+}
+
+// A13a — user-text grant, redundant assistant question, no later revocation.
+// Expected: no new WAIT_USER solely from that question; continue of the
+// already-authorized action in unchanged scope.
+test("packed A13a user-text grant with redundant question stays continue-eligible", {
+	timeout: 360_000,
+}, async (t) => {
+	const request = await captureDecisionRequest(t, {
+		label: "a13a-user-grant-redundant-question",
+		seed: (sm) => {
+			seededUser(sm, "Please apply the schema migration.", 1);
+			seededUser(sm, "Yes — apply the schema migration now.", 2);
+			// The redundant same-permission question the assistant asked anyway.
+			seededAssistant(sm, 3, [], "To be safe, may I apply the migration?");
+		},
+	});
+	const body = JSON.stringify(request.messages);
+	assert.match(body, /apply the schema migration now/);
+	assert.match(body, /may I apply the migration/);
+	const promptText = requestPromptText(request);
+	assert.match(promptText, FIXED_PERMISSION_GUIDANCE);
+	// No later revocation exists after the grant: none of the genuine user
+	// records following it restricts or revokes the migration permission.
+	const instructions = genuineUserInstructions(request);
+	const grantIndex = instructions.findIndex((text) =>
+		text.includes("apply the schema migration now"),
+	);
+	assert.ok(grantIndex >= 0, "grant record present");
+	for (const later of instructions.slice(grantIndex + 1)) {
+		assert.doesNotMatch(
+			later,
+			/only read-only|do not (apply|change)|do not apply anything|revok/i,
+			`no later revocation, got: ${later}`,
+		);
+	}
+});
+
+// A13b — successful-questionnaire-result-only grant plus redundant question.
+// Expected: same as A13a; the correlated tool result, not assistant
+// narration, is the authorization evidence preserved in the request.
+test("packed A13b questionnaire-result grant with redundant question stays continue-eligible", {
+	timeout: 360_000,
+}, async (t) => {
+	const request = await captureDecisionRequest(t, {
+		label: "a13b-questionnaire-grant-redundant-question",
+		seed: (sm) => {
+			seededUser(sm, "Set up the release, confirming choices with me.", 1);
+			seededAssistant(sm, 2, [
+				{
+					id: "ask-1",
+					name: "ask_followup_question",
+					arguments: { question: "Approve the release publish?" },
+				},
+			]);
+			seededToolResult(
+				sm,
+				"ask-1",
+				"ask_followup_question",
+				"APPROVE — the user selected approval for the release publish.",
+				3,
+			);
+			seededAssistant(sm, 4, [], "To be safe, may I proceed with the publish?");
+		},
+	});
+	const body = JSON.stringify(request.messages);
+	assert.match(body, /APPROVE — the user selected approval/);
+	assert.match(body, /may I proceed with the publish/);
+	assert.match(requestPromptText(request), FIXED_PERMISSION_GUIDANCE);
+});
+
+// A14 — latest delivered report plus stale plugin hint, analysis-only scope.
+// Expected: completion (unlock), not redelivery and not automatic apply.
+test("packed A14 delivered report with stale hint stays completion-eligible", {
+	timeout: 360_000,
+}, async (t) => {
+	const request = await captureDecisionRequest(t, {
+		label: "a14-delivered-report-stale-hint",
+		seed: (sm) => {
+			seededUser(
+				sm,
+				"Analyze the proposal and report its path, task status, validation, and next workflow. Analysis only — do not apply anything.",
+				1,
+			);
+			seededAssistant(
+				sm,
+				2,
+				[],
+				"Proposal path: openspec/changes/simplify-watchdog-outcomes-and-presentation. Tasks: 4/6 complete. Validation: npm run check green. Next workflow: apply the remaining tasks (requires your explicit request).",
+			);
+			// Real plugin-attributed stale hint contradicting that delivery.
+			sm.appendCustomMessageEntry(
+				"pi-continue-watchdog:continuation",
+				"Continue watchdog continued · VERIFYING · Report the proposal path, task status, validation result, and next workflow.",
+				true,
+				{
+					version: 1,
+					exchangeId: "seed-exchange-a14",
+					outcome: "continue",
+				},
+			);
+		},
+	});
+	const body = JSON.stringify(request.messages);
+	assert.match(body, /4\/6 complete/);
+	assert.match(body, /Continue watchdog continued · VERIFYING/);
+	// Scope marker: analysis-only, no apply permission anywhere in the request.
+	assert.match(body, /Analysis only — do not apply anything/);
+	const promptText = requestPromptText(request);
+	assert.match(promptText, FIXED_DELIVERY_GUIDANCE);
+	assert.match(promptText, /Do not repeat an already-delivered answer/);
+});
+
+// A15a — an assistant-proposed destructive action outside user-authorized scope.
+// Expected: no database mutation under parser permission. This does not prevent
+// authorized parser work or require asking for an unnecessary extra operation.
+test("packed A15a new-risk request keeps its user boundary in the request", {
+	timeout: 360_000,
+}, async (t) => {
+	const request = await captureDecisionRequest(t, {
+		label: "a15a-new-risk-request",
+		seed: (sm) => {
+			seededUser(
+				sm,
+				"Refactor the parser module only; do not change production data.",
+				1,
+			);
+			seededAssistant(
+				sm,
+				2,
+				[],
+				"I propose an additional step: drop the production database and rebuild it from scratch.",
+			);
+		},
+	});
+	const instructions = genuineUserInstructions(request);
+	const scopeIndex = instructions.findIndex((text) =>
+		text.includes("parser module only; do not change production data"),
+	);
+	assert.ok(scopeIndex >= 0, "the user, not the assistant, limits the scope");
+	assert.deepEqual(instructions.slice(scopeIndex + 1), [
+		"Kick off the ordinary turn.",
+	]);
+	assert.ok(
+		request.messages.some(
+			(message) =>
+				message.role === "assistant" &&
+				contentText(message).includes(
+					"I propose an additional step: drop the production database",
+				),
+		),
+		"the destructive operation is an unapproved assistant proposal",
+	);
+	const promptText = requestPromptText(request);
+	assert.match(
+		promptText,
+		/An earlier authorization does not override a later restriction/,
+	);
+	assert.match(promptText, /a distinct unsatisfied confirmation requirement/);
+});
+
+// A15b — distinct mandatory-confirmation policy still unmet.
+// Expected: the unmet confirmation remains a genuine WAIT_USER boundary.
+test("packed A15b unmet mandatory confirmation stays a real boundary", {
+	timeout: 360_000,
+}, async (t) => {
+	const request = await captureDecisionRequest(t, {
+		label: "a15b-mandatory-confirmation-unmet",
+		seed: (sm) => {
+			seededUser(
+				sm,
+				"Run the deployment pipeline. Before the destructive cutover, show its preview and require a separate reply of APPROVE CUTOVER. Starting the pipeline is not that confirmation.",
+				1,
+			);
+			seededAssistant(
+				sm,
+				2,
+				[],
+				"Cutover preview: replace the production deployment with the new release. The required separate confirmation has not been given yet.",
+			);
+		},
+	});
+	const instructions = genuineUserInstructions(request);
+	const policyIndex = instructions.findIndex((text) =>
+		text.includes("require a separate reply of APPROVE CUTOVER"),
+	);
+	assert.ok(policyIndex >= 0, "the confirmation rule must come from the user");
+	assert.match(instructions[policyIndex] ?? "", /Run the deployment pipeline/);
+	assert.deepEqual(instructions.slice(policyIndex + 1), [
+		"Kick off the ordinary turn.",
+	]);
+	assert.ok(
+		!request.messages.some((message) => message.role === "tool"),
+		"no questionnaire-result confirmation exists in this fixture",
+	);
+	assert.match(
+		requestPromptText(request),
+		/a distinct unsatisfied confirmation requirement/,
+	);
+});
+
+// A15c — missing credentials/authentication evidence.
+// Expected: the missing authentication remains required; earlier permission
+// for other work does not substitute for it.
+test("packed A15c missing authentication stays required in the request", {
+	timeout: 360_000,
+}, async (t) => {
+	const request = await captureDecisionRequest(t, {
+		label: "a15c-missing-authentication",
+		seed: (sm) => {
+			seededUser(sm, "Publish the signed release artifact.", 1);
+			seededAssistant(sm, 2, [
+				{
+					id: "release-auth-1",
+					name: "check_release_authentication",
+					arguments: { artifact: "release.tar.gz" },
+				},
+			]);
+			seededToolResult(
+				sm,
+				"release-auth-1",
+				"check_release_authentication",
+				JSON.stringify({
+					signingDevice: "awaiting_user_confirmation",
+					registryCredentials: "missing",
+				}),
+				3,
+			);
+			seededAssistant(
+				sm,
+				4,
+				[],
+				"The signing key's device authentication is unfinished and the registry credentials are unavailable, so the signing step cannot proceed yet.",
+			);
+		},
+	});
+	const callIndex = request.messages.findIndex(
+		(message) =>
+			message.role === "assistant" &&
+			message.tool_calls?.some(
+				(call) =>
+					call.id === "release-auth-1" &&
+					call.function?.name === "check_release_authentication",
+			),
+	);
+	const resultIndex = request.messages.findIndex(
+		(message) =>
+			message.role === "tool" && message.tool_call_id === "release-auth-1",
+	);
+	assert.ok(callIndex >= 0, "the authentication query must be preserved");
+	assert.ok(
+		resultIndex > callIndex,
+		"the result must follow its correlated call",
+	);
+	const result = request.messages[resultIndex];
+	assert.ok(result);
+	assert.deepEqual(JSON.parse(contentText(result)), {
+		signingDevice: "awaiting_user_confirmation",
+		registryCredentials: "missing",
+	});
+	assert.ok(
+		genuineUserInstructions(request).includes(
+			"Publish the signed release artifact.",
+		),
+		"release permission is distinct from authentication readiness",
+	);
+	const promptText = requestPromptText(request);
+	assert.match(
+		promptText,
+		/missing credentials, or unfinished device authentication/,
+	);
+});
+
+// A15d — later explicit read-only restriction overriding earlier grant.
+// Expected: earlier implementation permission is not used to resume mutation;
+// once the exploration is delivered, completion rather than invented work.
+test("packed A15d later read-only restriction overrides earlier grant", {
+	timeout: 360_000,
+}, async (t) => {
+	const request = await captureDecisionRequest(t, {
+		label: "a15d-later-readonly-restriction",
+		seed: (sm) => {
+			seededUser(sm, "Yes — apply the schema migration now.", 1);
+			seededUser(
+				sm,
+				"From now on, only read-only exploration; do not change anything.",
+				2,
+			);
+		},
+	});
+	const body = JSON.stringify(request.messages);
+	assert.match(body, /apply the schema migration now/);
+	assert.match(body, /only read-only exploration/);
+	// The restriction is the newest genuine user instruction about scope: no
+	// genuine user record after it re-authorizes mutation.
+	const instructions = genuineUserInstructions(request);
+	const restrictionIndex = instructions.findIndex((text) =>
+		text.includes("only read-only exploration"),
+	);
+	assert.ok(restrictionIndex >= 0, "restriction record present");
+	const grantIndex = instructions.findIndex((text) =>
+		text.includes("apply the schema migration now"),
+	);
+	assert.ok(
+		restrictionIndex > grantIndex && grantIndex >= 0,
+		"restriction supersedes the earlier grant in order",
+	);
+	for (const later of instructions.slice(restrictionIndex + 1)) {
+		assert.doesNotMatch(
+			later,
+			/apply the schema migration|you may (now )?apply|re-?authoriz/i,
+			`no later re-authorization, got: ${later}`,
+		);
+	}
+	assert.match(
+		requestPromptText(request),
+		/An earlier authorization does not override a later restriction/,
+	);
+});
+
+/**
+ * A2 actual transport: after an accepted AI unlock, the next ordinary user
+ * request contains the user work and prior conversation but none of the
+ * finalized inquiry protocol or the unlock reason; the quiet status exists
+ * exactly once as a UI-only custom entry (excluded from LLM context by the
+ * host's custom-entry design).
+ */
+test("packed next ordinary request after AI unlock has no unlock text or control exchange", {
+	timeout: 360_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t);
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "text", text: "Deploy work done." },
+		{
+			kind: "cw",
+			action: "unlock",
+			reasonType: "JOB_DONE",
+			reason: "Requested analysis delivered.",
+		},
+		{ kind: "text", text: "New ordinary work after unlock." },
+	]);
+	const { session } = await createSession(fixture, baseUrl);
+	try {
+		await session.prompt("Do the analysis.");
+		await waitForSessionIdle(session, 60_000, "first turn");
+		await waitFor(() => requests.length >= 2, 120_000, "decision request");
+		await waitForSessionIdle(session, 60_000, "decision turn");
+		// Exactly one quiet UI-only unlock status in stored session entries.
+		const branch = session.sessionManager.getBranch();
+		const statuses = branch.filter(
+			(entry) =>
+				entry.type === "custom" &&
+				entry.customType === "pi-continue-watchdog:ai-unlock",
+		);
+		assert.equal(statuses.length, 1);
+		// New user work after the unlock: its actual provider request excludes
+		// the unlock reason and all decision protocol traffic.
+		await session.prompt("Start unrelated work.");
+		await waitForSessionIdle(session, 60_000, "post-unlock turn");
+		const postUnlock = requests.at(-1);
+		assert.ok(postUnlock);
+		const body = JSON.stringify(postUnlock.messages);
+		assert.match(body, /Start unrelated work\./);
+		assert.doesNotMatch(body, /Requested analysis delivered\./);
+		assert.doesNotMatch(body, /pi-continue-watchdog:inquiry-fold/);
+		assert.doesNotMatch(body, /pi-continue-watchdog:inquiry/);
+		assert.doesNotMatch(body, /pi-continue-watchdog:ai-unlock/);
+		assert.doesNotMatch(body, /Continue watchdog unlocked/);
+		assert.doesNotMatch(body, /Decision received\./);
+	} finally {
+		await shutdownSession(session);
+	}
+});
+
+test("packed retired wait action is rejected as invalid without waiting effects", {
 	timeout: 360_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t, {
@@ -780,7 +1316,13 @@ test("packed bounded wait defers exhaustion until its deadline", {
 	});
 	const { baseUrl, requests } = await startMockServer(t, [
 		{ kind: "text", text: "External job pending." },
-		{ kind: "cw", action: "wait", waitSeconds: 30 },
+		// The retired wait payload: copied from the old protocol.
+		{
+			kind: "cw-invalid",
+			text: '{"action":"wait","reason_content":"Waiting for automation.","wait_seconds":30}',
+		},
+		// The correction is answered with a plain unlock, closing the cycle.
+		{ kind: "cw", action: "unlock", reason: "Job settled externally." },
 	]);
 	const { session } = await createSession(fixture, baseUrl);
 	try {
@@ -788,31 +1330,50 @@ test("packed bounded wait defers exhaustion until its deadline", {
 		await waitForSessionIdle(session, 60_000, "first turn");
 		await waitFor(() => requests.length >= 2, 120_000, "decision request");
 		await waitForSessionIdle(session, 60_000, "decision turn");
+		// The retired wait is one invalid response: a correction re-ask follows.
+		await waitFor(() => requests.length >= 3, 120_000, "correction request");
+		await waitForSessionIdle(session, 60_000, "correction turn");
+		// The rejection came from the retired-action validator, not from batch
+		// preflight treating duplicated visible JSON as prose: the singleton cw
+		// call carried empty visible content, so the correction must carry the
+		// retired-action diagnostic itself.
+		const correction = requests[2];
+		assert.ok(isDecisionRequest(correction), "request 3 is the correction");
+		assert.match(
+			JSON.stringify(correction.messages),
+			/wait is no longer an accepted action\./,
+			"correction carries RETIRED_WAIT_ACTION_ERROR",
+		);
 		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
-		const waiting = envelopes.filter(
-			(envelope) => envelope.name === "watchdog-waiting",
+		assert.equal(
+			envelopes.some((envelope) => envelope.name === "watchdog-waiting"),
+			false,
+			"no waiting hook for a retired wait payload",
 		);
-		assert.equal(waiting.length, 1);
-		assert.deepEqual(waiting[0].values, {
-			REASON: "Waiting for automation.",
-			WAIT_SECONDS: "30",
-		});
-		// No new provider request before the 30s wait deadline elapses.
-		await new Promise((resolve) => setTimeout(resolve, 12_000));
-		assert.equal(requests.length, 2);
-		// After the deadline and idle qualification, EXHAUSTED becomes eligible.
-		await new Promise((resolve) => setTimeout(resolve, 25_000));
-		const finalEnvelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
-		assert.ok(
-			finalEnvelopes.some(
+		assert.equal(
+			envelopes.some(
 				(envelope) =>
-					envelope.name === "user-ready" &&
-					(envelope.values as { STOP_KIND?: string } | undefined)?.STOP_KIND ===
-						"EXHAUSTED",
+					envelope.values &&
+					typeof envelope.values === "object" &&
+					"WAIT_SECONDS" in envelope.values,
 			),
-			"expected EXHAUSTED user-ready after the wait deadline",
+			false,
+			"no wait duration value on any hook",
 		);
-		assert.equal(requests.length, 2);
+		const ready = envelopes.filter(
+			(envelope) => envelope.name === "user-ready",
+		);
+		// The only terminal signal comes from the explicit correction unlock.
+		assert.equal(ready.length, 1);
+		assert.deepEqual(ready[0].values, {
+			STOP_KIND: "AI_UNLOCK",
+			REASON_TYPE: "JOB_DONE",
+			REASON: "Job settled externally.",
+		});
+		// No watchdog deadline timer dispatched additional work after the cycle
+		// ended: the request count stays at exactly three.
+		await new Promise((resolve) => setTimeout(resolve, 12_000));
+		assert.equal(requests.length, 3);
 	} finally {
 		await shutdownSession(session);
 	}
@@ -855,6 +1416,91 @@ test("packed invalid decisions correct twice then decision-fail", {
 	}
 });
 
+/**
+ * Native three-response regression for the retired action: three structurally
+ * valid singleton cw calls whose payload selects the retired wait action must
+ * stop after exactly three invalid decisions with no fourth native follow-up.
+ * The mock keeps visible content empty so each response reaches payload
+ * validation instead of dying at batch preflight.
+ */
+test("packed singleton retired waits stop without native follow-up", {
+	timeout: 360_000,
+}, async (t) => {
+	const outputRoot = await mkdtemp(join(tmpdir(), "cw-retired-waits-"));
+	const capturePath = join(outputRoot, "requests.json");
+	t.after(async () => rm(outputRoot, { recursive: true, force: true }));
+
+	const fixture = await makePackedFixture(t, { withSemanticProbe: true });
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "text", text: "Work settles." },
+		{
+			kind: "cw-invalid",
+			text: '{"action":"wait","reason_content":"Wait for CI.","wait_seconds":60}',
+		},
+		{
+			kind: "cw-invalid",
+			text: '{"action":"wait","reason_content":"Wait for CI.","wait_seconds":60}',
+		},
+		{
+			kind: "cw-invalid",
+			text: '{"action":"wait","reason_content":"Wait for CI.","wait_seconds":60}',
+		},
+	]);
+	const { session } = await createSession(fixture, baseUrl);
+	try {
+		await session.prompt("Do the work.");
+		await waitForSessionIdle(session, 30_000, "first turn");
+		await waitFor(() => requests.length >= 2, 120_000, "first decision");
+		await waitFor(() => requests.length >= 4, 240_000, "corrections");
+		await waitForSessionIdle(session, 60_000, "final decision turn");
+		const decisionRequests = requests.filter((request) =>
+			isDecisionRequest(request),
+		);
+		assert.equal(decisionRequests.length, 3);
+		// Every correction re-ask carries the retired-action validator
+		// diagnostic, proving the wait payload reached payload validation.
+		for (const correction of decisionRequests.slice(1)) {
+			assert.match(
+				JSON.stringify(correction.messages),
+				/wait is no longer an accepted action\./,
+			);
+		}
+		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
+		assert.equal(
+			envelopes.some((envelope) => envelope.name === "watchdog-waiting"),
+			false,
+			"no waiting hook for retired wait payloads",
+		);
+		assert.ok(
+			envelopes.some(
+				(envelope) =>
+					envelope.name === "user-ready" &&
+					(envelope.values as { STOP_KIND?: string } | undefined)?.STOP_KIND ===
+						"DECISION_FAILED",
+			),
+			"expected DECISION_FAILED user-ready",
+		);
+		// The fourth invalid response is never requested.
+		await new Promise((resolve) => setTimeout(resolve, 12_000));
+		assert.equal(requests.length, 4);
+	} finally {
+		try {
+			await writeFile(capturePath, JSON.stringify(requests, null, 2), "utf8");
+			await mkdir("/var/tmp/two-outcome-lifecycle/evidence", {
+				recursive: true,
+			});
+			await writeFile(
+				"/var/tmp/two-outcome-lifecycle/evidence/packed-singleton-retired-waits.requests.json",
+				JSON.stringify(requests, null, 2),
+				"utf8",
+			);
+		} catch {
+			// Evidence copy is best-effort; the in-test assertions are the gate.
+		}
+		await shutdownSession(session);
+	}
+});
+
 test("packed custom reasonTypes are matched case-insensitively in the decision", {
 	timeout: 300_000,
 }, async (t) => {
@@ -889,4 +1535,279 @@ test("packed custom reasonTypes are matched case-insensitively in the decision",
 	} finally {
 		await shutdownSession(session);
 	}
+});
+
+/**
+ * A13–A15 continuation input evidence: the actual NEXT ORDINARY request after
+ * an accepted continue must still carry the decisive seeded facts (grant /
+ * questionnaire result, delivered report + stale hint, unapproved scope,
+ * mandatory confirmation, authentication evidence, later read-only
+ * restriction) together with the fixed continuation envelope — and nothing
+ * else that could add or remove authority.
+ *
+ * The scripted continue reply only drives request assembly; it is never
+ * model-judgment evidence. Facts are asserted from the real serialized
+ * provider request captured on the localhost mock.
+ */
+async function captureContinuationRequest(
+	t: TestContext,
+	options: {
+		readonly label: string;
+		readonly seed: (manager: SessionManager) => void;
+		readonly reason: string;
+	},
+): Promise<RequestRecord> {
+	const fixture = await makePackedFixture(t);
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "text", text: "Ordinary settle turn." },
+		{
+			kind: "cw",
+			action: "continue",
+			reasonType: "WORK_REMAINS",
+			reason: options.reason,
+		},
+		{ kind: "text", text: "Continuation ordinary turn." },
+		{ kind: "cw", action: "unlock" },
+	]);
+	const sm = SessionManager.inMemory(fixture.cwd);
+	options.seed(sm);
+	const { session } = await createSession(fixture, baseUrl, {
+		sessionManager: sm,
+	});
+	try {
+		await session.prompt("Kick off the ordinary turn.");
+		await waitForSessionIdle(session, 60_000, "first turn");
+		await waitFor(() => requests.length >= 2, 180_000, "decision request");
+		await waitForSessionIdle(session, 60_000, "decision turn");
+		await waitFor(() => requests.length >= 3, 180_000, "continuation request");
+		const continuationRequest = requests[2];
+		assert.ok(continuationRequest, "expected a continuation request");
+		assert.ok(
+			!isDecisionRequest(continuationRequest),
+			"the captured request is the next ordinary request, not the inquiry",
+		);
+		const evidenceDir = "/var/tmp/two-outcome-lifecycle/evidence";
+		try {
+			await mkdir(evidenceDir, { recursive: true });
+			await writeFile(
+				`${evidenceDir}/${options.label}-continuation.json`,
+				JSON.stringify(
+					{
+						capturedAt: new Date().toISOString(),
+						expectedBoundary: options.label,
+						request: continuationRequest,
+					},
+					null,
+					2,
+				),
+				"utf8",
+			);
+		} catch {
+			// Best-effort evidence copy; in-test assertions are the gate.
+		}
+		return continuationRequest;
+	} finally {
+		await shutdownSession(session);
+	}
+}
+
+function assertContinuationEnvelope(request: RequestRecord): void {
+	const envelope = request.messages.find((message) =>
+		contentText(message).includes("Continue watchdog · continue ·"),
+	);
+	assert.ok(envelope, "continuation envelope present in the ordinary request");
+	const body = contentText(envelope);
+	assert.match(body, /Suggested next step: /);
+	assert.match(body, /does not revoke or reset permission/);
+	assert.doesNotMatch(body, /"reasonType"/);
+	assert.doesNotMatch(body, /Previous automated watchdog result/);
+}
+
+function assertNoDecisionInternals(request: RequestRecord): void {
+	const body = JSON.stringify(request.messages);
+	assert.doesNotMatch(
+		body,
+		/automated continuation check from the pi-continue-watchdog/,
+	);
+	assert.doesNotMatch(
+		body,
+		/Your entire response must be exactly one cw function call/,
+	);
+	assert.doesNotMatch(body, /"name":"cw"/);
+}
+
+// A13 continuation — a real user grant plus the assistant's redundant
+// re-question survive into the ordinary request that continues the work.
+test("packed A13 continuation request keeps the user grant and questionnaire evidence", {
+	timeout: 360_000,
+}, async (t) => {
+	const request = await captureContinuationRequest(t, {
+		label: "a13-continuation",
+		reason: "Apply the approved schema migration.",
+		seed: (sm) => {
+			seededUser(sm, "Please apply the schema migration.", 1);
+			seededUser(sm, "Yes — apply the schema migration now.", 2);
+			seededAssistant(sm, 3, [], "To be safe, may I apply the migration?");
+			// Successful correlated questionnaire answer (A13b evidence class).
+			seededAssistant(sm, 4, [
+				{
+					id: "ask-a13",
+					name: "ask_followup_question",
+					arguments: { question: "Approve the migration apply?" },
+				},
+			]);
+			seededToolResult(
+				sm,
+				"ask-a13",
+				"ask_followup_question",
+				"APPROVE — the user selected approval for the schema migration.",
+				5,
+			);
+		},
+	});
+	const body = JSON.stringify(request.messages);
+	assert.match(body, /apply the schema migration now/);
+	assert.match(body, /may I apply the migration\?/);
+	assert.match(body, /APPROVE — the user selected approval/);
+	assertContinuationEnvelope(request);
+	assertNoDecisionInternals(request);
+	// No new authority: the continuation envelope does not re-grant or widen
+	// anything — the only permission records are the genuine user ones.
+	const instructions = genuineUserInstructions(request);
+	assert.ok(
+		instructions.some((text) =>
+			text.includes("apply the schema migration now"),
+		),
+		"grant record survives in the ordinary request",
+	);
+	for (const text of instructions) {
+		assert.doesNotMatch(
+			text,
+			/you may (now )?apply|permission granted|approved by the watchdog/i,
+			`no watchdog-authored authority, got: ${text}`,
+		);
+	}
+});
+
+// A14 continuation — the delivered analysis-only report and the stale plugin
+// hint both survive; the continuation envelope subordinates the hint.
+test("packed A14 continuation request keeps delivered report and stale hint subordinate", {
+	timeout: 360_000,
+}, async (t) => {
+	const request = await captureContinuationRequest(t, {
+		label: "a14-continuation",
+		reason: "Verify the remaining analysis follow-up.",
+		seed: (sm) => {
+			seededUser(
+				sm,
+				"Analyze the proposal and report its path, task status, validation, and next workflow. Analysis only — do not apply anything.",
+				1,
+			);
+			seededAssistant(
+				sm,
+				2,
+				[],
+				"Proposal path: openspec/changes/simplify-watchdog-outcomes-and-presentation. Tasks: 4/6 complete. Validation: npm run check green.",
+			);
+			sm.appendCustomMessageEntry(
+				"pi-continue-watchdog:continuation",
+				"Continue watchdog continued · VERIFYING · Report the proposal path, task status, validation result, and next workflow.",
+				true,
+				{
+					version: 1,
+					exchangeId: "seed-exchange-a14-c",
+					outcome: "continue",
+				},
+			);
+		},
+	});
+	const body = JSON.stringify(request.messages);
+	assert.match(body, /4\/6 complete/);
+	assert.match(body, /Analysis only — do not apply anything/);
+	assert.match(body, /Continue watchdog continued · VERIFYING/);
+	assertContinuationEnvelope(request);
+	assertNoDecisionInternals(request);
+});
+
+// A15 continuation — unapproved scope, unmet mandatory confirmation,
+// authentication evidence, and a later read-only restriction all survive the
+// continuation envelope without being overridden by it.
+test("packed A15 continuation request keeps every genuine user boundary", {
+	timeout: 360_000,
+}, async (t) => {
+	const request = await captureContinuationRequest(t, {
+		label: "a15-continuation",
+		reason: "Continue the read-only verification work.",
+		seed: (sm) => {
+			seededUser(
+				sm,
+				"Refactor the parser module only; do not change production data.",
+				1,
+			);
+			seededAssistant(
+				sm,
+				2,
+				[],
+				"I propose an additional step: drop the production database and rebuild it from scratch.",
+			);
+			seededUser(
+				sm,
+				"Run the deployment pipeline. Before the destructive cutover, require a separate reply of APPROVE CUTOVER. Starting the pipeline is not that confirmation.",
+				3,
+			);
+			seededAssistant(
+				sm,
+				4,
+				[],
+				"The required separate confirmation has not been given yet.",
+			);
+			seededUser(sm, "Publish the signed release artifact.", 5);
+			seededAssistant(sm, 6, [
+				{
+					id: "auth-a15",
+					name: "check_release_authentication",
+					arguments: { artifact: "release.tar.gz" },
+				},
+			]);
+			seededToolResult(
+				sm,
+				"auth-a15",
+				"check_release_authentication",
+				JSON.stringify({
+					signingDevice: "awaiting_user_confirmation",
+					registryCredentials: "missing",
+				}),
+				7,
+			);
+			seededUser(
+				sm,
+				"From now on, only read-only exploration; do not change anything.",
+				8,
+			);
+		},
+	});
+	const body = JSON.stringify(request.messages);
+	assert.match(body, /parser module only; do not change production data/);
+	assert.match(body, /drop the production database/);
+	assert.match(body, /separate reply of APPROVE CUTOVER/);
+	assert.match(body, /awaiting_user_confirmation/);
+	assert.match(body, /Publish the signed release artifact/);
+	assert.match(body, /only read-only exploration/);
+	assertContinuationEnvelope(request);
+	assertNoDecisionInternals(request);
+	// Ordering: the read-only restriction is the latest genuine user scope
+	// record; the continuation envelope adds none after it.
+	const instructions = genuineUserInstructions(request);
+	const restrictionIndex = instructions.findIndex((text) =>
+		text.includes("only read-only exploration"),
+	);
+	assert.ok(restrictionIndex >= 0, "restriction record survives");
+	const afterRestriction = instructions.slice(restrictionIndex + 1);
+	assert.deepEqual(
+		afterRestriction.filter(
+			(text) => !text.includes("Kick off the ordinary turn."),
+		),
+		[],
+		"no user record after the restriction except the live turn",
+	);
 });

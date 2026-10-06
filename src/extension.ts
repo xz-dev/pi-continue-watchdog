@@ -34,6 +34,10 @@ import {
 	type RuntimeClock,
 	type RuntimeControllerHolder,
 } from "./runtime.js";
+import {
+	projectBranchPreparation,
+	projectCompactionPreparation,
+} from "./summary-projection.js";
 
 /** Dependencies supplied only by focused lifecycle tests. */
 export interface ContinueWatchdogExtensionOptions {
@@ -121,6 +125,23 @@ export function createContinueWatchdogExtension(
 		};
 		createMainCommands(pi, commandRuntime);
 		registerDecisionContextFolding(pi);
+		// Native summary isolation: the same exact-exchange projection used for
+		// ordinary requests also rewrites the host's own compaction and
+		// branch-summary preparations in place, so internal decision traffic
+		// stays out of native model input while accepted continuations survive
+		// at their original fold positions.
+		pi.on("session_before_compact", (event) => {
+			if (event.signal.aborted) return;
+			projectCompactionPreparation(event.preparation, event.branchEntries);
+		});
+		pi.on("session_before_tree", (event, ctx) => {
+			if (event.signal.aborted) return;
+			if (!event.preparation.userWantsSummary) return;
+			const oldBranch = ctx.sessionManager.getBranch(
+				event.preparation.oldLeafId ?? undefined,
+			);
+			projectBranchPreparation(event.preparation, oldBranch);
+		});
 		// Correlate a pending watchdog dispatch before real-user auto-lock can
 		// restart the cycle and discard the identity needed to downgrade a foreign run.
 		pi.on("message_start", (event, ctx) =>

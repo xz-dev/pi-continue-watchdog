@@ -1,10 +1,4 @@
-# terminal-outcome-gate Specification
-
-## Purpose
-
-Routes successful settlements into guarded continue-or-unlock inquiries, terminal errors into automatic unlock, and human aborts into immediate unlock while preserving current-ownership and aggregate-idle safeguards.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Terminal error settlement auto-unlocks
 A locked watchdog observing authoritative settlement with the tracked final `stopReason: "error"` after Pi retries are exhausted SHALL unlock automatically without opening an idle fence, inquiry, or ordinary continuation for that settlement. Its existing user notification and human-unlock-style error record SHALL remain distinguishable from manual unlock. Error text, classes, and string heuristics SHALL not decide this gate.
@@ -32,22 +26,6 @@ A successful eligible ordinary settlement SHALL retain the fixed idle fence and 
 #### Scenario: Abort path unchanged
 - **WHEN** the user aborts a locked run
 - **THEN** the existing immediate abort unlock path applies without an inquiry
-
-### Requirement: Gate only at true settlement
-
-The gate SHALL be evaluated only at the authoritative settled decision point with the plugin's existing stale/settlement guards. While Pi is automatically retrying, the run is busy and no settlement exists; the gate SHALL NOT unlock early during host retries or queued continuations. A settlement observation that is stale under existing guards SHALL NOT auto-unlock.
-
-#### Scenario: During automatic retry
-
-- **GIVEN** a run hit an error and Pi is automatically retrying
-- **WHEN** the retry is still in flight
-- **THEN** the watchdog remains locked and takes no unlock or decision action
-
-#### Scenario: Stale settlement ignored
-
-- **GIVEN** a new run started after an errored settlement was queued for processing
-- **WHEN** the stale settlement observation is evaluated
-- **THEN** no auto-unlock occurs
 
 ### Requirement: Contract updated before implementation
 The implementation's behavior documentation and affected executable process models SHALL describe the settlement matrix before or together with their corresponding runtime slice: success enters a guarded continue-or-unlock inquiry; terminal error auto-unlocks; abort immediately unlocks. They SHALL describe continuation-only retry accounting and native callback waiting without timed watchdog waits. They SHALL not require proactive ordinary-turn control calls or claim that UI hiding proves context isolation. These shipped-behavior documents SHALL be updated during implementation, not represented as already changed by a proposal alone.

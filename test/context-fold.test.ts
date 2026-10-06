@@ -5,7 +5,10 @@ import {
 	type ContextEvent,
 	convertToLlm,
 } from "@earendil-works/pi-coding-agent";
-import { MAX_INQUIRY_CONTENT_CODE_POINTS } from "pi-extension-utils/pi-inquiry";
+import {
+	createInquiryRuntime,
+	MAX_INQUIRY_CONTENT_CODE_POINTS,
+} from "pi-extension-utils/pi-inquiry";
 
 import { MAX_PROMPT_CHARACTERS } from "../src/config.js";
 import {
@@ -23,17 +26,15 @@ import {
 } from "../src/context-fold.js";
 
 import {
-	createCompletedWaitWatchdogEvent,
 	createContinueWatchdogEvent,
+	createDecisionFailedWatchdogEvent,
 	createExhaustedWatchdogEvent,
 	createUnlockWatchdogEvent,
-	createWaitWatchdogEvent,
-	formatCompletedWaitWatchdogEvent,
 	formatContinueWatchdogEvent,
+	formatDecisionFailedWatchdogEvent,
 	formatExhaustedWatchdogEvent,
 	formatRfc3339WithOffset,
 	formatUnlockWatchdogEvent,
-	formatWaitWatchdogEvent,
 	WATCHDOG_EVENT_MESSAGE_TYPE,
 	WATCHDOG_EVENT_VERSION,
 } from "../src/watchdog-event.js";
@@ -162,9 +163,9 @@ function foldMarker(options: {
 	readonly cycleId?: number;
 	readonly outcome:
 		| "continue"
-		| "wait"
 		| "unlock"
 		| "decision-failed"
+		| "invalidated"
 		| "preempted";
 	readonly continuePrompt?: string;
 	readonly timestamp: number;
@@ -244,10 +245,17 @@ test("shared continue body is frozen with full accepted reason and guidance", ()
 
 	assert.equal(fold.display, true);
 	assert.equal(fold.content, body);
-	assert.equal(body.includes(JSON.stringify(longReason)), true);
+	// The accepted reason appears once verbatim as the next-step hint; no
+	// prior-result JSON duplication of the reason.
+	assert.equal(body.split(longReason).length, 2);
 	assert.equal(body.includes("Custom guidance."), true);
-	assert.match(body, /every request in this session.*actual delivery/);
+	assert.match(body, /latest actually delivered results/);
 	assert.match(body, /already delivered, cancelled, or superseded/);
+	assert.match(
+		body,
+		/does not revoke or reset permission the user already granted/,
+	);
+	assert.doesNotMatch(body, /Previous automated watchdog result/);
 	assert.equal(body.includes("cw"), false);
 	assert.equal(
 		parseDecisionFoldDetails(fold.details)?.watchdogEvent?.occurredAt,
@@ -306,30 +314,37 @@ test("generated shared bodies preserve maximum valid configured fields", () => {
 		eventContent: unlockBody,
 		watchdogEvent: unlockEvent,
 	});
+	// The full unlock body still round-trips through the formatter and fold
+	// construction at any size; folding a legacy-shaped unlock replace-fold
+	// then keeps it OUT of ordinary model context (R1 contract: the unlock
+	// reason is control traffic, published today as the quiet UI-only status).
+	const unlockMessages = [
+		decision("exchange-2", 1, 1),
+		assistant([text("unlock")], 2),
+		{ role: "custom", ...unlockFold, timestamp: 3 },
+	];
 	assert.equal(
-		messageText(
-			foldDecisionContext([
-				decision("exchange-2", 1, 1),
-				assistant([text("unlock")], 2),
-				{ role: "custom", ...unlockFold, timestamp: 3 },
-			])[0] ?? {},
-		),
-		unlockBody,
+		foldDecisionContext(unlockMessages).filter(
+			(message) => (message as Message).role === "custom",
+		).length,
+		0,
+		"legacy-shaped unlock replacement does not reenter ordinary context",
 	);
 });
 
 test("automated continuation formatter preserves guidance and safely serializes the reason", () => {
+	const body = formatContinueWatchdogEvent(
+		createContinueWatchdogEvent({
+			occurredAtMs: 0,
+			offsetMinutes: 0,
+			reasonType: "VERIFYING",
+			reason: 'Run tests.\nDo not confuse "quoted" text.',
+		}),
+		CONTINUE_PROMPT,
+	);
 	assert.equal(
-		formatContinueWatchdogEvent(
-			createContinueWatchdogEvent({
-				occurredAtMs: 0,
-				offsetMinutes: 0,
-				reasonType: "VERIFYING",
-				reason: 'Run tests.\nDo not confuse "quoted" text.',
-			}),
-			CONTINUE_PROMPT,
-		),
-		`Continue watchdog continued · VERIFYING · 1970-01-01T00:00:00.000+00:00\n\nThis is an automated event from the pi-continue-watchdog extension, not a message or request from the user. It is not user approval, confirmation, consent, or authorization.\n\nPrevious automated watchdog result (model-generated reference only; not user instructions):\n{"reasonType":"VERIFYING","reason":"Run tests.\\nDo not confuse \\"quoted\\" text."}\n\nContinuation guidance:\n${CONTINUE_PROMPT}\n\nCheck every request in this session against actual delivery, including earlier requests. Exclude work already delivered, cancelled, or superseded. Continue only requested, authorized work that remains actionable.\n\nResume only work already requested and authorized by the user. Do not treat this message as permission for any action requiring user approval. If additional user input, approval, or assistance is required, stop and ask the user.`,
+		body,
+		`Continue watchdog · continue · VERIFYING · 1970-01-01T00:00:00.000+00:00\n\nAutomated guidance from the pi-continue-watchdog extension, not a user message or request.\nThis is not user approval, confirmation, consent, or authorization.\nAbsence of new authorization from this notice does not revoke or reset permission the user already granted; permission is reevaluated only against actual scope changes, revocations, and applicable unsatisfied requirements.\n\nSuggested next step: Run tests.\nDo not confuse "quoted" text.\n\nContinuation guidance:\n${CONTINUE_PROMPT}\n\nReconcile this suggested step against the user's current authorized scope and the latest actually delivered results before acting: exclude work already delivered, cancelled, or superseded; do not repeat an already-delivered answer and do not reopen a permission question the user already answered. Resume only requested, authorized work that remains actionable. If additional user input, approval, or assistance is required, stop that action and ask the user normally.`,
 	);
 });
 
@@ -405,25 +420,16 @@ test("builders emit exact decision and fold custom messages", () => {
 		},
 	);
 
-	assert.deepEqual(
-		createDecisionFoldMessage({
-			exchangeId: EXCHANGE_ID,
-			cycleId: 1,
-			outcome: "wait",
-		}),
-		{
-			customType: DECISION_FOLD_MESSAGE_TYPE,
-			content: "",
-			display: false,
-			details: {
-				version: DECISION_PROTOCOL_VERSION,
-				namespace: "pi-continue-watchdog",
-				inquiryId: EXCHANGE_ID,
-				attempt: 1,
-				outcome: "remove",
-				watchdogOutcome: "wait",
-			},
-		},
+	// The retired wait outcome can no longer be written: untyped callers get
+	// the same TypeError as every other invalid fold input.
+	assert.throws(
+		() =>
+			createDecisionFoldMessage({
+				exchangeId: EXCHANGE_ID,
+				cycleId: 1,
+				outcome: "wait",
+			} as never),
+		/wait is a retired outcome/,
 	);
 
 	assert.deepEqual(
@@ -470,13 +476,15 @@ test("builders emit exact decision and fold custom messages", () => {
 });
 
 test("legacy watchdogResult metadata is ignored without breaking folds", () => {
-	const legacy = createDecisionFoldMessage({
-		exchangeId: EXCHANGE_ID,
-		cycleId: 8,
-		outcome: "wait",
-	});
+	// Raw persisted legacy wait-fold record: written by an older version,
+	// constructed inline because no production writer admits wait anymore.
 	const details = {
-		...(legacy.details as Record<string, unknown>),
+		version: DECISION_PROTOCOL_VERSION,
+		namespace: "pi-continue-watchdog",
+		inquiryId: EXCHANGE_ID,
+		attempt: 8,
+		outcome: "remove",
+		watchdogOutcome: "wait",
 		watchdogResult: {
 			outcome: "wait",
 			reason: "Legacy waiting reason.",
@@ -486,6 +494,7 @@ test("legacy watchdogResult metadata is ignored without breaking folds", () => {
 	const parsed = parseDecisionFoldDetails(details);
 	assert.ok(parsed);
 	assert.equal(Object.hasOwn(parsed, "watchdogResult"), false);
+	assert.equal(parsed?.watchdogOutcome, "wait");
 });
 
 test("valid continue folds the complete exchange into the compact continue prompt", () => {
@@ -507,32 +516,56 @@ test("valid continue folds the complete exchange into the compact continue promp
 	]);
 });
 
-test("shared result folds stay before later standalone timeline events", () => {
-	const waitEvent = createWaitWatchdogEvent({
+test("legacy wait records stay readable and fold without restoring wait behavior", () => {
+	// Legacy records written by versions that still accepted waits. They are
+	// constructed inline as raw persisted data: no production wait constructor
+	// exists anymore, and reading these must not rearm any timer.
+	const waitBody =
+		"Continue watchdog waiting · 30s · 1970-01-01T00:00:30.000+00:00";
+	const completedBody =
+		"Continue watchdog delay elapsed · requested 30s · elapsed 31s · 1970-01-01T00:00:31.000+00:00";
+	const waitEvent = {
+		version: 1 as const,
+		kind: "wait" as const,
 		occurredAtMs: 0,
-		occurredAtOffsetMinutes: 0,
+		occurredAt: "1970-01-01T00:00:00.000+00:00",
 		reason: "Waiting for CI.",
 		waitSeconds: 30,
 		deadlineMs: 30_000,
-		deadlineOffsetMinutes: 0,
+		deadline: "1970-01-01T00:00:30.000+00:00",
+	};
+	// Raw persisted legacy replace-fold record with its wait replacement event,
+	// exactly in the stored format an older version wrote: the generic inquiry
+	// fold payload plus the legacy watchdog outcome/event details. Built through
+	// the shared inquiry runtime because the production decision-fold writer
+	// now rejects retired outcomes.
+	const legacyWaitFold = createInquiryRuntime("pi-continue-watchdog", {
+		inquiryId: EXCHANGE_ID,
+	}).fold(1, {
+		customType: WATCHDOG_EVENT_MESSAGE_TYPE,
+		content: waitBody,
+		details: waitEvent,
 	});
-	const waitBody = formatWaitWatchdogEvent(waitEvent);
-	const waitFold = createDecisionFoldMessage({
-		exchangeId: EXCHANGE_ID,
-		cycleId: 1,
-		outcome: "wait",
-		eventContent: waitBody,
-		watchdogEvent: waitEvent,
-	});
-	const completedEvent = createCompletedWaitWatchdogEvent({
+	const waitFold = {
+		...legacyWaitFold,
+		display: true,
+		details: {
+			...legacyWaitFold.details,
+			watchdogOutcome: "wait",
+			watchdogEvent: waitEvent,
+		},
+	};
+	const completedEvent = {
+		version: 1 as const,
+		kind: "wait-completed" as const,
+		occurredAtMs: 31_000,
+		occurredAt: "1970-01-01T00:00:31.000+00:00",
 		waitIdentity: "wait-1",
 		acceptedAtMs: 0,
-		acceptedAtOffsetMinutes: 0,
-		observedAtMs: 31_000,
-		observedAtOffsetMinutes: 0,
+		acceptedAt: "1970-01-01T00:00:00.000+00:00",
 		waitSeconds: 30,
-	});
-	const completedBody = formatCompletedWaitWatchdogEvent(completedEvent);
+		elapsedSeconds: 31,
+	};
 	const exhaustedEvent = createExhaustedWatchdogEvent({
 		occurredAtMs: 31_001,
 		offsetMinutes: 0,
@@ -565,12 +598,19 @@ test("shared result folds stay before later standalone timeline events", () => {
 		user("later", 7),
 	];
 
-	assert.deepEqual(
-		foldDecisionContext(messages)
-			.filter((message) => message.role === "custom")
-			.map(messageText),
-		[waitBody, completedBody, exhaustedBody],
-	);
+	// Legacy wait bodies are retired control traffic: the wait replace-fold
+	// and its replacement no longer reenter ordinary model context (R1
+	// contract), while the standalone shared completion/exhaustion events —
+	// which were published directly, not as fold replacements — survive.
+	const foldedCustoms = foldDecisionContext(messages)
+		.filter((message) => message.role === "custom")
+		.map(messageText);
+	assert.deepEqual(foldedCustoms, [completedBody, exhaustedBody]);
+	// A legacy wait fold still parses as a recognized legacy outcome for
+	// read/timeline compatibility; it simply never reenters model context.
+	const parsed = parseDecisionFoldDetails(waitFold.details);
+	assert.equal(parsed?.watchdogOutcome, "wait");
+	assert.equal(parsed?.watchdogEvent?.kind, "wait");
 });
 
 test("user-preempted decisions fold without a terminal assistant or replacement", () => {
@@ -927,19 +967,17 @@ test("builders reject invalid inputs and the context hook uses foldDecisionConte
 			timestamp: 3,
 		},
 	]);
-	assert.match(
-		AUTOMATED_CONTINUATION,
-		/not a message or request from the user/,
-	);
+	assert.match(AUTOMATED_CONTINUATION, /not a user message or request/);
 	assert.match(
 		AUTOMATED_CONTINUATION,
 		/not user approval, confirmation, consent, or authorization/,
 	);
-	assert.match(AUTOMATED_CONTINUATION, /"reasonType":"WORK_REMAINS"/);
+	// The reason appears once as the attributed next step, not JSON history.
 	assert.match(
 		AUTOMATED_CONTINUATION,
-		/"reason":"Implementation remains incomplete\."/,
+		/Suggested next step: Implementation remains incomplete\./,
 	);
+	assert.doesNotMatch(AUTOMATED_CONTINUATION, /"reasonType"/);
 });
 
 test("persisted string-or-text-block custom messages still fold", () => {
@@ -963,4 +1001,158 @@ test("persisted string-or-text-block custom messages still fold", () => {
 		persistedCustomMessage(fold, 3),
 	];
 	assert.deepEqual(foldDecisionContext(messages), [continuationMessage(3)]);
+});
+
+test("continuation envelope keeps A13–A15 counterparts in fixed wording", () => {
+	const event = createContinueWatchdogEvent({
+		occurredAtMs: 0,
+		offsetMinutes: 0,
+		reasonType: "VERIFYING",
+		reason: "Run the requested tests.",
+	});
+	const body = formatContinueWatchdogEvent(event, "Keep going.");
+	// A13 counterpart: the disclaimer does not erase existing permission.
+	assert.match(
+		body,
+		/does not revoke or reset permission the user already granted/,
+	);
+	assert.match(
+		body,
+		/only against actual scope changes, revocations, and applicable unsatisfied requirements/,
+	);
+	// A14 counterpart: a stale hint is not proof of missing delivery.
+	assert.match(body, /latest actually delivered results/);
+	assert.match(body, /do not repeat an already-delivered answer/);
+	assert.match(
+		body,
+		/do not reopen a permission question the user already answered/,
+	);
+	// Genuine boundaries remain intact: user authorization is still required.
+	assert.match(body, /stop that action and ask the user normally/);
+	// The envelope teaches no ordinary-turn control call.
+	assert.equal(body.includes("cw"), false);
+});
+
+test("recognized legacy unlock and wait replacements do not reenter ordinary context", () => {
+	// R1 regression: persisted legacy replace-folds whose replacement carries a
+	// validated unlock/wait control event must fold out of ordinary model
+	// context together with their exchange, while the shared failure and
+	// exhaustion events published directly (not as fold replacements) and all
+	// human records survive.
+	const unlockEvent = createUnlockWatchdogEvent({
+		occurredAtMs: 0,
+		offsetMinutes: 0,
+		reasonType: "JOB_DONE",
+		reason: "LEGACY_PRIVATE_UNLOCK_REASON",
+	});
+	const unlockFold = createDecisionFoldMessage({
+		exchangeId: "legacy-unlock-ex",
+		cycleId: 1,
+		outcome: "unlock",
+		eventContent: formatUnlockWatchdogEvent(unlockEvent),
+		watchdogEvent: unlockEvent,
+	});
+	const failedEvent = createDecisionFailedWatchdogEvent({
+		occurredAtMs: 1,
+		error: "The decision response was malformed.",
+	});
+	const failedFold = createDecisionFoldMessage({
+		exchangeId: "legacy-failed-ex",
+		cycleId: 3,
+		outcome: "decision-failed",
+		eventContent: formatDecisionFailedWatchdogEvent(failedEvent),
+		watchdogEvent: failedEvent,
+	});
+	const messages = [
+		user("original request", 1),
+		decision("legacy-unlock-ex", 1, 2),
+		{ role: "custom", ...unlockFold, timestamp: 5 },
+		user("human interjection", 6),
+		decision("legacy-failed-ex", 3, 7),
+		{ role: "custom", ...failedFold, timestamp: 8 },
+		user("new request", 9),
+	];
+	const folded = foldDecisionContext(messages);
+	const text = JSON.stringify(folded);
+	assert.doesNotMatch(text, /LEGACY_PRIVATE_UNLOCK_REASON/);
+	assert.match(text, /original request/);
+	assert.match(text, /human interjection/);
+	assert.match(text, /new request/);
+	// The permitted shared failure event (the decision-failed replacement)
+	// survives: that is how the current runtime publishes it.
+	assert.match(text, /decision response was malformed/i);
+});
+
+test("legacy wait replacement folds out while shared completion events survive", () => {
+	const waitEvent = {
+		version: 1 as const,
+		kind: "wait" as const,
+		occurredAtMs: 0,
+		occurredAt: "1970-01-01T00:00:00.000+00:00",
+		reason: "Waiting for CI.",
+		waitSeconds: 30,
+		deadlineMs: 30_000,
+		deadline: "1970-01-01T00:00:30.000+00:00",
+	};
+	const waitFold = createInquiryRuntime("pi-continue-watchdog", {
+		inquiryId: "legacy-wait-ex",
+	}).fold(1, {
+		customType: WATCHDOG_EVENT_MESSAGE_TYPE,
+		content: "Continue watchdog waiting · 30s · legacy",
+		details: waitEvent,
+	});
+	const messages = [
+		user("task", 1),
+		decision("legacy-wait-ex", 1, 2),
+		{
+			role: "custom",
+			...waitFold,
+			details: { ...waitFold.details, watchdogOutcome: "wait" },
+			timestamp: 3,
+		},
+		user("after", 4),
+	];
+	const text = JSON.stringify(foldDecisionContext(messages));
+	assert.doesNotMatch(text, /Continue watchdog waiting/);
+	assert.match(text, /task/);
+	assert.match(text, /after/);
+});
+
+test("user quotation of retired control text is never folded", () => {
+	// Control: a user message quoting legacy control text verbatim survives —
+	// cleanup is keyed on validated fold metadata, never body text.
+	const unlockEvent = createUnlockWatchdogEvent({
+		occurredAtMs: 0,
+		offsetMinutes: 0,
+		reasonType: "JOB_DONE",
+		reason: "QUOTED_REASON",
+	});
+	const unlockFold = createDecisionFoldMessage({
+		exchangeId: "other-ex",
+		cycleId: 1,
+		outcome: "unlock",
+		eventContent: formatUnlockWatchdogEvent(unlockEvent),
+		watchdogEvent: unlockEvent,
+	});
+	const messages = [
+		user("task", 1),
+		decision("other-ex", 1, 2),
+		{ role: "custom", ...unlockFold, timestamp: 3 },
+		{
+			role: "user",
+			content: `The watchdog said: ${formatUnlockWatchdogEvent(unlockEvent)}`,
+			timestamp: 4,
+		},
+	];
+	const folded = foldDecisionContext(messages);
+	const userText = folded
+		.filter((message) => (message as Message).role === "user")
+		.map((message) => messageText(message as Message))
+		.join("\n");
+	assert.match(userText, /QUOTED_REASON/);
+	// Only the fold's own replacement body is gone.
+	const customs = folded.filter(
+		(message) => (message as Message).role === "custom",
+	);
+	assert.equal(customs.length, 0);
 });

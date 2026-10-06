@@ -53,6 +53,7 @@ export const MAX_RETRIES = 10;
 export interface ContinueWatchdogConfig {
 	/** @deprecated Accepted and preserved, but the inquiry fence is fixed at 10s. */
 	idleDelaySeconds: number;
+	/** Budget of accepted, durably published continuations per lock cycle. */
 	maxRetries: number;
 	/** Configurable guidance embedded in the fixed watchdog decision prompt. */
 	decisionPrompt: string;

@@ -1,27 +1,4 @@
-# automated-continuation-message Specification
-
-## Purpose
-
-Ensures every automatic continuation is clearly attributed to the watchdog, carries its model-generated reason, and cannot be mistaken for user approval or authorization.
-
-## Requirements
-
-### Requirement: Automated continuation attribution
-The system SHALL identify every automatic continuation message as originating from the pi-continue-watchdog extension and SHALL state that the message is not a message or request from the user.
-
-#### Scenario: Provider receives automatic continuation
-- **WHEN** the watchdog accepts a continue decision and triggers the next model turn
-- **THEN** the continuation content identifies the pi-continue-watchdog extension as its source
-- **AND** the continuation content states that it is not a user message or request
-
-### Requirement: No implied user authorization
-The system SHALL state that an automatic continuation message is not user approval, confirmation, consent, or authorization and SHALL NOT represent it as permission for an action that requires user approval.
-
-#### Scenario: Prior assistant requested approval
-- **WHEN** existing conversation context contains an unresolved request for user approval
-- **AND** the watchdog emits an automatic continuation
-- **THEN** the continuation message explicitly denies that it supplies the requested approval or authorization
-- **AND** instructs the agent to stop and ask the user before performing the approval-gated action
+## MODIFIED Requirements
 
 ### Requirement: Bounded resumed work
 The system SHALL direct the agent to resume only still-needed work already requested and authorized by the user. It SHALL compare all outstanding session requests against actual delivery, excluding delivered, cancelled, or superseded work. When new input, approval, or assistance is necessary, it SHALL direct the agent to stop that action and ask the user normally, not call a control function proactively. Guidance SHALL preserve explicit permission for unchanged scope and SHALL not create a new confirmation step merely because the watchdog resumed the agent or a prior assistant reply asked for the same permission. Later scope restrictions and genuinely unsatisfied confirmation requirements SHALL remain controlling. A watchdog-generated next-action suggestion SHALL NOT override the user's scope, constraints, permissions, or latest actual delivery evidence.
@@ -78,6 +55,34 @@ New shared continuation, exhaustion, and decision-failure bodies SHALL identify 
 - **GIVEN** the user has authorized the exact remaining action and no separate confirmation requirement is outstanding
 - **WHEN** the continuation says that it is not user authorization
 - **THEN** its guidance preserves the existing permission instead of asking for the same approval again
+
+## REMOVED Requirements
+
+### Requirement: Direct continuation without inquiry
+**Reason**: The current guarded inquiry remains the sole model-decision entry point; this change does not restore proactive unlocking or unconditional continuation.
+**Migration**: Retain the predecessor's inquiry lifecycle and narrow its accepted results to continue and unlock.
+
+#### Scenario: Eligible ordinary settlement
+- **WHEN** locked work settles with budget remaining
+- **THEN** the qualified internal inquiry precedes any continuation
+
+### Requirement: Continuation body without model reason
+**Reason**: The accepted reason is the useful next-action hint the user wants surfaced.
+**Migration**: Carry the validated reason once as explicitly plugin-generated next-step guidance.
+
+#### Scenario: Accepted continuation reason
+- **WHEN** the decision selects continue with `Run the requested tests.`
+- **THEN** the continuation presents that text as its suggested next step
+
+### Requirement: Unlock and waiting guidance
+**Reason**: Ordinary work must not be taught proactive control calls; timed watchdog waiting is retired.
+**Migration**: Explain only actionable continuation and authorization boundaries in ordinary context; provide outcome selection rules only within the authorized inquiry.
+
+#### Scenario: Native callback work remains pending
+- **WHEN** a native callback-capable task is pending
+- **THEN** the continuation does not instruct proactive callback unlocking or replace the native callback with polling
+
+## ADDED Requirements
 
 ### Requirement: Action-oriented continuation reason
 Each accepted continuation SHALL introduce its normalized reason type and trimmed reason as the Continue watchdog next-action hint. It SHALL NOT wrap the reason merely as a quoted previous automated result or a JSON history object. The reason SHALL remain plugin-generated guidance, not new permission, task-completion evidence, or an unconditional instruction. Guidance SHALL require reconciliation against current user scope and latest delivered results rather than repeating an already-delivered answer or reopening an answered permission question solely because a watchdog reason requests it. No extra model request SHALL be used solely to rephrase that reason.

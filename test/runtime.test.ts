@@ -12,7 +12,6 @@ import {
 	type HumanUnlockEntry,
 	handleUnlock,
 	type MainCommandRuntime,
-	WAIT_ENTRY_TYPE,
 } from "../src/commands.js";
 import {
 	type ContinueWatchdogConfig,
@@ -362,11 +361,11 @@ function createFenceHarness(options?: { readonly rejectReport?: boolean }) {
 function createHarness(options?: {
 	readonly config?: Partial<ContinueWatchdogConfig>;
 	readonly sendThrows?: boolean;
-	readonly omitPersistedWait?: boolean;
 	readonly omitPersistedEvent?: (kind: string) => boolean;
 	readonly fatalExit?: import("../src/fatal-exit.js").FatalExitAdapter;
 	readonly onSend?: (message: SentMessage["message"]) => Error | undefined;
 	readonly appendThrows?: boolean | string;
+	readonly omitPersistedEntryTypes?: readonly string[];
 	readonly onAppend?: (type: string) => void;
 	readonly spliceBehavior?: "success" | "false" | "throw" | "absent";
 	readonly branchThrows?: boolean;
@@ -485,18 +484,16 @@ function createHarness(options?: {
 				startedDecisionDetails !== message.details
 			)
 				decisionStarted = false;
+			const foldDetails = parseDecisionFoldDetails(message.details);
 			const eventKind =
-				parseDecisionFoldDetails(message.details)?.watchdogEvent?.kind ??
+				foldDetails?.watchdogEvent?.kind ??
+				foldDetails?.watchdogOutcome ??
 				(message.details as { readonly kind?: string } | undefined)?.kind;
 			if (
 				(message.customType === DECISION_FOLD_MESSAGE_TYPE ||
 					message.customType === "pi-continue-watchdog:event") &&
-				!options?.omitPersistedEvent?.(eventKind ?? "") &&
+				!options?.omitPersistedEvent?.(eventKind ?? "")
 				// This unit transport persists immediately. Async ordering has real-host probes.
-				!(
-					options?.omitPersistedWait &&
-					parseDecisionFoldDetails(message.details)?.watchdogOutcome === "wait"
-				)
 			) {
 				if (options?.appendUnrelatedAssistantBeforeFold) {
 					branch.push({
@@ -526,6 +523,7 @@ function createHarness(options?: {
 			if (options?.appendThrows === true || options?.appendThrows === type) {
 				throw new Error("append failed");
 			}
+			if (options?.omitPersistedEntryTypes?.includes(type)) return;
 			entries.push({ type, data });
 			branch.push({
 				id: `custom-${branch.length + 1}`,
@@ -1644,7 +1642,17 @@ test("maximum configured guidance and unlock type survive shared publication", a
 	);
 	assert.ok(unlockFold);
 	assert.equal(unlocked.controller.snapshot.locked, false);
-	assert.equal(unlockFold.message.content.includes(maximumReasonType), true);
+	// The maximum unlock type survives into the quiet UI-only status entry;
+	// the fold itself stays remove-only with no model-bound body.
+	const statusEntries = unlocked.entries.filter(
+		(entry) => entry.type === "pi-continue-watchdog:ai-unlock",
+	);
+	assert.equal(statusEntries.length, 1);
+	assert.equal(
+		(statusEntries[0]?.data as { readonly reasonType?: string } | undefined)
+			?.reasonType,
+		maximumReasonType,
+	);
 });
 
 test("the visible shared fold is the continue evidence and dispatch", async () => {
@@ -1789,27 +1797,14 @@ for (const spliceBehavior of [
 					timestamp: 2,
 				},
 			];
+			// Remove-only unlock fold: the whole exchange folds away with no
+			// model-bound replacement event.
 			const folded = foldDecisionContext(messages);
-			assert.equal(folded.length, 1);
-			const eventMessage = folded[0] as {
-				readonly customType?: string;
-				readonly content?: unknown;
-				readonly details?: { readonly kind?: unknown };
-			};
-			assert.equal(eventMessage.customType, "pi-continue-watchdog:event");
-			const eventText = Array.isArray(eventMessage.content)
-				? eventMessage.content
-						.map((block) =>
-							typeof block === "object" &&
-							block !== null &&
-							typeof (block as { readonly text?: unknown }).text === "string"
-								? (block as { readonly text: string }).text
-								: "",
-						)
-						.join("")
-				: String(eventMessage.content ?? "");
-			assert.equal(eventText, fold.content);
-			assert.equal(eventMessage.details?.kind, "unlock");
+			assert.equal(folded.length, 0);
+			const details = parseDecisionFoldDetails(fold.details);
+			assert.equal(details?.watchdogOutcome, "unlock");
+			assert.equal(details?.outcome, "remove");
+			assert.equal(details?.replacement, undefined);
 		}
 	});
 }
@@ -2111,18 +2106,35 @@ test("decision message_end captures XML, clears its assistant, and persists a co
 	harness.streaming = false;
 	await settleOnly(harness);
 	assert.equal(harness.controller.snapshot.locked, false);
+	const auditEntries: Array<{ type: string; data: unknown }> =
+		harness.entries.filter(
+			(entry: { type: string; data: unknown }) =>
+				entry.type === "pi-continue-watchdog:decision-audit",
+		);
+	assert.deepEqual(auditEntries, [
+		{
+			type: "pi-continue-watchdog:decision-audit",
+			data: {
+				version: 1,
+				exchangeId: "exchange-1",
+				cycleId: 1,
+				outcome: "unlock",
+				reasonType: "WAIT_USER",
+				reason: "Waiting for approval.",
+			},
+		},
+	]);
+	// The final persisted record is the quiet UI-only unlock status.
 	assert.deepEqual(harness.entries.at(-1), {
-		type: "pi-continue-watchdog:decision-audit",
+		type: "pi-continue-watchdog:ai-unlock",
 		data: {
-			version: 1,
-			exchangeId: "exchange-1",
-			cycleId: 1,
-			outcome: "unlock",
 			reasonType: "WAIT_USER",
 			reason: "Waiting for approval.",
+			exchangeId: "exchange-1",
+			cycleId: 1,
 		},
 	});
-	assert.equal(harness.sent.at(-1)?.message.display, true);
+	assert.equal(harness.sent.at(-1)?.message.display, false);
 });
 
 test("decision provider error stays provisional so the same Pi run can retry and unlock", async () => {
@@ -2181,17 +2193,18 @@ test("decision provider error stays provisional so the same Pi run can retry and
 		).length,
 		1,
 	);
-	assert.equal(harness.sent.at(-1)?.message.display, true);
+	assert.equal(harness.sent.at(-1)?.message.display, false);
 	assert.equal(
 		parseDecisionFoldDetails(harness.sent.at(-1)?.message.details)
-			?.watchdogEvent?.kind,
+			?.watchdogOutcome,
 		"unlock",
 	);
 	assert.deepEqual(
 		harness.entries.filter(
 			(entry) =>
 				entry.type !== "pi-continue-watchdog:status" &&
-				entry.type !== INQUIRY_MARKER_ENTRY_TYPE,
+				entry.type !== INQUIRY_MARKER_ENTRY_TYPE &&
+				entry.type !== "pi-continue-watchdog:ai-unlock",
 		),
 		[
 			{
@@ -2203,6 +2216,22 @@ test("decision provider error stays provisional so the same Pi run can retry and
 					outcome: "unlock",
 					reasonType: "JOB_DONE",
 					reason: "All requested work is complete.",
+				},
+			},
+		],
+	);
+	assert.deepEqual(
+		harness.entries.filter(
+			(entry) => entry.type === "pi-continue-watchdog:ai-unlock",
+		),
+		[
+			{
+				type: "pi-continue-watchdog:ai-unlock",
+				data: {
+					reasonType: "JOB_DONE",
+					reason: "All requested work is complete.",
+					exchangeId: "exchange-1",
+					cycleId: 1,
 				},
 			},
 		],
@@ -2551,7 +2580,7 @@ test("continued settle rearms the fixed delay once and exhausts at max", async (
 });
 
 test("an unreadable receipt does not refund an already persisted outcome", async () => {
-	for (const outcome of ["continue", "wait"] as const) {
+	for (const outcome of ["continue"] as const) {
 		let sent = false;
 		const harness = createHarness({
 			onSend(message) {
@@ -2567,12 +2596,7 @@ test("an unreadable receipt does not refund an already persisted outcome", async
 		});
 		await startIdle(harness);
 		await harness.openDecision();
-		await settleResponse(
-			harness,
-			outcome === "continue"
-				? harness.answerContinue()
-				: harness.answerWait(60),
-		);
+		await settleResponse(harness, harness.answerContinue());
 		assert.ok(
 			harness.branch.some(
 				(entry) =>
@@ -2583,129 +2607,6 @@ test("an unreadable receipt does not refund an already persisted outcome", async
 		harness.runtime.clearOperationalPendingWork();
 		assert.equal(harness.controller.snapshot.attempt, 1, outcome);
 	}
-});
-
-test("unreadable wait receipts recover at the original deadline unless invalidated", async () => {
-	for (const action of [
-		"recover",
-		"recover-late",
-		"unlock",
-		"demote",
-	] as const) {
-		let unreadable = false;
-		const hooks: string[] = [];
-		const harness = createHarness({
-			config: { maxRetries: 1 },
-			hasUI: false,
-			onHook: (name) => hooks.push(name),
-			onSend(message) {
-				if (
-					parseDecisionFoldDetails(message.details)?.watchdogOutcome === "wait"
-				)
-					unreadable = true;
-				return undefined;
-			},
-			onReadBranch() {
-				if (unreadable) throw new Error("receipt unavailable");
-			},
-		});
-		await startIdle(harness);
-		await harness.openDecision();
-		await settleResponse(harness, harness.answerWait(60));
-		const deadline = harness.controller.snapshot.waitUntilMs;
-		assert.equal(harness.controller.snapshot.attempt, 1);
-		assert.deepEqual(hooks, []);
-		const timer = harness.clock.records.findLastIndex(
-			(record) => !record.cleared && record.delayMs === 60_000,
-		);
-		assert.ok(timer >= 0, "unresolved wait retains its deadline wake");
-		if (action === "unlock") await harness.unlock();
-		if (action === "demote")
-			harness.hub.bind({
-				instance: {},
-				sessionId: "new-main",
-				hasUI: true,
-				initialBusy: false,
-			});
-		if (action === "recover-late") {
-			harness.clock.fire(timer);
-			await Promise.resolve();
-			assert.deepEqual(hooks, []);
-			assert.equal(harness.controller.snapshot.attempt, 1);
-			assert.equal(harness.controller.snapshot.waitUntilMs, deadline);
-		}
-		unreadable = false;
-		harness.clock.fire(
-			action === "recover-late" ? harness.clock.records.length - 1 : timer,
-		);
-		await Promise.resolve();
-		await Promise.resolve();
-		if (action === "recover" || action === "recover-late") {
-			assert.equal(harness.controller.snapshot.attempt, 1);
-			assert.equal(harness.controller.snapshot.waitUntilMs, deadline);
-			assert.deepEqual(hooks, ["watchdog-waiting", "user-ready"]);
-			const completed = harness.sent.find(
-				(entry) =>
-					(entry.message.details as { kind?: string } | undefined)?.kind ===
-					"wait-completed",
-			);
-			assert.ok(completed, "original timing survives receipt recovery");
-			assert.equal(
-				(completed.message.details as { elapsedSeconds: number })
-					.elapsedSeconds,
-				action === "recover-late" ? 61 : 60,
-			);
-			await settleOnly(harness);
-			assert.deepEqual(hooks, ["watchdog-waiting", "user-ready"]);
-		} else assert.deepEqual(hooks, [], "invalidated wait cannot publish later");
-	}
-});
-
-test("wait publication requires a new persisted fold even when send returns normally", async () => {
-	const harness = createHarness({ omitPersistedWait: true });
-	await startIdle(harness);
-	await harness.openDecision();
-	await settleResponse(harness, harness.answerWait(60));
-	assert.equal(harness.controller.snapshot.attempt, 0);
-	assert.equal(harness.controller.snapshot.waitUntilMs, 0);
-	assert.equal(harness.controller.snapshot.locked, true);
-});
-
-test("wait acceptance and deadline share one commit-time clock sample", async () => {
-	let harness: Harness;
-	let advancedDuringCleanup = false;
-	harness = createHarness({
-		onWidget(key, value) {
-			if (
-				!advancedDuringCleanup &&
-				key === "pi-continue-watchdog:status" &&
-				value === undefined
-			) {
-				advancedDuringCleanup = true;
-				harness.clock.advance(1);
-			}
-		},
-	});
-	await startIdle(harness);
-	await harness.openDecision();
-	await settleResponse(harness, harness.answerWait(30, "Waiting for CI."));
-
-	assert.equal(advancedDuringCleanup, true);
-	const fold = harness.sent.findLast(
-		(entry) => entry.message.customType === DECISION_FOLD_MESSAGE_TYPE,
-	);
-	assert.ok(fold);
-	const event = (
-		fold.message.details as {
-			readonly watchdogEvent?: {
-				readonly kind?: unknown;
-				readonly occurredAtMs?: unknown;
-				readonly deadlineMs?: unknown;
-			};
-		}
-	).watchdogEvent;
-	assert.equal(event?.kind, "wait");
-	assert.equal(Number(event?.deadlineMs) - Number(event?.occurredAtMs), 30_000);
 });
 
 test("exhaustion event is one-shot under same-idle publication re-entry", async () => {
@@ -2772,420 +2673,62 @@ test("successful exhaustion publication survives a busy re-entrant edge", async 
 	);
 });
 
-test("completed wait reports requested 1500s and observed 1531s before the next inquiry", async () => {
-	const harness = createHarness();
-	await startIdle(harness);
-	await harness.openDecision();
-	await settleResponse(
-		harness,
-		harness.answerWait(1500, "Waiting for a long-running check."),
-	);
-	const waitTimer = harness.clock.records.findLastIndex(
-		(record) => record.delayMs === 1_500_000 && !record.cleared,
-	);
-	assert.ok(waitTimer >= 0);
-
-	harness.clock.advance(31_000);
-	harness.clock.fire(waitTimer);
-	await Promise.resolve();
-
-	const completed = harness.sent.findLast(
-		(entry) =>
-			entry.message.customType === "pi-continue-watchdog:event" &&
-			(entry.message.details as { readonly kind?: unknown } | undefined)
-				?.kind === "wait-completed",
-	);
-	assert.ok(completed);
-	const completedDetails = completed.message.details as {
-		readonly acceptedAtMs: number;
-		readonly occurredAtMs: number;
-		readonly waitSeconds: number;
-		readonly elapsedSeconds: number;
-	};
-	assert.equal(completedDetails.waitSeconds, 1500);
-	assert.equal(completedDetails.elapsedSeconds, 1531);
-	assert.equal(
-		completedDetails.occurredAtMs - completedDetails.acceptedAtMs,
-		1_531_000,
-	);
-	assert.match(completed.message.content, /requested 1500s · elapsed 1531s/);
-	assert.match(completed.message.content, /Only the watchdog delay elapsed\./);
-	const inquiry = harness.sent.at(-1)?.message;
-	assert.equal(inquiry?.customType, DECISION_MESSAGE_TYPE);
-	assert.equal(inquiry?.content.startsWith(completed.message.content), true);
-	const frozenBody = completed.message.content;
-	harness.clock.advance(60_000);
-	await settleResponse(harness, harness.answerInvalid("bad after wait"));
-	assert.equal(completed.message.content, frozenBody);
-	assert.equal(
-		harness.sent.at(-1)?.message.content.startsWith(frozenBody),
-		true,
-	);
-	assert.equal(
-		harness.sent.filter(
-			(entry) =>
-				(entry.message.details as { readonly kind?: unknown } | undefined)
-					?.kind === "wait-completed",
-		).length,
-		1,
-	);
-});
-
-test("completed wait survives a busy race before inquiry dispatch without duplication", async () => {
-	let harness: Harness;
-	let interrupted = false;
-	harness = createHarness({
-		onSend(message) {
-			if (
-				!interrupted &&
-				message.customType === "pi-continue-watchdog:event" &&
-				(message.details as { readonly kind?: unknown } | undefined)?.kind ===
-					"wait-completed"
-			) {
-				interrupted = true;
-				harness.streaming = true;
-				void harness.fire("agent_start", { type: "agent_start" });
-			}
-			return undefined;
-		},
-	});
-	await startIdle(harness);
-	await harness.openDecision();
-	await settleResponse(harness, harness.answerWait(30, "Waiting for CI."));
-	const inquiryCount = harness.sent.filter(
-		(entry) => entry.message.customType === DECISION_MESSAGE_TYPE,
-	).length;
-	const timer = harness.clock.records.findLastIndex(
-		(record) => record.delayMs === 30_000 && !record.cleared,
-	);
-	assert.ok(timer >= 0);
-
-	harness.clock.fire(timer);
-	await Promise.resolve();
-	assert.equal(interrupted, true);
-	const completion = harness.sent.findLast(
-		(entry) =>
-			(entry.message.details as { readonly kind?: unknown } | undefined)
-				?.kind === "wait-completed",
-	);
-	assert.ok(completion);
-	assert.equal(
-		harness.sent.filter(
-			(entry) => entry.message.customType === DECISION_MESSAGE_TYPE,
-		).length,
-		inquiryCount,
-	);
-
-	harness.streaming = false;
-	await settleOnly(harness);
-	const retryTimer = harness.clock.records.findLastIndex(
-		(record) => record.delayMs === 10_000 && !record.cleared,
-	);
-	assert.ok(retryTimer >= 0);
-	harness.clock.fire(retryTimer);
-	await Promise.resolve();
-
-	assert.equal(
-		harness.sent.filter(
-			(entry) =>
-				(entry.message.details as { readonly kind?: unknown } | undefined)
-					?.kind === "wait-completed",
-		).length,
-		1,
-	);
-	assert.equal(
-		harness.sent.at(-1)?.message.content.startsWith(completion.message.content),
-		true,
-	);
-});
-
-test("completed-wait publication failure dispatches no timing-aware inquiry", async () => {
-	const harness = createHarness({
-		onSend(message) {
-			return message.customType === "pi-continue-watchdog:event" &&
-				(message.details as { readonly kind?: unknown } | undefined)?.kind ===
-					"wait-completed"
-				? new Error("completed wait publication failed")
-				: undefined;
-		},
-	});
-	await startIdle(harness);
-	await harness.openDecision();
-	await settleResponse(harness, harness.answerWait(30, "Waiting for CI."));
-	const inquiryCount = harness.sent.filter(
-		(entry) => entry.message.customType === DECISION_MESSAGE_TYPE,
-	).length;
-	const timer = harness.clock.records.findLastIndex(
-		(record) => record.delayMs === 30_000 && !record.cleared,
-	);
-	assert.ok(timer >= 0);
-
-	harness.clock.fire(timer);
-	await Promise.resolve();
-
-	assert.equal(
-		harness.sent.filter(
-			(entry) => entry.message.customType === DECISION_MESSAGE_TYPE,
-		).length,
-		inquiryCount,
-	);
-	assert.equal(
-		harness.sent.some(
-			(entry) =>
-				(entry.message.details as { readonly kind?: unknown } | undefined)
-					?.kind === "wait-completed",
-		),
-		false,
-	);
-	assert.equal(harness.controller.snapshot.attempt, 1);
-	assert.equal(harness.controller.snapshot.locked, true);
-});
-
-test("separate waits keep separate starts and completion identities", async () => {
-	const harness = createHarness({ config: { maxRetries: 3 } });
-	await startIdle(harness);
-	await harness.openDecision();
-	await settleResponse(harness, harness.answerWait(30, "First wait."));
-	let timer = harness.clock.records.findLastIndex(
-		(record) => record.delayMs === 30_000 && !record.cleared,
-	);
-	assert.ok(timer >= 0);
-	harness.clock.fire(timer);
-	await Promise.resolve();
-
-	await settleResponse(harness, harness.answerWait(60, "Second wait."));
-	timer = harness.clock.records.findLastIndex(
-		(record) => record.delayMs === 60_000 && !record.cleared,
-	);
-	assert.ok(timer >= 0);
-	harness.clock.fire(timer);
-	await Promise.resolve();
-
-	const completions = harness.sent
-		.filter(
-			(entry) =>
-				(entry.message.details as { readonly kind?: unknown } | undefined)
-					?.kind === "wait-completed",
-		)
-		.map(
-			(entry) =>
-				entry.message.details as {
-					readonly waitIdentity: string;
-					readonly acceptedAtMs: number;
-				},
-		);
-	assert.equal(completions.length, 2);
-	assert.notEqual(completions[0]?.waitIdentity, completions[1]?.waitIdentity);
-	assert.notEqual(completions[0]?.acceptedAtMs, completions[1]?.acceptedAtMs);
-});
-
-test("renewed activity preserves the accepted wait start", async () => {
-	const harness = createHarness();
-	await startIdle(harness);
-	await harness.openDecision();
-	await settleResponse(harness, harness.answerWait(30, "Waiting for CI."));
-	const accepted = parseDecisionFoldDetails(
-		harness.sent.at(-1)?.message.details,
-	)?.watchdogEvent;
-	assert.equal(accepted?.kind, "wait");
-	if (accepted?.kind !== "wait")
-		throw new Error("expected accepted wait event");
-
-	harness.clock.advance(10_000);
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
-	harness.streaming = false;
-	await settleOnly(harness);
-	const timer = harness.clock.records.findLastIndex(
-		(record) => !record.cleared && record.delayMs > 0,
-	);
-	assert.ok(timer >= 0);
-	harness.clock.fire(timer);
-	await Promise.resolve();
-
-	const completed = harness.sent.findLast(
-		(entry) =>
-			(entry.message.details as { readonly kind?: unknown } | undefined)
-				?.kind === "wait-completed",
-	);
-	assert.ok(completed);
-	assert.equal(
-		(completed.message.details as { readonly acceptedAtMs: number })
-			.acceptedAtMs,
-		accepted.occurredAtMs,
-	);
-});
-
-test("wait timing is invalidated by unlock, fresh lock, replacement, and shutdown", async () => {
-	for (const invalidation of [
-		"unlock",
-		"fresh-lock",
-		"replacement",
-		"shutdown",
-	] as const) {
-		const harness = createHarness({
-			hasUI: invalidation === "replacement" ? false : undefined,
-			config: { maxRetries: 1 },
-		});
-		await startIdle(harness);
-		await harness.openDecision();
-		await settleResponse(harness, harness.answerWait(30, "Waiting for CI."));
-		const timerIndex = harness.clock.records.findLastIndex(
-			(record) => record.delayMs === 30_000 && !record.cleared,
-		);
-		assert.ok(timerIndex >= 0, invalidation);
-		const timer = harness.clock.records[timerIndex];
-		assert.ok(timer);
-
-		if (invalidation === "unlock") {
-			harness.runtime.applyTransition(harness.controller.unlock(), undefined, {
-				suppressNotify: true,
-			});
-			harness.runtime.clearOperationalPendingWork();
-		} else if (invalidation === "fresh-lock") {
-			harness.runtime.restartLockCycle(undefined, { notifyLocked: false });
-		} else if (invalidation === "replacement") {
-			harness.hub.bind({
-				instance: createHubAttachmentInstance(),
-				sessionId: "replacement-main",
-				hasUI: true,
-				initialBusy: false,
-			});
-		} else {
-			await harness.runtime.shutdown();
-		}
-
-		timer.callback();
-		await Promise.resolve();
-		assert.equal(
-			harness.sent.some(
-				(entry) =>
-					(entry.message.details as { readonly kind?: unknown } | undefined)
-						?.kind === "wait-completed",
-			),
-			false,
-			invalidation,
-		);
-	}
-});
-
-test("valid wait records a deadline, consumes one retry, and asks again only at that deadline", async () => {
-	const harness = createHarness();
-	await startIdle(harness);
-	await harness.openDecision();
-	const turnsBefore = harness.triggeredTurns;
-	const sentBefore = harness.sent.length;
-
-	await settleResponse(harness, harness.answerWait(300, "Waiting for CI."));
-
-	assert.equal(harness.triggeredTurns, turnsBefore);
-	assert.equal(harness.controller.snapshot.locked, true);
-	assert.equal(harness.controller.snapshot.attempt, 1);
-	assert.equal(harness.controller.snapshot.waitUntilMs, 310_000);
-	assert.deepEqual(
-		harness.entries.filter((entry) => entry.type === WAIT_ENTRY_TYPE),
-		[],
-	);
-	assert.deepEqual(harness.sent.at(-1)?.options, {
-		triggerTurn: false,
-		deliverAs: "steer",
-	});
-	assert.equal(harness.sent.at(-1)?.message.display, true);
-	assert.match(
-		harness.sent.at(-1)?.message.content ?? "",
-		/Continue watchdog waiting · 300s · /,
-	);
-	assert.equal(
-		parseDecisionFoldDetails(harness.sent.at(-1)?.message.details)
-			?.watchdogEvent?.kind,
-		"wait",
-	);
-	const waitTimer = harness.clock.records.findLastIndex(
-		(record) => record.delayMs === 300_000 && !record.cleared,
-	);
-	assert.ok(waitTimer >= 0);
-	assert.equal(harness.sent.length, sentBefore + 1);
-
-	harness.clock.fire(waitTimer);
-	await Promise.resolve();
-	assert.equal(harness.sent.length, sentBefore + 3);
-	const completedWait = harness.sent.at(-2)?.message;
-	assert.equal(completedWait?.customType, "pi-continue-watchdog:event");
-	assert.equal(
-		(completedWait?.details as { readonly kind?: unknown } | undefined)?.kind,
-		"wait-completed",
-	);
-	assert.equal(harness.sent.at(-1)?.message.customType, DECISION_MESSAGE_TYPE);
-	assert.equal(
-		(harness.sent.at(-1)?.message.content ?? "").includes(
-			completedWait?.content ?? "missing completed wait",
-		),
-		true,
-	);
-});
-
-test("final wait publishes elapsed then exhaustion without another inquiry", async () => {
+test("retired wait submission consumes no attempt, arms no deadline, and re-asks once", async () => {
 	const harness = createHarness({ config: { maxRetries: 1 } });
 	await startIdle(harness);
 	await harness.openDecision();
-	await settleResponse(harness, harness.answerWait(30, "Waiting for CI."));
-	const inquiryCount = harness.sent.filter(
-		(entry) => entry.message.customType === DECISION_MESSAGE_TYPE,
-	).length;
-	const timer = harness.clock.records.findLastIndex(
-		(record) => record.delayMs === 30_000 && !record.cleared,
-	);
-	assert.ok(timer >= 0);
-
-	harness.clock.fire(timer);
-	await Promise.resolve();
-	await Promise.resolve();
-
-	const terminalEvents = harness.sent
-		.filter(
-			(entry) => entry.message.customType === "pi-continue-watchdog:event",
-		)
-		.map(
-			(entry) =>
-				(entry.message.details as { readonly kind?: unknown } | undefined)
-					?.kind,
-		);
-	assert.deepEqual(terminalEvents, ["wait-completed", "exhausted"]);
-	assert.equal(
-		harness.sent.filter(
-			(entry) => entry.message.customType === DECISION_MESSAGE_TYPE,
-		).length,
-		inquiryCount,
-	);
-});
-
-test("legacy wait-entry append failures no longer split shared wait evidence", async () => {
-	const harness = createHarness({ appendThrows: WAIT_ENTRY_TYPE });
-	await startIdle(harness);
-	await harness.openDecision();
 	const sentBefore = harness.sent.length;
-
 	await settleResponse(harness, harness.answerWait(300, "Waiting for CI."));
 
-	assert.equal(harness.controller.snapshot.locked, true);
-	assert.equal(harness.controller.snapshot.attempt, 1);
+	// One invalid response: no attempt, no deadline, no wait fold, no timer.
+	assert.equal(harness.controller.snapshot.attempt, 0);
 	assert.equal(harness.controller.snapshot.exhausted, false);
-	assert.equal(harness.controller.snapshot.waitUntilMs, 310_000);
+	assert.equal(harness.controller.snapshot.locked, true);
 	assert.equal(
-		harness.entries.some((entry) => entry.type === WAIT_ENTRY_TYPE),
+		harness.sent.some(
+			(entry) =>
+				parseDecisionFoldDetails(entry.message.details)?.watchdogOutcome ===
+				"wait",
+		),
 		false,
 	);
 	assert.equal(
 		harness.clock.records.some(
 			(record) => record.delayMs === 300_000 && !record.cleared,
 		),
-		true,
+		false,
 	);
-	assert.equal(harness.sent.at(-1)?.message.display, true);
+	// The correction prompt is the only new dispatch.
 	assert.equal(harness.sent.length, sentBefore + 1);
+	assert.equal(harness.sent.at(-1)?.message.customType, DECISION_MESSAGE_TYPE);
 });
 
-test("valid unlock folds without a turn and leaves one compact persisted result", async () => {
+test("three retired wait submissions decision-fail and request no fourth response", async () => {
+	const hooks: string[] = [];
+	const harness = createHarness({ onHook: (name) => hooks.push(name) });
+	await startIdle(harness);
+	await harness.openDecision();
+	for (let attempt = 0; attempt < 3; attempt += 1) {
+		await settleResponse(harness, harness.answerWait(60, `wait ${attempt}`));
+	}
+	assert.equal(harness.controller.snapshot.decisionFailed, true);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(hooks.includes("watchdog-waiting"), false);
+	assert.ok(hooks.includes("user-ready"));
+	const decisionCount = harness.sent.filter(
+		(entry) => entry.message.customType === DECISION_MESSAGE_TYPE,
+	).length;
+	assert.equal(decisionCount, 3);
+	await settleOnly(harness);
+	assert.equal(
+		harness.sent.filter(
+			(entry) => entry.message.customType === DECISION_MESSAGE_TYPE,
+		).length,
+		3,
+	);
+});
+
+test("valid unlock folds remove-only and leaves one quiet UI-only status", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
 	await harness.openDecision();
@@ -3200,34 +2743,33 @@ test("valid unlock folds without a turn and leaves one compact persisted result"
 		deliverAs: "steer",
 	});
 	assert.equal(harness.triggeredTurns, turnsBefore);
-	assert.deepEqual(
-		harness.entries.filter(
-			(entry) =>
-				entry.type !== "pi-continue-watchdog:status" &&
-				entry.type !== INQUIRY_MARKER_ENTRY_TYPE,
-		),
-		[],
+	// The fold is remove-only: no model-bound replacement body or unlock event.
+	const fold = parseDecisionFoldDetails(harness.sent.at(-1)?.message.details);
+	assert.equal(fold?.watchdogOutcome, "unlock");
+	assert.equal(fold?.outcome, "remove");
+	assert.equal(fold?.replacement, undefined);
+	assert.equal(fold?.watchdogEvent, undefined);
+	assert.equal(harness.sent.at(-1)?.message.display, false);
+	// Exactly one quiet UI-only status entry carries the typed outcome.
+	const statusEntries = harness.entries.filter(
+		(entry) => entry.type === "pi-continue-watchdog:ai-unlock",
 	);
-	assert.equal(harness.sent.at(-1)?.message.display, true);
-	assert.match(
-		harness.sent.at(-1)?.message.content ?? "",
-		/Continue watchdog unlocked · JOB_DONE · /,
-	);
-	assert.equal(
-		parseDecisionFoldDetails(harness.sent.at(-1)?.message.details)
-			?.watchdogEvent?.kind,
-		"unlock",
-	);
-	assert.equal(
-		parseDecisionFoldDetails(harness.sent.at(-1)?.message.details)?.replacement
-			?.content,
-		harness.sent.at(-1)?.message.content,
-	);
+	assert.deepEqual(statusEntries, [
+		{
+			type: "pi-continue-watchdog:ai-unlock",
+			data: {
+				reasonType: "JOB_DONE",
+				reason: "waiting for user",
+				exchangeId: "exchange-1",
+				cycleId: 1,
+			},
+		},
+	]);
 	assert.equal(harness.controller.snapshot.locked, false);
 	assert.deepEqual(harness.notifications, []);
 });
 
-test("Example 7: AI unlock retains typed entry data only; no transient notification", async () => {
+test("Example 7: AI unlock persists typed entry data only; no transient notification", async () => {
 	const harness = createHarness({
 		config: { reasonTypes: ["NeedReview", "shipped"] },
 	});
@@ -3242,31 +2784,44 @@ test("Example 7: AI unlock retains typed entry data only; no transient notificat
 		harness.entries.filter(
 			(entry) =>
 				entry.type !== "pi-continue-watchdog:status" &&
-				entry.type !== INQUIRY_MARKER_ENTRY_TYPE,
+				entry.type !== INQUIRY_MARKER_ENTRY_TYPE &&
+				entry.type !== "pi-continue-watchdog:ai-unlock",
 		),
 		[],
 	);
-	assert.match(
-		harness.sent.at(-1)?.message.content ?? "",
-		/Continue watchdog unlocked · NEEDREVIEW · /,
+	assert.deepEqual(
+		harness.entries.filter(
+			(entry) => entry.type === "pi-continue-watchdog:ai-unlock",
+		),
+		[
+			{
+				type: "pi-continue-watchdog:ai-unlock",
+				data: {
+					reasonType: "NEEDREVIEW",
+					reason: "PR is open for human review.",
+					exchangeId: "exchange-1",
+					cycleId: 1,
+				},
+			},
+		],
 	);
 	assert.deepEqual(harness.notifications, []);
 });
 
 test("terminal publication requires receipts and recovers without model work or duplicate records", async () => {
-	for (const kind of [
-		"unlock",
-		"decision-failed",
-		"exhausted",
-		"wait-completed",
-	]) {
+	for (const kind of ["unlock", "decision-failed", "exhausted"]) {
 		for (const fault of ["absent", "unreadable"]) {
 			let failing = true;
 			let unreadable = false;
 			const hooks: string[] = [];
-			const eventKind = (details: unknown) =>
-				parseDecisionFoldDetails(details)?.watchdogEvent?.kind ??
-				(details as { kind?: string } | undefined)?.kind;
+			const eventKind = (details: unknown) => {
+				const fold = parseDecisionFoldDetails(details);
+				return (
+					fold?.watchdogEvent?.kind ??
+					fold?.watchdogOutcome ??
+					(details as { kind?: string } | undefined)?.kind
+				);
+			};
 			const harness = createHarness({
 				config: { maxRetries: 1 },
 				omitPersistedEvent: (value) =>
@@ -3293,13 +2848,12 @@ test("terminal publication requires receipts and recovers without model work or 
 				for (let i = 0; i < 3; i++)
 					await settleResponse(harness, harness.answerInvalid());
 			} else {
-				await settleResponse(harness, harness.answerWait(1));
-				const timer = harness.clock.records.findLastIndex(
-					(record) => record.delayMs === 1000 && !record.cleared,
-				);
-				assert.ok(timer >= 0);
-				harness.clock.fire(timer);
-				await Promise.resolve();
+				// Exhaustion arrives after the final continuation settles.
+				await settleResponse(harness, harness.answerContinue());
+				harness.streaming = true;
+				await harness.fire("agent_start", { type: "agent_start" });
+				harness.streaming = false;
+				await settleOnly(harness);
 			}
 			const label = `${kind}/${fault}`;
 			assert.equal(hooks.includes("user-ready"), false, label);
@@ -3330,15 +2884,35 @@ test("terminal publication requires receipts and recovers without model work or 
 				1,
 				label,
 			);
-			assert.equal(
-				harness.branch.filter(
+			if (kind === "unlock") {
+				// Two ordered artifacts: one remove-only fold and one quiet
+				// UI-only status entry; no model-bound unlock event exists.
+				assert.equal(
+					harness.branch.filter(
+						(entry) =>
+							entry.type === "custom_message" &&
+							eventKind(entry.details) === "unlock",
+					).length,
+					1,
+					label,
+				);
+				const statusEntries = harness.branch.filter(
 					(entry) =>
-						entry.type === "custom_message" &&
-						eventKind(entry.details) === kind,
-				).length,
-				1,
-				label,
-			);
+						entry.type === "custom" &&
+						entry.customType === "pi-continue-watchdog:ai-unlock",
+				);
+				assert.equal(statusEntries.length, 1, label);
+			} else {
+				assert.equal(
+					harness.branch.filter(
+						(entry) =>
+							entry.type === "custom_message" &&
+							eventKind(entry.details) === kind,
+					).length,
+					1,
+					label,
+				);
+			}
 			const attempts = harness.sent.filter(
 				(entry) => eventKind(entry.message.details) === kind,
 			);
@@ -3354,12 +2928,7 @@ test("terminal publication requires receipts and recovers without model work or 
 });
 
 test("resets invalidate unreadable terminal records without stale signals", async () => {
-	for (const kind of [
-		"unlock",
-		"decision-failed",
-		"exhausted",
-		"wait-completed",
-	]) {
+	for (const kind of ["unlock", "decision-failed", "exhausted"]) {
 		for (const reset of ["unlock", "fresh-cycle", "demote"]) {
 			let unreadable = false;
 			const hooks: string[] = [];
@@ -3367,8 +2936,10 @@ test("resets invalidate unreadable terminal records without stale signals", asyn
 				hasUI: false,
 				config: { maxRetries: 1 },
 				onSend(message) {
+					const fold = parseDecisionFoldDetails(message.details);
 					const eventKind =
-						parseDecisionFoldDetails(message.details)?.watchdogEvent?.kind ??
+						fold?.watchdogEvent?.kind ??
+						fold?.watchdogOutcome ??
 						(message.details as { kind?: string } | undefined)?.kind;
 					if (eventKind === kind) unreadable = true;
 					return undefined;
@@ -3386,13 +2957,11 @@ test("resets invalidate unreadable terminal records without stale signals", asyn
 				for (let i = 0; i < 3; i++)
 					await settleResponse(harness, harness.answerInvalid());
 			} else {
-				await settleResponse(harness, harness.answerWait(1));
-				harness.clock.fire(
-					harness.clock.records.findLastIndex(
-						(record) => record.delayMs === 1000 && !record.cleared,
-					),
-				);
-				await Promise.resolve();
+				await settleResponse(harness, harness.answerContinue());
+				harness.streaming = true;
+				await harness.fire("agent_start", { type: "agent_start" });
+				harness.streaming = false;
+				await settleOnly(harness);
 			}
 			assert.equal(hooks.includes("user-ready"), false, `${kind}/${reset}`);
 			if (reset === "unlock") await harness.unlock();
@@ -3409,46 +2978,6 @@ test("resets invalidate unreadable terminal records without stale signals", asyn
 			assert.equal(hooks.includes("user-ready"), false, `${kind}/${reset}`);
 		}
 	}
-});
-
-test("completed-wait receipt gates the next inquiry and keeps its original timing body", async () => {
-	let missing = true;
-	const harness = createHarness({
-		omitPersistedEvent: (kind) => missing && kind === "wait-completed",
-	});
-	await startIdle(harness);
-	await harness.openDecision();
-	await settleResponse(harness, harness.answerWait(30));
-	harness.clock.fire(
-		harness.clock.records.findLastIndex(
-			(record) => record.delayMs === 30000 && !record.cleared,
-		),
-	);
-	await Promise.resolve();
-	const completion = harness.sent.find(
-		(entry) =>
-			(entry.message.details as { kind?: string } | undefined)?.kind ===
-			"wait-completed",
-	);
-	assert.ok(completion);
-	const inquiries = () =>
-		harness.sent.filter(
-			(entry) => entry.message.customType === DECISION_MESSAGE_TYPE,
-		);
-	assert.equal(inquiries().length, 1);
-	missing = false;
-	await settleOnly(harness);
-	harness.clock.fire(
-		harness.clock.records.findLastIndex(
-			(record) => record.delayMs === 10000 && !record.cleared,
-		),
-	);
-	await Promise.resolve();
-	assert.equal(inquiries().length, 2);
-	assert.ok(
-		inquiries().at(-1)?.message.content.startsWith(completion.message.content),
-	);
-	assert.equal(harness.controller.snapshot.attempt, 1);
 });
 
 test("receipt-read re-entry cannot publish an old terminal intent in a fresh cycle", async () => {
@@ -5297,4 +4826,166 @@ test("runtime authentication failure after attach never exits Pi", async () => {
 	assert.equal(fatal.errors.length, 0);
 	harness.runtime.reconcileIdle();
 	assert.equal(harness.clock.records.length, 0);
+});
+
+test("retired wait is one invalid response with no timer, retry charge, or waiting hook", async () => {
+	const hooks: string[] = [];
+	const harness = createHarness({ onHook: (name) => hooks.push(name) });
+	await startIdle(harness);
+	await harness.openDecision();
+	await settleResponse(harness, harness.answerWait(60, "Waiting for CI."));
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(hooks.includes("watchdog-waiting"), false);
+	// No wait deadline timer is armed; only the fixed idle fence may remain.
+	const waitTimers = harness.clock.records.filter(
+		(record) => !record.cleared && record.delayMs !== 10_000,
+	);
+	assert.equal(waitTimers.length, 0);
+});
+
+test("WAIT_CALLBACK unlock arms no watchdog timer or retry charge", async () => {
+	const hooks: string[] = [];
+	const harness = createHarness({
+		config: {
+			reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED", "WAIT_CALLBACK"],
+		},
+		onHook: (name) => hooks.push(name),
+	});
+	await startIdle(harness);
+	await harness.openDecision();
+	await settleResponse(
+		harness,
+		harness.answerUnlock("Waiting for the subagent callback.", "WAIT_CALLBACK"),
+	);
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(hooks.includes("watchdog-waiting"), false);
+	assert.ok(hooks.includes("user-ready"));
+	const timers = harness.clock.records.filter(
+		(record) => !record.cleared && record.delayMs !== 10_000,
+	);
+	assert.equal(timers.length, 0);
+});
+
+test("AI unlock status-entry publication failures keep the unlock without fallback or premature hook", async () => {
+	for (const fault of ["absent", "unreadable", "throws"] as const) {
+		const hooks: string[] = [];
+		let statusUnreadable = false;
+		const harness = createHarness({
+			hasUI: false,
+			onHook: (name) => hooks.push(name),
+			onReadBranch() {
+				if (statusUnreadable) throw new Error("branch read failed");
+			},
+			// Sabotage only the quiet status entry: the remove-only fold still
+			// persists, so exactly the second artifact is unconfirmed.
+			...(fault === "absent"
+				? { omitPersistedEntryTypes: ["pi-continue-watchdog:ai-unlock"] }
+				: {}),
+			...(fault === "throws"
+				? { appendThrows: "pi-continue-watchdog:ai-unlock" }
+				: {}),
+		});
+		if (fault === "unreadable") statusUnreadable = true;
+		await startIdle(harness);
+		await harness.openDecision();
+		await settleResponse(harness, harness.answerUnlock());
+		const label = `status/${fault}`;
+
+		// The unlock itself is committed and never relocks.
+		assert.equal(harness.controller.snapshot.locked, false, label);
+		// No model-bound fallback unlock body was published.
+		assert.equal(
+			harness.sent.some(
+				(entry) =>
+					entry.message.customType === "pi-continue-watchdog:event" &&
+					(entry.message.details as { kind?: string } | undefined)?.kind ===
+						"unlock",
+			),
+			false,
+			label,
+		);
+		// The terminal hook stays gated behind the confirmed status receipt.
+		assert.equal(hooks.includes("user-ready"), false, label);
+
+		// A throwing append is retried on later confirmations by the same
+		// retained-intent path proven by the unreadable branch; both stay gated
+		// behind a confirmed new-branch-entry receipt.
+		// Confirmed-absence and unreadable receipts retain the pending intent
+		// without duplicate sends; a later healthy confirmation completes it.
+		if (fault === "absent" || fault === "unreadable") {
+			const before = harness.sent.length;
+			if (fault === "unreadable") statusUnreadable = false;
+			await settleOnly(harness);
+			// Absent stays absent in this harness (append still suppressed), so
+			// its intent remains pending with no duplicate fold sends.
+			if (fault === "absent") {
+				assert.equal(harness.sent.length, before, label);
+				assert.equal(hooks.includes("user-ready"), false, label);
+			} else {
+				const statusCount = harness.entries.filter(
+					(entry) => entry.type === "pi-continue-watchdog:ai-unlock",
+				).length;
+				assert.equal(statusCount, 1, label);
+				assert.equal(
+					hooks.filter((name) => name === "user-ready").length,
+					1,
+					label,
+				);
+			}
+		}
+	}
+});
+
+test("UI-only status publication resists synchronous same-idle reentry", async () => {
+	// R3 regression: appendEntry can reenter terminal confirmation
+	// synchronously (for example a hub state report triggered while the
+	// status append is still in flight). The in-flight guard must hold the
+	// reentry off so exactly one status entry is appended for the outcome.
+	let harnessRef: Harness;
+	let entered = false;
+	const hooks: string[] = [];
+	const harness = createHarness({
+		hasUI: true,
+		onHook: (name) => hooks.push(name),
+		onAppend(type) {
+			if (type === "pi-continue-watchdog:ai-unlock" && !entered) {
+				entered = true;
+				harnessRef.hub.bind({
+					instance: createHubAttachmentInstance(),
+					sessionId: "reentrant-child",
+					hasUI: false,
+					initialBusy: false,
+				});
+			}
+		},
+	});
+	harnessRef = harness;
+	await startIdle(harness);
+	await harness.openDecision();
+	await settleResponse(harness, harness.answerUnlock());
+
+	const statuses = harness.entries.filter(
+		(entry) => entry.type === "pi-continue-watchdog:ai-unlock",
+	);
+	assert.equal(entered, true, "the reentry path actually executed");
+	assert.equal(statuses.length, 1, "one status despite synchronous reentry");
+	assert.deepEqual(statuses, [
+		{
+			type: "pi-continue-watchdog:ai-unlock",
+			data: {
+				reasonType: "JOB_DONE",
+				reason: "All requested work is complete.",
+				exchangeId: "exchange-1",
+				cycleId: 1,
+			},
+		},
+	]);
+	// At most one user-ready hook fires for the single outcome.
+	assert.ok(
+		hooks.filter((name) => name.includes("user")).length <= 1,
+		"at most one user-ready hook",
+	);
+	assert.equal(harness.controller.snapshot.locked, false);
 });

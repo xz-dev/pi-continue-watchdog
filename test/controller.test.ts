@@ -35,7 +35,6 @@ test("initial snapshot is unlocked with no decision window", () => {
 		invalidDecisionAttempts: 0,
 		lastInvalidDecisionError: null,
 		decisionOpen: false,
-		waitUntilMs: 0,
 	});
 });
 
@@ -60,7 +59,6 @@ test("lock and main user start reset accounting and close pending decisions", ()
 		invalidDecisionAttempts: 0,
 		lastInvalidDecisionError: null,
 		decisionOpen: false,
-		waitUntilMs: 0,
 	});
 });
 
@@ -111,18 +109,24 @@ test("valid continues consume only the retry budget and exhaust at max", () => {
 	assert.equal(state.beginDecision(Number.MAX_SAFE_INTEGER).applied, false);
 });
 
-test("valid wait consumes a retry, blocks early decisions, and unlock clears its timestamp", () => {
+test("valid wait is retired: recordValidWait no longer exists and no wait deadline blocks decisions", () => {
 	const state = controller(3);
 	state.lock();
-	const waited = state.recordValidWait(openDecision(state), 310_000);
-	assert.deepEqual(effectKinds(waited), ["restoreDecisionTools"]);
-	assert.equal(state.snapshot.attempt, 1);
-	assert.equal(state.snapshot.waitUntilMs, 310_000);
-	assert.equal(state.beginDecision(309_999).applied, false);
-	assert.equal(state.beginDecision(310_000).applied, true);
+	// The timed-wait outcome is retired from the controller surface entirely;
+	// an old wait submission is one invalid response, never a scheduling state.
+	assert.equal("recordValidWait" in state, false);
+	assert.equal("rollbackValidWait" in state, false);
+	assert.equal("waitUntilMs" in state.snapshot, false);
+});
 
+test("continuation-only exhaustion uses idle and ownership conditions, not a wait deadline", () => {
+	const state = controller(1);
+	state.lock();
+	state.recordValidContinue(openDecision(state));
+	assert.equal(state.snapshot.exhausted, true);
+	assert.equal(state.beginDecision(0).applied, false);
 	state.unlock();
-	assert.equal(state.snapshot.waitUntilMs, 0);
+	assert.equal(state.snapshot.exhausted, true);
 });
 
 test("stale decisions cannot consume retry budget twice", () => {
