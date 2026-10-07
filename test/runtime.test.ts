@@ -374,6 +374,7 @@ function createHarness(options?: {
 	readonly fatalExit?: import("../src/fatal-exit.js").FatalExitAdapter;
 	readonly onSend?: (message: SentMessage["message"]) => Error | undefined;
 	readonly appendThrows?: boolean | string;
+	readonly contextEntriesThrows?: boolean;
 	readonly omitPersistedEntryTypes?: readonly string[];
 	readonly onAppend?: (type: string) => void;
 	readonly spliceBehavior?: "success" | "false" | "throw" | "absent";
@@ -573,10 +574,16 @@ function createHarness(options?: {
 		isProjectTrusted: () => true,
 		sessionManager: {
 			getSessionId: () => "main",
+			getSessionFile: () => undefined,
 			getLeafId: () => branch.at(-1)?.id ?? null,
 			getBranch: () => {
 				options?.onReadBranch?.();
 				if (options?.branchThrows) throw new Error("branch failed");
+				return branch;
+			},
+			buildContextEntries: () => {
+				if (options?.contextEntriesThrows)
+					throw new Error("effective context failed");
 				return branch;
 			},
 		},
@@ -1777,6 +1784,215 @@ test("agent_end finalizes while streaming but settled alone dispatches continue"
 	});
 });
 
+test("inquiry prompt carries the bounded source view and marker review metadata", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	// Seed effective-context evidence before the inquiry opens.
+	harness.branch.push(
+		{
+			id: "user-1",
+			type: "message",
+			message: {
+				role: "user",
+				content: [{ type: "text", text: "Deliver the deploy report." }],
+			},
+		},
+		{
+			id: "assistant-1",
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "text", text: "Report delivered: all checks green." },
+				],
+			},
+		},
+	);
+	await harness.openDecision({ start: false });
+
+	const decision = harness.sent.at(-1);
+	assert.equal(decision?.message.customType, DECISION_MESSAGE_TYPE);
+	const prompt = decision?.message.content ?? "";
+	// The bounded view is appended to the same inquiry body — the original
+	// native context is untouched and no second model request exists.
+	assert.match(prompt, /Decide now\./);
+	assert.match(prompt, /Source evidence \(bounded excerpts/);
+	assert.match(prompt, /Deliver the deploy report\./);
+	assert.match(prompt, /Report delivered: all checks green\./);
+	assert.equal(harness.sent.length, 1);
+
+	// The marker carries nested versioned review metadata on the same append.
+	const marker = harness.entries.find(
+		(entry) => entry.type === INQUIRY_MARKER_ENTRY_TYPE,
+	);
+	assert.ok(marker);
+	const data = marker.data as Record<string, unknown>;
+	assert.equal(data.version, 1);
+	assert.equal(data.exchangeId, "exchange-1");
+	const review = data.review as Record<string, unknown>;
+	assert.ok(review, "expected nested review metadata on the marker");
+	assert.equal(review.version, 1);
+	assert.equal(review.projectionVersion, 1);
+	assert.equal(typeof review.digest, "string");
+	assert.ok(Array.isArray(review.selectedSources));
+	const sources = review.selectedSources as Array<{
+		id: string;
+		provenance: string;
+	}>;
+	assert.ok(sources.some((source) => source.id === "user-1"));
+	assert.ok(sources.some((source) => source.id === "assistant-1"));
+	// Source references point at effective-context ids; no excerpt copy.
+	assert.equal(JSON.stringify(review).includes("Report delivered"), false);
+});
+
+test("corrected attempts re-project the view from current effective context", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.branch.push({
+		id: "user-1",
+		type: "message",
+		message: {
+			role: "user",
+			content: [{ type: "text", text: "First request." }],
+		},
+	});
+	await harness.openDecision();
+
+	// New evidence lands between the invalid response and the re-ask.
+	harness.branch.push({
+		id: "user-2",
+		type: "message",
+		message: {
+			role: "user",
+			content: [{ type: "text", text: "Later request for the re-ask." }],
+		},
+	});
+	await settleResponse(harness, harness.answerInvalid());
+
+	const reask = harness.sent.at(-1);
+	assert.equal(reask?.message.customType, DECISION_MESSAGE_TYPE);
+	assert.match(reask?.message.content ?? "", /Later request for the re-ask\./);
+	const markers = harness.entries.filter(
+		(entry) => entry.type === INQUIRY_MARKER_ENTRY_TYPE,
+	);
+	assert.equal(markers.length, 2);
+	const secondReview = (markers[1].data as Record<string, unknown>)
+		.review as Record<string, unknown>;
+	assert.ok(secondReview);
+	assert.equal(secondReview.cycleId, undefined);
+	const secondSources = secondReview.selectedSources as Array<{
+		id: string;
+	}>;
+	assert.ok(secondSources.some((source) => source.id === "user-2"));
+});
+
+test("decision audit carries the review association of its exchange", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.branch.push({
+		id: "user-1",
+		type: "message",
+		message: {
+			role: "user",
+			content: [{ type: "text", text: "Do the work." }],
+		},
+	});
+	await harness.openDecision();
+	const replacement = (await harness.endDecisionMessage(
+		harness.answerUnlock("Done.", "JOB_DONE"),
+	)) as DecisionMessageReplacement;
+	assert.ok(replacement);
+	const audit = harness.entries.find(
+		(entry) => entry.type === "pi-continue-watchdog:decision-audit",
+	);
+	assert.ok(audit);
+	const data = audit.data as Record<string, unknown>;
+	const review = data.review as Record<string, unknown> | undefined;
+	assert.ok(review, "expected nested review association on the audit");
+	assert.equal(review.version, 1);
+	assert.equal(typeof review.sourceDigest, "string");
+	const marker = harness.branch.find(
+		(entry) =>
+			entry.type === "custom" && entry.customType === INQUIRY_MARKER_ENTRY_TYPE,
+	);
+	assert.equal(review.markerEntryId, marker?.id);
+});
+
+test("view-build failure reports unavailable history without blocking dispatch", async () => {
+	const harness = createHarness({ contextEntriesThrows: true });
+	await startIdle(harness);
+	await harness.openDecision({ start: false });
+	const decision = harness.sent.at(-1);
+	assert.equal(decision?.message.customType, DECISION_MESSAGE_TYPE);
+	// The plain prompt is dispatched; the marker has no review field.
+	assert.equal(
+		(decision?.message.content ?? "").includes("Source evidence"),
+		false,
+	);
+	const marker = harness.entries.find(
+		(entry) => entry.type === INQUIRY_MARKER_ENTRY_TYPE,
+	);
+	assert.ok(marker);
+	assert.equal(
+		Object.hasOwn(marker.data as Record<string, unknown>, "review"),
+		false,
+	);
+	assert.ok(
+		harness.entries.some((entry) =>
+			JSON.stringify(entry.data).includes("Review source view unavailable"),
+		),
+	);
+});
+
+test("audit persistence failure keeps the published outcome behavior unchanged", async () => {
+	const harness = createHarness({
+		appendThrows: "pi-continue-watchdog:decision-audit",
+	});
+	await startIdle(harness);
+	await harness.openDecision();
+	const answer = harness.answerContinue();
+	await harness.endDecisionMessage(answer);
+	await settleResponse(harness, answer);
+	// The canonical continuation still publishes; a failed optional audit adds
+	// no execution gate, retry charge, provider call, or fallback store.
+	assert.equal(harness.controller.snapshot.attempt, 1);
+	assert.equal(harness.triggeredTurns, 2);
+	assert.equal(
+		harness.sent.at(-1)?.message.customType,
+		DECISION_FOLD_MESSAGE_TYPE,
+	);
+	assert.ok(
+		harness.entries.some((entry) =>
+			JSON.stringify(entry.data).includes("response audit unavailable"),
+		),
+		JSON.stringify(harness.entries),
+	);
+});
+
+test("review diagnostic reentrancy defers without leaving an open decision", async () => {
+	let harness: Harness;
+	harness = createHarness({
+		contextEntriesThrows: true,
+		onAppend(type) {
+			if (type === "pi-continue-watchdog:status") harness.streaming = true;
+		},
+	});
+	await startIdle(harness);
+	await harness.openDecision({ start: false });
+	assert.equal(harness.triggeredTurns, 0);
+	assert.equal(
+		harness.controller.snapshot.decisionOpen,
+		false,
+		JSON.stringify({
+			entries: harness.entries,
+			streaming: harness.streaming,
+			snapshot: harness.controller.snapshot,
+		}),
+	);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+});
+
 test("inquiry marker is persisted before the decision prompt", async () => {
 	const timeline: string[] = [];
 	const harness = createHarness({
@@ -2328,16 +2544,30 @@ test("decision message_end captures XML, clears its assistant, and persists a co
 		false,
 	);
 	assert.equal(replacement.message.stopReason, "stop");
-	assert.deepEqual(harness.entries.at(-1), {
-		type: "pi-continue-watchdog:decision-audit",
-		data: {
-			version: 1,
-			exchangeId: "exchange-1",
-			cycleId: 1,
-			outcome: "unlock",
-			reasonType: "WAIT_USER",
-			reason: "Waiting for approval.",
-		},
+	// The earlier unconsumed answer seeded one ordinary assistant row, so the
+	// exchange marker carried review metadata and the audit associates it.
+	const auditAtMessageEnd = harness.entries.at(-1) as
+		| {
+				readonly type: string;
+				readonly data: Record<string, unknown>;
+		  }
+		| undefined;
+	assert.ok(auditAtMessageEnd);
+	assert.equal(auditAtMessageEnd.type, "pi-continue-watchdog:decision-audit");
+	const auditReview = auditAtMessageEnd.data.review as
+		| Record<string, unknown>
+		| undefined;
+	assert.ok(auditReview, "expected nested review association on the audit");
+	assert.equal(auditReview.version, 1);
+	assert.equal(auditReview.markerEntryId, "custom-2");
+	const { review: _droppedReview, ...auditData } = auditAtMessageEnd.data;
+	assert.deepEqual(auditData, {
+		version: 1,
+		exchangeId: "exchange-1",
+		cycleId: 1,
+		outcome: "unlock",
+		reasonType: "WAIT_USER",
+		reason: "Waiting for approval.",
 	});
 
 	// The decision prompt itself already caused agent_start. At this point the
@@ -2356,7 +2586,16 @@ test("decision message_end captures XML, clears its assistant, and persists a co
 			(entry: { type: string; data: unknown }) =>
 				entry.type === "pi-continue-watchdog:decision-audit",
 		);
-	assert.deepEqual(auditEntries, [
+	const auditRecords = auditEntries.map(
+		(entry: { type: string; data: unknown }) => {
+			const { review: _dropped, ...data } = entry.data as Record<
+				string,
+				unknown
+			>;
+			return { type: entry.type, data };
+		},
+	);
+	assert.deepEqual(auditRecords, [
 		{
 			type: "pi-continue-watchdog:decision-audit",
 			data: {

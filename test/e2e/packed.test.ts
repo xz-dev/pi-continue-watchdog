@@ -74,6 +74,7 @@ interface PackedFixture {
 	readonly agentDir: string;
 	readonly cwd: string;
 	readonly packageDir: string;
+	readonly installRoot: string;
 }
 
 /**
@@ -208,7 +209,7 @@ async function makePackedFixture(
 		join(agentDir, "settings.json"),
 		JSON.stringify({ ...options?.piSettings, extensions }),
 	);
-	return { root, home, agentDir, cwd, packageDir, probeOut };
+	return { root, home, agentDir, cwd, packageDir, installRoot, probeOut };
 }
 
 interface ProbeRecord {
@@ -1953,4 +1954,217 @@ test("packed A15 continuation request keeps every genuine user boundary", {
 		[],
 		"no user record after the restriction except the live turn",
 	);
+});
+
+/**
+ * 2.1/2.2/3.1 — real disk-backed same-JSONL association. A completed exchange
+ * persists the bounded view in the owned inquiry body, nested review metadata
+ * on the hidden marker, the normalized response on the hidden audit, and the
+ * canonical fold — all under the same attempt, readable after a fresh-process
+ * reopen of the exact same session file. Deterministic localhost fixture
+ * provider only; input fidelity is asserted, not model accuracy.
+ */
+test("packed disk-backed session persists and reopens the review association", {
+	timeout: 360_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t);
+	const sessionDir = join(fixture.root, "sessions");
+	await mkdir(sessionDir, { recursive: true });
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "text", text: "Delivered the migration report." },
+		{
+			kind: "cw",
+			action: "unlock",
+			reasonType: "JOB_DONE",
+			reason: "Migration report delivered.",
+		},
+	]);
+	const sm = SessionManager.create(fixture.cwd, sessionDir);
+	const excludedId = sm.appendMessage({
+		role: "bashExecution",
+		command: "echo LOCAL_ONLY_COMMAND_SENTINEL",
+		output: "LOCAL_ONLY_OUTPUT_SENTINEL",
+		exitCode: 0,
+		cancelled: false,
+		truncated: false,
+		excludeFromContext: true,
+		timestamp: 1,
+	});
+	const includedId = sm.appendMessage({
+		role: "bashExecution",
+		command: "echo INCLUDED_COMMAND_SENTINEL",
+		output: "INCLUDED_OUTPUT_SENTINEL",
+		exitCode: 0,
+		cancelled: false,
+		truncated: false,
+		timestamp: 2,
+	});
+	let session: AgentSession | undefined;
+	try {
+		({ session } = await createSession(fixture, baseUrl, {
+			sessionManager: sm,
+		}));
+		await session.prompt("Report the migration status.");
+		await waitForSessionIdle(session, 60_000, "first turn");
+		await waitFor(() => requests.length >= 2, 120_000, "decision request");
+		await waitForSessionIdle(session, 60_000, "decision turn");
+
+		const decisionRequest = requests.find((request) =>
+			isDecisionRequest(request),
+		);
+		assert.ok(decisionRequest, "expected a serialized inquiry request");
+		const inquiryBody = requestPromptText(decisionRequest);
+		// The same inquiry carries the bounded provenance-labelled view.
+		assert.match(
+			inquiryBody,
+			/Source evidence \(bounded excerpts; omissions are not proof of absence/,
+		);
+		assert.match(inquiryBody, /Report the migration status\./);
+		assert.match(inquiryBody, /Delivered the migration report\./);
+		assert.match(inquiryBody, /INCLUDED_COMMAND_SENTINEL/);
+		assert.match(inquiryBody, /INCLUDED_OUTPUT_SENTINEL/);
+		assert.doesNotMatch(
+			JSON.stringify(requests),
+			/LOCAL_ONLY_(COMMAND|OUTPUT)_SENTINEL/,
+		);
+		assert.ok(
+			sm.getEntry(excludedId),
+			"native excluded record is retained locally",
+		);
+
+		const sessionFile = sm.getSessionFile();
+		assert.ok(sessionFile !== undefined, "session must be disk-backed");
+		// Fresh-process reopen: a separate Node/tsx process, running from the
+		// fixture install root where @earendil-works/pi-coding-agent resolves,
+		// reads the same JSONL with zero shared memory. Any assertion failure
+		// inside surfaces as a non-zero exit code on execFileAsync.
+		const verifyScript = join(fixture.installRoot, "verify-reopen.mts");
+		await writeFile(
+			verifyScript,
+			`import assert from "node:assert/strict";\n` +
+				`import { SessionManager } from "@earendil-works/pi-coding-agent";\n` +
+				`import { readReviewHistory } from ${JSON.stringify(join(fixture.packageDir, "src", "review-context.ts"))};\n` +
+				`const sm = SessionManager.open(process.argv[2]);\n` +
+				`const branch = sm.getBranch();\n` +
+				`const markers = branch.filter((e) => e.type === "custom" && e.customType === "pi-continue-watchdog:inquiry-marker");\n` +
+				`assert.equal(markers.length, 1, "marker survives fresh-process reopen");\n` +
+				`const review = markers[0].data?.review;\n` +
+				`assert.ok(review, "review metadata survives reopen");\n` +
+				`assert.equal(review.version, 1);\n` +
+				`const audits = branch.filter((e) => e.type === "custom" && e.customType === "pi-continue-watchdog:decision-audit");\n` +
+				`assert.equal(audits.length, 1, "audit survives reopen");\n` +
+				`assert.equal(audits[0].data?.review?.markerEntryId, markers[0].id);\n` +
+				`const folds = branch.filter((e) => e.type === "custom_message" && e.customType === "pi-continue-watchdog:inquiry-fold");\n` +
+				`assert.equal(folds.length, 1, "canonical fold survives reopen");\n` +
+				`assert.notEqual(sm.getSessionId(), "", "reopened session has identity");\n` +
+				`const history = readReviewHistory(sm);\n` +
+				`assert.equal(history.records.length, 1);\n` +
+				`assert.equal(history.records[0].reviewMetadata, "ok");\n` +
+				`assert.equal(history.records[0].responseOutcome, "unlock");\n` +
+				`assert.equal(history.records[0].publishedOutcome, "unlock");\n` +
+				`assert.equal(history.records[0].status, "published");\n` +
+				`const quietUnlock = sm.getEntry(history.records[0].unlockEntryId);\n` +
+				`assert.equal(quietUnlock?.customType, "pi-continue-watchdog:ai-unlock");\n` +
+				`assert.equal(quietUnlock.data.exchangeId, history.records[0].exchangeId);\n` +
+				`assert.equal(quietUnlock.data.cycleId, history.records[0].cycleId);\n` +
+				`const prompt = sm.getEntry(history.records[0].promptEntryId);\n` +
+				`assert.ok(prompt?.content.includes("Source evidence (bounded excerpts"));\n` +
+				`console.log("fresh-process reopen assertions passed");\n`,
+		);
+		const { stdout: reopenOut } = await execFileAsync(
+			process.execPath,
+			[
+				"--import",
+				join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs"),
+				verifyScript,
+				sessionFile,
+			],
+			{ cwd: fixture.installRoot, timeout: 60_000 },
+		);
+		assert.match(reopenOut, /fresh-process reopen assertions passed/);
+		const branch = sm.getBranch();
+		const storedInquiry = branch.find(
+			(entry) =>
+				entry.type === "custom_message" &&
+				entry.customType === "pi-continue-watchdog:inquiry",
+		);
+		assert.ok(
+			storedInquiry?.type === "custom_message" &&
+				typeof storedInquiry.content === "string",
+		);
+		assert.ok(
+			inquiryBody.includes(storedInquiry.content),
+			"persisted inquiry equals the assembled model-facing input",
+		);
+		const markers = branch.filter(
+			(entry) =>
+				entry.type === "custom" &&
+				entry.customType === "pi-continue-watchdog:inquiry-marker",
+		);
+		assert.equal(markers.length, 1);
+		const markerData = (markers[0] as { data?: unknown }).data as Record<
+			string,
+			unknown
+		>;
+		const markerReview = markerData.review as
+			| Record<string, unknown>
+			| undefined;
+		assert.ok(markerReview, "marker carries nested review metadata");
+		assert.equal(markerReview.version, 1);
+		assert.ok(
+			Array.isArray(markerReview.selectedSources) &&
+				(markerReview.selectedSources as unknown[]).length > 0,
+			"review records selected source ids",
+		);
+		const selectedSources = markerReview.selectedSources as { id: string }[];
+		assert.ok(selectedSources.some((source) => source.id === includedId));
+		assert.ok(selectedSources.every((source) => source.id !== excludedId));
+		assert.notEqual(markerReview.sourceHeadId, excludedId);
+		const audits = branch.filter(
+			(entry) =>
+				entry.type === "custom" &&
+				entry.customType === "pi-continue-watchdog:decision-audit",
+		);
+		assert.equal(audits.length, 1);
+		const auditData = (audits[0] as { data?: unknown }).data as Record<
+			string,
+			unknown
+		>;
+		assert.equal(auditData.exchangeId, markerData.exchangeId);
+		assert.equal(auditData.outcome, "unlock");
+		const auditReview = auditData.review as Record<string, unknown> | undefined;
+		assert.ok(auditReview, "audit carries the review association");
+		assert.equal(auditReview.version, 1);
+		assert.equal(auditReview.markerEntryId, markers[0].id);
+		// Canonical fold correlates the published outcome on the same attempt.
+		const folds = branch.filter(
+			(entry) =>
+				entry.type === "custom_message" &&
+				entry.customType === "pi-continue-watchdog:inquiry-fold",
+		);
+		assert.equal(folds.length, 1);
+		const foldDetails = (folds[0] as { details?: unknown }).details as Record<
+			string,
+			unknown
+		>;
+		assert.equal(foldDetails.watchdogOutcome, "unlock");
+		// No extra review entry type, sidecar, or second model request exists.
+		assert.equal(
+			branch.filter(
+				(entry) =>
+					entry.type === "custom" &&
+					String((entry as { customType?: unknown }).customType).includes(
+						"review",
+					),
+			).length,
+			0,
+		);
+		assert.equal(requests.filter(isDecisionRequest).length, 1);
+	} finally {
+		// Real cleanup on the live session, then reopen assertions run against
+		// the persisted file — never mask a mid-test failure behind them.
+		if (session !== undefined) {
+			await shutdownSession(session);
+		}
+	}
 });

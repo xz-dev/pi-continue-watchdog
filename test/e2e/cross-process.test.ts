@@ -135,6 +135,9 @@ async function makePackedFixture(
 		cwd: installRoot,
 		timeout: 30_000,
 	});
+	const hostManifest = JSON.parse(
+		await readFile(join(repoRoot, "package.json"), "utf8"),
+	) as { devDependencies: Record<string, string> };
 	await execFileAsync(
 		"npm",
 		[
@@ -149,6 +152,10 @@ async function makePackedFixture(
 			// narrower `allow-git=root` policy verified separately in CI.
 			"--allow-git=all",
 			tarball,
+			// Match the tested host, rather than resolving wildcard tarball peers.
+			...["@earendil-works/pi-coding-agent", "@earendil-works/pi-tui"].map(
+				(name) => `${name}@${hostManifest.devDependencies[name]}`,
+			),
 		],
 		{ cwd: installRoot, timeout: 120_000, maxBuffer: 8 * 1024 * 1024 },
 	);

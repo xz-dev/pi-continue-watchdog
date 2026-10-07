@@ -50,6 +50,18 @@ References to a consumed attempt below mean the locally confirmed phase. Stable 
 
 ---
 
+## Review assistance and historical association
+
+The approved `reduce-false-positive-continuations` change adds assistance, not a completion oracle. Its hidden inquiry keeps the native effective conversation and adds provenance-labelled excerpts: at most 8,000 Unicode code points including labels/footer, and 1,600 per excerpt including elision. Latest user/reply and two recent tool results lead; earlier requests/deliveries precede derived summaries and automation. Omitted evidence is not absent evidence. Exact native correlation, not quoted text or partial metadata, identifies owned controls. Bash rows use native `convertToLlm`, preserving its exclusion flag and cancellation/exit/truncation qualifiers; excluded commands, output and source IDs do not enter the supplement or its metadata.
+
+The existing three `cw` fields remain unchanged. Guidance asks for a concise deliverable assessment in `reason_content` before the verdict; either property order is valid. Earlier deliveries and unchanged permission remain relevant; reporting a future command does not authorize running it. No new checklist, confirmation click, special word, reviewer request, or semantic acceptance gate is added.
+
+A persisted review uses the owning native JSONL's existing marker, inquiry, optional audit, fold and canonical quiet-unlock record. The inquiry holds the assembled view once; nested versioned metadata records source references and association. A response is not a published outcome. Quiet unlock needs both its remove-fold and same-attempt status record on the active ancestry; `unlockEntryId` preserves the native reason's locator even if the optional audit is absent. Legacy replacement unlocks remain readable. Missing inquiry or audit, incomplete quiet publication, unknown metadata/policy, or unresolved/mismatched ancestry references is incomplete history; optional failure only emits a bounded existing status diagnostic and never retries, relocks an accepted unlock, restores authority or creates fallback storage. A missing inquiry is detected independently of the audit's optional prompt-ID field.
+
+Historical reads follow the host's current ancestor path at startup and before inquiries. Sources must precede that review on the same path. Non-label source identity survives native fork label recreation and parent re-chaining; origin session ID is provenance only. A leaf-only branch move is not persisted by tested Pi 0.85.1: fresh reopen restores its persisted tip. The watchdog never selects another leaf to disguise this host limitation. New views use native compaction-aware entries, not archived raw requests; recovery restores no lock, claim, budget, timer, dispatch or staged action.
+
+`watchdog-review-history.idea.lean` models that read-only association boundary. Existing lifecycle models remain unchanged; the new model assumes a correct host ancestry and already decoded records. Neither its proofs nor fixture verdicts establish natural-language completeness, provider-wire fidelity after later plugins, or repair of the historical false continuation. Independent semantic review remains an explicit verification gate.
+
 ## Product surface (fixed names)
 
 | Surface | Exact name / text | Who / channel |

@@ -125,14 +125,16 @@ function inquiryDetails(input: unknown): InquiryCorrelation | undefined {
 	};
 }
 
-function decisionDetails(input: unknown): DecisionMessageDetails | undefined {
+export function decisionDetails(
+	input: unknown,
+): DecisionMessageDetails | undefined {
 	const correlation = inquiryDetails(input);
 	return correlation?.namespace === DECISION_INQUIRY_NAMESPACE
 		? correlation
 		: undefined;
 }
 
-function markerDetails(
+export function markerDetails(
 	input: unknown,
 ): { exchangeId: string; cycleId: number } | undefined {
 	if (
@@ -466,7 +468,9 @@ export function neutralizeDecisionAssistant<T>(
 	return neutralizeInquiryAssistant(message, correlation, options);
 }
 
-function decisionCorrelationKey(details: InquiryCorrelation): string {
+export function decisionCorrelationKey(
+	details: Pick<InquiryCorrelation, "inquiryId" | "attempt">,
+): string {
 	return `${details.inquiryId}\u0000${details.attempt}`;
 }
 

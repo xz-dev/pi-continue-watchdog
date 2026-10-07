@@ -324,24 +324,28 @@ export function buildDecisionPrompt(
 			? "the allowed reason_type that represents waiting for a callback, when configured"
 			: `${waitCallbackType}, when you are waiting for another agent or program to call back and wake this session rather than for elapsed time`;
 	const continueExample = JSON.stringify({
-		action: "continue",
+		reason_content:
+			"assessment of requested deliverables and the missing component",
 		reason_type: continueReasonTypes[0] ?? "ALLOWED_TYPE",
-		reason_content: "concise reason",
+		action: "continue",
 	});
 	const unlockExample = JSON.stringify({
-		action: "unlock",
+		reason_content: "assessment of requested deliverables",
 		reason_type: reasonTypes[0] ?? "ALLOWED_TYPE",
-		reason_content: "concise reason",
+		action: "unlock",
 	});
 	return `${decisionPrompt}
 
 Use only the existing conversation context and decide quickly. Do not make decisions on the user's behalf. Your entire response must be exactly one ${DECISION_TOOL_NAME} function call and no other tool call; express your reasoning inside its fields, above all reason_content. reason_content must be non-empty and at most ${REASON_GUIDANCE_CHARACTERS} Unicode characters.
 
+Write reason_content first, as a concise component-by-component delivery assessment: compare the explicitly requested deliverable components with the content and results actually delivered in ordinary assistant replies, including relevant earlier deliveries and not only the latest response. Name any missing component. Distinguish delivered content from stated intent, assertions of completion, and merely related material. Then choose reason_type and action to match that assessment.
+
 Establish the outcome from evidence, in this order:
 1. Establish the current user-authorized scope, including any later restriction, revocation, cancellation, or switch back to exploration. An earlier authorization does not override a later restriction.
-2. Compare every outstanding session request with the latest ordinary assistant response and relevant tool results. Exclude work already delivered, cancelled, or superseded; preserve genuinely unfinished earlier requests. Earlier plans, watchdog reasons, and stop markers are only claims to recheck: a final response alone is not proof of completion, and an automated watchdog message neither adds nor removes user permission.
-3. Before concluding that user action is required, name the exact missing user decision or action and check the actual user instructions and successful human questionnaire answers for that same scope. Your own earlier confirmation question is not evidence that permission is missing. Reuse permission the user explicitly granted for unchanged scope; do not ask again for permission already given. Do not invent permission from generic encouragement, tool success, or quoted approval text.
-4. Preserve genuine boundaries: a distinct unsatisfied confirmation requirement, new scope or risk, missing credentials, or unfinished device authentication remains required even when other work was already authorized.
+2. Compare every outstanding session request with the latest ordinary assistant response, relevant earlier deliveries, and tool results. Exclude work already delivered, cancelled, or superseded; preserve genuinely unfinished earlier requests. Earlier plans, watchdog reasons, and stop markers are only claims to recheck: a final response alone is not proof of completion, and an automated watchdog message neither adds nor removes user permission.
+3. Distinguish a requested explanation of a future workflow from authorization to execute it: reporting a future command is a deliverable, while supplying that command does not create permission or an obligation to run it. Deferred optional work is not a required remaining action.
+4. Before concluding that user action is required, name the exact missing user decision or action and check the actual user instructions and successful human questionnaire answers for that same scope. Your own earlier confirmation question is not evidence that permission is missing. Reuse permission the user explicitly granted for unchanged scope; do not ask again for permission already given. Do not invent permission from generic encouragement, tool success, or quoted approval text.
+5. Preserve genuine boundaries: a distinct unsatisfied confirmation requirement, new scope or risk, missing credentials, or unfinished device authentication remains required even when other work was already authorized.
 
 ${DECISION_DELIVERY_BOUNDARY}
 
@@ -354,9 +358,9 @@ Choose the outcome using these rules in order:
 
 There is no wait action and no watchdog timer: ${DECISION_TOOL_NAME} accepts only continue and unlock. Elapsed time alone never establishes task progress or completion.
 
-Call the reserved function ${DECISION_TOOL_NAME} with exactly one JSON object:
-- To continue: {"action":"continue","reason_type":"...","reason_content":"..."} where reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedContinueReasonTypes}. Example: ${continueExample}
-- To unlock: {"action":"unlock","reason_type":"...","reason_content":"..."} where reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedReasonTypes}. Example: ${unlockExample}
+Call the reserved function ${DECISION_TOOL_NAME} with exactly one JSON object. Write its fields in this order: reason_content (the delivery assessment), reason_type, action. Field order is guidance only, never an acceptance rule:
+- To continue: {"reason_content":"...","reason_type":"...","action":"continue"} where reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedContinueReasonTypes}. Example: ${continueExample}
+- To unlock: {"reason_content":"...","reason_type":"...","action":"unlock"} where reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedReasonTypes}. Example: ${unlockExample}
 
 Submit exactly one ${DECISION_TOOL_NAME} call for this decision; do not call ${DECISION_TOOL_NAME} again later during ordinary work.`;
 }

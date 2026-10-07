@@ -283,6 +283,11 @@ async function makePackedFixture(t: TestContext): Promise<PackedFixture> {
 			"--no-fund",
 			"--allow-git=all",
 			tarball,
+			// The tarball peers `@earendil-works/*` on `*`; pin the same host
+			// versions the repo devDependencies use so npm does not resolve the
+			// newest release line (whose transitive tree may be unpublished).
+			`@earendil-works/pi-coding-agent@${HOST_VERSION}`,
+			`@earendil-works/pi-tui@${HOST_VERSION}`,
 		],
 		{ cwd: installRoot, timeout: 120_000, maxBuffer: 8 * 1024 * 1024 },
 	);

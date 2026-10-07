@@ -41,6 +41,7 @@ import {
 	findDecisionAssistantEntryId,
 	findPreemptedDecisionAssistantEntryIds,
 	INQUIRY_MARKER_ENTRY_TYPE,
+	markerDetails,
 	neutralizeDecisionAssistant,
 	PREEMPTED_DECISION_ERROR,
 	parseDecisionFoldDetails,
@@ -82,6 +83,13 @@ import {
 	isProcessDomainFatalError,
 	type ProcessDomainCoordinator,
 } from "./process-domain.js";
+import {
+	buildReviewSourceView,
+	createReviewSourceMetadata,
+	type ReviewAuditMetadata,
+	type ReviewSourceMetadata,
+	readReviewHistory,
+} from "./review-context.js";
 import {
 	createUserReadyEnvelope,
 	createWatchdogContinuedEnvelope,
@@ -163,6 +171,12 @@ interface ActiveDecision {
 	dispatchPending: boolean;
 	/** True only after Pi emits this decision's correlated custom message_start. */
 	submitted: boolean;
+	/** Review metadata recorded on the latest inquiry marker append, if any. */
+	reviewMetadata: ReviewSourceMetadata | null;
+	/** Persisted entry id of that marker, resolved post-append when readable. */
+	markerEntryId: string | null;
+	/** Persisted entry id of the correlated inquiry prompt record, if seen. */
+	promptEntryId: string | null;
 	/**
 	 * Matching prompt observed at this extension's context callback. This is
 	 * provisional evidence: Pi 0.85.1 can replace it in a later handler in the
@@ -188,6 +202,8 @@ interface InquiryMarkerEntry {
 	readonly version: 1;
 	readonly exchangeId: string;
 	readonly cycleId: number;
+	/** Nested versioned review metadata; absent on legacy markers. */
+	readonly review?: ReturnType<typeof createReviewSourceMetadata>;
 }
 
 interface SpliceEntryAPI {
@@ -1218,6 +1234,23 @@ export function createDecisionRuntime(
 		options.hub.reclaimMain(attachment);
 	};
 
+	const reportReviewHistory = (ctx: ExtensionContext): void => {
+		try {
+			const history = readReviewHistory(ctx.sessionManager);
+			const claim = getMainClaim();
+			if (history.diagnostic !== undefined && claim !== null && owns(claim))
+				appendStatus({
+					kind: "other-error",
+					exchangeId: history.records.at(-1)?.exchangeId ?? "recovery",
+					cycleId: history.records.at(-1)?.cycleId ?? 0,
+					message:
+						"Review history incomplete: some native records or source associations are unavailable.",
+				});
+		} catch {
+			// Diagnostic reads never restore authority or gate execution.
+		}
+	};
+
 	const sendDecisionPrompt = (
 		active: ActiveDecision,
 		cycleId: number,
@@ -1242,18 +1275,85 @@ export function createDecisionRuntime(
 		}
 		active.dispatchPending = true;
 		active.submitted = false;
+		const ctx = sessionContext;
+		if (ctx !== null) reportReviewHistory(ctx);
+		const review = (() => {
+			if (ctx === null) return null;
+			try {
+				const view = buildReviewSourceView(
+					ctx.sessionManager.buildContextEntries(),
+				);
+				// An empty evidence selection adds no model-facing supplement and
+				// leaves the marker in its legacy shape; a failed projection takes
+				// the same path so dispatch is never blocked by review data.
+				if (view.selected.length === 0) return null;
+				const metadata = createReviewSourceMetadata(view, {
+					sessionId: ctx.sessionManager.getSessionId(),
+					sessionFile: ctx.sessionManager.getSessionFile(),
+				});
+				return { prompt: `${decisionPrompt}\n\n${view.text}`, metadata };
+			} catch {
+				if (owns(active.claim))
+					appendStatus({
+						kind: "other-error",
+						exchangeId: active.exchangeId,
+						cycleId,
+						message:
+							"Review source view unavailable; native conversation retained.",
+					});
+				return null;
+			}
+		})();
+		// Diagnostic appends can be reentrant, just like other status effects.
+		if (
+			active.invalidated ||
+			(ctx !== null && !probePiAgentState(ctx).idle) ||
+			!activeGenerationCurrent(active) ||
+			!allIdleForClaim(active.claim)
+		) {
+			active.dispatchPending = false;
+			if (sendOptions?.deferOnBusy !== false) deferDecisionOnBusy(active);
+			return false;
+		}
 		try {
 			options.pi.appendEntry<InquiryMarkerEntry>(INQUIRY_MARKER_ENTRY_TYPE, {
 				version: 1,
 				exchangeId: active.exchangeId,
 				cycleId,
+				...(review === null ? {} : { review: review.metadata }),
 			});
+			active.reviewMetadata = review?.metadata ?? null;
+			active.markerEntryId = null;
+			active.promptEntryId = null;
+			if (ctx !== null) {
+				try {
+					for (const entry of ctx.sessionManager.getBranch().toReversed()) {
+						if (
+							entry.type === "custom" &&
+							entry.customType === INQUIRY_MARKER_ENTRY_TYPE
+						) {
+							const correlation = markerDetails(entry.data);
+							if (
+								correlation?.exchangeId !== active.exchangeId ||
+								correlation.cycleId !== cycleId
+							)
+								continue;
+							active.markerEntryId = entry.id;
+							break;
+						}
+					}
+				} catch {
+					// Optional association id stays unresolved.
+				}
+			}
 		} catch (error) {
 			active.dispatchPending = false;
 			throw error;
 		}
 		try {
-			const prompt = active.inquiry.prompt(decisionPrompt);
+			const prompt = active.inquiry.prompt(
+				review === null ? decisionPrompt : review.prompt,
+			);
 			if (!active.inquiry.markSent()) {
 				return false;
 			}
@@ -1325,6 +1425,9 @@ export function createDecisionRuntime(
 			invalidated: false,
 			dispatchPending: false,
 			submitted: false,
+			reviewMetadata: null,
+			markerEntryId: null,
+			promptEntryId: null,
 			contextConfirmed: false,
 			responseToolCallIds: new Set<string>(),
 			stagedResult: null,
@@ -2962,12 +3065,38 @@ export function createDecisionRuntime(
 			};
 		}
 		try {
+			const review: ReviewAuditMetadata | undefined =
+				active.reviewMetadata === null
+					? undefined
+					: {
+							version: 1,
+							...(active.markerEntryId === null
+								? {}
+								: { markerEntryId: active.markerEntryId }),
+							...(active.promptEntryId === null
+								? {}
+								: { promptEntryId: active.promptEntryId }),
+							...(active.reviewMetadata.sourceHeadId === null
+								? {}
+								: { sourceHeadId: active.reviewMetadata.sourceHeadId }),
+							sourceDigest: active.reviewMetadata.digest,
+						};
+			const record: DecisionAuditEntry & {
+				readonly review?: ReviewAuditMetadata;
+			} = review === undefined ? audit : { ...audit, review };
 			options.pi.appendEntry<DecisionAuditEntry>(
 				DECISION_AUDIT_ENTRY_TYPE,
-				audit,
+				record,
 			);
 		} catch {
-			// Audit persistence is optional; context hiding must still succeed.
+			// Optional diagnostics do not retry, relock, or gate publication.
+			if (owns(active.claim))
+				appendStatus({
+					kind: "other-error",
+					exchangeId: active.exchangeId,
+					cycleId,
+					message: "Review history incomplete: response audit unavailable.",
+				});
 		}
 
 		// Invalid owned transports end here, before native schema/unknown-tool
@@ -3136,6 +3265,10 @@ export function createDecisionRuntime(
 		}
 		active.dispatchPending = false;
 		active.submitted = true;
+		// The observed persisted prompt id, when the host surfaces the entry id,
+		// enriches the optional audit association without a second append.
+		const promptEntryId = (message as { readonly id?: unknown }).id;
+		if (typeof promptEntryId === "string") active.promptEntryId = promptEntryId;
 		selfDecisionRun = {
 			kind: "confirmed",
 			exchangeId: active.exchangeId,
@@ -3261,6 +3394,11 @@ export function createDecisionRuntime(
 			await configLoad;
 			if (!stopped && probePiAgentState(ctx).idle)
 				recoverPreemptedDecisionAssistants(ctx);
+			// Recover review history once from the host-selected active ancestry:
+			// audit/history data only, never restored locks, ownership, counters,
+			// timers, dispatch, or staged actions. A read failure or unsupported
+			// record stays diagnostic; nothing is repaired, migrated, or staged.
+			reportReviewHistory(ctx);
 		});
 
 		options.pi.on("agent_start", async (_event, ctx) => {

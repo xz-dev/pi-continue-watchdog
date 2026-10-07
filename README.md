@@ -22,6 +22,14 @@ Pi extension that keeps your agent working. When a locked cycle settles, the wat
 14. **Hooks.** `watchdog-continued` (normalized `REASON_TYPE` + `REASON`) and `user-ready` (`STOP_KIND` = `AI_UNLOCK` / `ERROR_UNLOCK` / `EXHAUSTED` / `DECISION_FAILED`) publish on the neutral `pi:semantic-hook:v1` channel after durable publication, still fenced by ownership and aggregate idle. The retired `watchdog-waiting` hook is no longer emitted. Manual unlock, abort, and cancelled work stay silent.
 15. **Cancellation.** Manual unlock aborts only the exact watchdog-owned decision, correction, or continuation run, removes its residue, revokes any pending submission, and never aborts ordinary user work. User takeover during a decision preempts it: the complete text-and-image takeover payload is re-issued once as a fresh user turn after the internal run settles.
 
+### Review evidence
+
+Owned inquiries include a bounded, provenance-labelled source view alongside the unchanged native effective conversation. The view is limited to 8,000 Unicode code points (1,600 per excerpt); omissions are explicit, not proof of missing delivery. Bash evidence uses Pi's native model conversion: `excludeFromContext` records remain local, while included records retain cancellation, exit-status and truncation qualifiers. Guidance asks for a concise delivery assessment in the existing `reason_content`; both JSON field orders remain valid.
+
+Review inputs and outcome associations stay in the owning native session JSONL. Ancestry-aware reads preserve inherited non-label sources across forks without restoring operational state. Complete new-format association requires the correlated inquiry; quiet unlock publication requires both its cleanup fold and canonical quiet status record. Missing records remain incomplete history, not another execution gate or a reason to repeat permission questions. Native compaction still determines new model context; tested Pi 0.85.1 does not persist a leaf-only rewind across reopen.
+
+These are deterministic input/storage guarantees, not proof that the original false continuation is fixed. See the [change evidence and limitations](openspec/changes/archive/2026-10-07-reduce-false-positive-continuations/README.md).
+
 ## Configuration
 
 Global `$PI_CODING_AGENT_DIR/pi-continue-watchdog.json` and trusted project `.pi/pi-continue-watchdog.json`; fields merge individually, invalid values keep the lower-precedence value with a diagnostic.

@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-10-06
+goal: Reduce unnecessary continuation after an already-delivered result, without
+  hiding genuinely unfinished authorized work.
