@@ -1,10 +1,4 @@
-# ai-unlock-tool Specification
-
-## Purpose
-
-Defines a stable root-only result function for authorized watchdog decision inquiries, preserving phase-gated submission and terminal unlock behavior without making control reasons a user-facing delivery channel.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Stable root-only tool registration
 The watchdog SHALL expose exactly one reserved decision-result function per root Pi process session. It SHALL use a fixed name distinct from reflect watchdog's `ref`, and SHALL NOT retain `unlock_continue_watchdog` as an additional proactive unlock tool. Locking, checking, correcting, continuing, and unlocking SHALL NOT add, remove, or swap tools or change their declarations. The declaration SHALL remain stable while the effective reason configuration is unchanged. If an existing lifecycle configuration load changes the effective reason constraints, the same named declaration SHALL be refreshed before those constraints are used for a decision; no additional tool, configuration watcher, or phase-specific schema SHALL be introduced. Active tool membership SHALL remain unchanged by this refresh. Child Pi processes inside the watchdog process domain SHALL NOT register this function. Stable registration SHALL NOT be represented as a guarantee of provider cache hits.
@@ -47,18 +41,7 @@ The parameter schema SHALL contain no explanatory descriptions, examples, or def
 - **THEN** it satisfies the length constraint
 - **AND** 1001 code points, an empty string, or whitespace-only content fail the structural contract
 
-### Requirement: Authorized unlock is terminal for its decision
-An accepted current unlock verdict SHALL unlock through normal authoritative semantics, clear pending automated work, publish one human-only outcome status with remove-only internal-exchange cleanup, and end its decision without an acknowledgement-only model request. It SHALL publish one eligible `user-ready` hook with `STOP_KIND=AI_UNLOCK`, normalized `REASON_TYPE`, and trimmed `REASON` only after that exact status and cleanup are confirmed, preserving current main ownership and aggregate/process-domain idle fences. No jev classification or review SHALL occur. Unrelated tools in the same response SHALL invalidate the decision rather than bypass decision-only tool restrictions.
-
-#### Scenario: Work complete
-- **WHEN** a confirmed current attempt accepts an unlock with type `job_done` and a valid reason
-- **THEN** the watchdog unlocks and starts no acknowledgement-only model turn
-- **AND** its human-only status records the outcome without a model-bound unlock body, and the eligible hook carries `REASON_TYPE=JOB_DONE`
-
-#### Scenario: User wait needs no external review
-- **WHEN** a confirmed current attempt accepts a valid `WAIT_USER` unlock
-- **THEN** it applies without a classifier request or review rejection counter
-- **AND** hook publication still waits for busy children and the process domain to become idle
+## ADDED Requirements
 
 ### Requirement: Compatible arguments remain normalized before schema validation
 Argument preparation SHALL preserve the existing trim and case-insensitive acceptance of actions and configured reason types and trim accepted reasons before native schema validation. It SHALL preserve unrelated extra properties and SHALL NOT fill missing arguments, truncate reasons, coerce non-string values, change an invalid action into a valid one, or grant watchdog authority. Both assessment-first and action-first objects SHALL remain admissible. Runtime validation SHALL continue rejecting reason types not allowed for the selected action even when that type occurs in the other action's schema enum.

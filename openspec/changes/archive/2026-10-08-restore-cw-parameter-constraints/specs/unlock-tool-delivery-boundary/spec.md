@@ -1,10 +1,4 @@
-# unlock-tool-delivery-boundary Specification
-
-## Purpose
-
-Keeps answers, results, reports, and questions in ordinary assistant replies rather than reserved watchdog control submissions, without disclosing the result function's usage contract during ordinary work.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Unlock tool is not a delivery channel
 Authorized decision instructions SHALL state that the reserved function submits watchdog control results, not user-facing delivery. Answers, results, reports, and questions SHALL be assessed in the ordinary replies already delivered; a reason field SHALL NOT substitute for a missing deliverable. The instructions SHALL state that the reason is for watchdog records and notifications, may be visible to the user, and must not be relied on as the user's answer. They SHALL NOT request another ordinary answer inside a decision-only response. The public function description, explanatory schema annotations, and startup guidelines SHALL NOT teach these usage instructions. Public field names, required markers, types, enums, and text bounds SHALL remain present as structural constraints rather than being treated as prohibited descriptions.

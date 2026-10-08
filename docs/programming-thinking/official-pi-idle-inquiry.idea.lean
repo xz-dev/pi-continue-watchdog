@@ -230,20 +230,27 @@ def summarizeKeeps (input : ProjectionInput) : Bool :=
   | .unownedRecord _ => true
   | _ => false
 
--- The reserved root function has a stable minimal declaration; its arguments are taught only by an inquiry.
+-- The reserved root function keeps a stable minimal declaration: fixed name
+-- and description, a structurally constrained parameter schema, and no
+-- explanatory parameter prose. Structural constraints (required fields,
+-- action enum, reason-type union, reason bounds) are part of the declaration;
+-- descriptions, examples, and defaults are not. Argument *usage* is still
+-- taught only by an inquiry.
 structure ReservedFunctionDeclaration where
   name : String
   description : String
   declaresArguments : Bool
   exposesReasonEnums : Bool
+  explainsParametersInDeclaration : Bool
   rootOnly : Bool
   deriving DecidableEq, Repr
 
 def reservedFunctionDeclaration : ReservedFunctionDeclaration :=
   { name := "cw"
     description := "don't use unless ask"
-    declaresArguments := false
-    exposesReasonEnums := false
+    declaresArguments := true
+    exposesReasonEnums := true
+    explainsParametersInDeclaration := false
     rootOnly := true }
 
 -- State separates the idle fence, attempt consumption, staged response, and the continuation budget.
@@ -517,8 +524,14 @@ def preflightResponse (blocks : List ResponseBlock)
         state
   | none => state
 
--- Once authority is established, non-object/truncated transports and malformed batches
--- project to a normal stop with no executable calls; ordinary responses remain untouched.
+-- The singleton result-call batch shape shared by transport projection and traces.
+def singleCallBatch (verdict : Verdict) : List ResponseBlock :=
+  [.cwCall 1 (some verdict)]
+
+-- Once authority is established, non-object/truncated transports, malformed batches,
+-- and schema-invalid payload singletons alike project to a normal stop with no
+-- executable calls; only a batch whose plan stays non-invalid retains its calls.
+-- Ordinary responses remain untouched.
 structure HostProjection where
   executable : List ResponseBlock
   terminate : Bool
@@ -532,7 +545,17 @@ def projectOwnedTransport (nativeShapeValid : Bool)
         if !nativeShapeValid || !validResponseBatch blocks then
           ⟨[], true, preflightResponse [.malformed] state⟩
         else
-          ⟨blocks, false, preflightResponse blocks state⟩
+          let projected := preflightResponse blocks state
+          match projected.active with
+          | some projectedAttempt =>
+              if projectedAttempt.planned == ResponsePlan.invalid then
+                -- A payload-invalid singleton ends before native schema-error
+                -- follow-up: no executable calls, a normal stop, and the
+                -- captured diagnostic charged once at settlement.
+                ⟨[], true, projected⟩
+              else
+                ⟨blocks, false, projected⟩
+          | none => ⟨blocks, false, projected⟩
       else
         ⟨blocks, false, state⟩
   | none => ⟨blocks, false, state⟩
@@ -542,6 +565,12 @@ def NativeTransportSafety : Prop :=
     decisionAuthorized attempt = true → attempt.captured = false →
     ∀ blocks, (projectOwnedTransport false blocks state).executable = [] ∧
       (projectOwnedTransport false blocks state).terminate = true) ∧
+  (∀ state attempt, state.active = some attempt →
+    decisionAuthorized attempt = true → attempt.captured = false →
+    ∀ blocks, validResponseBatch blocks = true →
+      provisionalPlan attempt.staged blocks = ResponsePlan.invalid →
+      (projectOwnedTransport true blocks state).executable = [] ∧
+        (projectOwnedTransport true blocks state).terminate = true) ∧
   (∀ state, state.active = none → ∀ nativeShape blocks,
     projectOwnedTransport nativeShape blocks state = ⟨blocks, false, state⟩)
 
@@ -553,9 +582,14 @@ def NativeTransportSafety : Prop :=
 -- host's compaction/branch-summary preparations. Scheduling, parser transport, metadata
 -- authenticity, and durable I/O remain explicit external assumptions.
 theorem native_transport_is_guarded : NativeTransportSafety := by
-  constructor
+  refine ⟨?_, ?_, ?_⟩
   · intro state attempt active authorized openWindow blocks
     simp [projectOwnedTransport, active, authorized, openWindow]
+  · intro state attempt active authorized openWindow blocks batchValid
+      planInvalid
+    simp only [projectOwnedTransport, active, authorized, openWindow,
+      Bool.not_false, Bool.and_self, Bool.not_true, batchValid]
+    simp [preflightResponse, active, authorized, openWindow, planInvalid]
   · intro state noAttempt nativeShape blocks
     simp [projectOwnedTransport, noAttempt]
 
@@ -758,9 +792,6 @@ def environmentAdmitted (environment : EnvironmentAssumptions) : Prop :=
     environment.responseCompletes = true ∧
     environment.settlementOccurs = true ∧
     environment.publicationDurable = true
-
-def singleCallBatch (verdict : Verdict) : List ResponseBlock :=
-  [.cwCall 1 (some verdict)]
 
 def invalidBatch : List ResponseBlock :=
   [.visibleText]
@@ -1423,8 +1454,9 @@ theorem summary_projection_keeps_continuations_and_unowned_only :
 theorem reserved_function_declaration_is_minimal :
     reservedFunctionDeclaration.name = "cw" ∧
       reservedFunctionDeclaration.description = "don't use unless ask" ∧
-      reservedFunctionDeclaration.declaresArguments = false ∧
-      reservedFunctionDeclaration.exposesReasonEnums = false ∧
+      reservedFunctionDeclaration.declaresArguments = true ∧
+      reservedFunctionDeclaration.exposesReasonEnums = true ∧
+      reservedFunctionDeclaration.explainsParametersInDeclaration = false ∧
       reservedFunctionDeclaration.rootOnly = true := by
   simp [reservedFunctionDeclaration]
 
@@ -1623,8 +1655,9 @@ def ProcessSafety : Prop :=
     (∀ event, humanEventBody event = modelEventBody event) ∧
     (reservedFunctionDeclaration.name = "cw" ∧
       reservedFunctionDeclaration.description = "don't use unless ask" ∧
-      reservedFunctionDeclaration.declaresArguments = false ∧
-      reservedFunctionDeclaration.exposesReasonEnums = false ∧
+      reservedFunctionDeclaration.declaresArguments = true ∧
+      reservedFunctionDeclaration.exposesReasonEnums = true ∧
+      reservedFunctionDeclaration.explainsParametersInDeclaration = false ∧
       reservedFunctionDeclaration.rootOnly = true) ∧
     (∀ guidance reasonType reason,
       let envelope := buildContinuationEnvelope guidance reasonType reason

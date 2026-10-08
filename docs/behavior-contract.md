@@ -69,7 +69,7 @@ Historical reads follow the host's current ancestor path at startup and before i
 | Lock command | `/lock-continue-watchdog` | Human (TUI) |
 | Unlock command | `/unlock-continue-watchdog [reason]` | Human (TUI); reason optional; **untyped** (no `reasonType`) |
 | Status command | `/status-continue-watchdog` | Human (TUI); read-only trigger diagnosis |
-| Reserved decision function | `cw` with description `don't use unless ask` and an open empty-object schema | Model-visible function, registered once per root process; declaration and active membership never change; children never register it |
+| Reserved decision function | `cw` with description `don't use unless ask` and a constrained parameter schema (three required strings, `action` enum `continue`/`unlock`, `reason_type` union of effective configured types, `reason_content` 1–1000 code points nonblank) | Model-visible function, registered once per root process; declaration and active membership never change across phases (a lifecycle config load that changes effective reason constraints refreshes the same named declaration); children never register it |
 | Default `continuePrompt` | `Continue until user assistance is required.` | Configurable guidance embedded verbatim in the fixed model-visible continuation body |
 | Default `reasonTypes` | `JOB_DONE`, `WAIT_USER`, `JOB_BLOCKED`, `WAIT_CALLBACK` | Built-in allowed unlock-tool type list; a valid configured list **replaces** this default |
 | Shared continuation event heading | `Continue watchdog · continue · <TYPE> · <RFC3339 timestamp>` with `Suggested next step: <reason>` | One persistent canonical attributed next-action body for human history and model context; durable before semantic publication and continuation dispatch |
@@ -212,8 +212,8 @@ Unlock first makes `locked=false`, then invalidates the current aggregate grace 
 **Then** the plugin registers exactly one model function, `cw`, with:
 
 - name and label `cw`, description exactly `don't use unless ask`
-- parameter schema `Type.Object({}, { additionalProperties: true })` — no argument properties, required fields, action enum, or reason enum
-- no `promptSnippet`, `promptGuidelines`, field descriptions, or configured values anywhere in the declaration
+- parameter schema declaring `reason_content`, `reason_type`, and `action` as required strings: `action` enumerates `continue`/`unlock`, `reason_type` enumerates the exact-deduplicated union of effective `reasonTypes` and `continueReasonTypes` in configured spellings, and `reason_content` declares `minLength: 1`, `maxLength: 1000` Unicode code points, and `pattern: "\\S"`; `additionalProperties: true` retains extra-field tolerance
+- no `promptSnippet`, `promptGuidelines`, parameter `description`, `title`, `examples`, `default`, or configured values as explanatory text anywhere in the declaration — structural keywords are constraints, not descriptions
 
 Registration happens once per process and the declaration and active tool membership never change through locking, waiting, checking, correcting, continuing, or unlocking. The old `unlock_continue_watchdog` name is not retained as an alias; human commands and the shortcut keep their names. Child Pi processes in the watchdog process domain never register the function.
 
@@ -225,20 +225,22 @@ User takeover, manual unlock, branch or session replacement, ownership loss, shu
 
 ### Payload contract
 
-The decision prompt (not the public schema) teaches the function's JSON payloads:
+The public schema carries the structural contract; the decision prompt teaches the same payloads as guidance, never as the sole enforcement:
 
 - `action`: `continue` or `unlock`, matched case-insensitively after trimming. The retired `wait` action is invalid regardless of its fields; `wait_seconds` never creates timing behavior.
 - `continue` additionally requires `reason_type` matched case-insensitively against effective `continueReasonTypes` (default `WORK_REMAINS`, `VERIFYING`), normalized uppercase.
 - `unlock` additionally requires `reason_type` matched case-insensitively against effective `reasonTypes` (default `JOB_DONE`, `WAIT_USER`, `JOB_BLOCKED`, `WAIT_CALLBACK`), normalized uppercase.
 - `reason_content` is a string, non-empty after trimming, at most 1000 Unicode code points; the prompt gives 500 as guidance, never as a stricter acceptance limit.
 
-Missing fields, wrong types, unrecognized actions or reason types, and invalid bounds are rejected without coercion or truncation. XML and prose are never parsed as a result.
+Before native schema validation, a pure `prepareArguments` compatibility hook normalizes compatible inputs: it trims `reason_content`, lowercases a valid `action`, and rewrites `reason_type` to the matched configured spelling for that action. It never supplies missing fields, coerces non-strings, changes an invalid action, or truncates a reason. For a config like `["ß"]`, `ß` is admitted and `SS` stays rejected — uppercase is the outcome representation, never an input alias.
+
+Missing fields, wrong types, unrecognized actions or reason types, and invalid bounds are rejected without coercion or truncation. Union membership in `reason_type` does not authorize the wrong action: a type configured only for continue still fails for unlock and vice versa. XML and prose are never parsed as a result.
 
 ### Batch preflight and staging
 
 During a confirmed decision the watchdog allows only `cw` to execute, without changing the declared or active tool list. The complete assistant batch is inspected at the owned `message_end` before any of its tools run: it must contain exactly one `cw` call and no other tool call. The batch's tool-call identities are recorded so `execute(toolCallId, ...)` correlates to that message and attempt; replayed identifiers and provisional or foreign runs never authorize.
 
-A response with no result call, duplicate result calls, an unrelated/unknown tool call, visible prose, a non-object container, or truncation is invalid as a whole. Project it to a normal stop with no executable calls before native dispatch; neither work side effects nor a valid-looking partial verdict may escape. No per-call result is required for suppressed calls. The response counts once and does not cause an unbudgeted native follow-up. For an admissible singleton, preserve the executable call and required thinking until dispatch.
+A response with no result call, duplicate result calls, an unrelated/unknown tool call, visible prose, a non-object container, or truncation is invalid as a whole. A singleton cw call whose arguments fail the payload contract — missing fields, non-strings, invalid actions — is invalid the same way. Both project to a normal stop with no executable calls before native dispatch, so Pi's schema-error path never requests a follow-up the watchdog did not budget; neither work side effects nor a valid-looking partial verdict may escape. No per-call result is required for suppressed calls. The response counts once as invalid at settlement, without a continuation retry charge or a raw-payload diagnostic. For a valid plan, preserve the executable call and required thinking until dispatch.
 
 For one authorized call, `execute` stages either a validated verdict or a named validation error and returns a short result with `terminate: true` for both cases; an authorized validation error is never thrown into an uncontrolled native follow-up loop. At authoritative settlement the staged outcome is finalized once, with fresh ownership and activity checks; a valid-looking response whose call never executed counts as an invalid missing-result response.
 
@@ -408,7 +410,7 @@ These examples are the accepted product contract. Each is externally observable 
 **And when** ordinary work calls `cw` before any decision attempt exists
 **Then**
 
-- an object-shaped call receives `This function is reserved for the plugin. Please try another function.`; a non-object container may receive Pi's native schema diagnostic instead. In either case, lock state, both budgets, and hooks are unchanged, unrelated tools remain available, and the run is not terminated.
+- a schema-admissible object-shaped call receives `This function is reserved for the plugin. Please try another function.`; a schema-invalid or non-object call may receive Pi's native schema diagnostic instead. In either case, lock state, both budgets, and hooks are unchanged, unrelated tools remain available, and the run is not terminated.
 
 **And when** a decision response mixes `cw` with another tool call
 **Then**

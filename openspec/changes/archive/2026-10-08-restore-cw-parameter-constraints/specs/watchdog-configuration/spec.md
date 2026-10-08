@@ -1,10 +1,4 @@
-# watchdog-configuration Specification
-
-## Purpose
-
-Defines which configuration keys the continue watchdog honors and how removed keys are reported, so a setting never appears accepted while having no effect.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Effective configuration keys
 The watchdog SHALL honor these configuration keys with existing per-field validation and precedence of built-ins, global, then trusted project:
@@ -40,29 +34,3 @@ The watchdog SHALL honor these configuration keys with existing per-field valida
 - **WHEN** a higher-precedence configuration supplies an invalid reason list
 - **THEN** schema generation and runtime validation use the same existing valid fallback
 - **AND** no empty enum or contradictory declaration is published
-
-### Requirement: Removed keys produce an error diagnostic
-A configuration layer containing `jevWaitCheck` SHALL produce an error-level diagnostic naming it as removed and without effect. The diagnostic SHALL not print nested values or credentials. `decisionPrompt` and `continueReasonTypes` SHALL remain active keys rather than removed keys. Other valid values SHALL still apply and extension load SHALL not fail. Configuration migration SHALL not modify credentials, environment variables, consumer settings, or user configuration files.
-
-#### Scenario: Old config with decisionPrompt
-- **WHEN** valid `decisionPrompt`, `continueReasonTypes`, and `maxRetries` settings are present
-- **THEN** all apply without removed-key diagnostics
-
-#### Scenario: Removed key is not reported as merely unsupported
-- **WHEN** `jevWaitCheck` is present with credentials or `enabled: false`
-- **THEN** the diagnostic identifies the removed key without exposing its nested values
-- **AND** it activates no classifier request and valid neighboring values still apply
-
-#### Scenario: Old config with jevWaitCheck
-- **GIVEN** global config sets `jevWaitCheck` with an API key and `maxRetries: 5`
-- **WHEN** configuration loads
-- **THEN** an error diagnostic names `jevWaitCheck` as removed without displaying its values
-- **AND** `maxRetries` 5 applies, load succeeds, and no jev request occurs
-
-### Requirement: Removed integration does not resolve shared credentials
-The continue watchdog SHALL NOT resolve TypeSafe or OpenRouter credentials for a jev classifier or review, infer enablement from their availability, or make either kind of jev request. It SHALL NOT remove or modify credentials or integrations used by other providers or extensions.
-
-#### Scenario: Shared key remains available
-- **WHEN** Pi or the environment contains TypeSafe or OpenRouter credentials
-- **THEN** ordinary settlement and decision processing make no jev classification or review request
-- **AND** those credentials remain unchanged for unrelated users of them

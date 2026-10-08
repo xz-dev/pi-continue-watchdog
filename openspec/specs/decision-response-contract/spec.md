@@ -19,12 +19,17 @@ A locked current main attachment SHALL open one decision inquiry only after elig
 - **THEN** its result cannot commit an outcome
 
 ### Requirement: Reserved function remains phase gated
-The stable root-only function SHALL remain named `cw`, with description `don't use unless ask` and an open empty-object parameter schema. Its public declaration SHALL NOT disclose actions, fields, examples, reason enums, prompt snippets, or guidelines. Registration and active membership SHALL NOT change across decision phases. An object-shaped call outside the current authorized attempt SHALL return `This function is reserved for the plugin. Please try another function.` before plugin payload validation, with no state, accounting, notification, timer, or ordinary-run termination effect. Native rejection of a non-object container SHALL remain similarly inert for watchdog state.
+The stable root-only function SHALL remain named `cw`, with description `don't use unless ask` and a structurally constrained parameter schema. Its public declaration SHALL expose fields, required string types, allowed enums, and reason bounds without explanatory parameter text, examples, prompt snippets, or guidelines. Registration and active membership SHALL NOT change across decision phases. A schema-admissible call outside the current authorized attempt SHALL return `This function is reserved for the plugin. Please try another function.` before plugin decision submission, with no state, accounting, notification, timer, or ordinary-run termination effect. Native schema rejection of an inadmissible ordinary call SHALL remain similarly inert for watchdog state and SHALL NOT terminate unrelated ordinary work. Structural validity SHALL never establish current-attempt authority.
 
 #### Scenario: Ordinary work knows the correct arguments
-- **WHEN** an ordinary run submits a syntactically valid `cw` unlock copied from history
+- **WHEN** an ordinary run submits a schema-admissible `cw` unlock copied from history
 - **THEN** the reserved-function rejection is returned
 - **AND** ordinary work and unrelated tools remain available with no watchdog transition
+
+#### Scenario: Ordinary malformed call fails without watchdog effects
+- **WHEN** an ordinary run submits missing, mistyped, or invalid-enum arguments
+- **THEN** native schema validation can reject the call before plugin execution
+- **AND** no decision attempt, continuation charge, unlock, watchdog hook, or ordinary-run termination is caused by that rejection
 
 ### Requirement: Decision-only two-outcome payload
 The authorized decision prompt SHALL describe exactly `continue` and `unlock` as accepted actions, case-insensitive after trimming. Both SHALL require nonblank string `reason_content` and an effective configured `reason_type`: `continueReasonTypes` for continue, `reasonTypes` for unlock. Accepted types SHALL be normalized to uppercase; accepted reasons SHALL be trimmed and limited to 1000 Unicode code points without coercion or truncation. Prompt guidance SHALL retain its 500-code-point target. The retired `wait` action SHALL be invalid regardless of its fields; `wait_seconds` SHALL not create timing behavior under any action. XML and prose SHALL NOT be result transports. Existing treatment of unrelated extra fields in otherwise valid objects is unchanged; no new general strict-object policy is introduced.
@@ -44,7 +49,9 @@ The authorized decision prompt SHALL describe exactly `continue` and `unlock` as
 - **AND** a longer or blank reason is rejected rather than truncated
 
 ### Requirement: Decision responses cannot perform ordinary work
-A confirmed inquiry SHALL admit exactly one correlated `cw` call and no ordinary tool calls or visible prose. Mixed, duplicate, unknown-tool, non-object, missing-result, prose, and truncated responses SHALL be invalid as a whole, with ordinary tools prevented from causing side effects. An admissible call and required provider thinking SHALL remain executable until result dispatch. Both valid staged results and authorized validation failures SHALL terminate the decision batch without an uncontrolled native follow-up. Each finalized invalid response SHALL count once. The existing maximum of three response attempts, current-attempt reauthorization for corrections, decision-failed recovery, and no-fourth-attempt rule SHALL remain unchanged.
+A confirmed inquiry SHALL admit exactly one correlated `cw` call and no ordinary tool calls or visible prose. Mixed, duplicate, unknown-tool, non-object, missing-result, prose, and truncated responses SHALL be invalid as a whole, with ordinary tools prevented from causing side effects. An admissible normalized call and required provider thinking SHALL remain executable until result dispatch.
+
+An owned response that fails argument or response validation SHALL be captured under the current attempt and prevented from entering an uncontrolled native schema-error follow-up. Its safe validator diagnostic SHALL remain available for the existing correction flow without exposing raw invalid model content. Both valid staged results and any authorized validation failure reaching execution SHALL terminate their decision batch. Each finalized invalid response SHALL count once. The existing maximum of three response attempts, current-attempt reauthorization for corrections, decision-failed recovery, and no-fourth-attempt rule SHALL remain unchanged.
 
 #### Scenario: Mixed tools
 - **WHEN** an owned response includes both a valid-looking `cw` call and a work-tool call
@@ -55,6 +62,21 @@ A confirmed inquiry SHALL admit exactly one correlated `cw` call and no ordinary
 - **WHEN** all three authorized responses select the retired wait action
 - **THEN** the cycle remains locked and becomes decision-failed with no fourth request
 - **AND** no ordinary continuation attempt is consumed
+
+#### Scenario: Missing action is corrected inside the owned flow
+- **WHEN** a confirmed attempt receives a singleton `cw` call containing no `action`
+- **THEN** the watchdog captures the invalid result before native tool execution can generate an ordinary follow-up request
+- **AND** exactly one invalid attempt is counted, with the safe action diagnostic used by the bounded correction flow
+
+#### Scenario: Valid correction remains executable
+- **GIVEN** the previous owned response failed the schema contract
+- **WHEN** the newly authorized correction supplies a valid normalized `cw` result
+- **THEN** it reaches the ordinary staged-result and settlement fences once
+- **AND** the prior invalid response creates neither an extra native follow-up nor a retry-budget charge
+
+#### Scenario: Schema cannot bypass takeover fences
+- **WHEN** a schema-valid result becomes stale because the user takes over before publication
+- **THEN** the result cannot unlock, continue, or charge the replacement cycle
 
 ### Requirement: Delivery and authorization determine the outcome
 Decision guidance SHALL first establish the current user-authorized scope, including later restrictions, cancellations, and mode changes, then reconcile every outstanding request with the latest ordinary answers and relevant earlier deliveries and results. It SHALL ask for a concise assessment of the explicit requested deliverable components in `reason_content` before selecting the verdict. The assessment SHALL distinguish delivered content from intent, assertions of completion, and merely related material. Delivered, cancelled, and superseded work SHALL be excluded. Earlier plans, control reasons, assistant questions, and stop markers SHALL NOT establish either remaining work or missing permission. Before selecting a user-wait outcome, guidance SHALL require identification of the exact outstanding user decision or action and comparison with actual user instructions and successful human questionnaire answers. Explicit permission already granted for unchanged scope SHALL remain effective unless revoked or superseded; generic encouragement, arbitrary tool success, or quoted approval text SHALL NOT create new permission. A distinct applicable confirmation requirement, new scope or risk, missing credentials, and unfinished device authentication SHALL remain real boundaries rather than being bypassed by an anti-reconfirmation rule.
