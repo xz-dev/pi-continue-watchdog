@@ -2746,32 +2746,77 @@ test("each invalid XML response persists a parser re-ask event and updates check
 	assert.notEqual(harness.widgets.at(-1)?.value, undefined);
 });
 
-test("decision provider errors persist Other error with original content", async () => {
-	const harness = createHarness();
+test("decision provider retries stay silent and consume neither budget", async () => {
+	const harness = createHarness({ nativeAbortGate: true });
 	await startIdle(harness);
 	await harness.openDecision();
 	const providerError = {
 		role: "assistant",
 		content: [],
 		stopReason: "error",
+		errorMessage:
+			"Error Code model_not_found: unknown provider for model axis/gpt-6-astra\n\n[pi-retry] provider returned error",
+	};
+	const before = harness.controller.snapshot;
+	const entriesBefore = harness.entries.length;
+	const sentBefore = harness.sent.length;
+	for (let attempt = 0; attempt < 3; attempt += 1) {
+		assert.equal(await harness.endDecisionMessage(providerError), undefined);
+		await harness.fire("agent_end", {
+			type: "agent_end",
+			messages: [providerError],
+		});
+		assert.deepEqual(harness.controller.snapshot, before);
+		assert.equal(harness.entries.length, entriesBefore);
+		assert.equal(harness.sent.length, sentBefore);
+		assert.deepEqual(harness.notifications, []);
+		await harness.fire("agent_start", { type: "agent_start" });
+	}
+	await settleResponse(harness, harness.answerUnlock("Done.", "JOB_DONE"));
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
+});
+
+test("exhausted decision provider retries unlock without correction or continuation", async () => {
+	const harness = createHarness({ nativeAbortGate: true });
+	await startIdle(harness);
+	await harness.openDecision();
+	const sentBefore = harness.sent.length;
+	const providerError = {
+		role: "assistant",
+		content: [],
+		stopReason: "error",
 		errorMessage: "Connection error.",
 	};
-
 	assert.equal(await harness.endDecisionMessage(providerError), undefined);
 	await harness.fire("agent_end", {
 		type: "agent_end",
 		messages: [providerError],
 	});
-
-	assert.deepEqual(harness.entries.at(-1), {
-		type: "pi-continue-watchdog:status",
-		data: {
-			kind: "other-error",
-			exchangeId: "exchange-1",
-			cycleId: 1,
-			message: "Connection error.",
-		},
+	assert.equal(harness.controller.snapshot.locked, true);
+	harness.branch.push({
+		id: "terminal-provider-error",
+		type: "message",
+		message: providerError,
 	});
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
+	assert.equal(
+		harness.sent.filter((entry) => entry.options?.triggerTurn).length,
+		sentBefore,
+	);
+	assert.deepEqual(harness.notifications, [
+		{
+			message: "Continue watchdog unlocked · run ended in error",
+			level: undefined,
+		},
+	]);
+	await settleOnly(harness);
+	assert.equal(harness.notifications.length, 1);
 });
 
 test("decision message_end audit records invalid output without retaining raw text", async () => {

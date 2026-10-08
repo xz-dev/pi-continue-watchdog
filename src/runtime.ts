@@ -388,13 +388,6 @@ function originalErrorMessage(error: unknown): string {
 		: "Unknown error";
 }
 
-function assistantErrorMessage(message: unknown): string {
-	if (typeof message !== "object" || message === null) return "Unknown error";
-	return originalErrorMessage(
-		(message as { readonly errorMessage?: unknown }).errorMessage,
-	);
-}
-
 /**
  * Re-present the argument snapshot a staged verdict already validated,
  * preserving the accepted input identity — action kind, matched configured
@@ -3165,23 +3158,7 @@ export function createDecisionRuntime(
 		// only a successful response or the final settled no-result may consume a
 		// decision attempt.
 		if (assistant !== undefined && isAbortedAssistant(assistant)) return;
-		if (assistant !== undefined && isErroredAssistant(assistant)) {
-			const active = activeDecision;
-			if (active !== null && owns(active.claim)) {
-				if (
-					!appendStatus({
-						kind: "other-error",
-						exchangeId: active.exchangeId,
-						cycleId: active.protocol.currentCycleId,
-						message: assistantErrorMessage(assistant),
-					}) ||
-					!owns(active.claim)
-				) {
-					silentlyAbandonDecision();
-				}
-			}
-			return;
-		}
+		if (assistant !== undefined && isErroredAssistant(assistant)) return;
 		const captured = capturedDecisionResponse;
 		if (
 			captured !== null &&
