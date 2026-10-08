@@ -64,6 +64,11 @@ interface MockReply {
 	readonly mixedToolName?: string;
 	readonly reasonType?: string;
 	readonly reason?: string;
+	/**
+	 * Raw cw argument object serialized verbatim. Overrides the action/
+	 * reasonType/reason shorthand for both valid and invalid cw replies.
+	 */
+	readonly args?: Record<string, unknown>;
 	readonly started?: () => void;
 	readonly text?: string;
 }
@@ -305,14 +310,16 @@ async function startMockServer(
 				// validation instead of being rejected at batch preflight as
 				// visible prose.
 				const argumentsJson =
-					reply.kind === "cw-invalid"
-						? (reply.text ?? "{}")
-						: JSON.stringify({
-								action: reply.action ?? "unlock",
-								reason_type: reply.reasonType ?? "JOB_DONE",
-								reason_content:
-									reply.reason ?? "All requested work is complete.",
-							});
+					reply.args !== undefined
+						? JSON.stringify(reply.args)
+						: reply.kind === "cw-invalid"
+							? (reply.text ?? "{}")
+							: JSON.stringify({
+									action: reply.action ?? "unlock",
+									reason_type: reply.reasonType ?? "JOB_DONE",
+									reason_content:
+										reply.reason ?? "All requested work is complete.",
+								});
 				sendSse(response, [
 					{
 						id,
@@ -750,7 +757,7 @@ test("packed native abort hides only the owned assistant notice through real Pi 
 	}
 });
 
-test("packed reserved function is advertised with minimal metadata to every request", {
+test("packed reserved function is advertised with its structural contract to every request", {
 	timeout: 180_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t);
@@ -769,9 +776,60 @@ test("packed reserved function is advertised with minimal metadata to every requ
 			);
 			assert.ok(declared, `expected ${TOOL_NAME} in request tools`);
 			assert.equal(declared.function?.description, "don't use unless ask");
-			const parameters = JSON.stringify(declared.function?.parameters);
-			assert.equal(parameters.includes("reason_type"), false);
-			assert.equal(parameters.includes("action"), false);
+			const parameters = declared.function?.parameters as {
+				type?: string;
+				required?: string[];
+				additionalProperties?: boolean;
+				properties?: Record<
+					string,
+					{
+						type?: string;
+						enum?: string[];
+						minLength?: number;
+						maxLength?: number;
+						pattern?: string;
+						description?: string;
+						title?: string;
+						examples?: unknown;
+						default?: unknown;
+					}
+				>;
+			};
+			assert.ok(parameters, "expected a serialized parameter schema");
+			assert.equal(parameters.type, "object");
+			assert.equal(parameters.additionalProperties, true);
+			assert.deepEqual([...(parameters.required ?? [])].sort(), [
+				"action",
+				"reason_content",
+				"reason_type",
+			]);
+			assert.deepEqual(
+				[...(parameters.properties?.action?.enum ?? [])].sort(),
+				["continue", "unlock"],
+			);
+			assert.deepEqual(parameters.properties?.reason_type?.enum, [
+				"JOB_DONE",
+				"WAIT_USER",
+				"JOB_BLOCKED",
+				"WAIT_CALLBACK",
+				"WORK_REMAINS",
+				"VERIFYING",
+			]);
+			const reasonContent = parameters.properties?.reason_content;
+			assert.equal(reasonContent?.type, "string");
+			assert.equal(reasonContent?.minLength, 1);
+			assert.equal(reasonContent?.maxLength, 1000);
+			assert.equal(reasonContent?.pattern, "\\S");
+			// Structural constraints reach the model without explanatory
+			// annotations: no parameter description, title, example, or default.
+			for (const [name, property] of Object.entries(
+				parameters.properties ?? {},
+			)) {
+				assert.equal(property.description, undefined, name);
+				assert.equal(property.title, undefined, name);
+				assert.equal(property.examples, undefined, name);
+				assert.equal(property.default, undefined, name);
+			}
 		}
 		// No startup usage guidance advertises the protocol in ordinary requests.
 		for (const request of requests) {
@@ -885,6 +943,78 @@ test("packed unauthorized proactive call returns the reserved error and continue
 			envelopes.some((envelope) => envelope.name === "user-ready"),
 			false,
 			"no user-ready before any authorized decision",
+		);
+	} finally {
+		await shutdownSession(session);
+	}
+});
+
+test("packed malformed ordinary cw receives a native error and ordinary work continues", {
+	timeout: 180_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t, { withSemanticProbe: true });
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "cw", args: { action: "bogus" } },
+		{ kind: "text", text: "Ordinary work continued after validation." },
+	]);
+	const notifications: string[] = [];
+	const { session } = await createSession(fixture, baseUrl, {
+		uiContext: createRpcUiContext(notifications),
+	});
+	try {
+		await session.prompt(
+			"Continue ordinary work after rejecting invalid arguments.",
+		);
+		await waitForSessionIdle(session, 30_000, "ordinary native rejection");
+		assert.equal(
+			requests.length,
+			2,
+			"native error must allow an ordinary follow-up",
+		);
+		assert.equal(requests.some(isDecisionRequest), false);
+		const nativeError = requests[1].messages.find(
+			(message) => message.role === "tool" && message.tool_call_id,
+		);
+		assert.ok(
+			nativeError,
+			"follow-up must receive the actual native tool result",
+		);
+		assert.match(contentText(nativeError), /Validation failed for tool "cw"/);
+		assert.doesNotMatch(contentText(nativeError), /reserved for the plugin/);
+		const branch = session.sessionManager.getBranch();
+		assert.ok(
+			branch.some(
+				(entry) =>
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					contentText(entry.message).includes(
+						"Ordinary work continued after validation.",
+					),
+			),
+			"ordinary response must complete rather than terminate at the schema error",
+		);
+		assert.equal(
+			branch.some(
+				(entry) =>
+					entry.type === "custom" &&
+					entry.customType === "pi-continue-watchdog:decision-audit",
+			),
+			false,
+			"ordinary malformed call must not be accounted as a decision response",
+		);
+		await session.prompt("/status-continue-watchdog");
+		assert.match(notifications.at(-1) ?? "", /Lock: locked/);
+		assert.match(notifications.at(-1) ?? "", /Attempt: 0\//);
+		assert.equal(requests.length, 2, "status inspection must not start work");
+		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
+		assert.equal(
+			envelopes.some(
+				(envelope) =>
+					envelope.name === "user-ready" ||
+					envelope.name === "watchdog-continued",
+			),
+			false,
+			"native rejection must neither unlock nor publish a continuation",
 		);
 	} finally {
 		await shutdownSession(session);
@@ -1656,9 +1786,11 @@ test("packed custom reasonTypes are matched case-insensitively in the decision",
 		{ kind: "text", text: "PR ready." },
 		{
 			kind: "cw",
-			action: "unlock",
-			reasonType: "needreview",
-			reason: "PR awaits review.",
+			args: {
+				action: " UNLOCK ",
+				reason_type: " needreview ",
+				reason_content: " PR awaits review. ",
+			},
 		},
 	]);
 	const { session } = await createSession(fixture, baseUrl);
@@ -1667,6 +1799,23 @@ test("packed custom reasonTypes are matched case-insensitively in the decision",
 		await waitForSessionIdle(session, 30_000, "first turn");
 		await waitFor(() => requests.length >= 2, 120_000, "decision request");
 		await waitForSessionIdle(session, 60_000, "decision turn");
+		// The effective custom reason spelling reaches the serialized schema;
+		// preparation normalizes the compatible padded/mixed-case input before
+		// native enum validation, so the configured casing still completes.
+		const declared = requests
+			.flatMap((request) => request.tools ?? [])
+			.find((tool) => tool.function?.name === TOOL_NAME);
+		const reasonTypeEnum = (
+			declared?.function?.parameters as {
+				properties?: { reason_type?: { enum?: string[] } };
+			}
+		)?.properties?.reason_type?.enum;
+		assert.deepEqual(reasonTypeEnum, [
+			"NeedReview",
+			"shipped",
+			"WORK_REMAINS",
+			"VERIFYING",
+		]);
 		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
 		const ready = envelopes.filter(
 			(envelope) => envelope.name === "user-ready",
@@ -1676,6 +1825,138 @@ test("packed custom reasonTypes are matched case-insensitively in the decision",
 			(ready[0].values as { REASON_TYPE?: string }).REASON_TYPE,
 			"NEEDREVIEW",
 		);
+		assert.equal(
+			(ready[0].values as { REASON?: string }).REASON,
+			"PR awaits review.",
+		);
+	} finally {
+		await shutdownSession(session);
+	}
+});
+
+/**
+ * Native invalid-payload regression (S7/S8): three singleton cw calls whose
+ * arguments are missing or carry an invalid action, then one valid
+ * correction. The owned message_end preflight must stop each invalid payload
+ * before native schema-error follow-up: exactly three decision inquiries,
+ * two corrections with the safe validator diagnostic, no fourth request, and
+ * the valid correction executes/stages/settles once.
+ */
+test("packed invalid cw payloads stop before native schema follow-up", {
+	timeout: 360_000,
+}, async (t) => {
+	const outputRoot = await mkdtemp(join(tmpdir(), "cw-invalid-payloads-"));
+	const capturePath = join(outputRoot, "requests.json");
+	t.after(async () => rm(outputRoot, { recursive: true, force: true }));
+
+	const fixture = await makePackedFixture(t, { withSemanticProbe: true });
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "text", text: "Work settles." },
+		// Attempt 1: singleton cw call missing every field.
+		{ kind: "cw-invalid", text: "{}" },
+		// Attempt 2: singleton cw call with an invalid action enum value.
+		{
+			kind: "cw-invalid",
+			text: '{"action":"bogus","reason_type":"JOB_DONE","reason_content":"Bad action."}',
+		},
+		// Attempt 3: missing action but otherwise plausible fields.
+		{
+			kind: "cw-invalid",
+			text: '{"reason_type":"JOB_DONE","reason_content":"Missing action."}',
+		},
+	]);
+	const { session } = await createSession(fixture, baseUrl);
+	try {
+		await session.prompt("Do the work.");
+		await waitForSessionIdle(session, 30_000, "first turn");
+		await waitFor(() => requests.length >= 2, 120_000, "first decision");
+		await waitFor(() => requests.length >= 4, 240_000, "corrections");
+		await waitForSessionIdle(session, 60_000, "final decision turn");
+		const decisionRequests = requests.filter((request) =>
+			isDecisionRequest(request),
+		);
+		assert.equal(decisionRequests.length, 3);
+		// Corrections carry the safe validator diagnostic, never the raw
+		// invalid payload or a native JSON-schema error dump.
+		for (const correction of decisionRequests.slice(1)) {
+			assert.match(
+				JSON.stringify(correction.messages),
+				/previous decision response was invalid/,
+			);
+			assert.doesNotMatch(
+				JSON.stringify(correction.messages),
+				/Validation failed for tool/,
+			);
+		}
+		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
+		assert.ok(
+			envelopes.some(
+				(envelope) =>
+					envelope.name === "user-ready" &&
+					(envelope.values as { STOP_KIND?: string } | undefined)?.STOP_KIND ===
+						"DECISION_FAILED",
+			),
+			"expected DECISION_FAILED user-ready",
+		);
+		// No fourth native request follows the third invalid payload: the
+		// settlement alone counts once; no continuation retry is charged.
+		await new Promise((resolve) => setTimeout(resolve, 12_000));
+		assert.equal(requests.length, 4);
+	} finally {
+		try {
+			await writeFile(capturePath, JSON.stringify(requests, null, 2), "utf8");
+		} catch {
+			// Fixture-owned capture is best-effort; assertions are the gate.
+		}
+		await shutdownSession(session);
+	}
+});
+
+/**
+ * S8: one schema-invalid owned response then a valid correction. The invalid
+ * payload must not generate a native schema-error follow-up request: the
+ * correction arrives exactly once as the bounded re-ask, and the valid call
+ * executes/stages/settles once.
+ */
+test("packed schema-invalid payload then valid correction settles once", {
+	timeout: 360_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t, { withSemanticProbe: true });
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "text", text: "Work settles." },
+		// Schema-invalid under the constrained contract: action enum violation.
+		{
+			kind: "cw-invalid",
+			text: '{"action":"bogus","reason_type":"JOB_DONE","reason_content":"Wrong action."}',
+		},
+		{ kind: "cw", action: "unlock", reason: "Corrected." },
+	]);
+	const { session } = await createSession(fixture, baseUrl);
+	try {
+		await session.prompt("Do the work.");
+		await waitForSessionIdle(session, 30_000, "first turn");
+		await waitFor(() => requests.length >= 2, 120_000, "first decision");
+		await waitFor(() => requests.length >= 3, 120_000, "correction");
+		await waitForSessionIdle(session, 60_000, "correction turn");
+		const decisionRequests = requests.filter((request) =>
+			isDecisionRequest(request),
+		);
+		assert.equal(decisionRequests.length, 2);
+		// The correction prompt carries the watchdog's safe diagnostic, not a
+		// native schema error or the raw invalid arguments.
+		assert.match(
+			JSON.stringify(decisionRequests[1].messages),
+			/previous decision response was invalid/,
+		);
+		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
+		const ready = envelopes.filter(
+			(envelope) => envelope.name === "user-ready",
+		);
+		assert.equal(ready.length, 1);
+		assert.equal((ready[0].values as { REASON?: string }).REASON, "Corrected.");
+		// No extra native follow-up: ordinary + inquiry + correction = 3.
+		await new Promise((resolve) => setTimeout(resolve, 12_000));
+		assert.equal(requests.length, 3);
 	} finally {
 		await shutdownSession(session);
 	}

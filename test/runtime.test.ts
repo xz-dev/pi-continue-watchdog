@@ -41,6 +41,7 @@ import {
 	buildDecisionPrompt,
 	DECISION_TOOL_BLOCK_REASON,
 	MISSING_DECISION_CALL_ERROR,
+	prepareDecisionArguments,
 } from "../src/decision-protocol.js";
 import {
 	createHubAttachmentInstance,
@@ -166,6 +167,7 @@ interface Harness {
 	readonly spliceAttempts: string[];
 	aborts: number;
 	registeredTools: string[];
+	decisionToolDefinitions: unknown[];
 	decisionToolDefinition: {
 		readonly execute: (
 			toolCallId: string,
@@ -452,6 +454,7 @@ function createHarness(options?: {
 		streaming: false,
 		triggeredTurns: 0,
 		registeredTools: [] as string[],
+		decisionToolDefinitions: [] as unknown[],
 		decisionToolDefinition: null,
 		submissionLog,
 	} as Harness;
@@ -525,6 +528,7 @@ function createHarness(options?: {
 		},
 		registerTool(definition: { readonly name: string }): void {
 			harness.registeredTools.push(definition.name);
+			harness.decisionToolDefinitions.push(definition);
 			harness.decisionToolDefinition =
 				definition as unknown as Harness["decisionToolDefinition"];
 		},
@@ -4972,12 +4976,23 @@ test("takeover preserves images and reissues the complete payload once", async (
 	}
 });
 
-test("authorized validation failure projects a real tool error without losing termination", async () => {
+test("authorized validation failure reaching execution still marks its tool result", async () => {
+	// Defense-in-depth: if an authorized invalid call reaches execute (native
+	// dispatch raced ahead of preflight), the staged invalid result still
+	// surfaces isError through the tool_result projection. Preflight removal
+	// is the primary path; this seam covers the authorized execution fallback.
 	const harness = createHarness();
 	await startIdle(harness);
 	await harness.openDecision();
 	const call = cwCall({ action: "bad" });
 	await harness.endDecisionMessage(call.message);
+	// Preflight captured the batch; an authorized direct execute for the
+	// recorded call id stages the validation failure.
+	const staged = await harness.decisionToolDefinition?.execute(
+		call.toolCallId,
+		call.args,
+	);
+	assert.equal(staged?.details?.outcome, "invalid");
 	const event = {
 		type: "tool_result",
 		toolName: "cw",
@@ -5471,5 +5486,458 @@ test("UI-only status publication resists synchronous same-idle reentry", async (
 		hooks.filter((name) => name.includes("user")).length <= 1,
 		"at most one user-ready hook",
 	);
+	assert.equal(harness.controller.snapshot.locked, false);
+});
+
+function cwParametersOf(definition: unknown): {
+	readonly required?: readonly string[];
+	readonly properties?: {
+		readonly action?: { readonly enum?: readonly string[] };
+		readonly reason_type?: { readonly enum?: readonly string[] };
+		readonly reason_content?: {
+			readonly minLength?: number;
+			readonly maxLength?: number;
+			readonly pattern?: string;
+			readonly description?: string;
+		};
+	};
+	readonly additionalProperties?: boolean;
+} {
+	return (definition as { parameters?: unknown })?.parameters as never;
+}
+
+test("cw registration derives its schema from effective custom constraints", async () => {
+	const harness = createHarness({
+		config: {
+			reasonTypes: ["NeedReview", "shipped"],
+			continueReasonTypes: ["verifying", "NeedReview"],
+		},
+	});
+	await startIdle(harness);
+	assert.deepEqual(harness.registeredTools, ["cw"]);
+	const parameters = cwParametersOf(harness.decisionToolDefinition);
+	assert.deepEqual([...(parameters.required ?? [])].sort(), [
+		"action",
+		"reason_content",
+		"reason_type",
+	]);
+	assert.deepEqual([...(parameters.properties?.action?.enum ?? [])].sort(), [
+		"continue",
+		"unlock",
+	]);
+	assert.deepEqual(parameters.properties?.reason_type?.enum, [
+		"NeedReview",
+		"shipped",
+		"verifying",
+	]);
+	assert.equal(parameters.properties?.reason_content?.minLength, 1);
+	assert.equal(parameters.properties?.reason_content?.maxLength, 1000);
+	assert.equal(parameters.properties?.reason_content?.pattern, "\\S");
+	assert.equal(parameters.properties?.reason_content?.description, undefined);
+	assert.equal(parameters.additionalProperties, true);
+	// One registration only: the initial declaration is not re-emitted.
+	assert.equal(harness.decisionToolDefinitions.length, 1);
+});
+
+test("cw declaration stays stable across decision phases", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	await harness.openDecision();
+	const declared = harness.decisionToolDefinition;
+	await settleResponse(harness, harness.answerContinue());
+	await harness.openDecision();
+	await settleResponse(harness, harness.answerUnlock());
+	// No phase transition re-registers the tool or changes its declaration.
+	assert.equal(harness.registeredTools.length, 1);
+	assert.equal(harness.decisionToolDefinitions.length, 1);
+	assert.equal(harness.decisionToolDefinition, declared);
+});
+
+test("changed effective constraints refresh only the same named declaration", async () => {
+	// A same-runtime main-handoff reload committing different effective reason
+	// types refreshes the same root `cw` declaration before the next decision;
+	// equal effective constraints never re-register, and an equal-config
+	// handoff emits nothing at all.
+	const hub = createObservableAgentHub();
+	const clock = new FakeClock();
+	const handlers = new Map<string, Handler[]>();
+	const holder = {
+		controller: null as ReturnType<typeof createLockDecisionController> | null,
+	};
+	const registered: unknown[] = [];
+	const configs = [
+		{
+			idleDelaySeconds: 3,
+			maxRetries: 3,
+			decisionPrompt: "Decide now.",
+			continuePrompt: "Continue compactly.",
+			reasonTypes: ["JOB_DONE"],
+			continueReasonTypes: ["WORK_REMAINS"],
+			unlockShortcut: "alt+u" as const,
+		},
+		{
+			idleDelaySeconds: 3,
+			maxRetries: 3,
+			decisionPrompt: "Decide now.",
+			continuePrompt: "Continue compactly.",
+			reasonTypes: ["NeedReview"],
+			continueReasonTypes: ["verifying"],
+			unlockShortcut: "alt+u" as const,
+		},
+	];
+	let loadCount = 0;
+	const instance = createHubAttachmentInstance();
+	const runtime = createDecisionRuntime({
+		pi: {
+			on(event: string, handler: Handler): void {
+				const list = handlers.get(event) ?? [];
+				list.push(handler);
+				handlers.set(event, list);
+			},
+			sendMessage(): void {},
+			appendEntry(): void {},
+			registerTool(definition: { readonly name: string }): void {
+				registered.push(definition);
+			},
+		} as unknown as ExtensionAPI,
+		hub,
+		attachmentInstance: instance,
+		controllerHolder: holder,
+		clock,
+		loadConfig: async () => ({
+			config: configs[Math.min(loadCount++, configs.length - 1)],
+			diagnostics: [],
+		}),
+	});
+	runtime.registerLifecycle();
+	const ctx = {
+		hasUI: false,
+		cwd: "/project",
+		isIdle: () => true,
+		isProjectTrusted: () => true,
+		sessionManager: { getSessionId: () => "main" },
+		ui: { notify(): void {} },
+	} as unknown as ExtensionContext;
+	for (const handler of handlers.get("session_start") ?? []) {
+		await handler({ type: "session_start" } as never, ctx);
+	}
+	assert.equal(registered.length, 1);
+	const initial = cwParametersOf(registered[0]);
+	assert.deepEqual(initial.properties?.reason_type?.enum, [
+		"JOB_DONE",
+		"WORK_REMAINS",
+	]);
+
+	// A UI usurper demotes the attachment; a same-runtime reclaim loads a new
+	// lifecycle config and refreshes only the same named declaration.
+	const usurper = hub.bind({
+		instance: createHubAttachmentInstance(),
+		sessionId: "usurper",
+		hasUI: true,
+	});
+	assert.ok(usurper.mainClaim);
+	hub.detach(usurper.attachment);
+	// The runtime's own attachment identity was bound at session_start; a
+	// probe bind on the same instance returns it unchanged.
+	const attachment = hub.bind({
+		instance,
+		sessionId: "main",
+		hasUI: true,
+	}).attachment;
+	hub.reclaimMain(attachment);
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(registered.length, 2);
+	assert.equal(
+		(registered[1] as { name?: string }).name,
+		"cw",
+		"same named root tool",
+	);
+	const refreshed = cwParametersOf(registered[1]);
+	assert.deepEqual(refreshed.properties?.reason_type?.enum, [
+		"NeedReview",
+		"verifying",
+	]);
+
+	// A second demote/reclaim cycle loads the same config a third time — equal
+	// effective constraints emit no further registration.
+	const usurper2 = hub.bind({
+		instance: createHubAttachmentInstance(),
+		sessionId: "usurper-2",
+		hasUI: true,
+	});
+	assert.ok(usurper2.mainClaim);
+	hub.detach(usurper2.attachment);
+	hub.reclaimMain(attachment);
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(registered.length, 2, "equal constraints never re-register");
+	runtime.shutdown();
+});
+
+test("allowlisted native refresh preserves a disabled cw membership", async () => {
+	// Pinned Pi behavior: registerTool() triggers a tool-registry refresh that
+	// adds every allowlisted registered tool to the active set — a
+	// user-disabled `cw` would be silently reactivated by a same-name
+	// replacement. The extension must snapshot and restore the pre-refresh
+	// active names through the public pi API on replacement only.
+	const hub = createObservableAgentHub();
+	const clock = new FakeClock();
+	const handlers = new Map<string, Handler[]>();
+	const holder = {
+		controller: null as ReturnType<typeof createLockDecisionController> | null,
+	};
+	const registered: unknown[] = [];
+	// Minimal host model: registered-but-disabled `cw` under an allowlist.
+	const allowedToolNames = new Set(["read", "cw"]);
+	const registry = new Map<string, unknown>();
+	let activeToolNames = ["read"];
+	const pi = {
+		on(event: string, handler: Handler): void {
+			const list = handlers.get(event) ?? [];
+			list.push(handler);
+			handlers.set(event, list);
+		},
+		sendMessage(): void {},
+		appendEntry(): void {},
+		registerTool(definition: { readonly name: string }): void {
+			const replacing = registry.has(definition.name);
+			registry.set(definition.name, definition);
+			registered.push(definition);
+			if (!replacing) {
+				// Native initial registration: the new extension tool is appended
+				// to the active set when it was not previously registered.
+				if (allowedToolNames.has(definition.name)) {
+					activeToolNames = [...activeToolNames, definition.name];
+				}
+				return;
+			}
+			// Simulate pinned Pi's allowlisted refresh: every allowlisted
+			// registered tool is pushed onto the active names regardless of
+			// prior disabled membership.
+			const next = activeToolNames.filter((name) => registry.has(name));
+			for (const name of registry.keys()) {
+				if (allowedToolNames.has(name)) next.push(name);
+			}
+			activeToolNames = [...new Set(next)];
+		},
+		getActiveTools(): string[] {
+			return [...activeToolNames];
+		},
+		setActiveTools(toolNames: string[]): void {
+			activeToolNames = [...new Set(toolNames)];
+		},
+	} as unknown as ExtensionAPI;
+	let loadCount = 0;
+	const configs = [
+		{
+			idleDelaySeconds: 3,
+			maxRetries: 3,
+			decisionPrompt: "Decide now.",
+			continuePrompt: "Continue compactly.",
+			reasonTypes: ["JOB_DONE"],
+			continueReasonTypes: ["WORK_REMAINS"],
+			unlockShortcut: "alt+u" as const,
+		},
+		{
+			idleDelaySeconds: 3,
+			maxRetries: 3,
+			decisionPrompt: "Decide now.",
+			continuePrompt: "Continue compactly.",
+			reasonTypes: ["NeedReview"],
+			continueReasonTypes: ["verifying"],
+			unlockShortcut: "alt+u" as const,
+		},
+	];
+	const instance = createHubAttachmentInstance();
+	const runtime = createDecisionRuntime({
+		pi,
+		hub,
+		attachmentInstance: instance,
+		controllerHolder: holder,
+		clock,
+		loadConfig: async () => ({
+			config: configs[Math.min(loadCount++, configs.length - 1)],
+			diagnostics: [],
+		}),
+	});
+	runtime.registerLifecycle();
+	const ctx = {
+		hasUI: false,
+		cwd: "/project",
+		isIdle: () => true,
+		isProjectTrusted: () => true,
+		sessionManager: { getSessionId: () => "main" },
+		ui: { notify(): void {} },
+	} as unknown as ExtensionContext;
+	for (const handler of handlers.get("session_start") ?? []) {
+		await handler({ type: "session_start" } as never, ctx);
+	}
+	// Initial registration: native membership behavior — `cw` becomes active.
+	assert.deepEqual(pi.getActiveTools(), ["read", "cw"]);
+	// The user disables `cw` afterwards; the registration stays in place.
+	pi.setActiveTools(["read"]);
+	assert.deepEqual(pi.getActiveTools(), ["read"]);
+
+	// Same-runtime demotion/reclaim commits a changed effective config and
+	// re-registers the same named tool; active membership must be preserved.
+	const usurper = hub.bind({
+		instance: createHubAttachmentInstance(),
+		sessionId: "usurper",
+		hasUI: true,
+	});
+	assert.ok(usurper.mainClaim);
+	hub.detach(usurper.attachment);
+	const attachment = hub.bind({
+		instance,
+		sessionId: "main",
+		hasUI: false,
+	}).attachment;
+	hub.reclaimMain(attachment);
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(registered.length, 2, "changed constraints re-registered");
+	const refreshed = cwParametersOf(registered[1]);
+	assert.deepEqual(refreshed.properties?.reason_type?.enum, [
+		"NeedReview",
+		"verifying",
+	]);
+	assert.deepEqual(
+		pi.getActiveTools(),
+		["read"],
+		"disabled cw must not be reactivated by the refresh",
+	);
+	runtime.shutdown();
+});
+
+test("invalid singleton cw payload stops with no executable calls pre-schema", async () => {
+	// S7 runtime seam: a batch-valid singleton cw whose arguments fail the
+	// payload contract is captured as invalid before any native schema-error
+	// follow-up — the projected message has no tool calls and a normal stop,
+	// so settlement counts exactly one invalid response and nothing else runs.
+	const harness = createHarness();
+	await startIdle(harness);
+	await harness.openDecision();
+	const projection = (await harness.endDecisionMessage(
+		cwCall({ reason_type: "JOB_DONE", reason_content: "No action." }).message,
+	)) as { message: { content: unknown[]; stopReason: string } };
+	assert.deepEqual(projection.message.content, []);
+	assert.equal(projection.message.stopReason, "stop");
+	// No call executed: the safe diagnostic comes from owned validation.
+	assert.deepEqual(harness.submissionLog, []);
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [projection.message],
+	});
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.controller.snapshot.locked, true);
+	const audit = harness.entries.findLast(
+		(entry) => entry.type === "pi-continue-watchdog:decision-audit",
+	);
+	assert.equal(
+		(audit?.data as { outcome?: string } | undefined)?.outcome,
+		"invalid",
+	);
+	assert.equal(
+		JSON.stringify(audit).includes("No action."),
+		false,
+		"audit carries the safe diagnostic, not raw arguments",
+	);
+});
+
+test("schema-invalid action enum singleton ends without native follow-up", async () => {
+	for (const args of [
+		{ action: "bogus", reason_type: "JOB_DONE", reason_content: "x" },
+		{ action: "wait", reason_type: "JOB_DONE", reason_content: "x" },
+	]) {
+		const harness = createHarness();
+		await startIdle(harness);
+		await harness.openDecision();
+		const projection = (await harness.endDecisionMessage(
+			cwCall(args).message,
+		)) as { message: { content: unknown[]; stopReason: string } };
+		assert.deepEqual(projection.message.content, [], JSON.stringify(args));
+		assert.equal(projection.message.stopReason, "stop");
+		assert.deepEqual(harness.submissionLog, []);
+		await harness.fire("agent_end", {
+			type: "agent_end",
+			messages: [projection.message],
+		});
+		harness.streaming = false;
+		await settleOnly(harness);
+		assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
+	}
+});
+
+test("compatible mixed-case input stays executable through preparation", async () => {
+	// `" UNLOCK "` remains a compatible admissible input: preparation
+	// lowercases the action before native enum validation, and the staged
+	// verdict settles once as an ordinary valid response.
+	const harness = createHarness();
+	await startIdle(harness);
+	await harness.openDecision();
+	const call = cwCall({
+		action: " UNLOCK ",
+		reason_type: " job_done ",
+		reason_content: " All done. ",
+	});
+	const prepared = prepareDecisionArguments(
+		call.args,
+		harness.config.reasonTypes,
+		harness.config.continueReasonTypes,
+	);
+	assert.deepEqual(prepared, {
+		action: "unlock",
+		reason_type: "JOB_DONE",
+		reason_content: "All done.",
+	});
+	await harness.endDecisionMessage(call.message);
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [call.message],
+	});
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.deepEqual(harness.submissionLog, ["staged"]);
+	assert.equal(harness.controller.snapshot.locked, false);
+});
+
+test("valid correction after invalid payload still executes once", async () => {
+	// S8: an invalid payload then a valid normalized correction; the valid
+	// call stages through the recorded identity and settles once.
+	const harness = createHarness();
+	await startIdle(harness);
+	await harness.openDecision();
+	await harness.endDecisionMessage(
+		cwCall({ action: "bogus", reason_type: "JOB_DONE", reason_content: "x" })
+			.message,
+	);
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [assistant([])],
+	});
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
+	// The bounded correction re-ask carries the safe diagnostic.
+	assert.match(
+		harness.sent.at(-1)?.message.content ?? "",
+		/previous decision response was invalid/,
+	);
+	// The correction cycle opens with fresh evidence; a valid answer
+	// executes and unlocks.
+	await harness.startDecision();
+	const correction = cwCall(unlockArgs());
+	await harness.endDecisionMessage(correction.message);
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [correction.message],
+	});
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.deepEqual(harness.submissionLog, ["staged"]);
 	assert.equal(harness.controller.snapshot.locked, false);
 });

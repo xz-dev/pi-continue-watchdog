@@ -6,7 +6,11 @@ import type {
 import { Container, Text } from "@earendil-works/pi-tui";
 import type { TSchema } from "typebox";
 import { Type } from "typebox";
-import { DECISION_TOOL_NAME } from "./decision-protocol.js";
+import {
+	DECISION_TOOL_NAME,
+	MAX_REASON_CHARACTERS,
+	prepareDecisionArguments,
+} from "./decision-protocol.js";
 
 /** Exact public description of the reserved decision-result function. */
 export const DECISION_TOOL_DESCRIPTION = "don't use unless ask";
@@ -62,20 +66,73 @@ function reservedFunctionResult(): AgentToolResult<DecisionToolDetails> {
 }
 
 /**
+ * Exact-deduplicated union of the effective unlock and continue reason
+ * types, preserving configured spellings and list order (unlock first).
+ * Structural vocabulary only: action-specific admission is still enforced by
+ * runtime validation, and uppercase remains the outcome representation, not
+ * an input alias.
+ */
+export function decisionReasonTypeEnum(
+	reasonTypes: readonly string[],
+	continueReasonTypes: readonly string[],
+): string[] {
+	const union: string[] = [];
+	const seen = new Set<string>();
+	for (const entry of [...reasonTypes, ...continueReasonTypes]) {
+		if (seen.has(entry)) continue;
+		seen.add(entry);
+		union.push(entry);
+	}
+	return union;
+}
+
+/** Build the constrained public parameter schema from effective reason lists. */
+export function createDecisionToolParameters(
+	reasonTypes: readonly string[],
+	continueReasonTypes: readonly string[],
+): TSchema {
+	return Type.Object(
+		{
+			reason_content: Type.String({
+				minLength: 1,
+				maxLength: MAX_REASON_CHARACTERS,
+				pattern: "\\S",
+			}),
+			reason_type: Type.String({
+				enum: decisionReasonTypeEnum(reasonTypes, continueReasonTypes),
+			}),
+			action: Type.String({ enum: ["continue", "unlock"] }),
+		},
+		{ additionalProperties: true },
+	);
+}
+
+/**
  * Build the root-only reserved decision-result function. The declaration is
- * fixed: minimal description, open empty-object schema, no prompt snippet or
- * guidelines, no reason enums. Authority lives in the runtime host, which
- * checks authorization before argument validation.
+ * minimal: description exactly `don't use unless ask`, a structurally
+ * constrained parameter schema derived from the effective reason
+ * configuration, no prompt snippet, no guidelines, and no explanatory
+ * parameter annotations. Authority lives in the runtime host, which checks
+ * authorization before argument validation; the schema is a structural
+ * contract, never an authorization source.
  */
 export function createDecisionToolDefinition(
 	host: DecisionToolHost,
+	reasonTypes: readonly string[],
+	continueReasonTypes: readonly string[],
 ): ToolDefinition<TSchema, DecisionToolDetails> {
 	return {
 		name: DECISION_TOOL_NAME,
 		label: DECISION_TOOL_NAME,
 		description: DECISION_TOOL_DESCRIPTION,
-		parameters: Type.Object({}, { additionalProperties: true }),
+		parameters: createDecisionToolParameters(reasonTypes, continueReasonTypes),
 		renderShell: "self",
+		// Compatibility preparation runs before native schema validation. It
+		// normalizes the existing trim/case-insensitive inputs into their
+		// configured spellings without manufacturing, coercing, or truncating
+		// values: what remains invalid stays invalid.
+		prepareArguments: (args) =>
+			prepareDecisionArguments(args, reasonTypes, continueReasonTypes),
 		async execute(toolCallId, args) {
 			const submission = host.submitDecisionResult({
 				toolCallId,
@@ -159,10 +216,29 @@ export function createDecisionToolDefinition(
 	} as ToolDefinition<TSchema, DecisionToolDetails>;
 }
 
-/** Register the reserved decision function exactly once per process session. */
+/**
+ * Register the reserved decision function exactly once per process session,
+ * or refresh the same named declaration when effective constraints changed.
+ * A same-name replacement must not change active membership: pinned Pi
+ * refreshes add every allowlisted registered tool to the active set, so a
+ * user-disabled `cw` would silently reactivate. Snapshot the pre-refresh
+ * active names through the public API and restore them after the swap.
+ * Initial registration deliberately keeps native membership behavior.
+ */
 export function registerDecisionTool(
 	pi: ExtensionAPI,
 	tool: ToolDefinition<TSchema, DecisionToolDetails>,
+	options?: { readonly preserveActiveMembership?: boolean },
 ): void {
+	const canPreserve =
+		typeof pi.getActiveTools === "function" &&
+		typeof pi.setActiveTools === "function";
+	const activeBefore =
+		options?.preserveActiveMembership === true && canPreserve
+			? pi.getActiveTools()
+			: null;
 	pi.registerTool(tool);
+	if (activeBefore !== null) {
+		pi.setActiveTools(activeBefore);
+	}
 }

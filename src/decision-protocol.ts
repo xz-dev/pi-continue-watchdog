@@ -85,12 +85,18 @@ export interface DecisionResponse {
 export type ValidDecision =
 	| {
 			readonly kind: "continue";
+			/** Uppercase outcome representation of the matched configured type. */
 			readonly reasonType: string;
+			/** Matched configured spelling accepted for this submission. */
+			readonly matchedReasonType: string;
 			readonly reason: string;
 	  }
 	| {
 			readonly kind: "unlock";
+			/** Uppercase outcome representation of the matched configured type. */
 			readonly reasonType: string;
+			/** Matched configured spelling accepted for this submission. */
+			readonly matchedReasonType: string;
 			readonly reason: string;
 	  };
 
@@ -188,10 +194,12 @@ function isOrdinaryObject(input: unknown): input is Record<string, unknown> {
 }
 
 /**
- * Trim AI reason-type input, match case-insensitively against configured types,
- * and return the uppercase form of the matched configured entry.
+ * Trim AI reason-type input and match case-insensitively against configured
+ * types, returning the configured spelling of the matched entry. Configured
+ * spelling is the accepted input identity; the uppercase outcome form is
+ * derived only when the caller asks for the result representation.
  */
-export function normalizeDecisionReasonType(
+export function matchDecisionReasonType(
 	reasonType: unknown,
 	reasonTypes: readonly string[],
 ): string | null {
@@ -201,10 +209,58 @@ export function normalizeDecisionReasonType(
 	const needle = trimmed.toLowerCase();
 	for (const entry of reasonTypes) {
 		if (entry.toLowerCase() === needle) {
-			return entry.toUpperCase();
+			return entry;
 		}
 	}
 	return null;
+}
+
+/**
+ * Trim AI reason-type input, match case-insensitively against configured types,
+ * and return the uppercase form of the matched configured entry.
+ */
+export function normalizeDecisionReasonType(
+	reasonType: unknown,
+	reasonTypes: readonly string[],
+): string | null {
+	return (
+		matchDecisionReasonType(reasonType, reasonTypes)?.toUpperCase() ?? null
+	);
+}
+
+/**
+ * Pre-schema compatibility preparation for the reserved decision function,
+ * wired through the host's native `prepareArguments` hook. It preserves the
+ * established trim and case-insensitive acceptance of `action` and the
+ * action-specific configured reason types, rewrites `reason_type` to the
+ * matched configured spelling, and trims `reason_content`. It never supplies
+ * absent fields, coerces non-strings, changes an invalid action into a valid
+ * one, or truncates an oversized reason: a returned value can still fail both
+ * native schema validation and runtime validation. Extra properties and the
+ * original argument object are left untouched.
+ */
+export function prepareDecisionArguments(
+	args: unknown,
+	reasonTypes: readonly string[],
+	continueReasonTypes: readonly string[],
+): unknown {
+	if (!isOrdinaryObject(args)) return args;
+	const prepared: Record<string, unknown> = { ...args };
+	if (typeof args.action === "string") {
+		const action = args.action.trim().toLowerCase();
+		if (action === "continue" || action === "unlock") {
+			prepared.action = action;
+			const matched = matchDecisionReasonType(
+				args.reason_type,
+				action === "continue" ? continueReasonTypes : reasonTypes,
+			);
+			if (matched !== null) prepared.reason_type = matched;
+		}
+	}
+	if (typeof args.reason_content === "string") {
+		prepared.reason_content = args.reason_content.trim();
+	}
+	return prepared;
 }
 
 /**
@@ -243,11 +299,11 @@ export function validateDecisionArguments(
 		if (args.reason_type === undefined || args.reason_content === undefined) {
 			return { valid: false, error: MISSING_CONTINUE_FIELDS_ERROR };
 		}
-		const reasonType = normalizeDecisionReasonType(
+		const matchedReasonType = matchDecisionReasonType(
 			args.reason_type,
 			continueReasonTypes,
 		);
-		if (reasonType === null) {
+		if (matchedReasonType === null) {
 			return { valid: false, error: INVALID_CONTINUE_REASON_TYPE_ERROR };
 		}
 		const reason = normalizeDecisionReason(args.reason_content);
@@ -256,7 +312,12 @@ export function validateDecisionArguments(
 		}
 		return {
 			valid: true,
-			decision: { kind: "continue", reasonType, reason },
+			decision: {
+				kind: "continue",
+				reasonType: matchedReasonType.toUpperCase(),
+				matchedReasonType,
+				reason,
+			},
 		};
 	}
 	if (normalizedAction === "wait") {
@@ -268,18 +329,26 @@ export function validateDecisionArguments(
 		if (args.reason_type === undefined || args.reason_content === undefined) {
 			return { valid: false, error: MISSING_UNLOCK_FIELDS_ERROR };
 		}
-		const reasonType = normalizeDecisionReasonType(
+		const matchedReasonType = matchDecisionReasonType(
 			args.reason_type,
 			reasonTypes,
 		);
-		if (reasonType === null) {
+		if (matchedReasonType === null) {
 			return { valid: false, error: INVALID_UNLOCK_REASON_TYPE_ERROR };
 		}
 		const reason = normalizeDecisionReason(args.reason_content);
 		if (reason === null) {
 			return { valid: false, error: INVALID_UNLOCK_REASON_ERROR };
 		}
-		return { valid: true, decision: { kind: "unlock", reasonType, reason } };
+		return {
+			valid: true,
+			decision: {
+				kind: "unlock",
+				reasonType: matchedReasonType.toUpperCase(),
+				matchedReasonType,
+				reason,
+			},
+		};
 	}
 	return { valid: false, error: INVALID_DECISION_ACTION_ERROR };
 }

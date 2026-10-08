@@ -3,6 +3,7 @@ import test from "node:test";
 import { DEFAULT_REASON_TYPES } from "../src/config.js";
 import {
 	buildDecisionPrompt,
+	prepareDecisionArguments,
 	validateDecisionArguments,
 } from "../src/decision-protocol.js";
 
@@ -96,6 +97,7 @@ test("both argument orders stay valid", () => {
 		decision: {
 			kind: "continue",
 			reasonType: "WORK_REMAINS",
+			matchedReasonType: "WORK_REMAINS",
 			reason: "Docs delivered; tests missing.",
 		},
 	});
@@ -113,7 +115,241 @@ test("both argument orders stay valid", () => {
 		decision: {
 			kind: "unlock",
 			reasonType: "JOB_DONE",
+			matchedReasonType: "JOB_DONE",
 			reason: "All requested work delivered.",
 		},
 	});
+});
+
+test("preparation normalizes compatible inputs to configured spellings", () => {
+	// The existing trim/case-insensitive admission is preserved before native
+	// schema validation: padded action casing, mixed-case reason types, and
+	// padded reasons all normalize to their configured spellings.
+	const prepared = prepareDecisionArguments(
+		{
+			action: " UNLOCK ",
+			reason_type: " job_done ",
+			reason_content: " All requested work delivered. ",
+			wait_seconds: 30,
+		},
+		["NeedReview", "JOB_DONE"],
+		[...CONTINUE_TYPES],
+	);
+	assert.deepEqual(prepared, {
+		action: "unlock",
+		reason_type: "JOB_DONE",
+		reason_content: "All requested work delivered.",
+		wait_seconds: 30,
+	});
+	const verdict = validateDecisionArguments(
+		prepared,
+		["NeedReview", "JOB_DONE"],
+		[...CONTINUE_TYPES],
+	);
+	assert.deepEqual(verdict, {
+		valid: true,
+		decision: {
+			kind: "unlock",
+			reasonType: "JOB_DONE",
+			matchedReasonType: "JOB_DONE",
+			reason: "All requested work delivered.",
+		},
+	});
+
+	// The matched spelling is the configured entry, preserving custom casing.
+	const customPrepared = prepareDecisionArguments(
+		{
+			action: "unlock",
+			reason_type: "needreview",
+			reason_content: "PR awaits review.",
+		},
+		["NeedReview", "shipped"],
+		[...CONTINUE_TYPES],
+	);
+	assert.deepEqual(customPrepared, {
+		action: "unlock",
+		reason_type: "NeedReview",
+		reason_content: "PR awaits review.",
+	});
+
+	// A 1000-code-point reason padded with whitespace stays valid after
+	// trimming; nothing is truncated.
+	const longReason = `  ${"x".repeat(1000)}  `;
+	const padded = prepareDecisionArguments(
+		{
+			action: "continue",
+			reason_type: " verifying ",
+			reason_content: longReason,
+		},
+		[...DEFAULT_REASON_TYPES],
+		[...CONTINUE_TYPES],
+	);
+	assert.deepEqual(padded, {
+		action: "continue",
+		reason_type: "VERIFYING",
+		reason_content: "x".repeat(1000),
+	});
+	const paddedVerdict = validateDecisionArguments(
+		padded,
+		[...DEFAULT_REASON_TYPES],
+		[...CONTINUE_TYPES],
+	);
+	assert.equal(paddedVerdict.valid, true);
+
+	// Preparation never mutates the caller's argument object.
+	const original = {
+		action: " UNLOCK ",
+		reason_type: " job_done ",
+		reason_content: " Done. ",
+	};
+	prepareDecisionArguments(original, ["JOB_DONE"], [...CONTINUE_TYPES]);
+	assert.deepEqual(original, {
+		action: " UNLOCK ",
+		reason_type: " job_done ",
+		reason_content: " Done. ",
+	});
+});
+
+test("preparation keeps invalid inputs invalid without manufacturing values", () => {
+	const unlockTypes = ["NeedReview", "shipped"];
+	// Missing fields are never supplied.
+	assert.deepEqual(
+		prepareDecisionArguments({}, unlockTypes, [...CONTINUE_TYPES]),
+		{},
+	);
+	// Non-string values are never stringified.
+	assert.deepEqual(
+		prepareDecisionArguments(
+			{ action: "unlock", reason_type: "NeedReview", reason_content: 5 },
+			unlockTypes,
+			[...CONTINUE_TYPES],
+		),
+		{ action: "unlock", reason_type: "NeedReview", reason_content: 5 },
+	);
+	// An invalid action is never rewritten to a valid one, and the unmatched
+	// reason type is left alone so enum admission cannot leak across actions.
+	assert.deepEqual(
+		prepareDecisionArguments(
+			{ action: "wait", reason_type: "needreview", reason_content: "w" },
+			unlockTypes,
+			[...CONTINUE_TYPES],
+		),
+		{ action: "wait", reason_type: "needreview", reason_content: "w" },
+	);
+	// An unmatched reason type keeps its raw spelling: schema and runtime
+	// validation still reject it.
+	assert.deepEqual(
+		prepareDecisionArguments(
+			{ action: "unlock", reason_type: "NOPE", reason_content: "x" },
+			unlockTypes,
+			[...CONTINUE_TYPES],
+		),
+		{ action: "unlock", reason_type: "NOPE", reason_content: "x" },
+	);
+	// An oversized reason is never truncated.
+	const oversized = "y".repeat(1001);
+	const unprepared = prepareDecisionArguments(
+		{ action: "continue", reason_type: "verifying", reason_content: oversized },
+		unlockTypes,
+		[...CONTINUE_TYPES],
+	);
+	assert.equal(
+		(unprepared as { reason_content: string }).reason_content.length,
+		1001,
+	);
+	assert.equal(
+		validateDecisionArguments(unprepared, unlockTypes, [...CONTINUE_TYPES])
+			.valid,
+		false,
+	);
+	// Non-object payloads pass through untouched.
+	assert.equal(
+		prepareDecisionArguments("cw()", unlockTypes, [...CONTINUE_TYPES]),
+		"cw()",
+	);
+});
+
+test("uppercase outcome is not an accepted input alias", () => {
+	// For effective config ["ß"], ß is admitted and keeps its configured
+	// identity; the uppercase outcome form SS is never an accepted alias.
+	const unlockTypes = ["ß"];
+	const prepared = prepareDecisionArguments(
+		{ action: "unlock", reason_type: " ß ", reason_content: "done" },
+		unlockTypes,
+		[...CONTINUE_TYPES],
+	);
+	assert.deepEqual(prepared, {
+		action: "unlock",
+		reason_type: "ß",
+		reason_content: "done",
+	});
+	assert.deepEqual(
+		validateDecisionArguments(prepared, unlockTypes, [...CONTINUE_TYPES]),
+		{
+			valid: true,
+			decision: {
+				kind: "unlock",
+				reasonType: "SS",
+				matchedReasonType: "ß",
+				reason: "done",
+			},
+		},
+	);
+	// Revalidating the preserved input identity still admits ß.
+	assert.equal(
+		validateDecisionArguments(
+			{ action: "unlock", reason_type: "ß", reason_content: "done" },
+			unlockTypes,
+			[...CONTINUE_TYPES],
+		).valid,
+		true,
+	);
+	// The uppercase output SS is not an input alias.
+	assert.equal(
+		validateDecisionArguments(
+			{ action: "unlock", reason_type: "SS", reason_content: "done" },
+			unlockTypes,
+			[...CONTINUE_TYPES],
+		).valid,
+		false,
+	);
+});
+
+test("union membership does not authorize the wrong action", () => {
+	// VERIFYING is a continue type; choosing unlock with it stays invalid even
+	// though the public reason_type enum union contains it.
+	assert.equal(
+		validateDecisionArguments(
+			{ action: "unlock", reason_type: "VERIFYING", reason_content: "x" },
+			[...DEFAULT_REASON_TYPES],
+			[...CONTINUE_TYPES],
+		).valid,
+		false,
+	);
+	// JOB_DONE is an unlock type; choosing continue with it stays invalid.
+	assert.equal(
+		validateDecisionArguments(
+			{ action: "continue", reason_type: "JOB_DONE", reason_content: "x" },
+			[...DEFAULT_REASON_TYPES],
+			[...CONTINUE_TYPES],
+		).valid,
+		false,
+	);
+	// An overlapping configured label remains valid for both actions.
+	assert.equal(
+		validateDecisionArguments(
+			{ action: "unlock", reason_type: "NeedReview", reason_content: "x" },
+			["NeedReview"],
+			["NeedReview"],
+		).valid,
+		true,
+	);
+	assert.equal(
+		validateDecisionArguments(
+			{ action: "continue", reason_type: "NeedReview", reason_content: "x" },
+			["NeedReview"],
+			["NeedReview"],
+		).valid,
+		true,
+	);
 });

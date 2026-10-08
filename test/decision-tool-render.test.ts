@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { Container, Text } from "@earendil-works/pi-tui";
 
+import { BUILT_IN_CONFIG } from "../src/config.js";
 import {
 	createDecisionToolDefinition,
 	DECISION_ALREADY_SUBMITTED_ERROR,
@@ -25,7 +26,11 @@ type RenderContext = {
 };
 
 function tool(host: DecisionToolHost) {
-	return createDecisionToolDefinition(host);
+	return createDecisionToolDefinition(
+		host,
+		BUILT_IN_CONFIG.reasonTypes,
+		BUILT_IN_CONFIG.continueReasonTypes,
+	);
 }
 
 function renderResult(

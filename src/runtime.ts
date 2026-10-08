@@ -396,15 +396,18 @@ function assistantErrorMessage(message: unknown): string {
 }
 
 /**
- * Reconstruct the argument snapshot a staged verdict validated against, so
- * planResponse revalidates exactly what execute accepted for this attempt.
+ * Re-present the argument snapshot a staged verdict already validated,
+ * preserving the accepted input identity — action kind, matched configured
+ * reason spelling, and trimmed reason — so planResponse revalidates exactly
+ * what execute accepted for this attempt instead of reconstructing arguments
+ * from the uppercase outcome representation.
  */
 function stagedVerdictArguments(validation: DecisionValidation): unknown {
 	if (!validation.valid) return null;
 	const decision = validation.decision;
 	return {
 		action: decision.kind,
-		reason_type: decision.reasonType,
+		reason_type: decision.matchedReasonType,
 		reason_content: decision.reason,
 	};
 }
@@ -1949,14 +1952,36 @@ export function createDecisionRuntime(
 		isOwnedDecisionCall,
 	};
 
-	/** Register the reserved decision function once per process, root only. */
-	let decisionToolRegistered = false;
+	/**
+	 * Register the reserved decision function in the root process only. The
+	 * same named declaration is refreshed only when an existing lifecycle
+	 * config load changes its effective reason constraints; equal effective
+	 * constraints keep the original declaration, and no phase transition ever
+	 * adds, removes, or swaps tools. Re-registration of the same name updates
+	 * the shared declaration while preserving its active membership.
+	 */
+	let decisionToolConstraints: string | null = null;
 	const registerRuntimeDecisionTool = (): void => {
-		if (decisionToolRegistered || !isRootProcess()) return;
-		decisionToolRegistered = true;
+		if (!isRootProcess()) return;
+		const constraints = JSON.stringify([
+			config.reasonTypes,
+			config.continueReasonTypes,
+		]);
+		if (decisionToolConstraints === constraints) return;
+		// Only an actual replacement preserves pre-refresh active membership
+		// (the allowlisted native refresh would otherwise reactivate a
+		// registered-but-disabled `cw`). Initial registration keeps the native
+		// membership behavior unchanged.
+		const replacing = decisionToolConstraints !== null;
+		decisionToolConstraints = constraints;
 		registerDecisionTool(
 			options.pi,
-			createDecisionToolDefinition(decisionToolHost),
+			createDecisionToolDefinition(
+				decisionToolHost,
+				config.reasonTypes,
+				config.continueReasonTypes,
+			),
+			replacing ? { preserveActiveMembership: true } : undefined,
 		);
 	};
 
@@ -3101,17 +3126,21 @@ export function createDecisionRuntime(
 
 		// Invalid owned transports end here, before native schema/unknown-tool
 		// and length fast paths can bypass tool_call and request another reply.
-		// The captured diagnostic is charged once at settlement. Only executable
-		// singleton cw calls retain their calls and required thinking for dispatch.
+		// A batch-shape failure and a payload-invalid singleton are stopped the
+		// same way: no executable calls, a normal stop, and the captured
+		// diagnostic charged once at settlement — never a native schema-error
+		// follow-up or an unbudgeted ordinary retry. Only valid plans retain
+		// their executable call and required thinking for dispatch.
+		const executable = batchValid && plan.outcome !== "invalid";
 		return {
 			message: {
 				...active.inquiry.neutralize(event.message),
-				...(!batchValid ? { stopReason: "stop" as const } : {}),
-				content: !batchValid
-					? []
-					: event.message.content.filter(
+				...(executable ? {} : { stopReason: "stop" as const }),
+				content: executable
+					? event.message.content.filter(
 							(block) => block.type === "toolCall" || block.type === "thinking",
-						),
+						)
+					: [],
 			},
 		};
 	};
