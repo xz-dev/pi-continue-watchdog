@@ -42,6 +42,16 @@ The gate SHALL be evaluated only at the authoritative settled decision point wit
 - **GIVEN** a run hit an error and Pi is automatically retrying
 - **WHEN** the retry is still in flight
 - **THEN** the watchdog remains locked and takes no unlock or decision action
+- **AND** provider failures do not consume correction or continuation attempts and do not append `Other error` status entries
+- **AND** Pi retains the original error for native retry handling
+
+#### Scenario: Decision request recovers or exhausts native retries
+
+- **GIVEN** a consumed decision inquiry encounters repeated provider failures
+- **WHEN** a native retry succeeds
+- **THEN** its result is handled in the same decision attempt without charging the failures
+- **WHEN** native retries instead exhaust and the run authoritatively settles in error
+- **THEN** the existing terminal-error unlock occurs once without a correction request, continuation, or added loop
 
 #### Scenario: Stale settlement ignored
 

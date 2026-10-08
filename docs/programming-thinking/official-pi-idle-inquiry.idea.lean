@@ -738,6 +738,20 @@ def manualUnlock (state : RuntimeState) : RuntimeState :=
       locked := false
       fence := none }
 
+-- The host supplies authoritative settlement only after native retries finish.
+-- Provider failures before that boundary leave the decision and both budgets intact.
+def providerFailureAt (event : PiPublicEvent) (state : RuntimeState) : RuntimeState :=
+  if event == .agentSettled then manualUnlock state else state
+
+theorem provider_failures_preserve_budgets (state : RuntimeState) :
+    providerFailureAt .agentEnd state = state ∧
+    (providerFailureAt .agentSettled state).locked = false ∧
+    (providerFailureAt .agentSettled state).active = none ∧
+    (providerFailureAt .agentSettled state).attempt = state.attempt ∧
+    (providerFailureAt .agentSettled state).invalidAttempts = state.invalidAttempts := by
+  cases h : state.active <;>
+    simp [providerFailureAt, manualUnlock, preemptActiveDecision, h]
+
 def freshLockCycle (state : RuntimeState) : RuntimeState :=
   { state with
       locked := true
@@ -1800,11 +1814,17 @@ theorem process_is_correct : ProcessSafety ∧
         (runGuardedInvalidResponse environment now3
           (runGuardedInvalidResponse environment now2
             (runGuardedInvalidResponse environment now1 state).2).2).2.decisionFailed = true) ∧
+    (∀ state, providerFailureAt .agentEnd state = state ∧
+      (providerFailureAt .agentSettled state).locked = false ∧
+      (providerFailureAt .agentSettled state).active = none ∧
+      (providerFailureAt .agentSettled state).attempt = state.attempt ∧
+      (providerFailureAt .agentSettled state).invalidAttempts = state.invalidAttempts) ∧
     NativeTransportSafety ∧ stagedResultIsError .stagedInvalid = true ∧
     (∀ current attempt, receiptAccount current .unreadable attempt = attempt) :=
   ⟨transition_invariants, unconsumed_pipeline_is_inert, foreign_context_does_not_confirm,
     guarded_inquiry_terminates, three_invalid_responses_fail_the_decision,
-    native_transport_is_guarded, staged_validation_is_error, unreadable_receipt_preserves_budget⟩
+    provider_failures_preserve_budgets, native_transport_is_guarded,
+    staged_validation_is_error, unreadable_receipt_preserves_budget⟩
 
 end OfficialPiIdleInquiry
 
@@ -1826,4 +1846,4 @@ def main : IO Unit := do
   let invalid3 := OfficialPiIdleInquiry.runGuardedInvalidResponse environment 0 invalid2.2
   IO.println s!"continue: attempt={continued.2.attempt}; callback unlock: locked={callback.2.locked}, attempt={callback.2.attempt}"
   IO.println s!"unlock: locked={unlocked.2.locked}, attempt={unlocked.2.attempt}; three invalid: failed={invalid3.2.decisionFailed}, attempt={invalid3.2.attempt}"
-  IO.println "process_is_correct: consumption-gated safety and conditional inquiry termination; external scheduling and durable publication are assumptions."
+  IO.println "process_is_correct: consumption-gated safety, provider failures preserve budgets until terminal unlock, and conditional inquiry termination; external scheduling and durable publication are assumptions."
