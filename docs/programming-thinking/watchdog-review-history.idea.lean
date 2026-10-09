@@ -25,6 +25,7 @@ structure ReviewRecord where
   auditMatches : Bool
   observed : Option Outcome
   foldOutcome : Option Outcome
+  interrupted : Bool
   quietUnlock : Bool
   unlockStatusPresent : Bool
   deriving Repr
@@ -59,14 +60,18 @@ def publishedOutcome (record : ReviewRecord) : Option Outcome :=
     if record.quietUnlock && !record.unlockStatusPresent then none else some .unlock
   | outcome => outcome
 
+-- A preempted or invalidated attempt consumed no response, so its audit is not owed.
+def auditSatisfied (record : ReviewRecord) : Bool :=
+  record.interrupted || (record.auditPresent && record.auditMatches)
+
 -- Missing inquiry/audit data or an incomplete publication marks association partial;
 -- an independently established published outcome remains readable.
 def recoverOne (eligibleSourceIds : List Nat) (record : ReviewRecord) : HistoricalReview :=
   let available := sourceAvailable eligibleSourceIds record
   { entryId := record.entryId
     sourceAvailable := available
-    complete := available && record.inquiryPresent && record.auditPresent &&
-      record.auditMatches && publicationComplete record
+    complete := available && record.inquiryPresent && auditSatisfied record &&
+      publicationComplete record
     observed := record.observed
     published := publishedOutcome record }
 
@@ -104,9 +109,15 @@ theorem missing_quiet_status_is_not_publication (eligible : List Nat) (record : 
   simp [recoverOne, publishedOutcome, publicationComplete, folded, quiet, missing]
 
 theorem missing_audit_is_incomplete (eligible : List Nat) (record : ReviewRecord)
-    (missing : record.auditPresent = false) :
+    (answered : record.interrupted = false) (missing : record.auditPresent = false) :
     (recoverOne eligible record).complete = false := by
-  simp [recoverOne, missing]
+  simp [recoverOne, auditSatisfied, answered, missing]
+
+theorem interrupted_owes_no_audit (eligible : List Nat) (record : ReviewRecord)
+    (stopped : record.interrupted = true) :
+    (recoverOne eligible record).complete =
+      (recoverOne eligible { record with auditPresent := true, auditMatches := true }).complete := by
+  simp [recoverOne, auditSatisfied, publicationComplete, sourceAvailable, sourcesRetained, stopped]
 
 theorem missing_sources_are_unavailable (eligible : List Nat) (record : ReviewRecord)
     (missing : sourcesRetained eligible record = false) :
@@ -116,8 +127,7 @@ theorem missing_sources_are_unavailable (eligible : List Nat) (record : ReviewRe
 theorem completeness_requires_association (eligible : List Nat) (record : ReviewRecord)
     (complete : (recoverOne eligible record).complete = true) :
     sourceAvailable eligible record = true ∧ record.inquiryPresent = true ∧
-      record.auditPresent = true ∧ record.auditMatches = true ∧
-      publicationComplete record = true := by
+      auditSatisfied record = true ∧ publicationComplete record = true := by
   simpa [recoverOne, Bool.and_eq_true, and_assoc] using complete
 
 -- Selection follows the supplied native path, not file chronology or origin session ID.
@@ -145,8 +155,11 @@ def process_is_correct_statement : Prop :=
   (∀ (sources : List Nat) (record : ReviewRecord) (observed : Option Outcome),
     (recoverOne sources { record with observed := observed }).published =
       (recoverOne sources record).published) ∧
-  (∀ (sources : List Nat) (record : ReviewRecord), record.auditPresent = false →
-    (recoverOne sources record).complete = false) ∧
+  (∀ (sources : List Nat) (record : ReviewRecord), record.interrupted = false →
+    record.auditPresent = false → (recoverOne sources record).complete = false) ∧
+  (∀ (sources : List Nat) (record : ReviewRecord), record.interrupted = true →
+    (recoverOne sources record).complete =
+      (recoverOne sources { record with auditPresent := true, auditMatches := true }).complete) ∧
   (∀ (sources : List Nat) (record : ReviewRecord), sourcesRetained sources record = false →
     (recoverOne sources record).sourceAvailable = false) ∧
   (∀ (sources : List Nat) (record : ReviewRecord), record.inquiryPresent = false →
@@ -157,7 +170,7 @@ def process_is_correct_statement : Prop :=
 
 theorem process_is_correct : process_is_correct_statement :=
   ⟨fun _ _ _ _ => rfl, response_is_not_publication,
-    missing_audit_is_incomplete, missing_sources_are_unavailable,
+    missing_audit_is_incomplete, interrupted_owes_no_audit, missing_sources_are_unavailable,
     missing_inquiry_is_incomplete, missing_quiet_status_is_not_publication⟩
 
 -- Kernel foundations are printed explicitly; no additional axioms or placeholders.
@@ -174,7 +187,7 @@ def main : IO Unit := do
     entryId := 10, originSessionId := 1, metadataVersion := some 1,
     projectionVersion := 1, schemaValid := true, sourceIds := [2, 3],
     inquiryPresent := true, auditPresent := true, auditMatches := true,
-    observed := some .continueWork, foldOutcome := none,
+    observed := some .continueWork, foldOutcome := none, interrupted := false,
     quietUnlock := false, unlockStatusPresent := false }
   let observedOnly := recoverOne [2, 3] record
   let quiet : ReviewRecord := { record with
@@ -184,12 +197,15 @@ def main : IO Unit := do
   let noInquiry := recoverOne [2, 3] { quiet with inquiryPresent := false }
   let noStatus := recoverOne [2, 3] { quiet with unlockStatusPresent := false }
   let noFold := recoverOne [2, 3] { quiet with foldOutcome := none }
+  let interruptedNoAudit := recoverOne [2, 3]
+    { record with observed := none, interrupted := true, auditPresent := false }
   let missing := recoverOne [2] record
   let restored := recoverSession 99 7 [10] (fun _ => [2, 3]) [record, { record with entryId := 11 }]
   let valid := observedOnly.published.isNone && published.complete &&
     published.published == some .unlock && noAudit.published == some .unlock &&
     !noAudit.complete && !noInquiry.complete && noInquiry.published == some .unlock &&
     noStatus.published.isNone && !noStatus.complete && noFold.published.isNone &&
-    !noFold.complete && !missing.sourceAvailable && restored.1 == 7 && restored.2.length == 1
+    !noFold.complete && interruptedNoAudit.complete &&
+    interruptedNoAudit.published.isNone && !missing.sourceAvailable && restored.1 == 7 && restored.2.length == 1
   if !valid then throw (IO.userError "review-history examples failed")
-  IO.println "Review history: inquiry required; quiet unlock needs fold and status; sibling excluded; live state unchanged."
+  IO.println "Review history: inquiry required; interrupted attempt owes no audit; quiet unlock needs fold and status; sibling excluded; live state unchanged."

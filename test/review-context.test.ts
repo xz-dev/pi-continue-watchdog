@@ -946,6 +946,34 @@ test("missing optional audit is incomplete history without losing the published 
 	assert.match(history.diagnostic ?? "", /audit unavailable/);
 });
 
+test("interrupted inquiry does not require a response audit", () => {
+	for (const [outcome, withAssistant] of [
+		["preempted", false],
+		["preempted", true],
+		["invalidated", false],
+		["invalidated", true],
+	] as const) {
+		const sm = SessionManager.inMemory("/var/tmp/review-interrupted");
+		user(sm, "report");
+		marker(
+			sm,
+			EXCHANGE,
+			1,
+			createReviewSourceMetadata(
+				buildReviewSourceView(sm.buildContextEntries()),
+			),
+		);
+		inquiryPrompt(sm);
+		// Real sessions keep the neutralized, emptied decision assistant.
+		if (withAssistant) decisionAssistant(sm);
+		inquiryFold(sm, outcome);
+		const history = readReviewHistory(sm);
+		assert.equal(history.records[0].reviewMetadata, "ok", outcome);
+		assert.equal(history.records[0].publishedOutcome, undefined, outcome);
+		assert.equal(history.diagnostic, undefined, outcome);
+	}
+});
+
 test("incomplete control metadata retains the ordinary reply recognized by native folding", () => {
 	const sm = SessionManager.inMemory("/var/tmp/review-inexact-control");
 	user(sm, "report");

@@ -1926,6 +1926,79 @@ test("decision audit carries the review association of its exchange", async () =
 	assert.equal(review.markerEntryId, marker?.id);
 });
 
+test("history gap is reported once, attributed to the affected exchange", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	harness.branch.push({
+		id: "user-1",
+		type: "message",
+		message: { role: "user", content: [{ type: "text", text: "Work." }] },
+	});
+	// A published unlock whose response audit is missing: a genuine gap.
+	const inquiry = {
+		version: 1,
+		namespace: "pi-continue-watchdog",
+		inquiryId: "gap-exchange",
+		attempt: 1,
+	};
+	harness.branch.push(
+		{
+			id: "gap-marker",
+			type: "custom",
+			customType: INQUIRY_MARKER_ENTRY_TYPE,
+			data: {
+				version: 1,
+				exchangeId: "gap-exchange",
+				cycleId: 1,
+				review: { version: 1, projectionVersion: 1 },
+			},
+		},
+		{
+			id: "gap-prompt",
+			type: "custom_message",
+			customType: DECISION_MESSAGE_TYPE,
+			details: inquiry,
+		},
+		{
+			id: "gap-fold",
+			type: "custom_message",
+			customType: DECISION_FOLD_MESSAGE_TYPE,
+			details: {
+				...inquiry,
+				outcome: "remove",
+				watchdogOutcome: "continue",
+			},
+		},
+		// A later legacy exchange without review metadata is not a gap.
+		{
+			id: "later-marker",
+			type: "custom",
+			customType: INQUIRY_MARKER_ENTRY_TYPE,
+			data: { version: 1, exchangeId: "later-exchange", cycleId: 1 },
+		},
+	);
+	const historyCards = () =>
+		harness.entries.filter((entry) =>
+			JSON.stringify(entry.data).includes("Review history incomplete: some"),
+		);
+	await harness.openDecision();
+	// The re-ask dispatches a second prompt over the same unchanged history.
+	const invalid = harness.answerInvalid();
+	await harness.endDecisionMessage(invalid);
+	await settleResponse(harness, invalid);
+	assert.equal(
+		harness.entries.filter((entry) => entry.type === INQUIRY_MARKER_ENTRY_TYPE)
+			.length,
+		2,
+	);
+	const cards = historyCards();
+	assert.equal(cards.length, 1);
+	assert.equal(
+		(cards[0].data as { exchangeId?: string }).exchangeId,
+		"gap-exchange",
+	);
+});
+
 test("view-build failure reports unavailable history without blocking dispatch", async () => {
 	const harness = createHarness({ contextEntriesThrows: true });
 	await startIdle(harness);
@@ -3997,6 +4070,36 @@ test("submitted decision invalidated by domain activity still redacts its assist
 		await harness.endDecisionMessage(assistant([text("ordinary response")])),
 		undefined,
 	);
+});
+
+test("subagent activity invalidating a submitted decision is disclosed once", async () => {
+	const fence = createFenceHarness();
+	const harness = createHarness({ processDomain: fence.domain });
+	const cards = () =>
+		harness.entries.filter((entry) =>
+			JSON.stringify(entry.data).includes("invalidated by subagent activity"),
+		);
+	await startIdle(harness);
+	// Activity before the prompt is submitted wastes no response: stay quiet.
+	await harness.openDecision({ start: false });
+	await Promise.resolve();
+	await Promise.resolve();
+	fence.advanceFence();
+	assert.equal(cards().length, 0);
+	await harness.openDecision({ start: false });
+	await Promise.resolve();
+	await Promise.resolve();
+	await harness.startDecision();
+	fence.advanceFence();
+	fence.advanceFence();
+	assert.equal(cards().length, 1);
+	assert.deepEqual(cards()[0].data, {
+		kind: "other-error",
+		exchangeId: "exchange-1",
+		cycleId: 1,
+		message:
+			"Decision check invalidated by subagent activity; its answer was discarded. The check will run again when all agents are idle.",
+	});
 });
 
 test("uncorrelated quarantine releases before an unrelated run", async () => {

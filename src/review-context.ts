@@ -880,9 +880,13 @@ export function readReviewHistory(manager: ReviewHistorySource): ReviewHistory {
 					"source metadata malformed or references unavailable on the review's ancestry",
 				);
 			}
-			if (accum.auditData === undefined)
-				problems.push("response audit unavailable");
-			else if (auditReview.state !== "ok")
+			// An interrupted attempt consumed no response, so it legitimately has no audit.
+			const interrupted =
+				accum.foldOutcome === "preempted" ||
+				accum.foldOutcome === "invalidated";
+			if (accum.auditData === undefined) {
+				if (!interrupted) problems.push("response audit unavailable");
+			} else if (auditReview.state !== "ok")
 				problems.push("audit review association unavailable");
 			if (auditReview.state === "ok") {
 				const association = auditReview.value;

@@ -1448,18 +1448,35 @@ export function createDecisionRuntime(
 		}
 	};
 
+	// Each check rereads the whole ancestry; disclose one unchanged gap set once.
+	let reportedHistoryDiagnostic: string | undefined;
 	const reportReviewHistory = (ctx: ExtensionContext): void => {
 		try {
 			const history = readReviewHistory(ctx.sessionManager);
 			const claim = getMainClaim();
-			if (history.diagnostic !== undefined && claim !== null && owns(claim))
+			if (
+				history.diagnostic === undefined ||
+				history.diagnostic === reportedHistoryDiagnostic ||
+				claim === null ||
+				!owns(claim)
+			)
+				return;
+			// Diagnostics are emitted in record order; attribute the card to the first gap.
+			const affected = history.records.find((record) =>
+				history.diagnostic?.startsWith(
+					`exchange ${record.exchangeId} attempt ${record.cycleId}:`,
+				),
+			);
+			if (
 				appendStatus({
 					kind: "other-error",
-					exchangeId: history.records.at(-1)?.exchangeId ?? "recovery",
-					cycleId: history.records.at(-1)?.cycleId ?? 0,
+					exchangeId: affected?.exchangeId ?? "recovery",
+					cycleId: affected?.cycleId ?? 0,
 					message:
 						"Review history incomplete: some native records or source associations are unavailable.",
-				});
+				})
+			)
+				reportedHistoryDiagnostic = history.diagnostic;
 		} catch {
 			// Diagnostic reads never restore authority or gate execution.
 		}
@@ -2661,7 +2678,22 @@ export function createDecisionRuntime(
 	const unsubscribeDomain = options.processDomain?.subscribe(
 		(_snapshot, source) => {
 			if (stopped || !domainReady || source === "local") return;
+			const active = activeDecision;
 			invalidateActiveDecision();
+			// A submitted check already spent a model response; say why it vanished.
+			if (
+				active !== null &&
+				active.invalidated &&
+				active.submitted &&
+				owns(active.claim)
+			)
+				appendStatus({
+					kind: "other-error",
+					exchangeId: active.exchangeId,
+					cycleId: active.protocol.currentCycleId,
+					message:
+						"Decision check invalidated by subagent activity; its answer was discarded. The check will run again when all agents are idle.",
+				});
 			syncHubState();
 		},
 	);
