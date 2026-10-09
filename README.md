@@ -1,6 +1,6 @@
 # pi-continue-watchdog
 
-> **Plugin-only boundary.** Inquiry authorization uses exact owned-run identity and this plugin's local context observation, not certification of the final provider payload after later handlers. Pi may reject non-object `cw` arguments before plugin authorization. Malformed owned batches are stopped before dispatch without per-call results. See [verification and historical findings](openspec/changes/align-unlock-tool-with-reflection-contract/verification.md). Publishing source does not install or deploy this plugin.
+> **Plugin-only boundary.** Inquiry authorization uses exact owned-run identity and this plugin's local context observation, not certification of the final provider payload after later handlers. Pi may reject non-object `cw` arguments before plugin authorization. Malformed owned batches are stopped before dispatch without per-call results. See [verification and historical findings](openspec/changes/archive/2026-10-06-align-unlock-tool-with-reflection-contract/verification.md). Publishing source does not install or deploy this plugin.
 
 Pi extension that keeps your agent working. When a locked cycle settles, the watchdog asks the model itself — through a hidden, phase-gated decision inquiry — whether to continue or unlock. Ordinary work cannot stop the cycle by itself: only a verdict submitted inside the watchdog's own consumed decision attempt, a human command, an abort, or a terminal error can.
 
