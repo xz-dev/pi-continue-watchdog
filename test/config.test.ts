@@ -530,6 +530,63 @@ test("invalid unlockShortcut values fall back to the default with one bounded di
 	assert.equal(merged.config.unlockShortcut, "alt+u");
 });
 
+test("unlockReviewEnabled defaults to true, accepts booleans, and layers like other keys", () => {
+	assert.equal(BUILT_IN_CONFIG.unlockReviewEnabled, true);
+
+	const enabled = validateConfig("project", { unlockReviewEnabled: true });
+	assert.equal(enabled.config.unlockReviewEnabled, true);
+	assert.deepEqual(enabled.diagnostics, []);
+
+	const disabled = validateConfig("project", { unlockReviewEnabled: false });
+	assert.equal(disabled.config.unlockReviewEnabled, false);
+	assert.deepEqual(disabled.diagnostics, []);
+
+	for (const invalid of [1, "true", null, [], {}]) {
+		const result = validateConfig("project", {
+			unlockReviewEnabled: invalid,
+		});
+		assert.equal(result.config.unlockReviewEnabled, undefined);
+		const diags = result.diagnostics.filter((d) =>
+			d.message.includes("unlockReviewEnabled"),
+		);
+		assert.equal(diags.length, 1, JSON.stringify(invalid));
+		assert.equal(diags[0]?.message, "unlockReviewEnabled must be a boolean");
+	}
+
+	// Invalid values merge as absent, preserving the built-in default.
+	assert.equal(
+		mergeConfig({ unlockReviewEnabled: "yes" }).config.unlockReviewEnabled,
+		true,
+	);
+	const layered = mergeConfig(
+		{ unlockReviewEnabled: true },
+		{ unlockReviewEnabled: false },
+	);
+	assert.equal(layered.config.unlockReviewEnabled, false);
+	const projectEnables = mergeConfig(
+		{ unlockReviewEnabled: false },
+		{ unlockReviewEnabled: true },
+	);
+	assert.equal(projectEnables.config.unlockReviewEnabled, true);
+});
+
+test("unlockReviewEnabled never restores the removed jevWaitCheck key", () => {
+	const result = validateConfig("project", {
+		unlockReviewEnabled: true,
+		jevWaitCheck: true,
+	});
+	assert.equal(result.config.unlockReviewEnabled, true);
+	assert.equal(
+		(result.config as Record<string, unknown>).jevWaitCheck,
+		undefined,
+	);
+	const diags = result.diagnostics.filter((d) =>
+		d.message.includes("jevWaitCheck"),
+	);
+	assert.equal(diags.length, 1);
+	assert.equal(diags[0]?.severity, "error");
+});
+
 test("a stale custom decisionPrompt cannot restore the retired wait action", () => {
 	const stale = mergeConfig({
 		decisionPrompt:

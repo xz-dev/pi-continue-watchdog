@@ -30,6 +30,18 @@ Review inputs and outcome associations stay in the owning native session JSONL. 
 
 These are deterministic input/storage guarantees, not proof that the original false continuation is fixed. See the [change evidence and limitations](openspec/changes/archive/2026-10-07-reduce-false-positive-continuations/README.md).
 
+### Unlock review
+
+On by default (`unlockReviewEnabled: true`). When the [`pi-llm-as-jev`](https://github.com/xz-dev/pi-llm-as-jev) review service is loaded, a valid AI `unlock` is checked by that service before it takes effect. If jev is not installed, not configured or unavailable for any reason, a warning is shown and the unlock proceeds without review; nothing is blocked. Set `false` to turn review off entirely. `continue`, manual unlock, abort and terminal-error unlock are never reviewed.
+
+- **Input:** the unlock reason plus the session's effective conversation — full user and assistant text, labelled summaries, and tool name/status only (no tool arguments or output). `ask_user_question` replies keep their question and answer text. Watchdog control traffic, thinking and context-excluded bash are left out. Known provider keys are redacted by the service.
+- **Supported, or review not completed** (service missing, error, timeout, too large, unsupported content, insufficient evidence): a warning is shown and the original unlock proceeds as if review were off. A missing service is warned about once per session; other skips each time. An incomplete review is never reported as approval.
+- **Challenged:** the model gets one reconsideration through the same `cw` contract. Its new answer is applied normally and is not reviewed again.
+- **Escape:** manual unlock, user input, abort or a branch/session change cancel a review immediately. There is no extra watchdog timer; the service's own timeouts apply.
+- **History:** each review result is appended to the session JSONL. Reopening a session only reads it; nothing is resumed.
+
+The review is a second opinion, not proof that work is complete. It does not review continuations or fix false continuations.
+
 ## Configuration
 
 Global `$PI_CODING_AGENT_DIR/pi-continue-watchdog.json` and trusted project `.pi/pi-continue-watchdog.json`; fields merge individually, invalid values keep the lower-precedence value with a diagnostic.
@@ -53,11 +65,12 @@ Global `$PI_CODING_AGENT_DIR/pi-continue-watchdog.json` and trusted project `.pi
 | `reasonTypes` | `["JOB_DONE", "WAIT_USER", "JOB_BLOCKED", "WAIT_CALLBACK"]` | Allowed unlock reason types; a valid list replaces defaults; disclosed only in authorized decision prompts |
 | `continueReasonTypes` | `["WORK_REMAINS", "VERIFYING"]` | Allowed continuation reason types |
 | `unlockShortcut` | `"alt+u"` | Human unlock shortcut key, or `false` to disable |
+| `unlockReviewEnabled` | `true` | Review AI unlocks with a loaded `pi-llm-as-jev` service; skipped with a warning when unavailable (see above) |
 | `idleDelaySeconds` | `10` | Accepted for compatibility only; the inquiry fence is fixed at ten seconds |
 
 ### Removed configuration
 
-`jevWaitCheck` was removed with the retired external jev integration. A configuration layer containing it produces an error-level diagnostic naming the key (never its nested values or credentials) and has no other effect; other valid keys still apply. Remove it manually if desired. The extension never resolves TypeSafe or OpenRouter credentials, makes no jev classification or review request, and does not modify shared credentials or environment variables.
+`jevWaitCheck` was removed with the retired external jev integration. A configuration layer containing it produces an error-level diagnostic naming the key (never its nested values or credentials) and has no other effect; other valid keys still apply. Remove it manually if desired. The extension never resolves TypeSafe or OpenRouter credentials and does not modify shared credentials or environment variables. The only jev interaction is the unlock review above, which uses the already-loaded service and its own credentials.
 
 Reason types keep their meanings: `JOB_DONE` — all work complete; `WAIT_USER` — user input/decision needed; `JOB_BLOCKED` — cannot proceed for another concrete reason; `WAIT_CALLBACK` — waiting for another agent or program to call back and wake the session. Notification consumers can filter on them (see pi-notify binding `if`).
 

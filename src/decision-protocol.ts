@@ -154,6 +154,21 @@ export interface DecisionProtocolSessionOptions {
 	readonly reasonTypes: readonly string[];
 	/** Effective allowed automatic-continue reason types for this decision window. */
 	readonly continueReasonTypes: readonly string[];
+	/**
+	 * Cycle the reopened window resumes at: a preserved logical phase
+	 * re-enters its deferred attempt (retry of a dispatched-but-unconsumed
+	 * response), so this is the attempt identity to continue, not the next
+	 * unconsumed cycle. Initial opens never set it.
+	 */
+	readonly initialCycleId?: number;
+	/**
+	 * Already-charged invalid responses for the reopened window. Restored
+	 * onto the controller after beginDecision reset so the resume keeps the
+	 * same remaining allowance instead of a fresh three.
+	 */
+	readonly invalidAttempts?: number;
+	/** Last safe validator diagnostic preserved for the resumed correction. */
+	readonly lastInvalidError?: string | null;
 }
 
 /**
@@ -565,8 +580,19 @@ export function formatDecisionFailedNotification(error: string): string {
 export function createDecisionProtocolSession(
 	options: DecisionProtocolSessionOptions,
 ): DecisionProtocolSession {
-	let cycleId = 1;
+	let cycleId = options.initialCycleId ?? 1;
 	let finalized: DecisionProtocolFinalization | null = null;
+
+	// A reopened preserved window restores the already-charged invalid
+	// accounting onto the fresh controller window before any response can
+	// charge it again; beginDecision reset it to zero for a NEW decision.
+	if (options.invalidAttempts !== undefined && options.invalidAttempts > 0) {
+		options.controller.restoreInvalidDecisionAttempts(
+			options.decisionId,
+			options.invalidAttempts,
+			options.lastInvalidError ?? null,
+		);
+	}
 
 	const ignoredFinalization = (): DecisionProtocolFinalization => ({
 		outcome: "ignored",

@@ -2429,16 +2429,27 @@ test("packed disk-backed session persists and reopens the review association", {
 			unknown
 		>;
 		assert.equal(foldDetails.watchdogOutcome, "unlock");
-		// No extra review entry type, sidecar, or second model request exists.
+		// Default-on unlock review with no jev loaded: exactly one skipped
+		// record; no other review entry type, sidecar, or second model request.
+		const reviewEntries = branch.filter(
+			(entry) =>
+				entry.type === "custom" &&
+				String((entry as { customType?: unknown }).customType).includes(
+					"review",
+				),
+		);
+		assert.equal(reviewEntries.length, 1);
 		assert.equal(
-			branch.filter(
-				(entry) =>
-					entry.type === "custom" &&
-					String((entry as { customType?: unknown }).customType).includes(
-						"review",
-					),
-			).length,
-			0,
+			(reviewEntries[0] as { customType?: unknown }).customType,
+			"pi-continue-watchdog:unlock-review",
+		);
+		assert.equal(
+			(
+				(reviewEntries[0] as { data?: unknown }).data as {
+					incompleteReason?: unknown;
+				}
+			).incompleteReason,
+			"unavailable",
 		);
 		assert.equal(requests.filter(isDecisionRequest).length, 1);
 	} finally {

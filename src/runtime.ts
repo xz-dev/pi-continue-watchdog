@@ -54,6 +54,7 @@ import {
 } from "./controller.js";
 import {
 	buildDecisionPrompt,
+	buildDecisionReaskPrompt,
 	createDecisionProtocolSession,
 	DECISION_TOOL_BLOCK_REASON,
 	DECISION_TOOL_NAME,
@@ -96,6 +97,17 @@ import {
 	emitSemanticHook,
 	type UserReadyValues,
 } from "./semantic-hook.js";
+import {
+	buildUnlockReviewProjection,
+	buildUnlockReviewRequest,
+	discoverUnlockReviewService,
+	type ReviewServiceLike,
+	runUnlockReview,
+	UNLOCK_REVIEW_PROJECTION_VERSION,
+	type UnlockReviewCandidate,
+	type UnlockReviewProjection,
+	type UnlockReviewReport,
+} from "./unlock-review.js";
 import {
 	createContinueWatchdogEvent,
 	createDecisionFailedWatchdogEvent,
@@ -190,12 +202,92 @@ interface ActiveDecision {
 		readonly toolCallId: string;
 		readonly validation: DecisionValidation;
 	} | null;
+	/**
+	 * Exchange id of the initial decision inquiry this logical decision
+	 * belongs to; a reconsideration carries the origin id so at most one
+	 * semantic recheck can ever run for one logical decision.
+	 */
+	readonly logicalRootExchangeId: string;
+	/** True when this inquiry is the single permitted semantic reconsideration. */
+	readonly isReconsideration: boolean;
+	/** Review disposition of the superseded candidate, for audit/history. */
+	readonly challengedByReview?: UnlockReviewRecord;
+	/** Challenge feedback text carried by this reconsideration inquiry. */
+	readonly reconsiderationFeedback?: string;
 }
 
 interface PendingFinalization {
 	readonly active: ActiveDecision;
 	readonly cycleId: number;
 	readonly plan: DecisionProtocolPlan;
+	/**
+	 * True when this unlock plan came from the semantic reconsideration
+	 * inquiry; such a result is committed without another review.
+	 */
+	readonly reconsidered?: boolean;
+	/** Set once the optional review (if any) reached a terminal disposition. */
+	reviewSettled?: boolean;
+	/** Terminal review disposition for audit/history; absent = not reviewed. */
+	reviewDisposition?: "supported" | "challenged" | "incomplete";
+}
+
+/** One in-flight optional unlock review operation. */
+interface PendingUnlockReview {
+	readonly active: ActiveDecision;
+	readonly cycleId: number;
+	readonly plan: Extract<DecisionProtocolPlan, { readonly outcome: "unlock" }>;
+	readonly abort: AbortController;
+	/** Settled once the service call resolved and disposition was applied. */
+	settled: boolean;
+}
+
+/** Versioned review association persisted on the owning session (custom entry). */
+export interface UnlockReviewRecord {
+	readonly version: 1;
+	readonly projectionVersion: number;
+	readonly exchangeId: string;
+	readonly cycleId: number;
+	readonly outcome: "supported" | "challenged" | "incomplete";
+	readonly incompleteReason?: string;
+	readonly backend?: string;
+	readonly model?: string;
+	readonly sourceHeadId?: string;
+	readonly gaps?: number;
+	readonly attemptCount?: number;
+	readonly observationCoverage?: "complete" | "unavailable";
+	readonly usage?: {
+		readonly inputTokens: number;
+		readonly outputTokens: number;
+		readonly costUsd: number;
+		readonly missing: number;
+	};
+	readonly errorMessage?: string;
+	readonly contextOverflow?: boolean;
+	/** Exchange id of the replacement inquiry a challenge opened, once known. */
+	readonly reconsiderExchangeId?: string;
+}
+
+export const UNLOCK_REVIEW_ENTRY_TYPE = "pi-continue-watchdog:unlock-review";
+
+/**
+ * Reconsideration feedback appended after the normal fixed decision prompt
+ * following a definite challenge. It names the challenged claim,
+ * distinguishes reviewer opinion from evidence, and re-asserts the unchanged
+ * cw contract — the reviewer never authors the replacement verdict. The base
+ * prompt must already contain the full configured reason lists, field limits
+ * and assessment/delivery boundaries: appending challenge text after the
+ * fixed contract keeps a custom decisionPrompt from silently dropping them.
+ */
+function buildReconsiderationFeedback(
+	candidate: UnlockReviewCandidate,
+): string {
+	return (
+		`An independent reviewer challenged your previous unlock decision ` +
+		`(${JSON.stringify(candidate.reasonType)}: ${JSON.stringify(candidate.reason)}). ` +
+		`The reviewer's challenge is an opinion, not new evidence and not a user decision; it may be wrong. ` +
+		`Recheck the original user instructions, deliveries, tool envelopes and recorded human answers in this conversation. ` +
+		`Then submit exactly one ${DECISION_TOOL_NAME} call under the same contract: keep unlock only if the stated stopping basis still holds on the evidence, otherwise choose an authorized continue. Do not let the reviewer's wording become your reason.`
+	);
 }
 
 interface InquiryMarkerEntry {
@@ -262,6 +354,11 @@ export interface DecisionRuntimeOptions {
 	readonly agentDir?: string;
 	/** Fired once per control acquisition when the effective config is committed. */
 	readonly onConfigReady?: (config: ContinueWatchdogConfig) => void;
+	/**
+	 * Test seam: deterministic review service override. Production callers
+	 * leave this unset so call-time `getJudgmentService()` discovery runs.
+	 */
+	readonly reviewService?: import("./unlock-review.js").ReviewServiceLike;
 }
 
 export type WatchdogTriggerBlocker =
@@ -457,7 +554,14 @@ export function createDecisionRuntime(
 	let pendingContinuationPublication: {
 		readonly active: ActiveDecision;
 		readonly cycleId: number;
-		readonly confirmed: () => boolean | undefined;
+		confirmed: (() => boolean | undefined) | null;
+		charged: boolean;
+		sending: boolean;
+		readonly publicationCycle: number;
+		readonly lifecycleGeneration: number;
+		readonly generation: ActivityGeneration;
+		readonly message: Parameters<ExtensionAPI["sendMessage"]>[0];
+		readonly watchdogEvent: ReturnType<typeof createContinueWatchdogEvent>;
 		readonly controller: LockDecisionController;
 		readonly attempt: number;
 		readonly body: string;
@@ -876,7 +980,11 @@ export function createDecisionRuntime(
 	 * Does not change controller lock/cycle accounting.
 	 */
 	const clearOperationalPendingWork = (): void => {
+		const previousPublicationCycle = publicationCycle;
 		publicationCycle += 1;
+		pendingUnlockReview?.abort.abort();
+		pendingUnlockReview = null;
+		deferredReconsideration = undefined;
 		const terminalDecision = pendingTerminalPublication?.active;
 		pendingTerminalPublication = null;
 		if (terminalDecision !== undefined) {
@@ -885,10 +993,14 @@ export function createDecisionRuntime(
 		}
 		const publication = pendingContinuationPublication;
 		if (
-			publication !== null &&
+			publication?.charged &&
+			publication.publicationCycle === previousPublicationCycle &&
+			publication.lifecycleGeneration === lifecycleGeneration &&
 			owns(publication.active.claim) &&
 			options.controllerHolder.controller === publication.controller &&
-			publication.confirmed() === false &&
+			(publication.confirmed === null || publication.confirmed() === false) &&
+			publicationCycle === previousPublicationCycle + 1 &&
+			options.controllerHolder.controller === publication.controller &&
 			publication.controller.snapshot.attempt === publication.attempt &&
 			!publication.controller.snapshot.decisionOpen
 		) {
@@ -1124,7 +1236,62 @@ export function createDecisionRuntime(
 		cleanupOutcome?: "preempted",
 		deferCleanupSend = false,
 	): void => {
-		if (active.invalidated) return;
+		if (active.invalidated || activeDecision !== active) return;
+		const pending = pendingFinalization;
+		// BUSY delays committing an already-consumed plan in its real window;
+		// generation/ownership replacement still takes the invalidation path.
+		if (
+			cleanupOutcome === undefined &&
+			active.isReconsideration &&
+			pending?.active === active &&
+			pending.cycleId === active.protocol.currentCycleId &&
+			pending.plan.outcome !== "ignored" &&
+			currentConsumedDecision() === active &&
+			activeGenerationCurrent(active) &&
+			options.controllerHolder.controller?.snapshot.decisionOpen === true
+		) {
+			return;
+		}
+		// Do not preserve a phase across a lifecycle/currentness replacement.
+		if (
+			cleanupOutcome === "preempted" ||
+			!activeGenerationCurrent(active) ||
+			!owns(active.claim)
+		) {
+			deferredReconsideration = undefined;
+		}
+		if (pendingUnlockReview?.active === active) {
+			pendingUnlockReview.abort.abort();
+			pendingUnlockReview = null;
+		}
+		if (
+			cleanupOutcome === undefined &&
+			activeGenerationCurrent(active) &&
+			owns(active.claim) &&
+			active.isReconsideration &&
+			active.challengedByReview !== undefined &&
+			active.reconsiderationFeedback !== undefined &&
+			deferredReconsideration === undefined
+		) {
+			// Controller count is consumed responses, not dispatched attempt ids.
+			const controllerSnapshot = options.controllerHolder.controller?.snapshot;
+			const sameWindow = controllerSnapshot?.decisionOpen === true;
+			deferredReconsideration = {
+				feedback: active.reconsiderationFeedback,
+				rootExchangeId: active.logicalRootExchangeId,
+				challengedBy: active.challengedByReview,
+				claim: active.claim,
+				resumeCycleId: sameWindow
+					? controllerSnapshot.invalidDecisionAttempts + 1
+					: active.protocol.currentCycleId,
+				invalidAttempts: sameWindow
+					? controllerSnapshot.invalidDecisionAttempts
+					: 0,
+				lastInvalidError: sameWindow
+					? controllerSnapshot.lastInvalidDecisionError
+					: null,
+			};
+		}
 		if (
 			cleanupOutcome === undefined &&
 			active.contextConfirmed &&
@@ -1230,6 +1397,56 @@ export function createDecisionRuntime(
 		options.hub.reclaimMain(attachment);
 	};
 
+	let pendingUnlockReview: PendingUnlockReview | null = null;
+	// A deferred reconsideration dispatch retains its semantic phase and
+	// remaining format allowance. Valid pending publication stays in its
+	// original consumed window; lifecycle replacement discards both.
+	let deferredReconsideration:
+		| {
+				readonly feedback: string;
+				readonly rootExchangeId: string;
+				readonly challengedBy: UnlockReviewRecord;
+				readonly claim: HubMainClaim;
+				/** Cycle the resumed window re-enters at (retry same attempt). */
+				readonly resumeCycleId: number;
+				/** Already-charged invalid responses; restored after reopen. */
+				readonly invalidAttempts: number;
+				/** Last safe validator diagnostic for the deferred correction. */
+				readonly lastInvalidError: string | null;
+		  }
+		| undefined;
+	let pendingReconsiderationForOpen:
+		| {
+				readonly feedback: string;
+				readonly rootExchangeId: string;
+				readonly challengedBy: UnlockReviewRecord;
+				readonly resumeCycleId?: number;
+				readonly invalidAttempts?: number;
+				readonly lastInvalidError?: string | null;
+		  }
+		| undefined;
+
+	// A missing/incompatible service is reported once per runtime; other skips each time.
+	let reviewUnavailableWarned = false;
+	const warnReviewSkipped = (
+		ctx: ExtensionContext,
+		reason: string | undefined,
+	): void => {
+		const missing = reason === "unavailable" || reason === "incompatible";
+		if (missing && reviewUnavailableWarned) return;
+		if (missing) reviewUnavailableWarned = true;
+		try {
+			ctx.ui.notify(
+				missing
+					? `Unlock review skipped: pi-llm-as-jev review service is ${reason}. Unlocking without review.`
+					: `Unlock review skipped (${reason ?? "incomplete"}). Unlocking without review.`,
+				"warning",
+			);
+		} catch {
+			// Non-TUI hosts may reject notify; the warning never gates the unlock.
+		}
+	};
+
 	const reportReviewHistory = (ctx: ExtensionContext): void => {
 		try {
 			const history = readReviewHistory(ctx.sessionManager);
@@ -1244,6 +1461,215 @@ export function createDecisionRuntime(
 				});
 		} catch {
 			// Diagnostic reads never restore authority or gate execution.
+		}
+	};
+
+	/**
+	 * Append one versioned review-association entry on the owning session.
+	 * Optional persistence: failures disclose via bounded diagnostics and
+	 * never relock, charge budget, or gate the outcome path.
+	 */
+	const appendUnlockReviewRecord = (
+		recordCtx: ExtensionContext,
+		record: UnlockReviewRecord,
+	): void => {
+		if (record.outcome === "incomplete")
+			warnReviewSkipped(recordCtx, record.incompleteReason);
+		try {
+			options.pi.appendEntry<UnlockReviewRecord>(
+				UNLOCK_REVIEW_ENTRY_TYPE,
+				record,
+			);
+		} catch {
+			try {
+				appendStatus({
+					kind: "other-error",
+					exchangeId: record.exchangeId,
+					cycleId: record.cycleId,
+					message: "Unlock review history incomplete.",
+				});
+			} catch {
+				// Diagnostics never gate execution.
+			}
+		}
+	};
+
+	/**
+	 * Apply a settled service report to its pending review. Runs only inside
+	 * deliverPending's guards: lifecycle invalidation aborts the in-flight
+	 * request, and a stale settle that lands anyway cannot publish, relock,
+	 * or charge the replacement cycle.
+	 */
+	const applyReviewOutcome = (
+		ctx: ExtensionContext,
+		state: PendingUnlockReview,
+		projection: UnlockReviewProjection,
+		report: UnlockReviewReport,
+	): void => {
+		const { active, cycleId, plan } = state;
+		const recordBase = {
+			version: 1 as const,
+			projectionVersion: UNLOCK_REVIEW_PROJECTION_VERSION,
+			exchangeId: active.exchangeId,
+			cycleId,
+			...(report.backend === undefined ? {} : { backend: report.backend }),
+			...(report.model === undefined ? {} : { model: report.model }),
+			...(projection.sourceHeadId === null
+				? {}
+				: { sourceHeadId: projection.sourceHeadId }),
+			...(projection.gaps.length === 0 ? {} : { gaps: projection.gaps.length }),
+			...(report.attemptCount === undefined
+				? {}
+				: { attemptCount: report.attemptCount }),
+			...(report.observationCoverage === undefined
+				? {}
+				: { observationCoverage: report.observationCoverage }),
+			...(report.usage === undefined ? {} : { usage: report.usage }),
+			...(report.errorMessage === undefined
+				? {}
+				: { errorMessage: report.errorMessage }),
+			...(report.contextOverflow === true ? { contextOverflow: true } : {}),
+		};
+		const pending = pendingFinalization;
+		// Stale callback fence: the logical decision may have been replaced,
+		// invalidated, or already committed. Only a still-current candidate
+		// with the same pending finalization may proceed.
+		if (
+			pending === null ||
+			pending.active !== active ||
+			pending.cycleId !== cycleId ||
+			active.invalidated ||
+			currentConsumedDecision() !== active
+		) {
+			return;
+		}
+		pending.reviewSettled = true;
+		if (report.outcome.kind === "challenged") {
+			pending.reviewDisposition = "challenged";
+			const record: UnlockReviewRecord = {
+				...recordBase,
+				outcome: "challenged",
+			};
+			openReconsideration(ctx, active, plan, record);
+			return;
+		}
+		pending.reviewDisposition =
+			report.outcome.kind === "supported" ? "supported" : "incomplete";
+		appendUnlockReviewRecord(ctx, {
+			...recordBase,
+			outcome: report.outcome.kind === "supported" ? "supported" : "incomplete",
+			...(report.outcome.kind === "incomplete"
+				? { incompleteReason: report.outcome.reason }
+				: {}),
+		});
+		// The still-current original candidate proceeds through the unchanged
+		// commit path; incomplete is recorded, never relabelled as approval.
+		void deliverPending(ctx);
+	};
+
+	/**
+	 * A definite challenge supersedes the initial candidate without
+	 * committing it and opens at most one separately owned reconsideration
+	 * inquiry bound to the same logical decision.
+	 */
+	const openReconsideration = (
+		ctx: ExtensionContext,
+		active: ActiveDecision,
+		plan: Extract<DecisionProtocolPlan, { readonly outcome: "unlock" }>,
+		reviewRecord: UnlockReviewRecord,
+	): void => {
+		const claim = active.claim;
+		const controller = options.controllerHolder.controller;
+		if (
+			controller === null ||
+			!owns(claim) ||
+			active.invalidated ||
+			currentConsumedDecision() !== active
+		)
+			return;
+		// The superseded initial candidate never commits. Close this decision
+		// window without attempts, then begin the replacement inquiry under
+		// the same lock cycle; only an accepted durable continuation may spend
+		// continuation budget.
+		pendingFinalization = null;
+		// Capture the local generation before any external boundary: manual
+		// unlock, takeover or restartLockCycle all run
+		// clearOperationalPendingWork which bumps localActivityGeneration, so a
+		// mismatch after the boundary proves this challenge is stale for the
+		// replacement cycle.
+		const challengeGeneration = localActivityGeneration;
+		const reconsideration = {
+			feedback: buildReconsiderationFeedback({
+				action: "unlock",
+				reasonType: plan.reasonType,
+				reason: plan.reason,
+			}),
+			rootExchangeId: active.logicalRootExchangeId,
+			challengedBy: reviewRecord,
+		};
+		// Retire the old phase BEFORE the reentrant fold dispatch: a user
+		// takeover, manual unlock or lock-cycle restart inside sendMessage must
+		// find no live review candidate and no usable challenge state. After the
+		// boundary the exact fences are rechecked; ownership alone is not proof
+		// the decision epoch survived.
+		const fold = active.inquiry.cancel();
+		active.invalidated = true;
+		activeDecision = null;
+		selfDecisionRun = { kind: "none" };
+		if (fold !== null) {
+			pendingInquiryCleanup = {
+				...fold,
+				details: {
+					...fold.details,
+					watchdogOutcome: "invalidated" as const,
+				} as InquiryFoldMessage["details"],
+			};
+			retryInquiryCleanup();
+		}
+		// Exact post-boundary fences: a restartLockCycle or takeover fired from
+		// the cleanup boundary must leave this stale challenge unable to open,
+		// charge, publish or unlock on the replacement cycle.
+		const liveController = options.controllerHolder.controller;
+		const stillCurrent =
+			liveController === controller &&
+			owns(claim) &&
+			!stopped &&
+			isCurrentMain() &&
+			liveController !== null &&
+			// Any lifecycle replacement after the boundary bumps the local
+			// generation; a mismatch strands the stale challenge.
+			localActivityGeneration === challengeGeneration &&
+			pendingFinalization === null &&
+			activeDecision === null &&
+			pendingUnlockReview === null;
+		if (!stillCurrent) {
+			// Old candidate never commits; the lock cycle stays under whatever
+			// terminal state the boundary callback produced.
+			return;
+		}
+		applyTransition(
+			controller.invalidateDecision(active.decisionId),
+			undefined,
+			{ claim },
+		);
+		const transition = controller.beginDecision(now());
+		if (!transition.applied) {
+			// Cannot open the replacement inquiry: the superseded candidate is
+			// never released; the lock cycle stays under existing accounting.
+			silentlyAbandonDecision();
+			return;
+		}
+		pendingReconsiderationForOpen = reconsideration;
+		applyTransition(transition, undefined, { claim });
+		pendingReconsiderationForOpen = undefined;
+		const newActive: ActiveDecision | null =
+			activeDecision as ActiveDecision | null;
+		if (newActive !== null && owns(claim)) {
+			const opened: ActiveDecision = newActive;
+			appendUnlockReviewRecord(ctx, {
+				...reviewRecord,
+				reconsiderExchangeId: opened.exchangeId,
+			});
 		}
 	};
 
@@ -1358,7 +1784,7 @@ export function createDecisionRuntime(
 				deliverAs: "steer",
 			});
 			if (hasPendingMessages() || !activeGenerationCurrent(active)) {
-				deferDecisionOnBusy(active);
+				if (sendOptions?.deferOnBusy !== false) deferDecisionOnBusy(active);
 				return false;
 			}
 			return true;
@@ -1374,7 +1800,17 @@ export function createDecisionRuntime(
 		}
 	};
 
-	const openDecision = (decisionId: number): void => {
+	const openDecision = (
+		decisionId: number,
+		reconsideration?: {
+			readonly feedback: string;
+			readonly rootExchangeId: string;
+			readonly challengedBy: UnlockReviewRecord;
+			readonly resumeCycleId?: number;
+			readonly invalidAttempts?: number;
+			readonly lastInvalidError?: string | null;
+		},
+	): void => {
 		// Exact claim fence for this open attempt — not a live re-lookup later.
 		const claim = getMainClaim();
 		const controller = currentController(claim);
@@ -1384,13 +1820,45 @@ export function createDecisionRuntime(
 		}
 		const stillOwns = (): boolean => owns(claim);
 
+		// A deferred semantic reconsideration resumes the same phase through
+		// any open path — busy dispatch, correction or final-publication
+		// deferral all re-enter here with no explicit reconsideration arg.
+		// Lifecycle replacement has already cleared deferredReconsideration.
+		if (
+			reconsideration === undefined &&
+			deferredReconsideration !== undefined
+		) {
+			const deferred = deferredReconsideration;
+			deferredReconsideration = undefined;
+			if (
+				deferred.claim.attachmentId === claim.attachmentId &&
+				deferred.claim.generation === claim.generation &&
+				owns(claim) &&
+				controller === options.controllerHolder.controller
+			) {
+				reconsideration = {
+					feedback: deferred.feedback,
+					rootExchangeId: deferred.rootExchangeId,
+					challengedBy: deferred.challengedBy,
+					resumeCycleId: deferred.resumeCycleId,
+					invalidAttempts: deferred.invalidAttempts,
+					lastInvalidError: deferred.lastInvalidError,
+				};
+			}
+		}
+
 		// Keep ordinary active tools and system prompt unchanged. Decision answers
 		// are final function-call text, not temporary decision tools.
-		const decisionPrompt = buildDecisionPrompt(
-			config.decisionPrompt,
-			config.reasonTypes,
-			config.continueReasonTypes,
-		);
+		// Both inquiry kinds share the same fixed protocol guidance; a
+		// reconsideration only appends discrete challenge feedback after the
+		// unchanged reason lists, field limits and assessment/delivery rules.
+		const decisionPrompt =
+			buildDecisionPrompt(
+				config.decisionPrompt,
+				config.reasonTypes,
+				config.continueReasonTypes,
+			) +
+			(reconsideration === undefined ? "" : `\n\n${reconsideration.feedback}`);
 		const domainFence = options.processDomain?.snapshot.fence ?? {
 			domainEpoch: "local",
 			activityGeneration: 0n,
@@ -1402,6 +1870,13 @@ export function createDecisionRuntime(
 			decisionPrompt,
 			reasonTypes: config.reasonTypes,
 			continueReasonTypes: config.continueReasonTypes,
+			...(reconsideration?.resumeCycleId === undefined
+				? {}
+				: {
+						initialCycleId: reconsideration.resumeCycleId,
+						invalidAttempts: reconsideration.invalidAttempts,
+						lastInvalidError: reconsideration.lastInvalidError,
+					}),
 		});
 		const active: ActiveDecision = {
 			decisionId,
@@ -1427,6 +1902,14 @@ export function createDecisionRuntime(
 			contextConfirmed: false,
 			responseToolCallIds: new Set<string>(),
 			stagedResult: null,
+			logicalRootExchangeId: reconsideration?.rootExchangeId ?? exchangeId,
+			isReconsideration: reconsideration !== undefined,
+			...(reconsideration === undefined
+				? {}
+				: {
+						challengedByReview: reconsideration.challengedBy,
+						reconsiderationFeedback: reconsideration.feedback,
+					}),
 			protocol,
 		};
 		activeDecision = active;
@@ -1458,7 +1941,12 @@ export function createDecisionRuntime(
 			sendDecisionPrompt(
 				active,
 				active.protocol.currentCycleId,
-				decisionPrompt,
+				reconsideration?.lastInvalidError == null
+					? decisionPrompt
+					: buildDecisionReaskPrompt(
+							decisionPrompt,
+							reconsideration.lastInvalidError,
+						),
 			);
 			// A demotion that lands during/after send must not leave a live exchange.
 			if (!stillOwns()) {
@@ -1484,7 +1972,7 @@ export function createDecisionRuntime(
 		if (currentController() === null) return;
 		switch (effect.kind) {
 			case "openDecisionWindow":
-				openDecision(effect.decisionId);
+				openDecision(effect.decisionId, pendingReconsiderationForOpen);
 				break;
 			case "restoreDecisionTools":
 				// Historical effect name: closes the decision window; no tool swap.
@@ -1508,12 +1996,12 @@ export function createDecisionRuntime(
 			readonly suppressNotify?: boolean;
 			readonly claim?: HubMainClaim;
 		},
-	): void => {
+	): ActiveDecision | null => {
 		const claim = applyOptions?.claim ?? getMainClaim();
-		if (claim === null || !options.hub.isCurrentMain(claim)) return;
+		if (claim === null || !options.hub.isCurrentMain(claim)) return null;
 		let opened: ActiveDecision | null = null;
 		for (const effect of transition.effects) {
-			if (!options.hub.isCurrentMain(claim)) return;
+			if (!options.hub.isCurrentMain(claim)) return opened;
 			if (effect.kind === "notify") {
 				if (!applyOptions?.suppressNotify && ctx !== undefined) {
 					ctx.ui.notify(
@@ -1524,8 +2012,12 @@ export function createDecisionRuntime(
 				}
 				continue;
 			}
-			applyEffect(effect, ctx);
-			if (effect.kind === "openDecisionWindow") opened = activeDecision;
+			if (effect.kind === "openDecisionWindow") {
+				openDecision(effect.decisionId, pendingReconsiderationForOpen);
+				opened = activeDecision;
+			} else {
+				applyEffect(effect, ctx);
+			}
 		}
 		if (transition.applied) {
 			localActivityGeneration += 1;
@@ -1535,6 +2027,7 @@ export function createDecisionRuntime(
 		if (opened !== null && latestGeneration !== null) {
 			opened.aggregateGeneration = latestGeneration;
 		}
+		return opened;
 	};
 
 	const getTriggerStatus = (): WatchdogTriggerStatus => {
@@ -1550,7 +2043,11 @@ export function createDecisionRuntime(
 		else if (!controllerSnapshot.locked) blocker = "unlocked";
 		else if (controllerSnapshot.exhausted) blocker = "exhausted";
 		else if (controllerSnapshot.decisionFailed) blocker = "decision-failed";
-		else if (pendingFinalization !== null) blocker = "decision-finalizing";
+		else if (
+			pendingFinalization !== null ||
+			pendingContinuationPublication?.confirmed === null
+		)
+			blocker = "decision-finalizing";
 		else if (
 			controllerSnapshot.decisionOpen ||
 			activeDecision !== null ||
@@ -1612,6 +2109,7 @@ export function createDecisionRuntime(
 			controllerEligible &&
 			activeDecision === null &&
 			pendingFinalization === null &&
+			pendingContinuationPublication?.confirmed !== null &&
 			pendingInquiryCleanup === null &&
 			selfDecisionRun.kind === "none";
 		return {
@@ -2087,6 +2585,10 @@ export function createDecisionRuntime(
 		const active = activeDecision;
 		const controller = options.controllerHolder.controller;
 		if (active === null || active.invalidated || controller === null) return;
+		if (pendingUnlockReview?.active === active) {
+			pendingUnlockReview.abort.abort();
+			pendingUnlockReview = null;
+		}
 		const snapshot = options.processDomain?.snapshot;
 		if (
 			!force &&
@@ -2402,9 +2904,13 @@ export function createDecisionRuntime(
 
 	const confirmContinuationPublication = (settled = false): void => {
 		const pending = pendingContinuationPublication;
-		if (pending === null) return;
+		if (pending === null || pending.confirmed === null || pending.sending)
+			return;
 		if (
 			!owns(pending.active.claim) ||
+			options.controllerHolder.controller !== pending.controller ||
+			publicationCycle !== pending.publicationCycle ||
+			lifecycleGeneration !== pending.lifecycleGeneration ||
 			watchdogOwnedRun?.exchangeId !== pending.active.exchangeId ||
 			watchdogOwnedRun.cycleId !== pending.cycleId
 		) {
@@ -2412,6 +2918,7 @@ export function createDecisionRuntime(
 			return;
 		}
 		const confirmed = pending.confirmed();
+		if (pendingContinuationPublication !== pending) return;
 		if (confirmed !== true) {
 			if (confirmed === false && settled) {
 				pendingContinuationPublication = null;
@@ -2427,12 +2934,20 @@ export function createDecisionRuntime(
 			}
 			return;
 		}
-		pendingContinuationPublication = null;
-		pending.active.inquiry.complete({
-			customType: CONTINUATION_MESSAGE_TYPE,
-			content: pending.body,
-		});
-		if (!owns(pending.active.claim)) return;
+		if (pendingContinuationPublication === pending) {
+			pendingContinuationPublication = null;
+			pending.active.inquiry.complete({
+				customType: CONTINUATION_MESSAGE_TYPE,
+				content: pending.body,
+			});
+		}
+		if (
+			!owns(pending.active.claim) ||
+			options.controllerHolder.controller !== pending.controller ||
+			publicationCycle !== pending.publicationCycle ||
+			lifecycleGeneration !== pending.lifecycleGeneration
+		)
+			return;
 		try {
 			emitSemanticHook(
 				options.pi.events,
@@ -2443,6 +2958,166 @@ export function createDecisionRuntime(
 			);
 		} catch {
 			// Listener failures cannot undo a persisted continuation.
+		}
+	};
+
+	/** Send only a not-yet-sent accepted continuation under its original fences. */
+	const sendPendingContinuation = async (
+		ctx: ExtensionContext,
+	): Promise<boolean> => {
+		const pending = pendingContinuationPublication;
+		if (pending === null || pending.confirmed !== null || pending.sending)
+			return false;
+		const ledgerCurrent = (): boolean =>
+			pendingContinuationPublication === pending &&
+			owns(pending.active.claim) &&
+			options.controllerHolder.controller === pending.controller &&
+			publicationCycle === pending.publicationCycle &&
+			lifecycleGeneration === pending.lifecycleGeneration &&
+			pending.controller.snapshot.locked &&
+			!pending.controller.snapshot.decisionOpen &&
+			!pending.controller.snapshot.decisionFailed &&
+			pending.controller.snapshot.attempt ===
+				pending.attempt - (pending.charged ? 0 : 1);
+		const current = (): boolean => {
+			const fence = options.processDomain?.snapshot.fence;
+			return (
+				ledgerCurrent() &&
+				!stopped &&
+				!pending.active.invalidated &&
+				localActivityGeneration ===
+					pending.generation.localActivityGeneration &&
+				sameActivityGeneration(
+					graceCoordinator.snapshot.generation,
+					pending.generation,
+				) &&
+				(fence === undefined ||
+					(fence.domainEpoch === pending.active.domainFence.domainEpoch &&
+						fence.activityGeneration ===
+							pending.active.domainFence.activityGeneration))
+			);
+		};
+		const refund = (): void => {
+			if (
+				pending.charged &&
+				ledgerCurrent() &&
+				pending.controller.rollbackValidContinue().applied
+			)
+				pending.charged = false;
+		};
+		const discard = (): false => {
+			refund();
+			if (pendingContinuationPublication === pending) {
+				pendingContinuationPublication = null;
+				pending.active.invalidated = true;
+				if (selfRunFor(pending.active)) selfDecisionRun = { kind: "none" };
+			}
+			return false;
+		};
+		const defer = (): false => {
+			if (!current()) return discard();
+			refund();
+			if (!pending.active.isReconsideration) {
+				pending.active.invalidated = true;
+				if (pendingContinuationPublication === pending)
+					pendingContinuationPublication = null;
+			}
+			return false;
+		};
+		pending.sending = true;
+		try {
+			if (!current()) return discard();
+			if (!allIdleForClaim(pending.active.claim)) return defer();
+			if (!current()) return discard();
+			if (options.processDomain !== undefined) {
+				let confirmed = false;
+				try {
+					confirmed = await options.processDomain.confirm(
+						pending.active.domainFence,
+					);
+				} catch {
+					disableDomain();
+					return false;
+				}
+				if (!current()) return discard();
+				if (!confirmed || !allIdleForClaim(pending.active.claim))
+					return defer();
+			}
+			if (!current()) return discard();
+			if (!allIdleForClaim(pending.active.claim)) return defer();
+			if (!current()) return discard();
+			if (!pending.charged) {
+				if (
+					!pending.controller.reapplyValidContinue(pending.attempt - 1).applied
+				)
+					return discard();
+				pending.charged = true;
+			}
+			const failSend = (): false => {
+				if (!ledgerCurrent()) return false;
+				refund();
+				pendingContinuationPublication = null;
+				watchdogOwnedRun = null;
+				pending.active.invalidated = true;
+				if (!allIdleForClaim(pending.active.claim)) return false;
+				if (
+					!owns(pending.active.claim) ||
+					options.controllerHolder.controller !== pending.controller ||
+					publicationCycle !== pending.publicationCycle ||
+					lifecycleGeneration !== pending.lifecycleGeneration
+				)
+					return false;
+				retainInquiryCleanup(pending.active);
+				retryInquiryCleanup();
+				if (
+					owns(pending.active.claim) &&
+					options.controllerHolder.controller === pending.controller &&
+					publicationCycle === pending.publicationCycle &&
+					lifecycleGeneration === pending.lifecycleGeneration
+				)
+					silentlyAbandonDecision();
+				return false;
+			};
+			let receipt: () => boolean | undefined;
+			try {
+				receipt = observeOutcomePublication(
+					ctx,
+					pending.active,
+					pending.cycleId,
+					pending.watchdogEvent,
+				);
+			} catch {
+				return failSend();
+			}
+			if (!current()) return discard();
+			if (!allIdleForClaim(pending.active.claim)) return defer();
+			if (!current()) return discard();
+			pending.confirmed = receipt;
+			watchdogOwnedRun = {
+				kind: "continuation",
+				claim: pending.active.claim,
+				exchangeId: pending.active.exchangeId,
+				cycleId: pending.cycleId,
+				phase: "pending-start",
+				cancelRequested: false,
+			};
+			try {
+				options.pi.sendMessage(pending.message, {
+					triggerTurn: true,
+					deliverAs: "steer",
+				});
+			} catch {
+				return failSend();
+			}
+			if (
+				pendingContinuationPublication !== pending ||
+				!owns(pending.active.claim)
+			)
+				return false;
+			reconcileIdle();
+			return true;
+		} finally {
+			pending.sending = false;
 		}
 	};
 
@@ -2457,7 +3132,11 @@ export function createDecisionRuntime(
 	 */
 	const deliverPending = async (ctx: ExtensionContext): Promise<boolean> => {
 		const pending = pendingFinalization;
-		if (pending === null || currentConsumedDecision() !== pending.active) {
+		if (
+			pending === null ||
+			currentConsumedDecision() !== pending.active ||
+			pending.active.invalidated
+		) {
 			return false;
 		}
 		const { active, cycleId, plan } = pending;
@@ -2476,6 +3155,115 @@ export function createDecisionRuntime(
 		if (!readyToFinalize()) {
 			deferDecisionOnBusy(active);
 			return false;
+		}
+
+		// Optional AI-unlock review: only a current, valid, initial unlock
+		// candidate from a non-reconsideration inquiry is eligible, exactly
+		// once per logical decision, before its effect is committed. Every
+		// other outcome and a reconsidered result skip this branch entirely.
+		if (
+			plan.outcome === "unlock" &&
+			config.unlockReviewEnabled &&
+			!active.isReconsideration &&
+			pending.reconsidered !== true &&
+			active.logicalRootExchangeId === active.exchangeId &&
+			pending.reviewSettled !== true
+		) {
+			if (pendingUnlockReview === null) {
+				const service: ReviewServiceLike | undefined = options.reviewService;
+				const discovery =
+					service !== undefined
+						? ({ status: "available", service } as const)
+						: discoverUnlockReviewService();
+				if (discovery.status !== "available") {
+					pending.reviewSettled = true;
+					pending.reviewDisposition = "incomplete";
+					appendUnlockReviewRecord(ctx, {
+						version: 1,
+						projectionVersion: UNLOCK_REVIEW_PROJECTION_VERSION,
+						exchangeId: active.exchangeId,
+						cycleId,
+						outcome: "incomplete",
+						incompleteReason: discovery.status,
+					});
+				} else {
+					let snapshotEntries: ReturnType<
+						typeof ctx.sessionManager.buildContextEntries
+					>;
+					try {
+						snapshotEntries = ctx.sessionManager.buildContextEntries();
+					} catch {
+						pending.reviewSettled = true;
+						pending.reviewDisposition = "incomplete";
+						appendUnlockReviewRecord(ctx, {
+							version: 1,
+							projectionVersion: UNLOCK_REVIEW_PROJECTION_VERSION,
+							exchangeId: active.exchangeId,
+							cycleId,
+							outcome: "incomplete",
+							incompleteReason: "error",
+							errorMessage: "macro snapshot projection failed",
+						});
+						return deliverPending(ctx);
+					}
+					// Synchronous snapshot call can be reentrant: a host callback
+					// may have demoted, unlocked or replaced the lock cycle. Recheck
+					// exact fences before installing a new pending review.
+					if (
+						pendingFinalization !== pending ||
+						active.invalidated ||
+						currentConsumedDecision() !== active ||
+						!readyToFinalize()
+					) {
+						return false;
+					}
+					let projection: UnlockReviewProjection;
+					try {
+						projection = buildUnlockReviewProjection(snapshotEntries);
+					} catch {
+						pending.reviewSettled = true;
+						pending.reviewDisposition = "incomplete";
+						appendUnlockReviewRecord(ctx, {
+							version: 1,
+							projectionVersion: UNLOCK_REVIEW_PROJECTION_VERSION,
+							exchangeId: active.exchangeId,
+							cycleId,
+							outcome: "incomplete",
+							incompleteReason: "error",
+							errorMessage: "macro snapshot projection failed",
+						});
+						return deliverPending(ctx);
+					}
+					const request = buildUnlockReviewRequest(projection, {
+						action: "unlock",
+						reasonType: plan.reasonType,
+						reason: plan.reason,
+					});
+					const reviewState: PendingUnlockReview = {
+						active,
+						cycleId,
+						plan,
+						abort: new AbortController(),
+						settled: false,
+					};
+					pendingUnlockReview = reviewState;
+					void (async () => {
+						const report = await runUnlockReview(
+							discovery.service,
+							request,
+							reviewState.abort.signal,
+						);
+						if (reviewState.settled) return;
+						reviewState.settled = true;
+						if (pendingUnlockReview === reviewState) pendingUnlockReview = null;
+						applyReviewOutcome(ctx, reviewState, projection, report);
+					})();
+					// The pending review is one business operation per logical
+					// decision; settlement callbacks re-enter via applyReviewOutcome.
+					return false;
+				}
+			}
+			if (pendingUnlockReview !== null) return false;
 		}
 		// Exact claim carried by this decision exchange — not a live re-lookup.
 		const claim = active.claim;
@@ -2523,8 +3311,10 @@ export function createDecisionRuntime(
 		}
 
 		if (currentConsumedDecision() !== active) return false;
-		const controllerBeforeCommit =
-			options.controllerHolder.controller?.snapshot;
+		const controllerAtCommit = options.controllerHolder.controller;
+		const publicationCycleAtCommit = publicationCycle;
+		const lifecycleAtCommit = lifecycleGeneration;
+		const controllerBeforeCommit = controllerAtCommit?.snapshot;
 		pendingFinalization = null;
 		const finalization = active.protocol.commitResponse(cycleId, plan);
 
@@ -2568,18 +3358,22 @@ export function createDecisionRuntime(
 						{ deferOnBusy: false },
 					)
 				) {
-					const cycleRolledBack = active.protocol.rollbackAfterReask(cycleId);
-					const controllerRolledBack =
-						controllerBeforeCommit !== undefined &&
-						options.controllerHolder.controller?.rollbackInvalidDecision(
-							active.decisionId,
-							controllerBeforeCommit.invalidDecisionAttempts,
-							controllerBeforeCommit.lastInvalidDecisionError,
-						).applied === true;
-					if (!cycleRolledBack || !controllerRolledBack) {
-						silentlyAbandonDecision();
-						return false;
+					if (!active.isReconsideration) {
+						const cycleRolledBack = active.protocol.rollbackAfterReask(cycleId);
+						const controllerRolledBack =
+							controllerBeforeCommit !== undefined &&
+							options.controllerHolder.controller?.rollbackInvalidDecision(
+								active.decisionId,
+								controllerBeforeCommit.invalidDecisionAttempts,
+								controllerBeforeCommit.lastInvalidDecisionError,
+							).applied === true;
+						if (!cycleRolledBack || !controllerRolledBack) {
+							silentlyAbandonDecision();
+							return false;
+						}
 					}
+					// A reconsideration response already consumed its format slot;
+					// failure to send the next prompt cannot replenish that slot.
 					deferDecisionOnBusy(active);
 					return false;
 				}
@@ -2607,7 +3401,7 @@ export function createDecisionRuntime(
 		}
 
 		if (stopIfStale(claim)) return false;
-		clearLiveStatus();
+		if (finalization.outcome !== "continue") clearLiveStatus();
 		if (stopIfStale(claim)) return false;
 
 		if (finalization.outcome === "decision-failed") {
@@ -2677,103 +3471,53 @@ export function createDecisionRuntime(
 		}
 
 		if (finalization.outcome === "continue") {
-			activeDecision = null;
-			capturedDecisionResponse = null;
 			const finalCycleId = finalization.cycleId;
 			const reasonType = finalization.reasonType;
 			const reason = finalization.reason;
 			if (
+				controllerAtCommit === null ||
 				typeof reasonType !== "string" ||
 				reasonType.length === 0 ||
 				typeof reason !== "string" ||
 				reason.length === 0
-			) {
+			)
 				return false;
-			}
-			const deferAcceptedContinue = (): false => {
-				options.controllerHolder.controller?.rollbackValidContinue();
-				active.invalidated = true;
-				clearLiveStatus();
-				return false;
-			};
-			if (stopIfStale(claim)) return false;
-			if (!allIdleForClaim(claim)) return deferAcceptedContinue();
-			if (options.processDomain !== undefined) {
-				let confirmed = false;
-				try {
-					confirmed = await options.processDomain.confirm(active.domainFence);
-				} catch {
-					disableDomain();
-					return false;
-				}
-				if (!confirmed) return deferAcceptedContinue();
-				if (!allIdleForClaim(claim)) return deferAcceptedContinue();
-			}
-			if (!allIdleForClaim(claim)) return deferAcceptedContinue();
 			const watchdogEvent = createContinueWatchdogEvent({
 				occurredAtMs: now(),
 				reasonType,
 				reason,
 			});
-			const continuationMessage = formatContinueWatchdogEvent(
+			const body = formatContinueWatchdogEvent(
 				watchdogEvent,
 				config.continuePrompt,
 			);
-			if (stopIfStale(claim)) return false;
-			try {
-				const controller = options.controllerHolder.controller;
-				if (controller === null) return false;
-				pendingContinuationPublication = {
-					active,
-					cycleId: finalCycleId,
-					controller,
-					attempt: controller.snapshot.attempt,
-					confirmed: observeOutcomePublication(
-						ctx,
-						active,
-						finalCycleId,
-						watchdogEvent,
-					),
-					body: continuationMessage,
-					reasonType,
-					reason,
-				};
-				watchdogOwnedRun = {
-					kind: "continuation",
-					claim,
+			pendingContinuationPublication = {
+				active,
+				cycleId: finalCycleId,
+				controller: controllerAtCommit,
+				attempt: finalization.transition.snapshot.attempt,
+				publicationCycle: publicationCycleAtCommit,
+				lifecycleGeneration: lifecycleAtCommit,
+				generation: active.aggregateGeneration,
+				confirmed: null,
+				charged: true,
+				sending: false,
+				body,
+				reasonType,
+				reason,
+				watchdogEvent,
+				message: createDecisionFoldMessage({
 					exchangeId: active.exchangeId,
 					cycleId: finalCycleId,
-					phase: "pending-start",
-					cancelRequested: false,
-				};
-				options.pi.sendMessage(
-					createDecisionFoldMessage({
-						exchangeId: active.exchangeId,
-						cycleId: finalCycleId,
-						outcome: "continue",
-						continuePrompt: continuationMessage,
-						watchdogEvent,
-					}),
-					{ triggerTurn: true, deliverAs: "steer" },
-				);
-			} catch {
-				pendingContinuationPublication = null;
-				watchdogOwnedRun = null;
-				if (!allIdleForClaim(claim)) return deferAcceptedContinue();
-				options.controllerHolder.controller?.rollbackValidContinue();
-				retainInquiryCleanup(active);
-				retryInquiryCleanup();
-				silentlyAbandonDecision();
-				return false;
-			}
-			// Trigger-turn delivery crosses async lifecycle work. Context/settlement
-			// confirms a newly persisted correlated fold before notifying listeners.
-			if (stopIfStale(claim)) return false;
-			// The continuation turn is now the only local busy source; reconcile the
-			// next retry from the controller state for hosts/tests that have not yet
-			// delivered its agent_start event.
-			reconcileIdle();
-			return true;
+					outcome: "continue",
+					continuePrompt: body,
+					watchdogEvent,
+				}),
+			};
+			activeDecision = null;
+			capturedDecisionResponse = null;
+			clearLiveStatus();
+			return sendPendingContinuation(ctx);
 		}
 
 		activeDecision = null;
@@ -2854,6 +3598,9 @@ export function createDecisionRuntime(
 								? { content: [{ type: "malformed" }] }
 								: response,
 						),
+			// A reconsidered unlock is committed directly: the single permitted
+			// review already ran for this logical decision.
+			reconsidered: active.isReconsideration,
 		};
 	};
 
@@ -3201,6 +3948,12 @@ export function createDecisionRuntime(
 				readonly attempt?: unknown;
 			};
 		};
+		if (
+			pendingContinuationPublication?.confirmed === null &&
+			(message.role === "user" || message.role === "custom")
+		) {
+			clearOperationalPendingWork();
+		}
 		const current = activeDecision;
 		if (ctx !== undefined) {
 			observeLiveState(ctx, {
@@ -3261,12 +4014,18 @@ export function createDecisionRuntime(
 			!isCurrentDecision &&
 			(message.role === "user" || message.role === "custom")
 		) {
-			deferDecisionOnBusy(active);
+			deferDecisionOnBusy(
+				active,
+				active.isReconsideration ? "preempted" : undefined,
+			);
 			return;
 		}
 		if (!active.dispatchPending) return;
 		if (!isCurrentDecision) {
-			deferDecisionOnBusy(active);
+			deferDecisionOnBusy(
+				active,
+				active.isReconsideration ? "preempted" : undefined,
+			);
 			return;
 		}
 		active.dispatchPending = false;
@@ -3466,6 +4225,9 @@ export function createDecisionRuntime(
 				observeLiveState(ctx);
 				return;
 			}
+			if (pendingContinuationPublication?.confirmed === null)
+				clearOperationalPendingWork();
+			deferredReconsideration = undefined;
 			selfDecisionRun = { kind: "none" };
 			observeLiveState(ctx);
 			// A re-issued takeover must pass through untouched so it becomes the
@@ -3479,6 +4241,21 @@ export function createDecisionRuntime(
 				!active.submitted ||
 				!owns(active.claim)
 			) {
+				return { action: "continue" };
+			}
+			// Idle pending-review phase: the original agent_settled already
+			// returned and no watchdog-owned run remains. Capturing the input
+			// would strand it until a settle that never arrives, so abort the
+			// in-flight review, retire the pending unlock, and let this exact
+			// input proceed normally as a fresh user turn. localIdle() was just
+			// refreshed by observeLiveState above; a live submitted run keeps
+			// the capture-and-reissue path below.
+			if (localIdle() && !active.dispatchPending) {
+				if (pendingUnlockReview?.active === active) {
+					pendingUnlockReview.abort.abort();
+					pendingUnlockReview = null;
+				}
+				deferDecisionOnBusy(active, "preempted");
 				return { action: "continue" };
 			}
 			// Swallow the raw takeover so 0.85.1's async abort cannot strand it as
@@ -3613,7 +4390,8 @@ export function createDecisionRuntime(
 			} else {
 				finalizeActiveDecision("missing");
 			}
-			const continued = await deliverPending(ctx);
+			const continued =
+				(await sendPendingContinuation(ctx)) || (await deliverPending(ctx));
 			if (!continued && probePiAgentState(ctx).idle)
 				spliceDecisionAssistant(ctx);
 			if (!continued) await maybePublishUserReady();

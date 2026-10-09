@@ -63,6 +63,8 @@ export interface ContinueWatchdogConfig {
 	continueReasonTypes: readonly string[];
 	/** Key binding for the human unlock shortcut, or false to disable it. */
 	unlockShortcut: string | false;
+	/** Third-party review of AI unlock decisions; default on, skipped with a warning when unavailable. */
+	unlockReviewEnabled: boolean;
 }
 
 export type ConfigLayer = Partial<ContinueWatchdogConfig>;
@@ -91,6 +93,7 @@ export const BUILT_IN_CONFIG: Readonly<ContinueWatchdogConfig> = Object.freeze({
 	reasonTypes: DEFAULT_REASON_TYPES,
 	continueReasonTypes: DEFAULT_CONTINUE_REASON_TYPES,
 	unlockShortcut: "alt+u",
+	unlockReviewEnabled: true,
 });
 
 const MAX_DIAGNOSTIC_LENGTH = 240;
@@ -103,6 +106,7 @@ const KNOWN_KEYS = new Set([
 	"reasonTypes",
 	"continueReasonTypes",
 	"unlockShortcut",
+	"unlockReviewEnabled",
 ]);
 
 /** Keys removed with the retired jev integration; values never load. */
@@ -125,6 +129,7 @@ function copyBuiltIn(): ContinueWatchdogConfig {
 		reasonTypes: [...BUILT_IN_CONFIG.reasonTypes],
 		continueReasonTypes: [...BUILT_IN_CONFIG.continueReasonTypes],
 		unlockShortcut: BUILT_IN_CONFIG.unlockShortcut,
+		unlockReviewEnabled: BUILT_IN_CONFIG.unlockReviewEnabled,
 	};
 }
 
@@ -294,6 +299,17 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 		}
 	}
 
+	if (Object.hasOwn(input, "unlockReviewEnabled")) {
+		const enabled = input.unlockReviewEnabled;
+		if (typeof enabled === "boolean") {
+			config.unlockReviewEnabled = enabled;
+		} else {
+			diagnostics.push(
+				diagnostic(source, "unlockReviewEnabled must be a boolean"),
+			);
+		}
+	}
+
 	for (const key of Object.keys(input)) {
 		if (!KNOWN_KEYS.has(key) && !REMOVED_KEYS.has(key)) {
 			diagnostics.push(diagnostic(source, "ignoring unsupported keys"));
@@ -348,6 +364,9 @@ export function mergeConfig(
 		}
 		if (partial.unlockShortcut !== undefined) {
 			config.unlockShortcut = partial.unlockShortcut;
+		}
+		if (partial.unlockReviewEnabled !== undefined) {
+			config.unlockReviewEnabled = partial.unlockReviewEnabled;
 		}
 	}
 

@@ -60,6 +60,17 @@ A persisted review uses the owning native JSONL's existing marker, inquiry, opti
 
 Historical reads follow the host's current ancestor path at startup and before inquiries. Sources must precede that review on the same path. Non-label source identity survives native fork label recreation and parent re-chaining; origin session ID is provenance only. A leaf-only branch move is not persisted by tested Pi 0.85.1: fresh reopen restores its persisted tip. The watchdog never selects another leaf to disguise this host limitation. New views use native compaction-aware entries, not archived raw requests; recovery restores no lock, claim, budget, timer, dispatch or staged action.
 
+### AI-unlock review (`unlockReviewEnabled`, default on)
+
+When enabled (the default), a current valid initial AI `unlock` is reviewed before commit by the already-loaded `pi-llm-as-jev` review-v1 service, discovered at call time (`version 1`, `reviewVersion 1`, callable `review`). No installation, provider fallback or direct HTTP. If the service is absent, incompatible or the review cannot complete, the extension shows a warning notification and the unlock proceeds unreviewed; it never interrupts the session. A missing/incompatible service warns once per runtime; other incomplete reviews warn each time. `false` disables review and lookup. `continue`, invalid calls, manual unlock, abort and terminal-error unlock perform no lookup.
+
+- **Input:** one fixed question (`supported` / `challenged` / `insufficient_evidence`) with the candidate claim and the complete effective-conversation snapshot as fixed state: full public user/assistant/custom text in order, labelled summaries, tool name/call/status only, `ask_user_question` reply question/answer text. Owned control traffic, thinking and `excludeFromContext` bash are removed using the same native rules as the bounded view. Unsupported content is a gap. Known provider secrets are redacted by the service. No 8,000-code-point crop, extra summarizer, `timeoutMs` or consumer timer.
+- **Outcome:** supported → original unlock to normal publication. Incomplete (service absent/incompatible, error/deadline/inactivity, abort, malformed or missing answer, unobserved, overflow, insufficient evidence, or a known input gap — the latter without calling the service) → the still-current original unlock, marked incomplete, never as approval. Challenged → one separately owned reconsideration inquiry with the normal fixed prompt plus the challenge; its result is applied without further review. At most two inquiries per logical decision, each with its own three-response format allowance; review and reconsideration spend no continuation budget.
+- **Cancellation:** manual unlock, takeover, abort, branch/session replacement and ownership loss abort the review; late results cannot publish, relock or charge.
+- **History:** one `pi-continue-watchdog:unlock-review` custom entry per review (outcome, backend/model, attempts, known usage with missing counts). Append failure is a bounded diagnostic only. Reopen reads history and never resumes review or reconsideration.
+
+`unlock-review-boundary.idea.lean` models this review boundary: fixed input, known-gap zero-call admission, one business call, challenge only from an observed accepted answer, current-original fallback, stale no-action and immediate escape. It assumes the projection and live/currentness inputs; it is not a TypeScript refinement or proof of review accuracy.
+
 `watchdog-review-history.idea.lean` models that read-only association boundary. Existing lifecycle models remain unchanged; the new model assumes a correct host ancestry and already decoded records. Neither its proofs nor fixture verdicts establish natural-language completeness, provider-wire fidelity after later plugins, or repair of the historical false continuation. Independent semantic review remains an explicit verification gate.
 
 ## Product surface (fixed names)
@@ -135,8 +146,9 @@ Continue until user assistance is required.
 | `continuePrompt` | exact default above | Guidance embedded verbatim in the fixed continuation body; nonblank and at most 16,384 Unicode code points |
 | `reasonTypes` | `["JOB_DONE","WAIT_USER","JOB_BLOCKED","WAIT_CALLBACK"]` | Allowed unlock-verdict types, disclosed only in authorized decision prompts. A valid configured list **replaces** the default. |
 | `continueReasonTypes` | `["WORK_REMAINS","VERIFYING"]` | Allowed continuation-verdict types. A valid configured list **replaces** the default. |
+| `unlockReviewEnabled` | `true` | AI-unlock review through a loaded `pi-llm-as-jev` service; skipped with a warning when unavailable. See the review section above. |
 
-The removed key `jevWaitCheck` is an **error**: when present, the extension reports an error diagnostic naming the key (never its nested values or credentials) and it has no effect; other valid keys still apply and load succeeds. The extension resolves no TypeSafe or OpenRouter credential for any jev purpose and modifies none.
+The removed key `jevWaitCheck` is an **error**: when present, the extension reports an error diagnostic naming the key (never its nested values or credentials) and it has no effect; other valid keys still apply and load succeeds. The extension resolves no TypeSafe or OpenRouter credential for any jev purpose and modifies none; the unlock review uses the loaded service's own credentials.
 
 **Config locations and precedence** (same pattern as sibling Pi plugins):
 

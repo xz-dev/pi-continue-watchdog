@@ -143,6 +143,7 @@ const CONFIG: LoadedConfig = {
 		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED", "WAIT_CALLBACK"],
 		continueReasonTypes: ["WORK_REMAINS", "VERIFYING"],
 		unlockShortcut: "alt+u",
+		unlockReviewEnabled: false,
 	},
 	diagnostics: [],
 };

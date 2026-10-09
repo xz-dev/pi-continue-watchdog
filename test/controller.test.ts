@@ -216,6 +216,76 @@ test("invalidating and unlocking require the current decision id", () => {
 	assert.equal(state.snapshot.locked, false);
 });
 
+test("resumed invalid accounting keeps the three-response bound, separate from maxRetries", () => {
+	for (const consumed of [1, 2]) {
+		const state = controller(1);
+		state.lock();
+		const previousId = openDecision(state);
+		for (let count = 0; count < consumed; count += 1) {
+			state.recordInvalidDecision(previousId, "safe diagnostic");
+		}
+		state.invalidateDecision(previousId);
+		const resumedId = openDecision(state);
+		assert.equal(
+			state.restoreInvalidDecisionAttempts(previousId, consumed, "stale")
+				.applied,
+			false,
+		);
+		for (const invalidCount of [-1, 0.5, 3]) {
+			assert.equal(
+				state.restoreInvalidDecisionAttempts(resumedId, invalidCount, "invalid")
+					.applied,
+				false,
+			);
+		}
+		assert.equal(
+			state.restoreInvalidDecisionAttempts(
+				resumedId,
+				consumed,
+				"safe diagnostic",
+			).applied,
+			true,
+		);
+		assert.equal(state.snapshot.invalidDecisionAttempts, consumed);
+		assert.equal(state.snapshot.lastInvalidDecisionError, "safe diagnostic");
+		for (let count = consumed + 1; count <= 3; count += 1) {
+			state.recordInvalidDecision(resumedId, "next diagnostic");
+			assert.equal(state.snapshot.decisionFailed, count === 3);
+		}
+		assert.equal(state.recordValidUnlock(resumedId).applied, false);
+		assert.equal(state.beginDecision(0).applied, false);
+		assert.equal(state.snapshot.invalidDecisionAttempts, 3);
+		assert.equal(state.snapshot.attempt, 0);
+		assert.equal(state.snapshot.exhausted, false);
+	}
+});
+
+test("postcommit reapply changes only the expected rolled-back continuation count", () => {
+	const state = controller(2);
+	state.lock();
+	state.recordValidContinue(openDecision(state));
+	state.rollbackValidContinue();
+	for (const count of [-1, 0.5, 1, 2, Number.NaN])
+		assert.equal(state.reapplyValidContinue(count).applied, false);
+	assert.deepEqual(state.reapplyValidContinue(0).effects, []);
+	assert.equal(state.snapshot.attempt, 1);
+	assert.equal(state.reapplyValidContinue(0).applied, false);
+	state.recordValidContinue(openDecision(state));
+	state.rollbackValidContinue();
+	assert.equal(state.reapplyValidContinue(1).applied, true);
+	assert.equal(state.snapshot.exhausted, true);
+	assert.equal(state.reapplyValidContinue(2).applied, false);
+	state.lock();
+	openDecision(state);
+	assert.equal(state.reapplyValidContinue(0).applied, false);
+	state.unlock();
+	assert.equal(state.reapplyValidContinue(0).applied, false);
+	state.lock();
+	const id = openDecision(state);
+	for (let i = 0; i < 3; i += 1) state.recordInvalidDecision(id, "invalid");
+	assert.equal(state.reapplyValidContinue(0).applied, false);
+});
+
 test("snapshots are fresh and construction copies retry config", () => {
 	const supplied = { maxRetries: 2 };
 	const state = createLockDecisionController(supplied);

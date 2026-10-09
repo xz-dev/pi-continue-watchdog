@@ -390,6 +390,7 @@ function createHarness(options?: {
 	readonly onWidget?: (key: string, value: unknown) => void;
 	readonly processDomain?: ProcessDomainCoordinator;
 	readonly isIdle?: () => boolean;
+	readonly reviewService?: import("../src/unlock-review.js").ReviewServiceLike;
 	readonly wouldTriggerAutoCompaction?: (content: string) => boolean;
 	readonly onCompact?: (options: {
 		readonly onComplete?: () => void;
@@ -411,6 +412,7 @@ function createHarness(options?: {
 			"VERIFYING",
 		],
 		unlockShortcut: options?.config?.unlockShortcut ?? "alt+u",
+		unlockReviewEnabled: options?.config?.unlockReviewEnabled ?? false,
 	};
 	const hub = createObservableAgentHub();
 	const controller = createLockDecisionController(config);
@@ -623,6 +625,7 @@ function createHarness(options?: {
 		initialConfig: config,
 		clock,
 		createExchangeId: () => "exchange-1",
+		reviewService: options?.reviewService,
 	});
 	if (options?.nativeAbortGate) {
 		registerMainAbortUnlock(pi, {
@@ -4206,6 +4209,7 @@ test("child completion only makes aggregate idle; exactly one inquiry comes from
 		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
 		continueReasonTypes: ["WORK_REMAINS", "VERIFYING"],
 		unlockShortcut: "alt+u",
+		unlockReviewEnabled: false,
 	};
 	const hub = createObservableAgentHub();
 	const clock = new FakeClock();
@@ -4294,6 +4298,7 @@ test("shared hub reclaims main after UI shutdown then prefers a new UI bind", as
 		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
 		continueReasonTypes: ["WORK_REMAINS", "VERIFYING"],
 		unlockShortcut: "alt+u",
+		unlockReviewEnabled: false,
 	};
 
 	function attach(sessionId: string, hasUI: boolean) {
@@ -4422,6 +4427,7 @@ test("effective config loads before binding is reconciled and shutdown blocks la
 			reasonTypes: ["JOB_DONE"],
 			continueReasonTypes: ["WORK_REMAINS", "VERIFYING"],
 			unlockShortcut: "alt+u",
+			unlockReviewEnabled: false,
 		},
 		diagnostics: [],
 	});
@@ -5619,6 +5625,7 @@ test("changed effective constraints refresh only the same named declaration", as
 			reasonTypes: ["JOB_DONE"],
 			continueReasonTypes: ["WORK_REMAINS"],
 			unlockShortcut: "alt+u" as const,
+			unlockReviewEnabled: false,
 		},
 		{
 			idleDelaySeconds: 3,
@@ -5628,6 +5635,7 @@ test("changed effective constraints refresh only the same named declaration", as
 			reasonTypes: ["NeedReview"],
 			continueReasonTypes: ["verifying"],
 			unlockShortcut: "alt+u" as const,
+			unlockReviewEnabled: false,
 		},
 	];
 	let loadCount = 0;
@@ -5783,6 +5791,7 @@ test("allowlisted native refresh preserves a disabled cw membership", async () =
 			reasonTypes: ["JOB_DONE"],
 			continueReasonTypes: ["WORK_REMAINS"],
 			unlockShortcut: "alt+u" as const,
+			unlockReviewEnabled: false,
 		},
 		{
 			idleDelaySeconds: 3,
@@ -5792,6 +5801,7 @@ test("allowlisted native refresh preserves a disabled cw membership", async () =
 			reasonTypes: ["NeedReview"],
 			continueReasonTypes: ["verifying"],
 			unlockShortcut: "alt+u" as const,
+			unlockReviewEnabled: false,
 		},
 	];
 	const instance = createHubAttachmentInstance();

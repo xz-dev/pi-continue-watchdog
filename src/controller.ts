@@ -60,9 +60,22 @@ export interface LockDecisionController {
 		previousAttempts: number,
 		previousError: string | null,
 	): ControllerTransition;
+	/**
+	 * Restore charged invalid accounting onto a freshly reopened window.
+	 * Used only to resume a preserved logical phase after ordinary busy
+	 * deferral; never bypasses the exhaustion decision or authorizes a
+	 * response the window has not earned.
+	 */
+	restoreInvalidDecisionAttempts(
+		decisionId: number,
+		invalidAttempts: number,
+		lastInvalidError: string | null,
+	): ControllerTransition;
 	recordValidContinue(decisionId: number): ControllerTransition;
 	/** Undo a just-recorded continue when its send raced a newly busy Pi. */
 	rollbackValidContinue(): ControllerTransition;
+	/** Reapply only the exact rolled-back accepted continuation count. */
+	reapplyValidContinue(previousAttempt: number): ControllerTransition;
 	recordValidUnlock(decisionId: number): ControllerTransition;
 	/** Close a stale decision without consuming attempts or unlocking. */
 	invalidateDecision(decisionId: number): ControllerTransition;
@@ -229,6 +242,30 @@ class PureLockDecisionController implements LockDecisionController {
 		return this.applied([]);
 	}
 
+	public restoreInvalidDecisionAttempts(
+		decisionId: number,
+		invalidAttempts: number,
+		lastInvalidError: string | null,
+	): ControllerTransition {
+		// Restoration only ever writes accounting back onto the currently open
+		// window it belongs to; a different decisionId or a closed window no-ops.
+		if (
+			!this.isCurrentDecision(decisionId) ||
+			this.state.decisionFailed ||
+			!Number.isInteger(invalidAttempts) ||
+			invalidAttempts < 0 ||
+			invalidAttempts >= INVALID_DECISION_LIMIT
+		) {
+			return this.noop();
+		}
+		this.state = {
+			...this.state,
+			invalidDecisionAttempts: invalidAttempts,
+			lastInvalidDecisionError: lastInvalidError,
+		};
+		return this.applied([]);
+	}
+
 	public recordValidContinue(decisionId: number): ControllerTransition {
 		if (!this.isCurrentDecision(decisionId)) return this.noop();
 		const attempt = this.state.attempt + 1;
@@ -250,6 +287,27 @@ class PureLockDecisionController implements LockDecisionController {
 			...this.state,
 			attempt: this.state.attempt - 1,
 			exhausted: false,
+		};
+		return this.applied([]);
+	}
+
+	public reapplyValidContinue(previousAttempt: number): ControllerTransition {
+		if (
+			!Number.isInteger(previousAttempt) ||
+			previousAttempt < 0 ||
+			previousAttempt >= this.maxRetries ||
+			this.state.attempt !== previousAttempt ||
+			!this.state.locked ||
+			this.state.exhausted ||
+			this.state.decisionFailed ||
+			this.state.decisionOpen
+		)
+			return this.noop();
+		const attempt = previousAttempt + 1;
+		this.state = {
+			...this.state,
+			attempt,
+			exhausted: attempt >= this.maxRetries,
 		};
 		return this.applied([]);
 	}
