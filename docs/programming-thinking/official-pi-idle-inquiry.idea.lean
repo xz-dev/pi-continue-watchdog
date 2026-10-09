@@ -35,7 +35,8 @@ inductive PiPublicEvent where
 -- Verdicts and response blocks abstract decoded input; JSON shape, trimming, and configured
 -- type admission remain transport obligations. The model checks reason bounds explicitly.
 -- The timed-wait verdict is retired: an old wait submission is one invalid response, never
--- an accepted outcome, and WAIT_CALLBACK is an unlock reason that arms no timer.
+-- an accepted outcome. The wire unlock with the built-in WAIT_CALLBACK type is a distinct
+-- lock-retaining callback suspension that arms no timer.
 inductive Verdict where
   | cont (reasonType : String) (reason : String)
   | unlock (reasonType : String) (reason : String)
@@ -45,6 +46,9 @@ def validVerdict (v : Verdict) : Bool :=
   match v with
   | .cont _ r => 0 < r.length && r.length ≤ maxReasonLength
   | .unlock _ r => 0 < r.length && r.length ≤ maxReasonLength
+
+def isWaitCallback (reasonType : String) : Bool :=
+  reasonType.toUpper == "WAIT_CALLBACK"
 
 def normalizeDecisionReasonType (supplied : String)
     (allowed : List String) : Option String :=
@@ -80,6 +84,7 @@ inductive GateDecision where
 
 inductive FinalOutcome where
   | continued
+  | callbackSuspended
   | unlocked
   | reask
   | decisionFailed
@@ -278,7 +283,8 @@ structure ActiveDecision where
 structure RuntimeState where
   locked : Bool
   attempt : Nat
-  maxRetries : Nat
+  maxContinue : Nat
+  callbackSuspended : Bool
   invalidAttempts : Nat
   decisionFailed : Bool
   nextDecisionId : DecisionId
@@ -291,10 +297,11 @@ structure RuntimeState where
   deriving DecidableEq, Repr
 
 -- Entry requires an idle locked cycle with capacity; authority additionally requires consumption.
-def initialState (maxRetries : Nat) : RuntimeState :=
+def initialState (maxContinue : Nat) : RuntimeState :=
   { locked := true
     attempt := 0
-    maxRetries
+    maxContinue
+    callbackSuspended := false
     invalidAttempts := 0
     decisionFailed := false
     nextDecisionId := 1
@@ -310,11 +317,11 @@ def aggregateIdle (state : RuntimeState) : Bool :=
     !state.pendingMessages
 
 def exhausted (state : RuntimeState) : Bool :=
-  state.attempt ≥ state.maxRetries
+  state.attempt ≥ state.maxContinue
 
 def fenceEligible (state : RuntimeState) : Bool :=
-  aggregateIdle state && !exhausted state && !state.decisionFailed &&
-    state.active.isNone
+  aggregateIdle state && !state.callbackSuspended && !exhausted state &&
+    !state.decisionFailed && state.active.isNone
 
 def decisionEligibleAt (state : RuntimeState) (_now : NowMs) : Bool :=
   fenceEligible state
@@ -691,11 +698,19 @@ def finalizeDecision (_now : NowMs) (stillQualified : Bool)
               { state with
                   active := none
                   attempt := state.attempt + 1 })
-        | .verdict (.unlock _ _) =>
-            (.unlocked,
-              { state with
-                  active := none
-                  locked := false })
+        | .verdict (.unlock reasonType _) =>
+            if isWaitCallback reasonType then
+              (.callbackSuspended,
+                { state with
+                    active := none
+                    attempt := state.attempt + 1
+                    callbackSuspended := true })
+            else
+              (.unlocked,
+                { state with
+                    active := none
+                    locked := false
+                    callbackSuspended := false })
         | .invalid =>
             if state.invalidAttempts + 1 < invalidDecisionLimit then
               (.reask,
@@ -736,6 +751,7 @@ def preemptActiveDecision (state : RuntimeState) : RuntimeState :=
 def manualUnlock (state : RuntimeState) : RuntimeState :=
   { preemptActiveDecision state with
       locked := false
+      callbackSuspended := false
       fence := none }
 
 -- The host supplies authoritative settlement only after native retries finish.
@@ -756,11 +772,31 @@ def freshLockCycle (state : RuntimeState) : RuntimeState :=
   { state with
       locked := true
       attempt := 0
+      callbackSuspended := false
       invalidAttempts := 0
       decisionFailed := false
       fence := none
       active := none
       exhaustionPublished := false }
+
+-- Actual ordinary main-session work ends a suspension in the same cycle without spending or
+-- replenishing units; control, review, and publication traffic never call this transition.
+def resumeFromCallback (state : RuntimeState) : RuntimeState :=
+  if state.callbackSuspended then { state with callbackSuspended := false } else state
+
+-- A fixed, non-configurable list of exact whole-text extension wake messages; no trimming,
+-- case folding, prefix, or fuzzy match. Dynamically composed producer prompts are not covered.
+def callbackWakeTexts : List String :=
+  ["Inspect subagent updates above. Answer pending supervisor requests within your authority. For completed work, read saved results and resume the already-authorized parent task, or report completion. If approval is required, explicitly ask the user. Do not silently yield, rerun completed work, or infer new authorization.",
+    "New intercom message above."]
+
+def isKnownCallbackWake (text : String) : Bool :=
+  callbackWakeTexts.contains text
+
+-- A user-role message start is callback work only for an exact wake text; any other text is
+-- genuine user work and starts a fresh cycle.
+def observeUserMessageStart (text : String) (state : RuntimeState) : RuntimeState :=
+  if isKnownCallbackWake text then resumeFromCallback state else freshLockCycle state
 
 -- Timer expiry is separate from idle qualification; the fixed fence is the only timer.
 def timerTick (now : NowMs) (state : RuntimeState) : RuntimeState :=
@@ -783,7 +819,7 @@ def advanceTimer (now : Nat) (seconds : Nat) (state : RuntimeState) :
   | n + 1 => advanceTimer now n (timerTick now state)
 
 def exhaustionEligible (state : RuntimeState) : Bool :=
-  state.locked && exhausted state && aggregateIdle state
+  state.locked && !state.callbackSuspended && exhausted state && aggregateIdle state
 
 def decisionFailedEligible (state : RuntimeState) : Bool :=
   state.locked && state.decisionFailed && aggregateIdle state
@@ -1177,12 +1213,56 @@ theorem accepted_unlock_unlocks_without_attempt
     (consumed : consumedEvidence attempt = true)
     (captured : attempt.captured = true)
     (notInvalid : attempt.invalidated = false)
-    (planned : attempt.planned = .verdict (.unlock reasonType reason)) :
+    (planned : attempt.planned = .verdict (.unlock reasonType reason))
+    (notCallback : isWaitCallback reasonType = false) :
     (finalizeDecision now true state).1 = .unlocked ∧
       (finalizeDecision now true state).2.locked = false ∧
       (finalizeDecision now true state).2.attempt = state.attempt ∧
       (finalizeDecision now true state).2.active.isNone = true := by
-  simp [finalizeDecision, decisionAuthorized, consumed, h, captured, notInvalid, planned]
+  simp [finalizeDecision, decisionAuthorized, consumed, h, captured, notInvalid, planned,
+    notCallback]
+
+theorem accepted_callback_retains_lock_and_spends_one_unit
+    (now : NowMs) (state : RuntimeState) (attempt : ActiveDecision)
+    {reasonType reason : String}
+    (h : state.active = some attempt)
+    (consumed : consumedEvidence attempt = true)
+    (captured : attempt.captured = true)
+    (notInvalid : attempt.invalidated = false)
+    (planned : attempt.planned = .verdict (.unlock reasonType reason))
+    (callback : isWaitCallback reasonType = true) :
+    (finalizeDecision now true state).1 = .callbackSuspended ∧
+      (finalizeDecision now true state).2.locked = state.locked ∧
+      (finalizeDecision now true state).2.attempt = state.attempt + 1 ∧
+      (finalizeDecision now true state).2.callbackSuspended = true ∧
+      (finalizeDecision now true state).2.active.isNone = true := by
+  simp [finalizeDecision, decisionAuthorized, consumed, h, captured, notInvalid, planned,
+    callback]
+
+-- A suspended cycle opens no inquiry and reports no exhaustion, whatever idle or time does.
+theorem suspension_blocks_inquiry_and_exhaustion
+    (now : NowMs) (state : RuntimeState)
+    (suspended : state.callbackSuspended = true) :
+    decisionEligibleAt state now = false ∧ exhaustionEligible state = false := by
+  simp [decisionEligibleAt, fenceEligible, exhaustionEligible, suspended]
+
+-- Callback work resumes the same cycle without spending or replenishing; a genuine user
+-- message starts a fresh cycle; only exact wake texts count as callback work.
+theorem callback_wake_resumes_without_charge
+    (state : RuntimeState) :
+    (observeUserMessageStart "New intercom message above." state).attempt = state.attempt ∧
+      (observeUserMessageStart "New intercom message above." state).callbackSuspended = false ∧
+      (observeUserMessageStart "New intercom message above." state).locked = state.locked := by
+  have known : isKnownCallbackWake "New intercom message above." = true := by
+    simp [isKnownCallbackWake, callbackWakeTexts]
+  unfold observeUserMessageStart resumeFromCallback
+  cases hs : state.callbackSuspended <;> simp [known, hs]
+
+theorem near_match_wake_is_genuine_user_work
+    (state : RuntimeState) :
+    observeUserMessageStart "New intercom message above. " state = freshLockCycle state ∧
+      observeUserMessageStart "new intercom message above." state = freshLockCycle state := by
+  constructor <;> simp [observeUserMessageStart, isKnownCallbackWake, callbackWakeTexts]
 
 theorem early_invalid_reasks_with_fresh_evidence
     (now : NowMs) (state : RuntimeState) (attempt : ActiveDecision)
@@ -1234,7 +1314,8 @@ theorem rollback_restores_failed_publication
 theorem exhaustion_eligibility_ignores_retired_waits
     (state : RuntimeState) :
     exhaustionEligible state =
-      (state.locked && exhausted state && aggregateIdle state) := by
+      (state.locked && !state.callbackSuspended && exhausted state &&
+        aggregateIdle state) := by
   rfl
 
 theorem busy_children_block_terminal_publication
@@ -1304,7 +1385,12 @@ theorem finalized_window_grants_no_submission_authority
           | true =>
               cases hp : attempt.planned with
               | none => simp [finalizeDecision, h, ha, hc, hp] at finished
-              | verdict v => cases v <;> simp [finalizeDecision, h, ha, hc, hp]
+              | verdict v =>
+                  cases v with
+                  | cont => simp [finalizeDecision, h, ha, hc, hp]
+                  | unlock reasonType _ =>
+                      cases hw : isWaitCallback reasonType <;>
+                        simp [finalizeDecision, h, ha, hc, hp, hw]
               | invalid =>
                   simp only [finalizeDecision, h, ha, hc, hp, Bool.not_true,
                     Bool.false_or, Bool.false_eq_true, ite_false]
@@ -1326,7 +1412,11 @@ theorem invalid_attempts_stay_bounded
         · exact bounded
         · cases hp : attempt.planned with
           | none => simpa [hp] using bounded
-          | verdict v => cases v <;> simpa [hp] using bounded
+          | verdict v =>
+              cases v with
+              | cont => simpa [hp] using bounded
+              | unlock reasonType _ =>
+                  cases hw : isWaitCallback reasonType <;> simpa [hp, hw] using bounded
           | invalid =>
               simp only
               split <;> simp_all <;> omega
@@ -1500,7 +1590,8 @@ theorem guarded_unlock_cycle_reaches_outcome
     (admitted : environmentAdmitted environment)
     (now : NowMs) (state : RuntimeState) (reasonType reason : String)
     (eligible : decisionEligibleAt state now = true)
-    (valid : validVerdict (.unlock reasonType reason) = true) :
+    (valid : validVerdict (.unlock reasonType reason) = true)
+    (notCallback : isWaitCallback reasonType = false) :
     (runGuardedInquiry environment now (.unlock reasonType reason) state).1 =
       .unlocked ∧
       (runGuardedInquiry environment now (.unlock reasonType reason) state).2.locked =
@@ -1513,7 +1604,30 @@ theorem guarded_unlock_cycle_reaches_outcome
     singleCallBatch, provisionalPlan, submitDecisionResult, captureSettlement,
     finalizeDecision, valid, freshAttempt, consumedEvidence, decisionAuthorized,
     validResponseBatch, cwBlockCount, otherToolCount, hasDisallowedContent,
-    verdictOf, toolCallIds]
+    verdictOf, toolCallIds, notCallback]
+
+theorem guarded_callback_cycle_reaches_outcome
+    (environment : EnvironmentAssumptions)
+    (admitted : environmentAdmitted environment)
+    (now : NowMs) (state : RuntimeState) (reasonType reason : String)
+    (eligible : decisionEligibleAt state now = true)
+    (valid : validVerdict (.unlock reasonType reason) = true)
+    (callback : isWaitCallback reasonType = true) :
+    (runGuardedInquiry environment now (.unlock reasonType reason) state).1 =
+      .callbackSuspended ∧
+      (runGuardedInquiry environment now (.unlock reasonType reason) state).2.locked =
+        state.locked ∧
+      (runGuardedInquiry environment now (.unlock reasonType reason) state).2.attempt =
+        state.attempt + 1 ∧
+      (runGuardedInquiry environment now (.unlock reasonType reason) state).2.callbackSuspended =
+        true := by
+  obtain ⟨h1, h2, h3, h4, h5, h6⟩ := admitted
+  simp [runGuardedInquiry, h1, h2, h3, h4, h5, h6, beginDecision, eligible,
+    dispatchPrompt, observeRunStart, observeProviderContext, preflightResponse,
+    singleCallBatch, provisionalPlan, submitDecisionResult, captureSettlement,
+    finalizeDecision, valid, freshAttempt, consumedEvidence, decisionAuthorized,
+    validResponseBatch, cwBlockCount, otherToolCount, hasDisallowedContent,
+    verdictOf, toolCallIds, callback]
 
 theorem three_invalid_responses_fail_the_decision
     (environment : EnvironmentAssumptions)
@@ -1610,6 +1724,7 @@ def ProcessSafety : Prop :=
       consumedEvidence attempt = true →
       attempt.captured = true → attempt.invalidated = false →
       attempt.planned = .verdict (.unlock reasonType reason) →
+      isWaitCallback reasonType = false →
       (finalizeDecision now true state).1 = .unlocked ∧
         (finalizeDecision now true state).2.locked = false ∧
         (finalizeDecision now true state).2.attempt = state.attempt ∧
@@ -1634,7 +1749,8 @@ def ProcessSafety : Prop :=
     (∀ state, state.active.isNone = true → 0 < state.attempt →
       (rollbackContinue state).attempt = state.attempt - 1) ∧
     (∀ state, exhaustionEligible state =
-      (state.locked && exhausted state && aggregateIdle state)) ∧
+      (state.locked && !state.callbackSuspended && exhausted state &&
+        aggregateIdle state)) ∧
     (∀ state, state.busyChildren ≠ [] →
       exhaustionEligible state = false ∧
         decisionFailedEligible state = false) ∧
@@ -1727,8 +1843,9 @@ theorem transition_invariants : ProcessSafety := by
       captured notInvalid planned
     exact ⟨p.1, p.2.1, p.2.2⟩
   · intro now state attempt reasonType reason h consumed captured notInvalid planned
+      notCallback
     have p := accepted_unlock_unlocks_without_attempt now state attempt h consumed
-      captured notInvalid planned
+      captured notInvalid planned notCallback
     exact ⟨p.1, p.2.1, p.2.2.1, p.2.2.2⟩
   · intro now state attempt h consumed captured notInvalid planned withinBudget
     have p := early_invalid_reasks_with_fresh_evidence now state attempt h consumed
@@ -1768,7 +1885,8 @@ theorem unconsumed_pipeline_is_inert
 -- Required outcomes make conditional end-to-end termination explicit rather than relying on example execution.
 def requiredOutcome : Verdict → FinalOutcome
   | .cont .. => .continued
-  | .unlock .. => .unlocked
+  | .unlock reasonType _ =>
+      if isWaitCallback reasonType then .callbackSuspended else .unlocked
 
 theorem guarded_inquiry_terminates
     (environment : EnvironmentAssumptions)
@@ -1782,10 +1900,33 @@ theorem guarded_inquiry_terminates
       exact (guarded_continue_cycle_reaches_outcome environment admitted now state
         reasonType reason eligible valid).1
   | unlock reasonType reason =>
-      exact (guarded_unlock_cycle_reaches_outcome environment admitted now state
-        reasonType reason eligible valid).1
+      cases hc : isWaitCallback reasonType with
+      | false =>
+          simpa [requiredOutcome, hc] using
+            (guarded_unlock_cycle_reaches_outcome environment admitted now state
+              reasonType reason eligible valid hc).1
+      | true =>
+          simpa [requiredOutcome, hc] using
+            (guarded_callback_cycle_reaches_outcome environment admitted now state
+              reasonType reason eligible valid hc).1
 
--- Whole-inquiry correctness combines safety, unauthorized inertness, context revocation, and bounded progress.
+-- The final unit may be a callback suspension: it waits first, and exhaustion becomes
+-- eligible only after actual callback work resumes the same cycle (and later settles idle).
+theorem final_callback_unit_waits_before_exhaustion
+    (state : RuntimeState)
+    (suspended : state.callbackSuspended = true)
+    (locked : state.locked = true)
+    (spent : state.maxContinue ≤ state.attempt)
+    (idle : aggregateIdle state = true) :
+    exhaustionEligible state = false ∧
+      exhaustionEligible (resumeFromCallback state) = true ∧
+      (resumeFromCallback state).attempt = state.attempt := by
+  simp only [aggregateIdle, Bool.and_eq_true] at idle
+  simp [exhaustionEligible, resumeFromCallback, exhausted, aggregateIdle, suspended, locked,
+    idle, spent]
+
+-- Whole-inquiry correctness combines safety, unauthorized inertness, context revocation, bounded progress,
+-- and callback suspension: quiet waiting, exact-wake resumption, and final-unit waiting before exhaustion.
 -- Runtime scheduling, metadata authenticity, parser correctness, and durable I/O remain external obligations.
 theorem process_is_correct : ProcessSafety ∧
     (∀ state attempt, state.active = some attempt → consumedEvidence attempt = false →
@@ -1820,11 +1961,31 @@ theorem process_is_correct : ProcessSafety ∧
       (providerFailureAt .agentSettled state).attempt = state.attempt ∧
       (providerFailureAt .agentSettled state).invalidAttempts = state.invalidAttempts) ∧
     NativeTransportSafety ∧ stagedResultIsError .stagedInvalid = true ∧
-    (∀ current attempt, receiptAccount current .unreadable attempt = attempt) :=
+    (∀ current attempt, receiptAccount current .unreadable attempt = attempt) ∧
+    (∀ now state, state.callbackSuspended = true →
+      decisionEligibleAt state now = false ∧ exhaustionEligible state = false) ∧
+    (∀ state, state.callbackSuspended = true → state.locked = true →
+      state.maxContinue ≤ state.attempt → aggregateIdle state = true →
+      exhaustionEligible state = false ∧
+        exhaustionEligible (resumeFromCallback state) = true ∧
+        (resumeFromCallback state).attempt = state.attempt) ∧
+    (∀ state,
+      (observeUserMessageStart "New intercom message above." state).attempt =
+          state.attempt ∧
+        (observeUserMessageStart "New intercom message above." state).callbackSuspended =
+          false ∧
+        (observeUserMessageStart "New intercom message above." state).locked =
+          state.locked) ∧
+    (∀ state,
+      observeUserMessageStart "New intercom message above. " state = freshLockCycle state ∧
+        observeUserMessageStart "new intercom message above." state =
+          freshLockCycle state) :=
   ⟨transition_invariants, unconsumed_pipeline_is_inert, foreign_context_does_not_confirm,
     guarded_inquiry_terminates, three_invalid_responses_fail_the_decision,
     provider_failures_preserve_budgets, native_transport_is_guarded,
-    staged_validation_is_error, unreadable_receipt_preserves_budget⟩
+    staged_validation_is_error, unreadable_receipt_preserves_budget,
+    suspension_blocks_inquiry_and_exhaustion, final_callback_unit_waits_before_exhaustion,
+    callback_wake_resumes_without_charge, near_match_wake_is_genuine_user_work⟩
 
 end OfficialPiIdleInquiry
 
@@ -1844,6 +2005,9 @@ def main : IO Unit := do
   let invalid1 := OfficialPiIdleInquiry.runGuardedInvalidResponse environment 0 initial
   let invalid2 := OfficialPiIdleInquiry.runGuardedInvalidResponse environment 0 invalid1.2
   let invalid3 := OfficialPiIdleInquiry.runGuardedInvalidResponse environment 0 invalid2.2
-  IO.println s!"continue: attempt={continued.2.attempt}; callback unlock: locked={callback.2.locked}, attempt={callback.2.attempt}"
+  let resumed := OfficialPiIdleInquiry.observeUserMessageStart "New intercom message above." callback.2
+  let human := OfficialPiIdleInquiry.observeUserMessageStart "New intercom message above. " callback.2
+  IO.println s!"continue: attempt={continued.2.attempt}; callback: outcome={repr callback.1}, locked={callback.2.locked}, attempt={callback.2.attempt}, suspended={callback.2.callbackSuspended}, exhaustionEligible={OfficialPiIdleInquiry.exhaustionEligible callback.2}"
+  IO.println s!"exact wake: attempt={resumed.attempt}, suspended={resumed.callbackSuspended}, exhaustionEligible={OfficialPiIdleInquiry.exhaustionEligible resumed}; near match: attempt={human.attempt}, suspended={human.callbackSuspended}"
   IO.println s!"unlock: locked={unlocked.2.locked}, attempt={unlocked.2.attempt}; three invalid: failed={invalid3.2.decisionFailed}, attempt={invalid3.2.attempt}"
-  IO.println "process_is_correct: consumption-gated safety, provider failures preserve budgets until terminal unlock, and conditional inquiry termination; external scheduling and durable publication are assumptions."
+  IO.println "process_is_correct: consumption-gated safety, provider failures preserve budgets until terminal unlock, conditional inquiry termination, and lock-retaining callback suspension with exact-wake resumption; external scheduling, durable publication, and host message attribution are assumptions."

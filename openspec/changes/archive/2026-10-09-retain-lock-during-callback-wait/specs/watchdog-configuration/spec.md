@@ -1,10 +1,4 @@
-# watchdog-configuration Specification
-
-## Purpose
-
-Defines which configuration keys the continue watchdog honors and how removed keys are reported, so a setting never appears accepted while having no effect.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Effective configuration keys
 The watchdog SHALL honor these configuration keys with existing per-field validation and precedence of built-ins, global, then trusted project:

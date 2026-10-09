@@ -125,3 +125,61 @@ test("A2: timeline renders the AI unlock once with its typed reason", () => {
 		/AI unlock · JOB_DONE · Requested analysis delivered\./,
 	);
 });
+
+test("callback suspension renders one retained-lock status, never 'unlocked'", () => {
+	const component = createAiUnlockEntryRenderer()(
+		aiUnlockEntry({
+			reasonType: "WAIT_CALLBACK",
+			reason: "Waiting for the child.",
+			exchangeId: "exA",
+			cycleId: 1,
+			effect: "callback-suspended",
+		}) as never,
+		{ expanded: false },
+		theme as never,
+	);
+	const text = (component?.render(200) ?? []).join("\n");
+	assert.match(text, /waiting for callback \(lock retained\)/);
+	assert.match(text, /WAIT_CALLBACK · Waiting for the child\./);
+	assert.doesNotMatch(text, /unlocked/);
+	const timeline = formatContinueTimeline([
+		aiUnlockEntry({
+			reasonType: "WAIT_CALLBACK",
+			reason: "Waiting for the child.",
+			exchangeId: "exA",
+			cycleId: 1,
+			effect: "callback-suspended",
+		}),
+	]);
+	assert.match(
+		timeline,
+		/callback wait · WAIT_CALLBACK · Waiting for the child\./,
+	);
+});
+
+test("legacy WAIT_CALLBACK unlock records keep their unlock meaning", () => {
+	const component = createAiUnlockEntryRenderer()(
+		aiUnlockEntry({
+			reasonType: "WAIT_CALLBACK",
+			reason: "Old callback unlock.",
+			exchangeId: "exA",
+			cycleId: 1,
+		}) as never,
+		{ expanded: false },
+		theme as never,
+	);
+	assert.deepEqual(component?.render(80), [
+		"Continue watchdog unlocked · WAIT_CALLBACK · Old callback unlock.",
+	]);
+	assert.match(
+		formatContinueTimeline([
+			aiUnlockEntry({
+				reasonType: "WAIT_CALLBACK",
+				reason: "Old callback unlock.",
+				exchangeId: "exA",
+				cycleId: 1,
+			}),
+		]),
+		/AI unlock · WAIT_CALLBACK · Old callback unlock\./,
+	);
+});

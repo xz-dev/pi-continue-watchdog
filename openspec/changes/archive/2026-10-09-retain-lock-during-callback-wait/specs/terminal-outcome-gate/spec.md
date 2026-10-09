@@ -1,22 +1,4 @@
-# terminal-outcome-gate Specification
-
-## Purpose
-
-Routes successful settlements into guarded continue-or-unlock inquiries, terminal errors into automatic unlock, and human aborts into immediate unlock while preserving current-ownership and aggregate-idle safeguards.
-
-## Requirements
-
-### Requirement: Terminal error settlement auto-unlocks
-A locked watchdog observing authoritative settlement with the tracked final `stopReason: "error"` after Pi retries are exhausted SHALL unlock automatically without opening an idle fence, inquiry, or ordinary continuation for that settlement. Its existing user notification and human-unlock-style error record SHALL remain distinguishable from manual unlock. Error text, classes, and string heuristics SHALL not decide this gate.
-
-#### Scenario: Final network error while locked
-- **WHEN** a locked run truly settles with terminal `stopReason: "error"` after host retries
-- **THEN** it unlocks with the existing error notification and record
-- **AND** no decision inquiry or continuation starts
-
-#### Scenario: Gate ignores error text
-- **WHEN** a settled run reports `stopReason: "stop"` but mentions an error in its text
-- **THEN** normal guarded decision eligibility applies rather than error auto-unlock
+## MODIFIED Requirements
 
 ### Requirement: Successful settlement keeps the decision stage
 A successful eligible ordinary settlement SHALL retain the fixed idle fence and guarded internal inquiry. Its two wire actions SHALL remain `continue` and `unlock`; the validated `unlock`/`WAIT_CALLBACK` pair SHALL have a distinct callback-suspension effect. A decision's own settlement SHALL NOT recursively open another inquiry. Accepted continuation SHALL be followed by ordinary work; actual unlock SHALL stop automatic work without a scheduled wake-up; accepted callback suspension SHALL retain the lock and stop automatic inquiry/work until ordinary main work actually resumes. Abort SHALL retain its immediate unlock path. Suspended, exhausted, or decision-failed cycles SHALL start no new inquiry. Consuming the final `maxContinue` unit with callback suspension SHALL NOT prevent the external callback from starting ordinary work and SHALL NOT produce exhaustion until that work successfully settles under current guards.
@@ -45,32 +27,6 @@ A successful eligible ordinary settlement SHALL retain the fixed idle fence and 
 #### Scenario: Terminal error during resumed work
 - **WHEN** actual resumed callback work authoritatively settles in terminal error
 - **THEN** the existing error auto-unlock path applies rather than successful-settlement exhaustion or another inquiry
-
-### Requirement: Gate only at true settlement
-
-The gate SHALL be evaluated only at the authoritative settled decision point with the plugin's existing stale/settlement guards. While Pi is automatically retrying, the run is busy and no settlement exists; the gate SHALL NOT unlock early during host retries or queued continuations. A settlement observation that is stale under existing guards SHALL NOT auto-unlock.
-
-#### Scenario: During automatic retry
-
-- **GIVEN** a run hit an error and Pi is automatically retrying
-- **WHEN** the retry is still in flight
-- **THEN** the watchdog remains locked and takes no unlock or decision action
-- **AND** provider failures do not consume correction or continuation attempts and do not append `Other error` status entries
-- **AND** Pi retains the original error for native retry handling
-
-#### Scenario: Decision request recovers or exhausts native retries
-
-- **GIVEN** a consumed decision inquiry encounters repeated provider failures
-- **WHEN** a native retry succeeds
-- **THEN** its result is handled in the same decision attempt without charging the failures
-- **WHEN** native retries instead exhaust and the run authoritatively settles in error
-- **THEN** the existing terminal-error unlock occurs once without a correction request, continuation, or added loop
-
-#### Scenario: Stale settlement ignored
-
-- **GIVEN** a new run started after an errored settlement was queued for processing
-- **WHEN** the stale settlement observation is evaluated
-- **THEN** no auto-unlock occurs
 
 ### Requirement: Contract updated before implementation
 The implementation's behavior documentation and affected executable process models SHALL describe the settlement matrix before or together with their corresponding runtime slice: successful eligible work enters a guarded two-action inquiry; actual unlock releases the lock; the compatible callback pair suspends while retaining it; terminal error auto-unlocks; abort immediately unlocks. They SHALL describe the plugin-specific `maxContinue` default of ten, removal of `maxRetries`, shared continuation/callback accounting, and final-wait exhaustion only after actual resumed work settles. They SHALL retain event-driven callback waiting without timed watchdog waits, and SHALL NOT require proactive ordinary-turn control calls or claim that UI hiding proves context isolation. These shipped-behavior documents SHALL be updated during implementation, not represented as already changed by a proposal alone.

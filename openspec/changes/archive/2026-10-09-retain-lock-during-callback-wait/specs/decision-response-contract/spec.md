@@ -1,10 +1,9 @@
-# decision-response-contract Specification
+## RENAMED Requirements
 
-## Purpose
+- FROM: `### Requirement: Only accepted continuations consume the retry budget`
+- TO: `### Requirement: Continuation and callback suspension share the plugin budget`
 
-Defines a watchdog-owned continue-or-unlock decision that preserves guarded function submission, meaningful next-action guidance, and bounded automatic activity without a timed-wait scheduler.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Watchdog owns decision entry
 A locked current main attachment SHALL open one initial decision inquiry only after eligible ordinary work settles, the fixed 10-second idle fence elapses, and existing local, child, process-domain, ownership, and generation checks qualify. Suspended, exhausted, and decision-failed cycles SHALL open none. Queueing an inquiry SHALL NOT authorize a result: the current owned run and the plugin's local context projection SHALL observe that exact attempt before a correlated call can act. This local observation SHALL NOT be described as certification of arbitrary later provider transformations. An enabled unlock review SHALL be allowed to request at most one separately owned semantic reconsideration inquiry after a definite challenge to a valid initial `unlock`-action candidate, including `WAIT_CALLBACK`. That inquiry SHALL retain live qualification and exact-attempt observation requirements without starting a new lock cycle, replenishing the plugin budget, or introducing a timed-wait scheduler. The initial inquiry and its optional reconsideration SHALL form one bounded logical decision. Callback suspension SHALL begin only when the final current callback result is accepted, not when an initial candidate is awaiting review.
@@ -27,19 +26,6 @@ A locked current main attachment SHALL open one initial decision inquiry only af
 - **WHEN** a current cycle is suspended awaiting callback and another idle observation occurs
 - **THEN** no inquiry or continuation is scheduled even though the lock remains held
 
-### Requirement: Reserved function remains phase gated
-The stable root-only function SHALL remain named `cw`, with description `don't use unless ask` and a structurally constrained parameter schema. Its public declaration SHALL expose fields, required string types, allowed enums, and reason bounds without explanatory parameter text, examples, prompt snippets, or guidelines. Registration and active membership SHALL NOT change across decision phases. A schema-admissible call outside the current authorized attempt SHALL return `This function is reserved for the plugin. Please try another function.` before plugin decision submission, with no state, accounting, notification, timer, or ordinary-run termination effect. Native schema rejection of an inadmissible ordinary call SHALL remain similarly inert for watchdog state and SHALL NOT terminate unrelated ordinary work. Structural validity SHALL never establish current-attempt authority.
-
-#### Scenario: Ordinary work knows the correct arguments
-- **WHEN** an ordinary run submits a schema-admissible `cw` unlock copied from history
-- **THEN** the reserved-function rejection is returned
-- **AND** ordinary work and unrelated tools remain available with no watchdog transition
-
-#### Scenario: Ordinary malformed call fails without watchdog effects
-- **WHEN** an ordinary run submits missing, mistyped, or invalid-enum arguments
-- **THEN** native schema validation can reject the call before plugin execution
-- **AND** no decision attempt, continuation charge, unlock, watchdog hook, or ordinary-run termination is caused by that rejection
-
 ### Requirement: Decision-only two-outcome payload
 The authorized decision prompt SHALL describe exactly `continue` and `unlock` as accepted wire actions, case-insensitive after trimming. Both SHALL require nonblank string `reason_content` and an effective configured `reason_type`: `continueReasonTypes` for continue, `reasonTypes` for unlock. Accepted types SHALL be normalized to uppercase; accepted reasons SHALL be trimmed and limited to 1000 Unicode code points without coercion or truncation. Prompt guidance SHALL retain its 500-code-point target. These two wire actions SHALL have three execution effects: continue, actual unlock, or callback suspension for the validated built-in `unlock`/`WAIT_CALLBACK` pair. Authorized guidance SHALL state this compatibility exception rather than falsely promise that the callback pair releases the lock. Matching SHALL retain the configured type's validated identity; an unrelated custom label or reason text SHALL NOT acquire callback semantics merely from an uppercase display representation. The retired `wait` action SHALL be invalid regardless of its fields; `wait_seconds` SHALL NOT create timing behavior under any action. XML and prose SHALL NOT be result transports. Existing treatment of unrelated extra fields in otherwise valid objects is unchanged; no new general strict-object policy is introduced.
 
@@ -61,41 +47,6 @@ The authorized decision prompt SHALL describe exactly `continue` and `unlock` as
 - **WHEN** a current valid `unlock`/`WAIT_CALLBACK` result is finally accepted
 - **THEN** it suspends the current locked cycle without requiring a new action or field
 - **AND** an extra `wait_seconds` field cannot schedule a wake-up
-
-### Requirement: Decision responses cannot perform ordinary work
-A confirmed inquiry SHALL admit exactly one correlated `cw` call and no ordinary tool calls or visible prose. Mixed, duplicate, unknown-tool, non-object, missing-result, prose, and truncated responses SHALL be invalid as a whole, with ordinary tools prevented from causing side effects. An admissible normalized call and required provider thinking SHALL remain executable until result dispatch.
-
-An owned response that fails argument or response validation SHALL be captured under the current attempt and prevented from entering an uncontrolled native schema-error follow-up. Its safe validator diagnostic SHALL remain available for the existing correction flow without exposing raw invalid model content. Both valid staged results and any authorized validation failure reaching execution SHALL terminate their decision batch. Each finalized invalid response SHALL count once. The maximum of three response attempts per inquiry, current-attempt reauthorization for corrections, decision-failed recovery, and no-fourth-attempt rule within an inquiry SHALL remain unchanged. A semantic challenge SHALL NOT be classified as a malformed response. The single optional semantic reconsideration SHALL have its own ordinary inquiry-format allowance; one logical decision SHALL therefore contain at most two inquiries and six consumed decision responses, not counting service-owned transport attempts. Format correction SHALL NOT reset the one-reconsideration limit or authorize ordinary work.
-
-#### Scenario: Mixed tools
-- **WHEN** an owned response includes both a valid-looking `cw` call and a work-tool call
-- **THEN** neither commits its effect and the work tool never executes
-- **AND** the response counts as one invalid attempt
-
-#### Scenario: Repeated retired action
-- **WHEN** all three authorized responses select the retired wait action
-- **THEN** the cycle remains locked and becomes decision-failed with no fourth request
-- **AND** no ordinary continuation attempt is consumed
-
-#### Scenario: Missing action is corrected inside the owned flow
-- **WHEN** a confirmed attempt receives a singleton `cw` call containing no `action`
-- **THEN** the watchdog captures the invalid result before native tool execution can generate an ordinary follow-up request
-- **AND** exactly one invalid attempt is counted, with the safe action diagnostic used by the bounded correction flow
-
-#### Scenario: Valid correction remains executable
-- **GIVEN** the previous owned response failed the schema contract
-- **WHEN** the newly authorized correction supplies a valid normalized `cw` result
-- **THEN** it reaches the ordinary staged-result and settlement fences once
-- **AND** the prior invalid response creates neither an extra native follow-up nor a retry-budget charge
-
-#### Scenario: Schema cannot bypass takeover fences
-- **WHEN** a schema-valid result becomes stale because the user takes over before publication
-- **THEN** the result cannot unlock, continue, or charge the replacement cycle
-
-#### Scenario: Format correction during semantic reconsideration
-- **WHEN** a definite review challenge opens the one reconsideration inquiry and that inquiry receives malformed responses
-- **THEN** it uses at most its three format-response attempts and then the existing decision-failed behavior
-- **AND** neither malformed responses nor a valid reconsidered unlock cause another semantic review
 
 ### Requirement: Delivery and authorization determine the outcome
 Decision guidance SHALL first establish the current user-authorized scope, including later restrictions, cancellations, and mode changes, then reconcile every outstanding request with the latest ordinary answers and relevant earlier deliveries and results. It SHALL ask for a concise assessment of the explicit requested deliverable components in `reason_content` before selecting the verdict. The assessment SHALL distinguish delivered content from intent, assertions of completion, and merely related material. Delivered, cancelled, and superseded work SHALL be excluded. Earlier plans, control reasons, assistant questions, and stop markers SHALL NOT establish either remaining work or missing permission. Before selecting a user-wait outcome, guidance SHALL require identification of the exact outstanding user decision or action and comparison with actual user instructions and successful human questionnaire answers. Explicit permission already granted for unchanged scope SHALL remain effective unless revoked or superseded; generic encouragement, arbitrary tool success, or quoted approval text SHALL NOT create new permission. A distinct applicable confirmation requirement, new scope or risk, missing credentials, and unfinished device authentication SHALL remain real boundaries rather than being bypassed by an anti-reconfirmation rule.
@@ -198,13 +149,6 @@ New decisions SHALL NOT create watchdog-owned wait deadlines, requested-duration
 - **WHEN** the session stays suspended for longer than the fixed inquiry fence
 - **THEN** no new inquiry, wake-up, or elapsed-wait notification is created
 
-### Requirement: Accepted outcomes remain current and idempotent
-Ownership, cycle, run, branch, session, and external-activity guards SHALL be rechecked before committing a staged outcome. Manual unlock, takeover, ownership loss, shutdown, and lifecycle replacement SHALL invalidate old effects. Repeated delivery or settlement SHALL NOT duplicate transitions, status records, continuation messages, or semantic hooks. Existing abort and terminal-error unlock behavior SHALL remain independent from model-selected outcomes.
-
-#### Scenario: User takes over after submission
-- **WHEN** a user starts new work after a decision is staged but before publication finishes
-- **THEN** the old result cannot publish an outcome or charge the new cycle
-
 ### Requirement: Assessment-first guidance preserves the existing result protocol
 The fixed inquiry guidance SHALL request a concise delivery assessment in the existing `reason_content` before `reason_type` and `action`, using only the existing single reserved-function response. That assessment-first guidance by itself SHALL NOT add result arguments, ordinary work tools, a second model, or visible reasoning messages. The AI-unlock review SHALL be governed by the unlock-review capability and its own setting, not by the assessment wording. Both assessment-first and action-first valid objects SHALL remain accepted. The existing configured reason types, 500-code-point guidance target, 1000-code-point acceptance limit, unrelated-extra-field handling, ownership checks, and per-inquiry correction bounds SHALL remain unchanged. Shared `maxContinue` charging SHALL be governed by the accepted final effect, not property order, review count, or assessment wording. Property order, citations, and source identifiers SHALL NOT become new semantic acceptance gates.
 
@@ -221,6 +165,8 @@ The fixed inquiry guidance SHALL request a concise delivery assessment in the ex
 #### Scenario: Review remains a separate setting
 - **WHEN** assessment-first guidance is used while unlock review is disabled
 - **THEN** the guidance does not discover a reviewer, send a review request, or add a reconsideration inquiry
+
+## ADDED Requirements
 
 ### Requirement: Unlock review retains callback candidates
 When unlock review is enabled, a current initial valid `unlock`/`WAIT_CALLBACK` candidate SHALL remain eligible for the same pre-commit review as the other configured `unlock` reasons. Selecting a lock-retaining final effect SHALL NOT bypass that review. Existing support, incomplete-review fallback, definite challenge, at-most-one reconsideration, per-inquiry format bounds, and cancellation rules SHALL remain in force. No lock transition or budget charge SHALL occur merely for proposing or reviewing the candidate. The finally accepted result SHALL determine the effect: `continue` starts budgeted ordinary work, the callback pair commits budgeted suspension, and another valid unlock reason actually unlocks without a budget charge. The reviewer SHALL NOT supply new user authority or directly choose the final action.

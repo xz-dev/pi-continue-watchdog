@@ -6,12 +6,13 @@
  * Validation:
  * - idleDelaySeconds remains accepted for configuration compatibility only;
  *   automatic inquiries always use the fixed ten-second runtime fence.
- * - maxRetries remains a safe integer in [1, 10].
+ * - maxContinue is a safe integer in [1, 10] (shared continue/callback budget).
  * - reasonTypes and continueReasonTypes are nonempty arrays of trim-nonblank
  *   strings; valid lists replace the defaults.
  * - decisionPrompt and continuePrompt are non-blank bounded Unicode strings.
- * - jevWaitCheck is a removed key: each occurrence reports a named error
- *   diagnostic naming the key only (never nested values) and has no effect.
+ * - jevWaitCheck and maxRetries are removed keys: each occurrence reports a
+ *   named error diagnostic naming the key only (never values) and has no
+ *   effect. maxRetries is not an alias for maxContinue.
  * Invalid values are rejected (no silent clamp).
  */
 
@@ -41,20 +42,20 @@ export const MAX_PROMPT_CHARACTERS = 16_384;
 /** Minimum accepted deprecated idleDelaySeconds compatibility value. */
 export const MIN_IDLE_DELAY_SECONDS = 0;
 
-/** Minimum accepted maxRetries (inclusive). */
-export const MIN_RETRIES = 1;
+/** Minimum accepted maxContinue (inclusive). */
+export const MIN_CONTINUE = 1;
 
 /**
- * Maximum accepted maxRetries (inclusive).
+ * Maximum accepted maxContinue (inclusive).
  * Matches the accepted product default budget; higher values are not required.
  */
-export const MAX_RETRIES = 10;
+export const MAX_CONTINUE = 10;
 
 export interface ContinueWatchdogConfig {
 	/** @deprecated Accepted and preserved, but the inquiry fence is fixed at 10s. */
 	idleDelaySeconds: number;
-	/** Budget of accepted, durably published continuations per lock cycle. */
-	maxRetries: number;
+	/** Shared per-cycle budget for accepted continuations and callback suspensions. */
+	maxContinue: number;
 	/** Configurable guidance embedded in the fixed watchdog decision prompt. */
 	decisionPrompt: string;
 	/** Configurable guidance embedded in the fixed automated continuation envelope. */
@@ -87,7 +88,7 @@ export interface MergeConfigResult {
 
 export const BUILT_IN_CONFIG: Readonly<ContinueWatchdogConfig> = Object.freeze({
 	idleDelaySeconds: 10,
-	maxRetries: 10,
+	maxContinue: 10,
 	decisionPrompt: DEFAULT_DECISION_PROMPT,
 	continuePrompt: DEFAULT_CONTINUE_PROMPT,
 	reasonTypes: DEFAULT_REASON_TYPES,
@@ -100,7 +101,7 @@ const MAX_DIAGNOSTIC_LENGTH = 240;
 
 const KNOWN_KEYS = new Set([
 	"idleDelaySeconds",
-	"maxRetries",
+	"maxContinue",
 	"decisionPrompt",
 	"continuePrompt",
 	"reasonTypes",
@@ -109,8 +110,11 @@ const KNOWN_KEYS = new Set([
 	"unlockReviewEnabled",
 ]);
 
-/** Keys removed with the retired jev integration; values never load. */
-const REMOVED_KEYS: ReadonlySet<string> = new Set(["jevWaitCheck"]);
+/** Removed keys; values never load. Optional replacement hint per key. */
+const REMOVED_KEYS: ReadonlyMap<string, string | null> = new Map([
+	["jevWaitCheck", null],
+	["maxRetries", "maxContinue"],
+]);
 
 function diagnostic(
 	source: string,
@@ -123,7 +127,7 @@ function diagnostic(
 function copyBuiltIn(): ContinueWatchdogConfig {
 	return {
 		idleDelaySeconds: BUILT_IN_CONFIG.idleDelaySeconds,
-		maxRetries: BUILT_IN_CONFIG.maxRetries,
+		maxContinue: BUILT_IN_CONFIG.maxContinue,
 		decisionPrompt: BUILT_IN_CONFIG.decisionPrompt,
 		continuePrompt: BUILT_IN_CONFIG.continuePrompt,
 		reasonTypes: [...BUILT_IN_CONFIG.reasonTypes],
@@ -141,12 +145,12 @@ function validIdleDelaySeconds(value: unknown): value is number {
 	);
 }
 
-function validMaxRetries(value: unknown): value is number {
+function validMaxContinue(value: unknown): value is number {
 	return (
 		typeof value === "number" &&
 		Number.isSafeInteger(value) &&
-		value >= MIN_RETRIES &&
-		value <= MAX_RETRIES
+		value >= MIN_CONTINUE &&
+		value <= MAX_CONTINUE
 	);
 }
 
@@ -227,26 +231,28 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 		}
 	}
 
-	if (Object.hasOwn(input, "maxRetries")) {
-		const retries = input.maxRetries;
-		if (validMaxRetries(retries)) {
-			config.maxRetries = retries;
+	if (Object.hasOwn(input, "maxContinue")) {
+		const budget = input.maxContinue;
+		if (validMaxContinue(budget)) {
+			config.maxContinue = budget;
 		} else {
 			diagnostics.push(
 				diagnostic(
 					source,
-					"maxRetries must be a safe integer between 1 and 10",
+					"maxContinue must be a safe integer between 1 and 10",
 				),
 			);
 		}
 	}
 
-	for (const key of REMOVED_KEYS) {
+	for (const [key, replacement] of REMOVED_KEYS) {
 		if (!Object.hasOwn(input, key)) continue;
 		diagnostics.push(
 			diagnostic(
 				source,
-				`${key} was removed and has no effect; remove it from the configuration`,
+				replacement === null
+					? `${key} was removed and has no effect; remove it from the configuration`
+					: `${key} was removed and has no effect; use ${replacement} instead`,
 				"error",
 			),
 		);
@@ -347,8 +353,8 @@ export function mergeConfig(
 		if (partial.idleDelaySeconds !== undefined) {
 			config.idleDelaySeconds = partial.idleDelaySeconds;
 		}
-		if (partial.maxRetries !== undefined) {
-			config.maxRetries = partial.maxRetries;
+		if (partial.maxContinue !== undefined) {
+			config.maxContinue = partial.maxContinue;
 		}
 		if (partial.decisionPrompt !== undefined) {
 			config.decisionPrompt = partial.decisionPrompt;

@@ -6,8 +6,8 @@ import {
 	createLockDecisionController,
 } from "../src/controller.js";
 
-function controller(maxRetries = 3) {
-	return createLockDecisionController({ maxRetries });
+function controller(maxContinue = 3) {
+	return createLockDecisionController({ maxContinue });
 }
 
 function decisionId(transition: ControllerTransition): number {
@@ -31,6 +31,7 @@ test("initial snapshot is unlocked with no decision window", () => {
 		locked: false,
 		attempt: 0,
 		exhausted: false,
+		callbackSuspended: false,
 		decisionFailed: false,
 		invalidDecisionAttempts: 0,
 		lastInvalidDecisionError: null,
@@ -55,6 +56,7 @@ test("lock and main user start reset accounting and close pending decisions", ()
 		locked: true,
 		attempt: 0,
 		exhausted: false,
+		callbackSuspended: false,
 		decisionFailed: false,
 		invalidDecisionAttempts: 0,
 		lastInvalidDecisionError: null,
@@ -216,7 +218,7 @@ test("invalidating and unlocking require the current decision id", () => {
 	assert.equal(state.snapshot.locked, false);
 });
 
-test("resumed invalid accounting keeps the three-response bound, separate from maxRetries", () => {
+test("resumed invalid accounting keeps the three-response bound, separate from maxContinue", () => {
 	for (const consumed of [1, 2]) {
 		const state = controller(1);
 		state.lock();
@@ -287,7 +289,7 @@ test("postcommit reapply changes only the expected rolled-back continuation coun
 });
 
 test("snapshots are fresh and construction copies retry config", () => {
-	const supplied = { maxRetries: 2 };
+	const supplied = { maxContinue: 2 };
 	const state = createLockDecisionController(supplied);
 	state.lock();
 	const first = state.snapshot;
@@ -295,7 +297,7 @@ test("snapshots are fresh and construction copies retry config", () => {
 	assert.notEqual(first, second);
 	assert.deepEqual(first, second);
 
-	supplied.maxRetries = 99;
+	supplied.maxContinue = 99;
 	state.recordValidContinue(openDecision(state));
 	state.recordValidContinue(openDecision(state));
 	assert.equal(state.snapshot.exhausted, true);
@@ -309,4 +311,59 @@ test("snapshots are fresh and construction copies retry config", () => {
 			: null,
 		"Invalid decision.",
 	);
+});
+
+test("callback suspension shares the budget, retains the lock, and blocks inquiries", () => {
+	const state = controller(3);
+	state.lock();
+	state.recordValidContinue(openDecision(state));
+	const id = openDecision(state);
+	const suspended = state.recordValidCallbackSuspension(id);
+	assert.equal(suspended.applied, true);
+	assert.deepEqual(effectKinds(suspended), ["restoreDecisionTools"]);
+	assert.equal(state.snapshot.locked, true);
+	assert.equal(state.snapshot.callbackSuspended, true);
+	assert.equal(state.snapshot.attempt, 2);
+	assert.equal(state.snapshot.decisionOpen, false);
+	// Stale/duplicate results, idle observations and rollback spend nothing.
+	assert.equal(state.recordValidCallbackSuspension(id).applied, false);
+	assert.equal(state.beginDecision(Number.MAX_SAFE_INTEGER).applied, false);
+	assert.equal(state.rollbackValidContinue().applied, false);
+	assert.equal(state.reapplyValidContinue(1).applied, false);
+	assert.equal(state.snapshot.attempt, 2);
+	// Callback work resumes the same cycle without spending or replenishing.
+	assert.equal(state.resumeFromCallback().applied, true);
+	assert.equal(state.resumeFromCallback().applied, false);
+	assert.equal(state.snapshot.attempt, 2);
+	assert.equal(state.snapshot.callbackSuspended, false);
+	state.recordValidContinue(openDecision(state));
+	assert.equal(state.snapshot.exhausted, true);
+});
+
+test("final callback unit is exhausted numerically but stays suspended until resume", () => {
+	const state = controller(2);
+	state.lock();
+	state.recordValidContinue(openDecision(state));
+	state.recordValidCallbackSuspension(openDecision(state));
+	assert.equal(state.snapshot.attempt, 2);
+	assert.equal(state.snapshot.exhausted, true);
+	assert.equal(state.snapshot.callbackSuspended, true);
+	state.resumeFromCallback();
+	assert.equal(state.snapshot.exhausted, true);
+	assert.equal(state.snapshot.callbackSuspended, false);
+	assert.equal(state.beginDecision(Number.MAX_SAFE_INTEGER).applied, false);
+});
+
+test("unlock and a fresh lock clear callback suspension", () => {
+	const state = controller(3);
+	state.lock();
+	state.recordValidCallbackSuspension(openDecision(state));
+	state.unlock();
+	assert.equal(state.snapshot.callbackSuspended, false);
+	assert.equal(state.snapshot.locked, false);
+	state.lock();
+	state.recordValidCallbackSuspension(openDecision(state));
+	state.onMainUserMessageStart();
+	assert.equal(state.snapshot.callbackSuspended, false);
+	assert.equal(state.snapshot.attempt, 0);
 });

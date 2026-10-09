@@ -6,14 +6,16 @@
  */
 
 export interface LockDecisionControllerConfig {
-	readonly maxRetries: number;
+	readonly maxContinue: number;
 }
 
 export interface LockDecisionSnapshot {
 	readonly locked: boolean;
-	/** Number of accepted continue outcomes already consumed in this lock cycle. */
+	/** Shared maxContinue units consumed: accepted continuations plus callback suspensions. */
 	readonly attempt: number;
 	readonly exhausted: boolean;
+	/** Locked cycle is quietly waiting for external callback work; no inquiries. */
+	readonly callbackSuspended: boolean;
 	readonly decisionFailed: boolean;
 	readonly invalidDecisionAttempts: number;
 	readonly lastInvalidDecisionError: string | null;
@@ -77,6 +79,13 @@ export interface LockDecisionController {
 	/** Reapply only the exact rolled-back accepted continuation count. */
 	reapplyValidContinue(previousAttempt: number): ControllerTransition;
 	recordValidUnlock(decisionId: number): ControllerTransition;
+	/**
+	 * Accept a final WAIT_CALLBACK result: close the decision, keep the lock,
+	 * enter callback suspension, and spend one shared unit.
+	 */
+	recordValidCallbackSuspension(decisionId: number): ControllerTransition;
+	/** Actual ordinary work started: leave suspension in the same cycle (+0). */
+	resumeFromCallback(): ControllerTransition;
 	/** Close a stale decision without consuming attempts or unlocking. */
 	invalidateDecision(decisionId: number): ControllerTransition;
 }
@@ -88,6 +97,7 @@ interface MutableState {
 	locked: boolean;
 	attempt: number;
 	exhausted: boolean;
+	callbackSuspended: boolean;
 	decisionFailed: boolean;
 	invalidDecisionAttempts: number;
 	lastInvalidDecisionError: string | null;
@@ -100,6 +110,7 @@ function snapshotOf(state: MutableState): LockDecisionSnapshot {
 		locked: state.locked,
 		attempt: state.attempt,
 		exhausted: state.exhausted,
+		callbackSuspended: state.callbackSuspended,
 		decisionFailed: state.decisionFailed,
 		invalidDecisionAttempts: state.invalidDecisionAttempts,
 		lastInvalidDecisionError: state.lastInvalidDecisionError,
@@ -118,6 +129,7 @@ function initialState(): MutableState {
 		locked: false,
 		attempt: 0,
 		exhausted: false,
+		callbackSuspended: false,
 		decisionFailed: false,
 		invalidDecisionAttempts: 0,
 		lastInvalidDecisionError: null,
@@ -129,10 +141,10 @@ function initialState(): MutableState {
 class PureLockDecisionController implements LockDecisionController {
 	private state = initialState();
 	private nextDecisionId = 1;
-	private readonly maxRetries: number;
+	private readonly maxContinue: number;
 
 	public constructor(config: LockDecisionControllerConfig) {
-		this.maxRetries = config.maxRetries;
+		this.maxContinue = config.maxContinue;
 	}
 
 	public get snapshot(): LockDecisionSnapshot {
@@ -159,6 +171,7 @@ class PureLockDecisionController implements LockDecisionController {
 		this.state = {
 			...this.state,
 			locked: false,
+			callbackSuspended: false,
 			decisionOpen: false,
 			decisionId: null,
 		};
@@ -272,7 +285,7 @@ class PureLockDecisionController implements LockDecisionController {
 		this.state = {
 			...this.state,
 			attempt,
-			exhausted: attempt >= this.maxRetries,
+			exhausted: attempt >= this.maxContinue,
 			invalidDecisionAttempts: 0,
 			lastInvalidDecisionError: null,
 			decisionOpen: false,
@@ -282,7 +295,13 @@ class PureLockDecisionController implements LockDecisionController {
 	}
 
 	public rollbackValidContinue(): ControllerTransition {
-		if (this.state.decisionOpen || this.state.attempt === 0) return this.noop();
+		// A callback unit is never refunded; only an unsent continuation rolls back.
+		if (
+			this.state.decisionOpen ||
+			this.state.callbackSuspended ||
+			this.state.attempt === 0
+		)
+			return this.noop();
 		this.state = {
 			...this.state,
 			attempt: this.state.attempt - 1,
@@ -295,9 +314,10 @@ class PureLockDecisionController implements LockDecisionController {
 		if (
 			!Number.isInteger(previousAttempt) ||
 			previousAttempt < 0 ||
-			previousAttempt >= this.maxRetries ||
+			previousAttempt >= this.maxContinue ||
 			this.state.attempt !== previousAttempt ||
 			!this.state.locked ||
+			this.state.callbackSuspended ||
 			this.state.exhausted ||
 			this.state.decisionFailed ||
 			this.state.decisionOpen
@@ -307,7 +327,7 @@ class PureLockDecisionController implements LockDecisionController {
 		this.state = {
 			...this.state,
 			attempt,
-			exhausted: attempt >= this.maxRetries,
+			exhausted: attempt >= this.maxContinue,
 		};
 		return this.applied([]);
 	}
@@ -320,6 +340,30 @@ class PureLockDecisionController implements LockDecisionController {
 			decisionId: null,
 		};
 		return this.applied([{ kind: "restoreDecisionTools", decisionId }]);
+	}
+
+	public recordValidCallbackSuspension(
+		decisionId: number,
+	): ControllerTransition {
+		if (!this.isCurrentDecision(decisionId)) return this.noop();
+		const attempt = this.state.attempt + 1;
+		this.state = {
+			...this.state,
+			attempt,
+			exhausted: attempt >= this.maxContinue,
+			callbackSuspended: true,
+			invalidDecisionAttempts: 0,
+			lastInvalidDecisionError: null,
+			decisionOpen: false,
+			decisionId: null,
+		};
+		return this.applied([{ kind: "restoreDecisionTools", decisionId }]);
+	}
+
+	public resumeFromCallback(): ControllerTransition {
+		if (!this.state.locked || !this.state.callbackSuspended) return this.noop();
+		this.state = { ...this.state, callbackSuspended: false };
+		return this.applied([]);
 	}
 
 	public recordValidUnlock(decisionId: number): ControllerTransition {
@@ -340,6 +384,7 @@ class PureLockDecisionController implements LockDecisionController {
 		return (
 			Number.isFinite(nowMs) &&
 			this.state.locked &&
+			!this.state.callbackSuspended &&
 			!this.state.exhausted &&
 			!this.state.decisionFailed &&
 			!this.state.decisionOpen
@@ -374,5 +419,5 @@ class PureLockDecisionController implements LockDecisionController {
 export function createLockDecisionController(
 	config: LockDecisionControllerConfig,
 ): LockDecisionController {
-	return new PureLockDecisionController({ maxRetries: config.maxRetries });
+	return new PureLockDecisionController({ maxContinue: config.maxContinue });
 }

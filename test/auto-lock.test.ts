@@ -3,6 +3,7 @@ import test from "node:test";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
+	CALLBACK_WAKE_TEXTS,
 	type MainUserAutoLockBinding,
 	registerMainUserAutoLock,
 } from "../src/auto-lock.js";
@@ -110,7 +111,7 @@ function fireHandlers(
 
 function createHarness(): Harness {
 	const hub = createObservableAgentHub();
-	const controller = createLockDecisionController({ maxRetries: 1 });
+	const controller = createLockDecisionController({ maxContinue: 1 });
 	const handlers = new Map<string, LifecycleHandler[]>();
 	const calls: string[] = [];
 	const commandNames: string[] = [];
@@ -202,6 +203,7 @@ test("actual main user message_start locks without a command notification", () =
 		locked: true,
 		attempt: 0,
 		exhausted: false,
+		callbackSuspended: false,
 		decisionFailed: false,
 		invalidDecisionAttempts: 0,
 		lastInvalidDecisionError: null,
@@ -286,7 +288,7 @@ test("non-user roles and missing messages are inert", () => {
 test("child, demoted, and detached handlers stay inert; reclaim restores main", () => {
 	const hub = createObservableAgentHub();
 	const oldMain = bindMain(hub, "headless-main", false);
-	const oldController = createLockDecisionController({ maxRetries: 1 });
+	const oldController = createLockDecisionController({ maxContinue: 1 });
 	const oldHandlers = new Map<string, LifecycleHandler[]>();
 	registerMainUserAutoLock(
 		createMultiHandlerPi({ handlers: oldHandlers }),
@@ -299,7 +301,7 @@ test("child, demoted, and detached handlers stay inert; reclaim restores main", 
 		hasUI: false,
 	});
 	assert.ok(child.attachment);
-	const childController = createLockDecisionController({ maxRetries: 1 });
+	const childController = createLockDecisionController({ maxContinue: 1 });
 	const childHandlers = new Map<string, LifecycleHandler[]>();
 	registerMainUserAutoLock(createMultiHandlerPi({ handlers: childHandlers }), {
 		isCurrentMain: () => false,
@@ -307,7 +309,7 @@ test("child, demoted, and detached handlers stay inert; reclaim restores main", 
 	});
 
 	const electedMain = bindMain(hub, "ui-main", true);
-	const electedController = createLockDecisionController({ maxRetries: 1 });
+	const electedController = createLockDecisionController({ maxContinue: 1 });
 	const electedHandlers = new Map<string, LifecycleHandler[]>();
 	registerMainUserAutoLock(
 		createMultiHandlerPi({ handlers: electedHandlers }),
@@ -347,4 +349,64 @@ test("repeated actual user events invoke the main transition each time", () => {
 	fireHandlers(handlers, "message_start", userMessageStart());
 	fireHandlers(handlers, "message_start", userMessageStart());
 	assert.equal(calls, 2);
+});
+
+test("only exact built-in callback wake texts keep the current cycle", () => {
+	const handlers = new Map<string, LifecycleHandler[]>();
+	let calls = 0;
+	registerMainUserAutoLock(createMultiHandlerPi({ handlers }), {
+		isCurrentMain: () => true,
+		onMainUserMessageStart: () => {
+			calls += 1;
+		},
+	});
+	const start = (content: unknown) => ({
+		type: "message_start",
+		message: { role: "user", content },
+	});
+	assert.equal(CALLBACK_WAKE_TEXTS.size, 2);
+	for (const wake of CALLBACK_WAKE_TEXTS) {
+		fireHandlers(handlers, "message_start", start(wake));
+		fireHandlers(
+			handlers,
+			"message_start",
+			start([{ type: "text", text: wake }]),
+		);
+	}
+	assert.equal(calls, 0);
+	// Near matches, extra content, and other user text are genuine user work.
+	for (const content of [
+		" New intercom message above.",
+		"New intercom message above. ",
+		"new intercom message above.",
+		"New intercom message above.\nPlease also fix X.",
+		[
+			{ type: "text", text: "New intercom message above." },
+			{ type: "image", data: "", mimeType: "image/png" },
+		],
+		"Please continue.",
+	]) {
+		fireHandlers(handlers, "message_start", start(content));
+	}
+	assert.equal(calls, 6);
+});
+
+test("wired extension: a wake keeps suspended usage, a human message starts fresh", () => {
+	const harness = createHarness();
+	const { controller } = harness;
+	controller.lock();
+	controller.recordValidCallbackSuspension(decisionId(controller));
+	assert.equal(controller.snapshot.attempt, 1);
+	harness.fire({
+		type: "message_start",
+		message: { role: "user", content: "New intercom message above." },
+	});
+	assert.equal(controller.snapshot.attempt, 1);
+	assert.equal(controller.snapshot.locked, true);
+	harness.fire({
+		type: "message_start",
+		message: { role: "user", content: "New request from the user." },
+	});
+	assert.equal(controller.snapshot.attempt, 0);
+	assert.equal(controller.snapshot.callbackSuspended, false);
 });

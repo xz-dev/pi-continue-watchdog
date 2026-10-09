@@ -115,7 +115,7 @@ function notifyCtx(
 }
 
 function makeController(): LockDecisionController {
-	return createLockDecisionController({ maxRetries: 2 });
+	return createLockDecisionController({ maxContinue: 2 });
 }
 
 function decisionId(controller: LockDecisionController): number {
@@ -851,4 +851,47 @@ test("Pi retry errors before settle remain silent, successful retry does not unl
 	assert.equal(controller.snapshot.locked, true);
 	assert.deepEqual(harness.received, []);
 	await fireHandlers(harness.handlers, "session_shutdown", {}, harness.ctx);
+});
+
+test("terminal error/abort of final-unit callback work overrides exhaustion", async () => {
+	for (const [stopReason, stopKind] of [
+		["error", "ERROR_UNLOCK"],
+		["aborted", null],
+	] as const) {
+		const controller = makeController();
+		controller.lock();
+		controller.recordValidContinue(decisionId(controller));
+		controller.recordValidCallbackSuspension(decisionId(controller));
+		assert.equal(controller.snapshot.exhausted, true);
+		assert.equal(controller.snapshot.callbackSuspended, true);
+		const harness = createExtensionHarness(controller);
+		await fireHandlers(
+			harness.handlers,
+			"session_start",
+			{ type: "session_start", reason: "startup" },
+			harness.ctx,
+		);
+		assert.equal(controller.snapshot.callbackSuspended, true);
+		// Actual callback work resumes the same cycle, then ends terminally.
+		await fireHandlers(
+			harness.handlers,
+			"agent_start",
+			{ type: "agent_start" },
+			harness.ctx,
+		);
+		assert.equal(controller.snapshot.callbackSuspended, false);
+		harness.sessionManager.append(assistant("a1", stopReason));
+		await fireHandlers(
+			harness.handlers,
+			"agent_settled",
+			{ type: "agent_settled" },
+			harness.ctx,
+		);
+		assert.equal(controller.snapshot.locked, false, stopReason);
+		const kinds = harness.received.map(
+			(envelope) => envelope.values?.STOP_KIND,
+		);
+		assert.equal(kinds.includes("EXHAUSTED"), false, stopReason);
+		if (stopKind !== null) assert.deepEqual(kinds, [stopKind]);
+	}
 });

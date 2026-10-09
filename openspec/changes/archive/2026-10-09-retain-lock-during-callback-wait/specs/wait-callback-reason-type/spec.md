@@ -1,10 +1,4 @@
-# wait-callback-reason-type Specification
-
-## Purpose
-
-Gives the agent a typed way to end its turn while it waits for another agent or program to call back, so the watchdog does not continue it and notification consumers can tell this stop apart from one that needs the user.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Built-in WAIT_CALLBACK reason type
 Default `reasonTypes` SHALL remain `JOB_DONE`, `WAIT_USER`, `JOB_BLOCKED`, and `WAIT_CALLBACK`; a valid configured list SHALL replace those defaults. Only authorized decision guidance SHALL explain callback waiting. The compatible wire pair `action: "unlock"` with a validated configured type matching the built-in `WAIT_CALLBACK` SHALL suspend automatic watchdog activity while retaining the lock, rather than unlock. The inquiry SHALL finish without an acknowledgement-only model turn. This accepted suspension SHALL consume one unit of the plugin's shared `maxContinue` budget, without resetting its cycle or previous usage. No new action, duration, timer, poll, fabricated callback, or ordinary-turn stopping function SHALL be introduced. Other unlock reasons, including `JOB_DONE`, SHALL retain actual unlock semantics.
@@ -39,6 +33,8 @@ Callback selection guidance SHALL exist only inside the authorized inquiry. The 
 - **WHEN** a remote job can only be monitored through a task tool
 - **THEN** guidance does not describe it as a future callback
 - **AND** any continuation names an available authorized monitoring action, not a watchdog delay
+
+## ADDED Requirements
 
 ### Requirement: Callback suspension resumes on actual ordinary work
 A suspended current cycle SHALL remain locked and start no automatic inquiry or work turn solely because time passes, aggregate idle is observed again, or unrelated child/domain status changes. Actual new ordinary work beginning in the owning main session SHALL end suspension without consuming another budget unit or resetting prior usage. Owned inquiry, correction, review, publication, and status traffic SHALL NOT qualify as that work. A callback notice without a started run SHALL NOT resume the cycle. A user-role message whose entire text exactly equals an entry of the plugin's built-in callback wake-text list SHALL be treated as automation: it SHALL NOT start a fresh cycle, replenish usage, or count as genuine user takeover, while it still counts as ordinary work that ends suspension. The list SHALL be fixed in the plugin, SHALL NOT be configurable or disableable, and SHALL contain only exact texts known to be sent by callback producers (initially the pi-subagents parent wake and the pi-intercom idle wake). Matching SHALL compare the whole text exactly, without trimming, prefix, substring, case folding, or pattern rules. Any other user-role message, including an extension-sent one, SHALL retain the existing user-message fresh-cycle behavior; role alone SHALL NOT establish automation. Genuine new human work SHALL retain the existing fresh-cycle behavior. A callback arriving before a pending suspension commits SHALL invalidate the old result rather than let it suspend the newer work.

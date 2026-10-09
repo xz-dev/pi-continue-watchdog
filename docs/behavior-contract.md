@@ -23,7 +23,7 @@ This contract supersedes the proactive unlock-tool + direct-continuation design.
 | Always-advertised `unlock_continue_watchdog` callable from ordinary work | One reserved root-only function `cw` whose arguments are taught only in authorized decision prompts |
 | Lock alone authorizing a model-issued stop | Only the exact consumed current decision attempt can submit a verdict |
 | Direct continuation at qualified idle | One hidden decision inquiry precedes any ordinary continuation |
-| Waiting inside the agent's own turn only | **Removed**: only `continue` and `unlock` are accepted; `WAIT_CALLBACK` covers expected external wake-ups and arms no timer |
+| Waiting inside the agent's own turn only | **Removed**: only `continue` and `unlock` are accepted; `unlock` with built-in `WAIT_CALLBACK` retains the lock and quietly suspends until callback work starts, arming no timer |
 | Invalid arguments as ordinary tool-error follow-ups | Bounded correction (three responses) and a `DECISION_FAILED` terminal state |
 | Untyped continuations | The accepted continue reason type and reason appear in the shared continuation body; `continueReasonTypes` is restored |
 | jev wait classification and WAIT_USER permission review | Removed entirely; delivery and user boundaries are judged inside the authorized decision inquiry |
@@ -45,7 +45,7 @@ References to a consumed attempt below mean the locally confirmed phase. Stable 
 | **Actor** | A human driving Pi with a root main agent and watchdog-loaded same-process or authenticated child Pi sessions |
 | **Need** | After a qualified settlement the watchdog asks the model itself, through a hidden phase-gated decision inquiry, whether to continue or unlock; ordinary work can no longer stop the cycle on its own |
 | **Value** | Reduces stalled sessions after subagents finish; native tool-call reliability replaces an XML protocol the model produced unreliably; the tool declaration stays stable without promising provider cache hits |
-| **In scope (v1)** | Runtime lock; auto-lock on actual main user work; manual lock/unlock (optional reason); automatic unlock when the main run is actually aborted as Pi reports or settles in terminal error; one root-only reserved `cw` decision-result function with fixed minimal metadata; watchdog-owned continue/unlock inquiries after the fixed ten-second aggregate-idle fence; bounded invalid-response correction (three) and decision-failed terminal state; continuation-only retry budget; exhaustion after `maxRetries` accepted published continuations; shared canonical event timeline with runtime-authored local-offset RFC 3339 timestamps; exact-exchange context folding of completed inquiries; authenticated cross-process child activity, neutral connect/disconnect-as-idle, fixed 1-second reconnect with fresh live reports; legacy session readability; config; packaging/CI/publication |
+| **In scope (v1)** | Runtime lock; auto-lock on actual main user work; manual lock/unlock (optional reason); automatic unlock when the main run is actually aborted as Pi reports or settles in terminal error; one root-only reserved `cw` decision-result function with fixed minimal metadata; watchdog-owned continue/unlock inquiries after the fixed ten-second aggregate-idle fence; bounded invalid-response correction (three) and decision-failed terminal state; shared `maxContinue` budget for accepted published continuations and lock-retaining `WAIT_CALLBACK` suspensions; exhaustion after `maxContinue` units; shared canonical event timeline with runtime-authored local-offset RFC 3339 timestamps; exact-exchange context folding of completed inquiries; authenticated cross-process child activity, neutral connect/disconnect-as-idle, fixed 1-second reconnect with fresh live reports; legacy session readability; config; packaging/CI/publication |
 | **Out of scope (v1)** | Durable lock across reload/new/resume/restart; sessions that did not load the watchdog; depending on pi-subagents or any other plugin; replacing Pi footer; wall-clock or loop-count watchdogs (those belong to pi-watchdog); XML decision transport; any external classifier or permission reviewer (jev removed) |
 
 ---
@@ -103,7 +103,7 @@ Correct all accidental `cointinue` spellings; public names use `continue` only.
 | `JOB_DONE` | All work is complete |
 | `WAIT_USER` | User input, approval, or action is required |
 | `JOB_BLOCKED` | Work remains unfinished and cannot proceed for a non-`WAIT_USER` blocker |
-| `WAIT_CALLBACK` | Waiting for another agent or program to call back and wake the agent (for example an async subagent completion) |
+| `WAIT_CALLBACK` | Waiting for another agent or program to call back and wake the agent (for example an async subagent completion). Unlike other types, an accepted result retains the lock and suspends automatic inquiries (see Callback waiting) |
 
 Configured type lists may use ordinary nonblank UTF-8 text. Trust sane user config; do **not** impose identifier-format regexes, artificial length/count caps, or collision hardening beyond the validation rules below.
 
@@ -141,12 +141,14 @@ Continue until user assistance is required.
 | Key | Default | Notes |
 |---|---|---|
 | `idleDelaySeconds` | `10` | Deprecated compatibility key. It remains accepted/preserved, but runtime ignores it; the inquiry fence is exactly 10 seconds. |
-| `maxRetries` | `10` | Budget of accepted, durably published continuations per lock cycle; safe integer in `[1, 10]` |
+| `maxContinue` | `10` | Per-cycle plugin budget shared by accepted, durably published continuations and accepted `WAIT_CALLBACK` suspensions; safe integer in `[1, 10]`. Unrelated to Pi/provider retry settings |
 | `decisionPrompt` | exact default above | Decision-only guidance preceding the fixed outcome and function instructions; nonblank and at most 16,384 Unicode code points |
 | `continuePrompt` | exact default above | Guidance embedded verbatim in the fixed continuation body; nonblank and at most 16,384 Unicode code points |
 | `reasonTypes` | `["JOB_DONE","WAIT_USER","JOB_BLOCKED","WAIT_CALLBACK"]` | Allowed unlock-verdict types, disclosed only in authorized decision prompts. A valid configured list **replaces** the default. |
 | `continueReasonTypes` | `["WORK_REMAINS","VERIFYING"]` | Allowed continuation-verdict types. A valid configured list **replaces** the default. |
 | `unlockReviewEnabled` | `true` | AI-unlock review through a loaded `pi-llm-as-jev` service; skipped with a warning when unavailable. See the review section above. |
+
+The removed key `maxRetries` is an **error**, not an alias: it reports `maxRetries was removed and has no effect; use maxContinue instead`, never applies its value (even at higher precedence), and leaves the effective `maxContinue` unchanged. The extension never rewrites configuration files.
 
 The removed key `jevWaitCheck` is an **error**: when present, the extension reports an error diagnostic naming the key (never its nested values or credentials) and it has no effect; other valid keys still apply and load succeeds. The extension resolves no TypeSafe or OpenRouter credential for any jev purpose and modifies none; the unlock review uses the loaded service's own credentials.
 
@@ -158,7 +160,7 @@ The removed key `jevWaitCheck` is an **error**: when present, the extension repo
 
 Trusted-project fields override global field-by-field (`builtins < global < trusted project`). Invalid high-precedence values must not erase valid lower-precedence values; emit bounded diagnostics. Missing files are silent. Configured prompt limits count Unicode code points without truncation: exactly 16,384 is valid and longer values are invalid. Reason-type list entries are only trimmed and required to be nonblank; they have no identifier regex or artificial per-entry length limit.
 
-**Fence rule:** every candidate decision inquiry cancels/replaces the previous event-loop timer and waits a full fixed 10 seconds. Every relevant event and every child report replaces it, including repeated equal idle reports. Each accepted, durably published continuation advances the `maxRetries` attempt; unlock, invalid responses, inquiry dispatch, corrections, stale results, and transport deferrals advance none.
+**Fence rule:** every candidate decision inquiry cancels/replaces the previous event-loop timer and waits a full fixed 10 seconds. Every relevant event and every child report replaces it, including repeated equal idle reports. Each accepted, durably published continuation and each accepted `WAIT_CALLBACK` suspension advances the shared `maxContinue` attempt; actual unlock, invalid responses, inquiry dispatch, corrections, review/reconsideration, stale results, and transport deferrals advance none.
 
 ---
 
@@ -169,8 +171,9 @@ Per main ownership generation / lock cycle, at least:
 | Field / phase | Meaning |
 |---|---|
 | `locked` | Whether automatic decision-after-idle is armed |
-| `attempt` | Number of accepted, durably published continuations consumed in the current cycle (0 after reset) |
-| `exhausted` | `locked` and `maxRetries` accepted continuations already consumed; no new inquiry until reset |
+| `attempt` | Number of accepted, durably published continuations plus accepted callback suspensions consumed in the current cycle (0 after reset) |
+| `exhausted` | `locked` and `maxContinue` units already consumed; no new inquiry until reset |
+| `callbackSuspended` | `locked` after an accepted `WAIT_CALLBACK`; no inquiry until actual ordinary main-session work starts (same cycle, no unit spent) or the cycle ends. Never restored from history |
 | `decisionOpen` | A decision inquiry is currently open with its identity |
 | `invalidDecisionAttempts` | Invalid responses consumed by the current inquiry (bounded at three) |
 | `decisionFailed` | Locked terminal state after the third invalid response; no automatic requests until reset |
@@ -276,15 +279,28 @@ The prompt is locally confirmed only when its exact correlated message appears i
 
 | Accepted verdict | Accounting | Next effect |
 |---|---|---|
-| `continue` | One retry attempt | Publish one reason-bearing continuation and start its ordinary work turn |
-| `unlock` | No attempt | Clear pending work, publish the unlock outcome, retain idle-gated user-ready intent |
+| `continue` | One unit | Publish one reason-bearing continuation and start its ordinary work turn |
+| `unlock` + built-in `WAIT_CALLBACK` | One unit | Retain the lock, close the decision, suspend automatic inquiries, publish one quiet callback-suspension status and an idle-gated `user-ready` `WAIT_CALLBACK` |
+| `unlock` (any other type) | No attempt | Clear pending work, publish the unlock outcome, retain idle-gated user-ready intent |
 | Third invalid response | No continuation attempt | Stay locked but decision-failed; publish the failure event and stop automatic requests for that cycle |
 
 Corrections are scheduled by the runtime, not by Pi's ordinary tool-error follow-up: at most two corrective re-asks follow the initial response, each with a fresh owned and consumed attempt. Dispatch failure, deferral, cancellation, or stale ownership is not an invalid model answer and consumes nothing. Terminal `stopReason: "error"` and human abort keep their existing separate paths.
 
 ### Callback waiting
 
-Timed watchdog waits are removed. `WAIT_CALLBACK` remains an unlock reason: it is selected when another agent or program is actually expected to call back and wake the session and no independent authorized action remains; it arms no timer, poll, or fabricated callback and charges no retry attempt. Work lacking a callback uses an available authorized monitoring or task-owned waiting action in ordinary work, or reports the real blocker through an unlock category. Legacy wait and completed-wait records remain readable without restoring a timer or regaining decision authority.
+Timed watchdog waits are removed and the wire shape is unchanged: `cw` `{action:"unlock", reason_type:"WAIT_CALLBACK", reason_content}`. It is selected when another agent or program is actually expected to call back and wake the session and no independent authorized action remains. Only the built-in `WAIT_CALLBACK` (case-insensitive after trimming, when present in `reasonTypes`) has this meaning; custom types and other unlock types keep unlocking. An accepted result:
+
+- keeps the lock, closes the decision, spends one shared `maxContinue` unit, and sets the cycle callback-suspended;
+- arms no timer, poll, or fabricated callback; later idle observations, elapsed time, notice-only messages, status updates, and unrelated child activity open no inquiry;
+- persists one quiet human-only status (`Continue watchdog waiting for callback (lock retained) · WAIT_CALLBACK · <reason>`) and, under the normal aggregate-idle and ownership gates, one `user-ready` `STOP_KIND=WAIT_CALLBACK` with normalized `REASON_TYPE` and trimmed `REASON`.
+
+Suspension ends when actual ordinary work starts in the owning main session: the work runs in the same cycle without spending or replenishing units, and the ordinary 10-second fence applies after it settles. Control, review, and publication traffic never end it. Manual unlock, abort/error unlock, new user work (fresh cycle), and lifecycle replacement end it with their existing precedence. Callback work that starts before the suspension is committed or its signal is published retires that stale verdict or signal.
+
+If the suspension spends the final unit, the cycle stays locked and suspended and signals `WAIT_CALLBACK`, not `EXHAUSTED`; exhaustion becomes eligible once, after the resumed callback work settles successfully. Review applies to the `WAIT_CALLBACK` candidate like any AI unlock; only the final accepted effect consumes a unit.
+
+**Callback wake texts.** Pi's public events cannot attribute a starting user-role message to its producer, so a fixed, non-configurable, non-disableable list of exact whole-text wake messages (pi-subagents parent wake; pi-intercom `New intercom message above.`) is treated as callback work rather than a fresh cycle or human takeover. Any other text, including near matches or extra content, keeps fresh-cycle behavior. Dynamically composed producer prompts are a known gap.
+
+History never restores a lock, suspension, budget, timer, or signal. Legacy `WAIT_CALLBACK` unlock records keep their unlock meaning; legacy wait and completed-wait records remain readable without restoring a timer or regaining decision authority.
 
 ### Finalization fence
 
@@ -442,7 +458,7 @@ Stale timer callbacks (wrong generation/epoch/ownership or cleared by busy/unloc
 
 ### Example 8 — Exhaustion after max accepted continuations
 
-**Given** default `maxRetries = 10` and 10 accepted, durably published continuations have already been consumed in this lock cycle
+**Given** default `maxContinue = 10` and 10 units (accepted, durably published continuations and/or accepted callback suspensions) have already been consumed in this lock cycle
 **When** main remains locked and all observable sessions become idle again
 **Then**
 
@@ -467,7 +483,7 @@ Stale timer callbacks (wrong generation/epoch/ownership or cleared by busy/unloc
 **Given** the elected main attachment observes a new aggregate-idle epoch and the watchdog has finished every automatic action it can take
 **When** the terminal stop is one of:
 
-1. An accepted `unlock` verdict with validated `reason_type` and `reason_content`
+1. An accepted `unlock` verdict with validated `reason_type` and `reason_content` (built-in `WAIT_CALLBACK` publishes `STOP_KIND=WAIT_CALLBACK` and keeps the lock)
 2. Automatic continuations exhausted
 3. The main run settles with terminal `stopReason: "error"` and the watchdog automatically unlocks
 
@@ -475,6 +491,12 @@ Stale timer callbacks (wrong generation/epoch/ownership or cleared by busy/unloc
 
 ```json
 {"version":1,"name":"user-ready","values":{"STOP_KIND":"AI_UNLOCK","REASON_TYPE":"<matched TYPE>","REASON":"<validated reason>"}}
+```
+
+or, for an accepted callback suspension (lock retained):
+
+```json
+{"version":1,"name":"user-ready","values":{"STOP_KIND":"WAIT_CALLBACK","REASON_TYPE":"WAIT_CALLBACK","REASON":"<validated reason>"}}
 ```
 
 or
@@ -504,7 +526,7 @@ or
 ### Example 12 — Trusted config overrides with safe fallback
 
 **Given** global and/or trusted-project `pi-continue-watchdog.json`
-**When** valid `maxRetries`, `decisionPrompt`, `continuePrompt`, `reasonTypes`, `continueReasonTypes`, and/or `unlockShortcut` are provided
+**When** valid `maxContinue`, `decisionPrompt`, `continuePrompt`, `reasonTypes`, `continueReasonTypes`, and/or `unlockShortcut` are provided
 **Then** effective config uses field-level override (trusted project over global over defaults). The deprecated `idleDelaySeconds` key may be parsed/preserved for compatibility but never changes the fixed 10-second runtime fence. A valid `reasonTypes` list replaces its built-in default rather than extending it.
 
 **When** valid `decisionPrompt` and `continueReasonTypes` values are provided

@@ -365,6 +365,7 @@ export type WatchdogTriggerBlocker =
 	| "not-main"
 	| "config-loading"
 	| "unlocked"
+	| "callback-suspended"
 	| "exhausted"
 	| "decision-failed"
 	| "observable-agent-busy"
@@ -377,7 +378,7 @@ export interface WatchdogTriggerStatus {
 	readonly main: boolean;
 	readonly locked: boolean | null;
 	readonly attempt: number | null;
-	readonly maxRetries: number;
+	readonly maxContinue: number;
 	readonly blocker: WatchdogTriggerBlocker | null;
 	readonly gracePhase: "blocked" | "grace" | "ready";
 	readonly graceRemainingMs: number | null;
@@ -2041,6 +2042,8 @@ export function createDecisionRuntime(
 		else if (!configReady || controllerSnapshot === undefined)
 			blocker = "config-loading";
 		else if (!controllerSnapshot.locked) blocker = "unlocked";
+		else if (controllerSnapshot.callbackSuspended)
+			blocker = "callback-suspended";
 		else if (controllerSnapshot.exhausted) blocker = "exhausted";
 		else if (controllerSnapshot.decisionFailed) blocker = "decision-failed";
 		else if (
@@ -2064,7 +2067,7 @@ export function createDecisionRuntime(
 			main: claim !== null && owns(claim),
 			locked: controllerSnapshot?.locked ?? null,
 			attempt: controllerSnapshot?.attempt ?? null,
-			maxRetries: config.maxRetries,
+			maxContinue: config.maxContinue,
 			blocker,
 			gracePhase: grace.phase,
 			graceRemainingMs:
@@ -2091,6 +2094,7 @@ export function createDecisionRuntime(
 		};
 		const controllerEligible =
 			controller?.snapshot.locked === true &&
+			!controller.snapshot.callbackSuspended &&
 			!controller.snapshot.exhausted &&
 			!controller.snapshot.decisionFailed &&
 			!controller.snapshot.decisionOpen;
@@ -2266,11 +2270,25 @@ export function createDecisionRuntime(
 
 		let envelope = null as ReturnType<typeof createUserReadyEnvelope> | null;
 		const unlockIntent = pendingUnlock;
+		if (
+			unlockIntent?.STOP_KIND === "WAIT_CALLBACK" &&
+			!(controller.snapshot.locked && controller.snapshot.callbackSuspended)
+		) {
+			// Callback work already resumed: the old waiting signal is retired.
+			pendingUnlock = null;
+			return;
+		}
 		if (unlockIntent !== null) {
 			envelope = createUserReadyEnvelope(unlockIntent);
 		} else {
 			const snapshot = controller.snapshot;
-			if (snapshot.locked && snapshot.exhausted) {
+			// A final-unit callback wait keeps WAIT_CALLBACK precedence: exhaustion
+			// becomes eligible only after resumed callback work settles.
+			if (
+				snapshot.locked &&
+				snapshot.exhausted &&
+				!snapshot.callbackSuspended
+			) {
 				envelope = createUserReadyEnvelope({ STOP_KIND: "EXHAUSTED" });
 			}
 		}
@@ -2296,11 +2314,16 @@ export function createDecisionRuntime(
 			if (liveController !== controller) return;
 			if (unlockIntent !== null) {
 				if (pendingUnlock !== unlockIntent) return;
+				if (
+					unlockIntent.STOP_KIND === "WAIT_CALLBACK" &&
+					!liveController.snapshot.callbackSuspended
+				)
+					return;
 			} else {
 				const live = liveController.snapshot;
 				let liveEnvelope: ReturnType<typeof createUserReadyEnvelope> | null =
 					null;
-				if (live.locked && live.exhausted) {
+				if (live.locked && live.exhausted && !live.callbackSuspended) {
 					liveEnvelope = createUserReadyEnvelope({ STOP_KIND: "EXHAUSTED" });
 				} else if (live.locked && live.decisionFailed) {
 					liveEnvelope = createUserReadyEnvelope({
@@ -2344,7 +2367,12 @@ export function createDecisionRuntime(
 			}
 			if (!allIdleForClaim(claim)) return;
 			const live = currentController(claim)?.snapshot;
-			if (live === undefined || !live.locked || !live.exhausted) {
+			if (
+				live === undefined ||
+				!live.locked ||
+				!live.exhausted ||
+				live.callbackSuspended
+			) {
 				return;
 			}
 		}
@@ -2732,10 +2760,12 @@ export function createDecisionRuntime(
 		const terminalCurrent =
 			pending.values.STOP_KIND === "AI_UNLOCK"
 				? snapshot?.locked === false
-				: snapshot?.locked === true &&
-					(pending.values.STOP_KIND === "DECISION_FAILED"
-						? snapshot.decisionFailed
-						: snapshot.exhausted);
+				: pending.values.STOP_KIND === "WAIT_CALLBACK"
+					? snapshot?.locked === true && snapshot.callbackSuspended
+					: snapshot?.locked === true &&
+						(pending.values.STOP_KIND === "DECISION_FAILED"
+							? snapshot.decisionFailed
+							: snapshot.exhausted);
 		if (!terminalCurrent || !sharedPublicationCurrent(pending.publication)) {
 			pendingTerminalPublication = null;
 			return;
@@ -3464,7 +3494,8 @@ export function createDecisionRuntime(
 
 		if (
 			(finalization.outcome !== "continue" &&
-				finalization.outcome !== "unlock") ||
+				finalization.outcome !== "unlock" &&
+				finalization.outcome !== "callback") ||
 			finalization.cycleId === undefined
 		) {
 			return false;
@@ -3550,8 +3581,11 @@ export function createDecisionRuntime(
 					outcome: "unlock",
 				}),
 			),
+			// A final callback result retains the lock: same quiet path, its own
+			// stop kind and an explicit applied-effect record (never `unlocked`).
 			values: {
-				STOP_KIND: "AI_UNLOCK",
+				STOP_KIND:
+					finalization.outcome === "callback" ? "WAIT_CALLBACK" : "AI_UNLOCK",
 				REASON_TYPE: reasonType,
 				REASON: reason,
 			},
@@ -3562,6 +3596,9 @@ export function createDecisionRuntime(
 					reason,
 					exchangeId: active.exchangeId,
 					cycleId: finalization.cycleId,
+					...(finalization.outcome === "callback"
+						? { effect: "callback-suspended" as const }
+						: {}),
 				},
 				receipt: null,
 				sending: false,
@@ -4198,6 +4235,18 @@ export function createDecisionRuntime(
 				selfDecisionRun = { kind: "none" };
 			}
 			observeLiveState(ctx, { preserveGeneration: provisionalInternal });
+			if (
+				claim !== null &&
+				controller !== null &&
+				!provisionalInternal &&
+				controller.resumeFromCallback().applied
+			) {
+				// Actual ordinary work ends callback suspension in the same cycle
+				// (+0 units). An unpublished waiting signal is retired, never replayed.
+				if (pendingTerminalPublication?.values.STOP_KIND === "WAIT_CALLBACK")
+					pendingTerminalPublication = null;
+				if (pendingUnlock?.STOP_KIND === "WAIT_CALLBACK") pendingUnlock = null;
+			}
 			if (claim !== null && controller !== null) {
 				const transition = controller.ensureLocked();
 				if (transition.applied) {

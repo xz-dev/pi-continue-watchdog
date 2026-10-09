@@ -1701,12 +1701,14 @@ function aiUnlockStatusEntry(
 	manager: SessionManager,
 	exchangeId: string,
 	reason: string,
+	callback = false,
 ): string {
 	return manager.appendCustomEntry("pi-continue-watchdog:ai-unlock", {
-		reasonType: "JOB_DONE",
+		reasonType: callback ? "WAIT_CALLBACK" : "JOB_DONE",
 		reason,
 		exchangeId,
 		cycleId: 1,
+		...(callback ? { effect: "callback-suspended" } : {}),
 	});
 }
 
@@ -1734,6 +1736,19 @@ test("production compaction projection keeps ordinary work and continuations wit
 	decisionToolResultEntry(sm, "prodUnlock");
 	foldEntry(sm, "prodUnlock", 1, "unlock");
 	aiUnlockStatusEntry(sm, "prodUnlock", "Requested analysis delivered.");
+	// A lock-retaining callback suspension shares the remove-only unlock fold.
+	markerEntry(sm, "prodCallback", 1);
+	inquiryPromptEntry(sm, "prodCallback", 1);
+	decisionAssistantEntry(sm, "prodCallback", "unlock");
+	decisionToolResultEntry(sm, "prodCallback");
+	foldEntry(sm, "prodCallback", 1, "unlock");
+	aiUnlockStatusEntry(
+		sm,
+		"prodCallback",
+		"Waiting for the child callback.",
+		true,
+	);
+	userEntry(sm, "Prod callback result read.", 7);
 	userEntry(sm, "Prod tail question.", 8);
 	const rawBefore = JSON.stringify(sm.getBranch());
 
@@ -1766,7 +1781,10 @@ test("production compaction projection keeps ordinary work and continuations wit
 	// Internal traffic and the quiet unlock status stay out of model input.
 	assertNoWatchdogLeak(body, "prodEx");
 	assertNoWatchdogLeak(body, "prodUnlock");
+	assertNoWatchdogLeak(body, "prodCallback");
 	assert.doesNotMatch(body, /Requested analysis delivered\./);
+	assert.doesNotMatch(body, /Waiting for the child callback\./);
+	assert.match(body, /Prod callback result read\./);
 	assert.doesNotMatch(body, /pi-continue-watchdog:ai-unlock/);
 	assert.equal(body.includes("pi-continue-watchdog:inquiry"), false);
 	// Raw stored entries are untouched by projection itself: the pre-existing

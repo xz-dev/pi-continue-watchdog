@@ -1586,7 +1586,7 @@ test("packed retired wait action is rejected as invalid without waiting effects"
 }, async (t) => {
 	const fixture = await makePackedFixture(t, {
 		withSemanticProbe: true,
-		watchdogConfig: { maxRetries: 1 },
+		watchdogConfig: { maxContinue: 1 },
 	});
 	const { baseUrl, requests } = await startMockServer(t, [
 		{ kind: "text", text: "External job pending." },

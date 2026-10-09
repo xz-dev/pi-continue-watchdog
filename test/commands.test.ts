@@ -84,7 +84,7 @@ function createHarness(): CommandHarness {
 	}> = [];
 	const effects: CommandRuntimeEffect[] = [];
 	const timeline: string[] = [];
-	const controller = createLockDecisionController({ maxRetries: 2 });
+	const controller = createLockDecisionController({ maxContinue: 2 });
 	let currentMain = true;
 
 	const pi = {
@@ -117,7 +117,7 @@ function createHarness(): CommandHarness {
 			main: currentMain,
 			locked: controller.snapshot.locked,
 			attempt: controller.snapshot.attempt,
-			maxRetries: 2,
+			maxContinue: 2,
 			blocker: currentMain ? "observable-agent-busy" : "not-main",
 			gracePhase: "blocked",
 			graceRemainingMs: null,
@@ -267,7 +267,7 @@ test("status formatter shows an eligible grace countdown", () => {
 			main: true,
 			locked: true,
 			attempt: 3,
-			maxRetries: 10,
+			maxContinue: 10,
 			blocker: null,
 			gracePhase: "grace",
 			graceRemainingMs: 9_001,

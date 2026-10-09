@@ -107,6 +107,8 @@ export type DecisionValidation =
 export type DecisionProtocolOutcome =
 	| "continue"
 	| "unlock"
+	/** Final `unlock` + built-in WAIT_CALLBACK: lock-retaining suspension. */
+	| "callback"
 	| "reask"
 	| "decision-failed"
 	| "ignored";
@@ -137,6 +139,12 @@ export type DecisionProtocolPlan =
 			readonly cycleId: number;
 			readonly reasonType: string;
 			readonly reason: string;
+			/**
+			 * The wire `unlock` matched the configured built-in WAIT_CALLBACK
+			 * type; committing it suspends instead of unlocking. The candidate is
+			 * still an ordinary `unlock` for review eligibility.
+			 */
+			readonly callback: boolean;
 	  }
 	| {
 			readonly outcome: "invalid";
@@ -144,6 +152,15 @@ export type DecisionProtocolPlan =
 			readonly error: string;
 	  }
 	| { readonly outcome: "ignored" };
+
+/**
+ * True only when the matched configured spelling is the built-in WAIT_CALLBACK
+ * identity (case-insensitive, as validation matches). Custom labels never
+ * acquire callback meaning.
+ */
+export function isWaitCallbackReasonType(matchedReasonType: string): boolean {
+	return matchedReasonType.toUpperCase() === "WAIT_CALLBACK";
+}
 
 export interface DecisionProtocolSessionOptions {
 	readonly controller: LockDecisionController;
@@ -436,7 +453,7 @@ ${DECISION_DELIVERY_BOUNDARY}
 Choose the outcome using these rules in order:
 1. If all requested and authorized work is complete, submit unlock. For reason_type, ${jobDoneGuidance}.
 2. Submit continue only if at least one concrete requested and authorized next action can be performed immediately for a still-incomplete deliverable without additional user input, approval, confirmation, authorization, credentials, or another user action. reason_content must name that immediately executable action, not a user-blocked action. Do not repeat an already-delivered answer, invent optional follow-up work, or treat a suggested future workflow step as unfinished work.
-3. If you are waiting for another agent or program to call back and wake this session, and no independent authorized action remains, submit unlock with reason_type ${callbackGuidance}. Do not describe work lacking a callback as a future callback.
+3. If you are waiting for another agent or program to call back and wake this session, and no independent authorized action remains, submit unlock with reason_type ${callbackGuidance}. That result keeps the watchdog locked and quietly paused until the callback starts work, and it uses one continue allowance. Do not describe work lacking a callback as a future callback.
 4. If no authorized action can proceed now because a specific user decision, approval, confirmation, authorization, credentials, or other user action is required, submit unlock. For reason_type, ${waitUserGuidance}. Name the exact outstanding requirement in reason_content.
 5. Otherwise, if work cannot proceed for a blocker that is neither user action nor an expected callback, submit unlock. For reason_type, ${jobBlockedGuidance}.
 
@@ -657,6 +674,7 @@ export function createDecisionProtocolSession(
 			cycleId,
 			reasonType: validation.decision.reasonType,
 			reason: validation.decision.reason,
+			callback: isWaitCallbackReasonType(validation.decision.matchedReasonType),
 		};
 	};
 
@@ -691,13 +709,15 @@ export function createDecisionProtocolSession(
 			};
 			return finalized;
 		}
-		const transition = options.controller.recordValidUnlock(options.decisionId);
+		const transition = plan.callback
+			? options.controller.recordValidCallbackSuspension(options.decisionId)
+			: options.controller.recordValidUnlock(options.decisionId);
 		if (!transition.applied) {
 			finalized = { outcome: "ignored", transition };
 			return finalized;
 		}
 		finalized = {
-			outcome: "unlock",
+			outcome: plan.callback ? "callback" : "unlock",
 			transition,
 			reasonType: plan.reasonType,
 			reason: plan.reason,

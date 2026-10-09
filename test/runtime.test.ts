@@ -46,6 +46,7 @@ import {
 import {
 	createHubAttachmentInstance,
 	createObservableAgentHub,
+	type HubAttachment,
 } from "../src/hub.js";
 import {
 	type DomainFence,
@@ -399,7 +400,7 @@ function createHarness(options?: {
 }): Harness {
 	const config: ContinueWatchdogConfig = {
 		idleDelaySeconds: options?.config?.idleDelaySeconds ?? 3,
-		maxRetries: options?.config?.maxRetries ?? 3,
+		maxContinue: options?.config?.maxContinue ?? 3,
 		decisionPrompt: options?.config?.decisionPrompt ?? "Decide now.",
 		continuePrompt: options?.config?.continuePrompt ?? "Continue compactly.",
 		reasonTypes: options?.config?.reasonTypes ?? [
@@ -3072,7 +3073,7 @@ test("decision window blocks ordinary tool_call before execution", async () => {
 });
 
 test("continued settle rearms the fixed delay once and exhausts at max", async () => {
-	const harness = createHarness({ config: { maxRetries: 2 } });
+	const harness = createHarness({ config: { maxContinue: 2 } });
 	await startIdle(harness);
 	await harness.openDecision();
 	await settleResponse(harness, harness.answerContinue());
@@ -3149,7 +3150,7 @@ test("exhaustion event is one-shot under same-idle publication re-entry", async 
 	let harness: Harness;
 	let reentered = false;
 	harness = createHarness({
-		config: { maxRetries: 1 },
+		config: { maxContinue: 1 },
 		onSend(message) {
 			if (
 				!reentered &&
@@ -3180,7 +3181,7 @@ test("successful exhaustion publication survives a busy re-entrant edge", async 
 	let harness: Harness;
 	let interrupted = false;
 	harness = createHarness({
-		config: { maxRetries: 1 },
+		config: { maxContinue: 1 },
 		onSend(message) {
 			if (
 				!interrupted &&
@@ -3210,7 +3211,7 @@ test("successful exhaustion publication survives a busy re-entrant edge", async 
 });
 
 test("retired wait submission consumes no attempt, arms no deadline, and re-asks once", async () => {
-	const harness = createHarness({ config: { maxRetries: 1 } });
+	const harness = createHarness({ config: { maxContinue: 1 } });
 	await startIdle(harness);
 	await harness.openDecision();
 	const sentBefore = harness.sent.length;
@@ -3359,7 +3360,7 @@ test("terminal publication requires receipts and recovers without model work or 
 				);
 			};
 			const harness = createHarness({
-				config: { maxRetries: 1 },
+				config: { maxContinue: 1 },
 				omitPersistedEvent: (value) =>
 					failing && fault === "absent" && value === kind,
 				onSend(message) {
@@ -3470,7 +3471,7 @@ test("resets invalidate unreadable terminal records without stale signals", asyn
 			const hooks: string[] = [];
 			const harness = createHarness({
 				hasUI: false,
-				config: { maxRetries: 1 },
+				config: { maxContinue: 1 },
 				onSend(message) {
 					const fold = parseDecisionFoldDetails(message.details);
 					const eventKind =
@@ -4030,7 +4031,7 @@ test("uncorrelated quarantine releases before an unrelated run", async () => {
 test("stale fenced valid continue does not consume retry or exhaust", async () => {
 	const fence = createFenceHarness();
 	const harness = createHarness({
-		config: { maxRetries: 1 },
+		config: { maxContinue: 1 },
 		processDomain: fence.domain,
 	});
 	await startIdle(harness);
@@ -4203,7 +4204,7 @@ test("same-process child activity cancels a submitted inquiry immediately", asyn
 test("child completion only makes aggregate idle; exactly one inquiry comes from main", async () => {
 	const config: ContinueWatchdogConfig = {
 		idleDelaySeconds: 3,
-		maxRetries: 2,
+		maxContinue: 2,
 		decisionPrompt: "Decide now.",
 		continuePrompt: "Continue compactly.",
 		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
@@ -4292,7 +4293,7 @@ test("shared hub reclaims main after UI shutdown then prefers a new UI bind", as
 	const clock = new FakeClock();
 	const config: ContinueWatchdogConfig = {
 		idleDelaySeconds: 3,
-		maxRetries: 2,
+		maxContinue: 2,
 		decisionPrompt: "Decide now.",
 		continuePrompt: "Continue compactly.",
 		reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED"],
@@ -4421,7 +4422,7 @@ test("effective config loads before binding is reconciled and shutdown blocks la
 	resolveLoad({
 		config: {
 			idleDelaySeconds: 4,
-			maxRetries: 2,
+			maxContinue: 2,
 			decisionPrompt: "Loaded decision.",
 			continuePrompt: "Loaded continue.",
 			reasonTypes: ["JOB_DONE"],
@@ -5394,7 +5395,7 @@ test("retired wait is one invalid response with no timer, retry charge, or waiti
 	assert.equal(waitTimers.length, 0);
 });
 
-test("WAIT_CALLBACK unlock arms no watchdog timer or retry charge", async () => {
+test("WAIT_CALLBACK retains the lock, spends one unit, and stays quiet until callback work", async () => {
 	const hooks: string[] = [];
 	const harness = createHarness({
 		config: {
@@ -5408,14 +5409,208 @@ test("WAIT_CALLBACK unlock arms no watchdog timer or retry charge", async () => 
 		harness,
 		harness.answerUnlock("Waiting for the subagent callback.", "WAIT_CALLBACK"),
 	);
-	assert.equal(harness.controller.snapshot.locked, false);
-	assert.equal(harness.controller.snapshot.attempt, 0);
-	assert.equal(hooks.includes("watchdog-waiting"), false);
-	assert.ok(hooks.includes("user-ready"));
-	const timers = harness.clock.records.filter(
-		(record) => !record.cleared && record.delayMs !== 10_000,
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.callbackSuspended, true);
+	assert.equal(harness.controller.snapshot.attempt, 1);
+	assert.equal(hooks.filter((name) => name === "user-ready").length, 1);
+	const status = harness.entries.find(
+		(entry) => entry.type === "pi-continue-watchdog:ai-unlock",
 	);
-	assert.equal(timers.length, 0);
+	assert.equal(
+		(status?.data as { effect?: string } | undefined)?.effect,
+		"callback-suspended",
+	);
+	// Same remove-only fold as an actual unlock: the exchange and its human-only
+	// status leave model/summary input through the existing projection paths.
+	const fold = parseDecisionFoldDetails(
+		harness.sent.findLast(
+			(entry) => entry.message.customType === DECISION_FOLD_MESSAGE_TYPE,
+		)?.message.details,
+	);
+	assert.equal(fold?.outcome, "remove");
+	assert.equal(fold?.watchdogOutcome, "unlock");
+	assert.equal(fold?.replacement, undefined);
+	assert.equal(
+		harness.sent.some(
+			(entry) => entry.message.customType === "pi-continue-watchdog:event",
+		),
+		false,
+	);
+	// Idle observations and elapsed time arm no inquiry fence or timer.
+	await settleOnly(harness);
+	const sentBefore = harness.sent.length;
+	for (const record of harness.clock.records.filter((r) => !r.cleared)) {
+		harness.clock.advance(record.delayMs);
+		record.callback();
+	}
+	await settleOnly(harness);
+	assert.equal(harness.sent.length, sentBefore);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(
+		harness.clock.records.filter(
+			(record) => !record.cleared && record.delayMs !== 10_000,
+		).length,
+		0,
+	);
+	assert.equal(
+		harness.runtime.getTriggerStatus().blocker,
+		"callback-suspended",
+	);
+	// A notice-only callback (displayed, no triggered turn) does not resume.
+	const notice = {
+		role: "custom",
+		customType: "subagent-notify",
+		content: [{ type: "text", text: "child finished" }],
+		display: true,
+		timestamp: Date.now(),
+	};
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: notice,
+	});
+	await harness.fire("message_end", { type: "message_end", message: notice });
+	harness.runtime.reconcileIdle();
+	await settleOnly(harness);
+	assert.equal(harness.controller.snapshot.callbackSuspended, true);
+	assert.equal(harness.sent.length, sentBefore);
+	// A known wake text starts work: same cycle, no new unit, no reset.
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: {
+			role: "user",
+			content: [{ type: "text", text: "New intercom message above." }],
+			timestamp: Date.now(),
+		},
+	});
+	assert.equal(harness.controller.snapshot.callbackSuspended, false);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.attempt, 1);
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [assistant([text("read the child result")])],
+	});
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.equal(hooks.filter((name) => name === "user-ready").length, 1);
+	// Allowance remains: settled callback work re-arms the ordinary idle fence.
+	assert.equal(
+		harness.runtime.getTriggerStatus().blocker === "callback-suspended",
+		false,
+	);
+	const fence = harness.clock.records.findLast(
+		(record) => record.delayMs === 10_000 && !record.cleared,
+	);
+	assert.ok(fence, "expected the ordinary idle fence after callback work");
+});
+
+async function suspendForCallback(harness: Harness): Promise<void> {
+	await startIdle(harness);
+	await harness.openDecision();
+	await settleResponse(
+		harness,
+		harness.answerUnlock("Waiting for the subagent callback.", "WAIT_CALLBACK"),
+	);
+	assert.equal(harness.controller.snapshot.callbackSuspended, true);
+}
+
+const CALLBACK_REASONS = {
+	reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED", "WAIT_CALLBACK"],
+};
+
+test("manual unlock and actual ordinary work end callback suspension", async () => {
+	const manual = createHarness({ config: CALLBACK_REASONS });
+	await suspendForCallback(manual);
+	await manual.unlock();
+	assert.equal(manual.controller.snapshot.locked, false);
+	assert.equal(manual.controller.snapshot.callbackSuspended, false);
+
+	const human = createHarness({ config: CALLBACK_REASONS });
+	await suspendForCallback(human);
+	human.streaming = true;
+	await human.fire("agent_start", { type: "agent_start" });
+	await human.fire("message_start", {
+		type: "message_start",
+		message: { role: "user", content: "Do something else.", timestamp: 1 },
+	});
+	// Fresh-cycle reset for genuine user text is owned by auto-lock (tested there).
+	assert.equal(human.controller.snapshot.locked, true);
+	assert.equal(human.controller.snapshot.callbackSuspended, false);
+});
+
+test("restart, shutdown, and history reopen never restore or signal a suspension", async () => {
+	// A fresh lock cycle (session replacement / restart) clears suspension.
+	const restarted = createHarness({ config: CALLBACK_REASONS });
+	await suspendForCallback(restarted);
+	restarted.runtime.restartLockCycle();
+	assert.equal(restarted.controller.snapshot.callbackSuspended, false);
+	assert.equal(restarted.controller.snapshot.attempt, 0);
+
+	// Shutdown: late lifecycle events publish nothing and dispatch nothing.
+	const hooks: string[] = [];
+	const stopped = createHarness({
+		config: CALLBACK_REASONS,
+		onHook: (name) => hooks.push(name),
+	});
+	await suspendForCallback(stopped);
+	const sentBefore = stopped.sent.length;
+	const hooksBefore = hooks.length;
+	await stopped.runtime.shutdown();
+	await stopped.fire("agent_start", { type: "agent_start" });
+	await settleOnly(stopped);
+	assert.equal(stopped.sent.length, sentBefore);
+	assert.equal(hooks.length, hooksBefore);
+
+	// History reopen: the suspension record is audit only.
+	const reopenedHooks: string[] = [];
+	const reopened = createHarness({
+		config: CALLBACK_REASONS,
+		onHook: (name) => reopenedHooks.push(name),
+	});
+	reopened.branch.push(...stopped.branch);
+	assert.ok(
+		reopened.branch.some(
+			(entry) =>
+				(entry as { customType?: string; type?: string }).customType ===
+					"pi-continue-watchdog:ai-unlock" ||
+				(entry as { type?: string }).type === "pi-continue-watchdog:ai-unlock",
+		),
+		"history carries the callback-suspended record",
+	);
+	await startIdle(reopened);
+	await settleOnly(reopened);
+	assert.equal(reopened.controller.snapshot.locked, false);
+	assert.equal(reopened.controller.snapshot.callbackSuspended, false);
+	assert.equal(reopened.controller.snapshot.attempt, 0);
+	assert.deepEqual(reopenedHooks, []);
+});
+
+test("callback work that starts before the waiting signal retires it", async () => {
+	const hooks: string[] = [];
+	const harness = createHarness({
+		config: CALLBACK_REASONS,
+		onHook: (name) => hooks.push(name),
+	});
+	await startIdle(harness);
+	await harness.openDecision();
+	await harness.startDecision();
+	const answer = harness.answerUnlock("Waiting.", "WAIT_CALLBACK");
+	await harness.fire("agent_end", { type: "agent_end", messages: [answer] });
+	// Actual callback work starts after the verdict is staged, before its
+	// guarded commit at agent_settled.
+	await harness.startUnrelatedRun({
+		role: "user",
+		content: [text("New intercom message above.")],
+		timestamp: Date.now(),
+	});
+	assert.equal(harness.controller.snapshot.callbackSuspended, false);
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.equal(hooks.includes("user-ready"), false);
+	assert.equal(harness.controller.snapshot.callbackSuspended, false);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.controller.snapshot.locked, true);
 });
 
 test("AI unlock status-entry publication failures keep the unlock without fallback or premature hook", async () => {
@@ -5486,6 +5681,124 @@ test("AI unlock status-entry publication failures keep the unlock without fallba
 			}
 		}
 	}
+});
+
+test("callback status publication failures keep the charged suspension without fallback or premature hook", async () => {
+	for (const fault of ["absent", "unreadable", "throws", "busy"] as const) {
+		const hooks: string[] = [];
+		let statusUnreadable = false;
+		const harness = createHarness({
+			hasUI: false,
+			config: CALLBACK_REASONS,
+			onHook: (name) => hooks.push(name),
+			onReadBranch() {
+				if (statusUnreadable) throw new Error("branch read failed");
+			},
+			...(fault === "absent"
+				? { omitPersistedEntryTypes: ["pi-continue-watchdog:ai-unlock"] }
+				: {}),
+			...(fault === "throws"
+				? { appendThrows: "pi-continue-watchdog:ai-unlock" }
+				: {}),
+		});
+		if (fault === "unreadable") statusUnreadable = true;
+		await startIdle(harness);
+		await harness.openDecision();
+		// Aggregate busy: an observable child stays busy across publication.
+		const child =
+			fault === "busy"
+				? harness.hub.bind({
+						instance: createHubAttachmentInstance(),
+						sessionId: "busy-child",
+						hasUI: false,
+						initialBusy: true,
+					}).attachment
+				: null;
+		await settleResponse(
+			harness,
+			harness.answerUnlock("Waiting for the child.", "WAIT_CALLBACK"),
+		);
+		const label = `callback-status/${fault}`;
+		if (child !== null) {
+			// Busy before the guarded commit defers the result: no charge/signal.
+			assert.equal(harness.controller.snapshot.locked, true, label);
+			assert.equal(harness.controller.snapshot.callbackSuspended, false, label);
+			assert.equal(harness.controller.snapshot.attempt, 0, label);
+			assert.equal(hooks.includes("user-ready"), false, label);
+			harness.hub.markIdle(child);
+			await settleOnly(harness);
+			assert.equal(harness.controller.snapshot.attempt, 0, label);
+			assert.equal(harness.controller.snapshot.callbackSuspended, false, label);
+			assert.equal(hooks.includes("user-ready"), false, label);
+			assert.ok(
+				harness.clock.records.some(
+					(record) => record.delayMs === 10_000 && !record.cleared,
+				),
+				"deferred result re-arms the ordinary idle fence",
+			);
+			continue;
+		}
+		assert.equal(harness.controller.snapshot.locked, true, label);
+		assert.equal(harness.controller.snapshot.callbackSuspended, true, label);
+		assert.equal(harness.controller.snapshot.attempt, 1, label);
+		assert.equal(
+			harness.sent.some(
+				(entry) => entry.message.customType === "pi-continue-watchdog:event",
+			),
+			false,
+			label,
+		);
+		assert.equal(hooks.includes("user-ready"), false, label);
+		// Repeated confirmations never refund or charge again.
+		if (fault === "unreadable") statusUnreadable = false;
+		await settleOnly(harness);
+		await settleOnly(harness);
+		assert.equal(harness.controller.snapshot.attempt, 1, label);
+		assert.equal(harness.controller.snapshot.callbackSuspended, true, label);
+		const signals = hooks.filter((name) => name === "user-ready").length;
+		assert.equal(signals, fault === "unreadable" ? 1 : 0, label);
+	}
+});
+
+test("aggregate busy after an accepted callback suspension defers only its signal", async () => {
+	const hooks: string[] = [];
+	let harnessRef: Harness | null = null;
+	let child: HubAttachment | null = null;
+	const harness = createHarness({
+		config: CALLBACK_REASONS,
+		onHook: (name) => hooks.push(name),
+		// The quiet status append happens after the guarded commit; a child
+		// becoming busy there races the status/hook confirmation.
+		onAppend(type) {
+			if (type !== "pi-continue-watchdog:ai-unlock" || child !== null) return;
+			assert.ok(harnessRef);
+			child = harnessRef.hub.bind({
+				instance: createHubAttachmentInstance(),
+				sessionId: "late-busy-child",
+				hasUI: false,
+				initialBusy: true,
+			}).attachment;
+		},
+	});
+	harnessRef = harness;
+	await startIdle(harness);
+	await harness.openDecision();
+	await settleResponse(
+		harness,
+		harness.answerUnlock("Waiting for the child.", "WAIT_CALLBACK"),
+	);
+	assert.ok(child, "busy child bound after commit");
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.callbackSuspended, true);
+	assert.equal(harness.controller.snapshot.attempt, 1);
+	assert.equal(hooks.includes("user-ready"), false);
+	harness.hub.markIdle(child);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	await settleOnly(harness);
+	await settleOnly(harness);
+	assert.equal(hooks.filter((name) => name === "user-ready").length, 1);
+	assert.equal(harness.controller.snapshot.attempt, 1);
+	assert.equal(harness.controller.snapshot.callbackSuspended, true);
 });
 
 test("UI-only status publication resists synchronous same-idle reentry", async () => {
@@ -5619,7 +5932,7 @@ test("changed effective constraints refresh only the same named declaration", as
 	const configs = [
 		{
 			idleDelaySeconds: 3,
-			maxRetries: 3,
+			maxContinue: 3,
 			decisionPrompt: "Decide now.",
 			continuePrompt: "Continue compactly.",
 			reasonTypes: ["JOB_DONE"],
@@ -5629,7 +5942,7 @@ test("changed effective constraints refresh only the same named declaration", as
 		},
 		{
 			idleDelaySeconds: 3,
-			maxRetries: 3,
+			maxContinue: 3,
 			decisionPrompt: "Decide now.",
 			continuePrompt: "Continue compactly.",
 			reasonTypes: ["NeedReview"],
@@ -5785,7 +6098,7 @@ test("allowlisted native refresh preserves a disabled cw membership", async () =
 	const configs = [
 		{
 			idleDelaySeconds: 3,
-			maxRetries: 3,
+			maxContinue: 3,
 			decisionPrompt: "Decide now.",
 			continuePrompt: "Continue compactly.",
 			reasonTypes: ["JOB_DONE"],
@@ -5795,7 +6108,7 @@ test("allowlisted native refresh preserves a disabled cw membership", async () =
 		},
 		{
 			idleDelaySeconds: 3,
-			maxRetries: 3,
+			maxContinue: 3,
 			decisionPrompt: "Decide now.",
 			continuePrompt: "Continue compactly.",
 			reasonTypes: ["NeedReview"],

@@ -16,6 +16,8 @@ export const WATCHDOG_CONTINUED_HOOK_NAME = "watchdog-continued";
 
 export type UserReadyStopKind =
 	| "AI_UNLOCK"
+	/** Lock retained; the watchdog quietly waits for external callback work. */
+	| "WAIT_CALLBACK"
 	| "ERROR_UNLOCK"
 	| "EXHAUSTED"
 	| "DECISION_FAILED";
@@ -30,9 +32,9 @@ export interface SemanticHookEnvelope {
 
 export interface UserReadyValues {
 	readonly STOP_KIND: UserReadyStopKind;
-	/** Present only for AI decision unlock; matched configured type uppercased. */
+	/** Present only for AI_UNLOCK/WAIT_CALLBACK; matched configured type uppercased. */
 	readonly REASON_TYPE?: string;
-	/** Present only for AI decision unlock; validated trimmed reason. */
+	/** Present only for AI_UNLOCK/WAIT_CALLBACK; validated trimmed reason. */
 	readonly REASON?: string;
 }
 

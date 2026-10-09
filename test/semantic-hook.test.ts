@@ -236,7 +236,7 @@ function createSemanticHarness(options?: {
 }): SemanticHarness {
 	const config: ContinueWatchdogConfig = {
 		idleDelaySeconds: options?.config?.idleDelaySeconds ?? 3,
-		maxRetries: options?.config?.maxRetries ?? 2,
+		maxContinue: options?.config?.maxContinue ?? 2,
 		decisionPrompt: options?.config?.decisionPrompt ?? "Decide now.",
 		continuePrompt: options?.config?.continuePrompt ?? "Continue compactly.",
 		reasonTypes: options?.config?.reasonTypes ?? [
@@ -594,7 +594,7 @@ test("AI decision unlock publishes exact validated reasonType and reason once at
 });
 
 test("exhausted and decisionFailed publish exact STOP_KIND envelopes once", async () => {
-	const exhausted = createSemanticHarness({ config: { maxRetries: 1 } });
+	const exhausted = createSemanticHarness({ config: { maxContinue: 1 } });
 	await startIdle(exhausted);
 	await exhausted.openDecision();
 	await settleResponse(exhausted, exhausted.answerContinue());
@@ -706,7 +706,7 @@ test("three retired wait submissions decision-fail without any waiting hook", as
 });
 
 test("final continuation exhausts and publishes EXHAUSTED with no wait deadline timer", async () => {
-	const harness = createSemanticHarness({ config: { maxRetries: 1 } });
+	const harness = createSemanticHarness({ config: { maxContinue: 1 } });
 	await startIdle(harness);
 	await harness.openDecision();
 	await settleResponse(harness, harness.answerContinue());
@@ -731,7 +731,7 @@ test("final continuation exhausts and publishes EXHAUSTED with no wait deadline 
 	assert.deepEqual(deadlineTimers, []);
 });
 
-test("WAIT_CALLBACK unlock publishes typed user-ready with no waiting hook or timer", async () => {
+test("WAIT_CALLBACK publishes its own stop kind while the lock is retained", async () => {
 	const harness = createSemanticHarness({
 		config: {
 			reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED", "WAIT_CALLBACK"],
@@ -741,25 +741,97 @@ test("WAIT_CALLBACK unlock publishes typed user-ready with no waiting hook or ti
 	await harness.openDecision();
 	await settleResponse(
 		harness,
-		harness.answerUnlock("Waiting for the subagent callback.", "WAIT_CALLBACK"),
+		harness.answerUnlock(
+			"  Waiting for the subagent callback.  ",
+			"wait_callback",
+		),
 	);
-	assert.equal(harness.snapshotController().attempt, 0);
-	assert.equal(harness.snapshotController().locked, false);
+	assert.equal(harness.snapshotController().attempt, 1);
+	assert.equal(harness.snapshotController().locked, true);
 	assert.deepEqual(harness.received, [
 		{
 			version: 1,
 			name: "user-ready",
 			values: {
-				STOP_KIND: "AI_UNLOCK",
+				STOP_KIND: "WAIT_CALLBACK",
 				REASON_TYPE: "WAIT_CALLBACK",
 				REASON: "Waiting for the subagent callback.",
 			},
 		},
 	]);
+	harness.runtime.reconcileIdle();
+	await settleOnly(harness);
+	assert.equal(harness.received.length, 1);
 	const deadlineTimers = harness.clock.records.filter(
 		(record) => !record.cleared && record.delayMs !== 10_000,
 	);
 	assert.deepEqual(deadlineTimers, []);
+});
+
+test("final callback unit waits first and reports exhaustion after callback work settles", async () => {
+	const harness = createSemanticHarness({
+		config: {
+			maxContinue: 2,
+			reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED", "WAIT_CALLBACK"],
+		},
+	});
+	await startIdle(harness);
+	await harness.openDecision();
+	await settleResponse(harness, harness.answerContinue());
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [assistant([{ type: "text", text: "started child" }], "stop")],
+	});
+	harness.streaming = false;
+	await settleOnly(harness);
+	// Second inquiry from the same cycle's idle fence (no fresh lock).
+	const fence = harness.clock.records.findLastIndex(
+		(record) => record.delayMs === 10_000 && !record.cleared,
+	);
+	assert.ok(fence >= 0, "expected a second idle fence in the same cycle");
+	harness.clock.fire(fence);
+	for (let i = 0; i < 50; i += 1) await Promise.resolve();
+	await harness.startDecision();
+	await settleResponse(
+		harness,
+		harness.answerUnlock("Waiting for the child.", "WAIT_CALLBACK"),
+	);
+	assert.equal(harness.snapshotController().attempt, 2);
+	assert.equal(harness.snapshotController().exhausted, true);
+	assert.deepEqual(
+		harness.received.map(
+			(envelope) => envelope.values?.STOP_KIND ?? envelope.name,
+		),
+		["watchdog-continued", "WAIT_CALLBACK"],
+	);
+	harness.runtime.reconcileIdle();
+	await settleOnly(harness);
+	assert.equal(harness.received.length, 2);
+
+	// Actual callback work runs without replenishing, then settles: EXHAUSTED once.
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	assert.equal(harness.snapshotController().attempt, 2);
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [
+			assistant([{ type: "text", text: "child result read" }], "stop"),
+		],
+	});
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.deepEqual(
+		harness.received.map(
+			(envelope) => envelope.values?.STOP_KIND ?? envelope.name,
+		),
+		["watchdog-continued", "WAIT_CALLBACK", "EXHAUSTED"],
+	);
+	harness.runtime.reconcileIdle();
+	await settleOnly(harness);
+	assert.equal(harness.received.length, 3);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
 });
 
 test("continue shared-fold failure publishes no hook and dispatches no continuation", async () => {
@@ -818,7 +890,7 @@ test("accepted continue publishes its typed reason while unlock-free idle stays 
 	await settleOnly(human);
 	assert.equal(human.received.length, 0);
 
-	const continued = createSemanticHarness({ config: { maxRetries: 3 } });
+	const continued = createSemanticHarness({ config: { maxContinue: 3 } });
 	await startIdle(continued);
 	await continued.openDecision();
 	await settleResponse(

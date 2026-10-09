@@ -1,10 +1,4 @@
-# watchdog-event-timeline Specification
-
-## Purpose
-
-Defines durable shared continuation, exhaustion, and safe failure events, quiet human-only unlock statuses, and exact-ownership projection of internal control traffic without rewriting stored history or inferring external-task progress.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Active-branch and upgrade compatibility
 The watchdog SHALL use Pi's normal active-branch and compaction boundaries without scanning sibling history to reconstruct its own timeline. Reopening retained continuation, UI-only unlock, and callback-suspension records SHALL preserve their published data without rerunning actions or restoring locks, suspensions, budgets, pending signals, or timers. Legacy wait, elapsed-wait, unlock, and failed-decision records SHALL remain readable without rewriting stored history. A pre-upgrade `WAIT_CALLBACK` unlock record SHALL remain a historical unlock, not be reinterpreted as a new suspension or re-emitted with a new stop kind. Existing summaries created before this change SHALL NOT be claimed to have been retroactively cleaned. New projection logic SHALL retain exact-exchange legacy cleanup without deleting unrelated user or extension messages.
@@ -104,30 +98,6 @@ A continuation SHALL start work and publish its hook only under the existing cur
 - **WHEN** the last shared budget unit is spent on callback suspension but no ordinary work has resumed
 - **THEN** no exhaustion event is published solely because the numeric limit is reached
 
-### Requirement: Quiet human-only AI unlock status
-A newly accepted AI unlock SHALL persist one non-interactive, theme-muted gray status with the extension name, `unlocked`, normalized reason type, and trimmed reason. It SHALL not use a user-message bubble or prominent custom-message box, show the inquiry or tool protocol, print an acknowledgement or timestamp, or repeat the model-facing authorization disclaimer. Long text SHALL wrap safely at terminal width without executing terminal controls. Visual compaction SHALL not change the stored reason or notification payload. Actual user-facing answers and questions SHALL remain ordinary assistant output, not this control reason. Manual, shortcut, abort, and terminal-error presentation is otherwise unchanged.
-
-#### Scenario: Completed work
-- **WHEN** the inquiry accepts `JOB_DONE` with reason `Requested analysis delivered.`
-- **THEN** one gray status reads `Continue watchdog unlocked · JOB_DONE · Requested analysis delivered.`
-- **AND** no separate `Decision received.`, inquiry, parameter block, timestamp, or disclaimer is shown
-
-#### Scenario: Narrow terminal and unusual reason text
-- **WHEN** a reason contains wide characters, newlines, or terminal control characters
-- **THEN** the quiet status wraps within the current width and renders controls inertly
-- **AND** it remains one logical status rather than a second user-facing answer
-
-### Requirement: Inquiry traffic is not user-facing content
-Owned inquiry prompts, corrective prompts, response protocol, `cw` call arguments, and acknowledgement results SHALL stay out of normal transcript presentation, including streaming and resumed rendering. Successful inquiries SHALL expose only their accepted outcome. Invalid internal attempts SHALL not dump their raw response; terminal decision failure SHALL retain one safe diagnostic. An unauthorized ordinary `cw` call SHALL retain a visible rejection so hidden internal UI does not conceal ordinary errors or misuse. Unrelated tools and assistant content SHALL not be hidden.
-
-#### Scenario: Corrected inquiry
-- **WHEN** an owned invalid response is corrected and then accepted
-- **THEN** the user sees the accepted outcome without either internal question, submission, or receipt
-
-#### Scenario: Unauthorized ordinary call
-- **WHEN** an ordinary run calls `cw` outside an authorized inquiry
-- **THEN** its rejection remains visible and ordinary work remains usable
-
 ### Requirement: Finalized control traffic is excluded from later model input
 After an owned decision finishes or is invalidated, subsequent ordinary provider requests and newly generated native compaction and branch-summary requests SHALL exclude its raw inquiry/correction prompts, assistant protocol submissions, tool results, and human-only AI-unlock or callback-suspension status. Accepted continuation content SHALL remain at its correct position and be available for ordinary work and native summaries. During an active inquiry, the minimum current prompt, correction history, executable call, and required provider thinking SHALL remain available until dispatch; isolation SHALL NOT disable authorized execution. Projection SHALL be scoped by exact ownership metadata, not text matching or tool name alone. It SHALL preserve unrelated messages, file-operation evidence, native summary settings, cancellation, and active-branch boundaries.
 
@@ -156,6 +126,8 @@ This guarantee covers watchdog-owned raw records in supported native request pat
 - **WHEN** real callback work starts after suspension
 - **THEN** its provider input can contain the external task's actual result
 - **AND** that external result is not hidden along with the watchdog-owned wait status or protocol
+
+## ADDED Requirements
 
 ### Requirement: Quiet human-only callback suspension status
 A newly accepted callback suspension SHALL persist one non-interactive, theme-muted quiet status identifying Continue watchdog, waiting for callback, the retained lock, normalized `WAIT_CALLBACK`, and the trimmed reason. It SHALL NOT say `unlocked` or assert task completion. It SHALL reuse the existing quiet-status safety and presentation constraints: no user-message bubble, prominent control box, protocol, acknowledgement-only turn, printed timestamp, or repeated authorization disclaimer; safe wrapping and inert terminal controls; unchanged stored reason and notification values despite visual compaction. Actual answers, callback results, and user questions SHALL remain ordinary conversation, not the control reason. Its recorded outcome kind SHALL distinguish new suspension from pre-upgrade callback unlock history.

@@ -11,10 +11,10 @@ import {
 	DEFAULT_DECISION_PROMPT,
 	DEFAULT_REASON_TYPES,
 	loadConfigText,
+	MAX_CONTINUE,
 	MAX_PROMPT_CHARACTERS,
-	MAX_RETRIES,
+	MIN_CONTINUE,
 	MIN_IDLE_DELAY_SECONDS,
-	MIN_RETRIES,
 	mergeConfig,
 	validateConfig,
 } from "../src/config.js";
@@ -51,7 +51,7 @@ async function fixture(
 
 test("built-in defaults match acceptance and reject the stale direct reminder", () => {
 	assert.equal(BUILT_IN_CONFIG.idleDelaySeconds, 10);
-	assert.equal(BUILT_IN_CONFIG.maxRetries, 10);
+	assert.equal(BUILT_IN_CONFIG.maxContinue, 10);
 	assert.equal(BUILT_IN_CONFIG.decisionPrompt, ACCEPTED_DECISION_PROMPT);
 	assert.equal(
 		BUILT_IN_CONFIG.continuePrompt,
@@ -91,7 +91,7 @@ test("global and trusted project overrides apply field-by-field", () => {
 		decisionPrompt: "Custom decision prompt for global.",
 	});
 	assert.equal(globalOnly.config.idleDelaySeconds, 7);
-	assert.equal(globalOnly.config.maxRetries, 10);
+	assert.equal(globalOnly.config.maxContinue, 10);
 	assert.equal(
 		globalOnly.config.decisionPrompt,
 		"Custom decision prompt for global.",
@@ -107,7 +107,7 @@ test("global and trusted project overrides apply field-by-field", () => {
 	const withProject = mergeConfig(
 		{
 			idleDelaySeconds: 7,
-			maxRetries: 4,
+			maxContinue: 4,
 			decisionPrompt: "Global decision",
 			continuePrompt: "Global continue",
 			reasonTypes: ["GlobalType"],
@@ -121,7 +121,7 @@ test("global and trusted project overrides apply field-by-field", () => {
 		},
 	);
 	assert.equal(withProject.config.idleDelaySeconds, 9);
-	assert.equal(withProject.config.maxRetries, 4);
+	assert.equal(withProject.config.maxContinue, 4);
 	assert.equal(withProject.config.decisionPrompt, "Global decision");
 	assert.equal(withProject.config.continuePrompt, "Project continue");
 	// continuePrompt stays configurable guidance; runtime wraps it in fixed
@@ -188,18 +188,18 @@ test("invalid higher-precedence fields preserve lower valid values", () => {
 	const { config, diagnostics } = mergeConfig(
 		{
 			idleDelaySeconds: 8,
-			maxRetries: 5,
+			maxContinue: 5,
 			decisionPrompt: "Global decision prompt",
 		},
 		{
 			idleDelaySeconds: -1,
-			maxRetries: 0,
+			maxContinue: 0,
 			decisionPrompt: "",
 			continuePrompt: 123,
 		},
 	);
 	assert.equal(config.idleDelaySeconds, 8);
-	assert.equal(config.maxRetries, 5);
+	assert.equal(config.maxContinue, 5);
 	assert.equal(config.decisionPrompt, "Global decision prompt");
 	assert.equal(config.continuePrompt, DEFAULT_CONTINUE_PROMPT);
 	assert.ok(diagnostics.length >= 3);
@@ -225,7 +225,7 @@ test("validateConfig rejects non-objects, arrays, and invalid field types", () =
 
 	const invalid = validateConfig("project", {
 		idleDelaySeconds: Number.NaN,
-		maxRetries: 1.5,
+		maxContinue: 1.5,
 		decisionPrompt: "   ",
 		continuePrompt: null,
 		unknownKey: true,
@@ -239,16 +239,16 @@ test("validateConfig rejects non-objects, arrays, and invalid field types", () =
 
 test("idle delay accepts every finite nonnegative number while retries keep integer bounds", () => {
 	assert.equal(MIN_IDLE_DELAY_SECONDS, 0);
-	assert.equal(MIN_RETRIES, 1);
-	assert.equal(MAX_RETRIES, 10);
+	assert.equal(MIN_CONTINUE, 1);
+	assert.equal(MAX_CONTINUE, 10);
 
 	for (const idleDelaySeconds of [0, 0.5, 3601, Number.MAX_VALUE]) {
 		const result = validateConfig("global", {
 			idleDelaySeconds,
-			maxRetries: MAX_RETRIES,
+			maxContinue: MAX_CONTINUE,
 		});
 		assert.equal(result.config.idleDelaySeconds, idleDelaySeconds);
-		assert.equal(result.config.maxRetries, MAX_RETRIES);
+		assert.equal(result.config.maxContinue, MAX_CONTINUE);
 		assert.deepEqual(result.diagnostics, []);
 	}
 
@@ -258,19 +258,19 @@ test("idle delay accepts every finite nonnegative number while retries keep inte
 		assert.equal(result.diagnostics.length, 1);
 		assert.match(result.diagnostics[0]?.message ?? "", /idleDelaySeconds/i);
 	}
-	for (const retries of [0, 1.5, MAX_RETRIES + 1]) {
-		const result = validateConfig("project", { maxRetries: retries });
-		assert.equal(result.config.maxRetries, undefined);
+	for (const retries of [0, 1.5, MAX_CONTINUE + 1]) {
+		const result = validateConfig("project", { maxContinue: retries });
+		assert.equal(result.config.maxContinue, undefined);
 		assert.equal(result.diagnostics.length, 1);
-		assert.match(result.diagnostics[0]?.message ?? "", /maxRetries/i);
+		assert.match(result.diagnostics[0]?.message ?? "", /maxContinue/i);
 	}
 
 	const preserved = mergeConfig(
-		{ idleDelaySeconds: 12, maxRetries: 4 },
-		{ idleDelaySeconds: -1, maxRetries: 11 },
+		{ idleDelaySeconds: 12, maxContinue: 4 },
+		{ idleDelaySeconds: -1, maxContinue: 11 },
 	);
 	assert.equal(preserved.config.idleDelaySeconds, 12);
-	assert.equal(preserved.config.maxRetries, 4);
+	assert.equal(preserved.config.maxContinue, 4);
 	assert.ok(preserved.diagnostics.length >= 2);
 });
 
@@ -310,12 +310,12 @@ test("unsupported keys emit one content-free diagnostic while known fields remai
 	const secretKey = "api_key_SECRET_do_not_leak";
 	// JSON own-string keys only, including `__proto__` as a normal unknown field.
 	const input = JSON.parse(
-		`{"idleDelaySeconds":8,"maxRetries":3,"decisionPrompt":"Keep me","${secretKey}":"value-must-not-appear","__proto__":"json-own-key"}`,
+		`{"idleDelaySeconds":8,"maxContinue":3,"decisionPrompt":"Keep me","${secretKey}":"value-must-not-appear","__proto__":"json-own-key"}`,
 	) as Record<string, unknown>;
 
 	const result = validateConfig("project", input);
 	assert.equal(result.config.idleDelaySeconds, 8);
-	assert.equal(result.config.maxRetries, 3);
+	assert.equal(result.config.maxContinue, 3);
 	assert.equal(result.config.decisionPrompt, "Keep me");
 
 	const unknownDiags = result.diagnostics.filter((d) =>
@@ -344,21 +344,21 @@ test("loadRuntimeConfig merges agentDir global with trusted project file", async
 		join(agentDir, "pi-continue-watchdog.json"),
 		JSON.stringify({
 			idleDelaySeconds: 5,
-			maxRetries: 2,
+			maxContinue: 2,
 			decisionPrompt: "From global file",
 		}),
 	);
 	await writeFile(
 		join(cwd, ".pi", "pi-continue-watchdog.json"),
 		JSON.stringify({
-			maxRetries: 6,
+			maxContinue: 6,
 			continuePrompt: "From project file",
 		}),
 	);
 
 	const loaded = await loadRuntimeConfig({ cwd, trusted: true, agentDir });
 	assert.equal(loaded.config.idleDelaySeconds, 5);
-	assert.equal(loaded.config.maxRetries, 6);
+	assert.equal(loaded.config.maxContinue, 6);
 	assert.equal(loaded.config.decisionPrompt, "From global file");
 	assert.equal(loaded.config.continuePrompt, "From project file");
 	assert.deepEqual(loaded.diagnostics, []);
@@ -376,13 +376,13 @@ test("untrusted project file is ignored while global still applies", async (t) =
 			idleDelaySeconds: 99,
 			decisionPrompt: "Untrusted must not apply",
 			continuePrompt: "Untrusted continue",
-			maxRetries: 1,
+			maxContinue: 1,
 		}),
 	);
 
 	const loaded = await loadRuntimeConfig({ cwd, trusted: false, agentDir });
 	assert.equal(loaded.config.idleDelaySeconds, 4);
-	assert.equal(loaded.config.maxRetries, 10);
+	assert.equal(loaded.config.maxContinue, 10);
 	assert.equal(loaded.config.decisionPrompt, "Global only");
 	assert.equal(loaded.config.continuePrompt, DEFAULT_CONTINUE_PROMPT);
 	assert.deepEqual(loaded.diagnostics, []);
@@ -430,13 +430,13 @@ test("malformed project JSON keeps global valid values", async (t) => {
 	const { agentDir, cwd } = await fixture(t);
 	await writeFile(
 		join(agentDir, "pi-continue-watchdog.json"),
-		JSON.stringify({ idleDelaySeconds: 11, maxRetries: 3 }),
+		JSON.stringify({ idleDelaySeconds: 11, maxContinue: 3 }),
 	);
 	await writeFile(join(cwd, ".pi", "pi-continue-watchdog.json"), "{ broken");
 
 	const loaded = await loadRuntimeConfig({ cwd, trusted: true, agentDir });
 	assert.equal(loaded.config.idleDelaySeconds, 11);
-	assert.equal(loaded.config.maxRetries, 3);
+	assert.equal(loaded.config.maxContinue, 3);
 	assert.equal(loaded.config.decisionPrompt, DEFAULT_DECISION_PROMPT);
 	assert.equal(loaded.config.continuePrompt, DEFAULT_CONTINUE_PROMPT);
 	assert.equal(loaded.diagnostics.length, 1);
@@ -585,6 +585,47 @@ test("unlockReviewEnabled never restores the removed jevWaitCheck key", () => {
 	);
 	assert.equal(diags.length, 1);
 	assert.equal(diags[0]?.severity, "error");
+});
+
+test("maxRetries is a removed key, never an alias for maxContinue", async (t) => {
+	const oldOnly = validateConfig("global", {
+		maxRetries: 2,
+		decisionPrompt: "Neighbor stays",
+	});
+	assert.equal(oldOnly.config.maxContinue, undefined);
+	assert.equal(oldOnly.config.decisionPrompt, "Neighbor stays");
+	assert.equal(oldOnly.diagnostics.length, 1);
+	assert.equal(oldOnly.diagnostics[0]?.severity, "error");
+	assert.match(
+		oldOnly.diagnostics[0]?.message ?? "",
+		/maxRetries.*maxContinue/,
+	);
+	assert.doesNotMatch(oldOnly.diagnostics[0]?.message ?? "", /\b2\b/);
+	assert.equal(mergeConfig(oldOnly.config).config.maxContinue, 10);
+
+	const both = validateConfig("project", { maxContinue: 3, maxRetries: 7 });
+	assert.equal(both.config.maxContinue, 3);
+	assert.equal(
+		both.diagnostics.filter((d) => d.message.includes("maxRetries")).length,
+		1,
+	);
+
+	const { agentDir, cwd } = await fixture(t);
+	await writeFile(
+		join(agentDir, "pi-continue-watchdog.json"),
+		JSON.stringify({ maxContinue: 4 }),
+	);
+	await writeFile(
+		join(cwd, ".pi", "pi-continue-watchdog.json"),
+		JSON.stringify({ maxRetries: 1, jevWaitCheck: { apiKey: "secret" } }),
+	);
+	const loaded = await loadRuntimeConfig({ cwd, trusted: true, agentDir });
+	assert.equal(loaded.config.maxContinue, 4);
+	assert.deepEqual(
+		loaded.diagnostics.map((d) => d.severity),
+		["error", "error"],
+	);
+	assert.ok(loaded.diagnostics.every((d) => !d.message.includes("secret")));
 });
 
 test("a stale custom decisionPrompt cannot restore the retired wait action", () => {

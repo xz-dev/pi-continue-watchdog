@@ -3,6 +3,7 @@ import test from "node:test";
 import { DEFAULT_REASON_TYPES } from "../src/config.js";
 import {
 	buildDecisionPrompt,
+	isWaitCallbackReasonType,
 	prepareDecisionArguments,
 	validateDecisionArguments,
 } from "../src/decision-protocol.js";
@@ -352,4 +353,54 @@ test("union membership does not authorize the wrong action", () => {
 		).valid,
 		true,
 	);
+});
+
+test("only the built-in WAIT_CALLBACK unlock is classified as callback suspension", () => {
+	const reasonTypes = [...DEFAULT_REASON_TYPES, "WAIT_CALLBACK", "CUSTOM_WAIT"];
+	const classify = (reasonType: string, extra?: Record<string, unknown>) => {
+		const verdict = validateDecisionArguments(
+			{
+				action: "unlock",
+				reason_type: reasonType,
+				reason_content: "x",
+				...extra,
+			},
+			reasonTypes,
+			[...CONTINUE_TYPES],
+		);
+		assert.equal(verdict.valid, true, reasonType);
+		return verdict.valid && verdict.decision.kind === "unlock"
+			? isWaitCallbackReasonType(verdict.decision.matchedReasonType)
+			: null;
+	};
+	assert.equal(classify("WAIT_CALLBACK"), true);
+	assert.equal(classify("  wait_callback "), true);
+	assert.equal(classify("WAIT_CALLBACK", { wait_seconds: 60 }), true);
+	assert.equal(classify("JOB_DONE"), false);
+	assert.equal(classify("CUSTOM_WAIT"), false);
+	// Excluded from the configured list: an ordinary invalid unlock reason type.
+	const excluded = validateDecisionArguments(
+		{ action: "unlock", reason_type: "WAIT_CALLBACK", reason_content: "x" },
+		["JOB_DONE"],
+		[...CONTINUE_TYPES],
+	);
+	assert.equal(excluded.valid, false);
+	// WAIT_CALLBACK is not a continue reason type.
+	const asContinue = validateDecisionArguments(
+		{ action: "continue", reason_type: "WAIT_CALLBACK", reason_content: "x" },
+		reasonTypes,
+		[...CONTINUE_TYPES],
+	);
+	assert.equal(asContinue.valid, false);
+});
+
+test("callback guidance explains the retained lock and shared allowance", () => {
+	const prompt = buildDecisionPrompt(
+		"Decide now.",
+		[...DEFAULT_REASON_TYPES, "WAIT_CALLBACK"],
+		[...CONTINUE_TYPES],
+	);
+	assert.match(prompt, /WAIT_CALLBACK, when you are waiting/);
+	assert.match(prompt, /keeps the watchdog locked/);
+	assert.doesNotMatch(prompt, /"action"\s*:\s*"wait"/);
 });

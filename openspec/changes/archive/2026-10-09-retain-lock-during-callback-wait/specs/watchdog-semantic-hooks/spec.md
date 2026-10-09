@@ -1,10 +1,4 @@
-# watchdog-semantic-hooks Specification
-
-## Purpose
-
-Defines the complete, optional set of `pi:semantic-hook:v1` notifications the continue watchdog publishes so consumers such as pi-notify can react without depending on internal state.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Published hook set
 The watchdog SHALL publish only these `pi:semantic-hook:v1` hooks:
@@ -25,31 +19,6 @@ The watchdog SHALL publish only these `pi:semantic-hook:v1` hooks:
 #### Scenario: Real completion remains an unlock signal
 - **WHEN** a current `JOB_DONE` unlock is accepted and its publication qualifies
 - **THEN** `user-ready` carries `STOP_KIND=AI_UNLOCK` and `REASON_TYPE=JOB_DONE`
-
-### Requirement: Simple continuation signal
-Exactly one `watchdog-continued` hook SHALL follow durable publication of each current accepted continuation. Its values SHALL be the accepted normalized reason type and trimmed next-action reason without a retry count or separately generated explanation. Inquiry dispatch, correction, failed publication, stale ownership, and unlock status SHALL emit no continuation hook.
-
-#### Scenario: Continuation published
-- **WHEN** the accepted next-action event is durably published for the current main claim
-- **THEN** one hook carries its accepted type and reason
-
-#### Scenario: Continuation not published
-- **WHEN** publication fails or current ownership is lost
-- **THEN** no continuation hook is emitted
-
-### Requirement: Silent human and abort paths
-Manual unlock, the unlock shortcut, main-agent abort, ordinary unlocked idle, and cancelled or stale work SHALL publish no semantic hook.
-
-#### Scenario: Human unlock
-- **WHEN** the user runs `/unlock-continue-watchdog`
-- **THEN** no `user-ready` hook is published
-
-### Requirement: Consumers remain optional
-Hook publication SHALL be best-effort to current listeners only. The watchdog SHALL NOT depend on, identify, wait for, or import any consumer, and a throwing listener SHALL NOT change watchdog state.
-
-#### Scenario: Listener throws
-- **WHEN** a listener throws while receiving `watchdog-continued`
-- **THEN** the continuation turn and later watchdog behavior are unchanged
 
 ### Requirement: Terminal signals retain aggregate-idle fencing
 AI unlock, callback suspension, terminal-error unlock, exhaustion, and decision failure SHALL emit `user-ready` only while the exact outcome and main claim remain current and all existing local, child, process-domain, and stale-publication guards permit it. AI unlock and callback suspension SHALL require confirmation of their respective human-only status and finalized internal-exchange cleanup rather than a shared model-bound stopping message. Repeated settlement and publication observations SHALL NOT duplicate signals. A final-budget callback suspension SHALL emit only its eligible `WAIT_CALLBACK` signal while suspended; an `EXHAUSTED` signal SHALL become eligible only after resumed ordinary work successfully settles. A callback that resumes work before its waiting signal becomes eligible SHALL retire that old signal, not replay it afterward. No retired wait deadline SHALL defer exhaustion. Manual unlock, shortcuts, abort, ordinary unlocked idle, and stale or cancelled work SHALL remain silent.

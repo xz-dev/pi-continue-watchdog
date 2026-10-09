@@ -93,6 +93,20 @@ export interface AiUnlockEntry {
 	readonly reason: string;
 	readonly exchangeId: string;
 	readonly cycleId: number;
+	/**
+	 * Applied effect. Absent on legacy records, which always meant an actual
+	 * unlock (including old WAIT_CALLBACK unlocks). New callback results record
+	 * `callback-suspended`: the lock was retained.
+	 */
+	readonly effect?: "callback-suspended";
+}
+
+/** Quiet status text for an accepted lock-retaining callback wait. */
+export function formatCallbackSuspensionEntryText(
+	reason: string,
+	reasonType: string,
+): string {
+	return `Continue watchdog waiting for callback (lock retained) · ${reasonType} · ${reason}`;
 }
 
 /**
@@ -364,7 +378,9 @@ export function createAiUnlockEntryRenderer(): EntryRenderer<AiUnlockEntry> {
 		const fields = getAiUnlockFields(entry);
 		if (fields === null) return undefined;
 		return createStaticTextComponent(
-			formatUnlockEntryText(fields.reason, fields.reasonType),
+			fields.callback
+				? formatCallbackSuspensionEntryText(fields.reason, fields.reasonType)
+				: formatUnlockEntryText(fields.reason, fields.reasonType),
 			theme,
 		);
 	};
@@ -374,6 +390,7 @@ export function createAiUnlockEntryRenderer(): EntryRenderer<AiUnlockEntry> {
 function getAiUnlockFields(entry: unknown): {
 	readonly reasonType: string;
 	readonly reason: string;
+	readonly callback: boolean;
 } | null {
 	if (typeof entry !== "object" || entry === null) return null;
 	const data = (entry as { readonly data?: unknown }).data;
@@ -387,7 +404,11 @@ function getAiUnlockFields(entry: unknown): {
 	) {
 		return null;
 	}
-	return { reasonType: fields.reasonType, reason: fields.reason };
+	return {
+		reasonType: fields.reasonType,
+		reason: fields.reason,
+		callback: fields.effect === "callback-suspended",
+	};
 }
 
 /**
@@ -461,7 +482,7 @@ function timelineLine(entry: TimelineBranchEntry): string | null {
 	if (entry.customType === HUMAN_UNLOCK_ENTRY_TYPE)
 		return `${data?.reasonType ? "AI unlock" : "human unlock"} · ${String(data?.reason ?? "")}`;
 	if (entry.customType === AI_UNLOCK_ENTRY_TYPE)
-		return `AI unlock · ${String(data?.reasonType ?? "")} · ${String(data?.reason ?? "")}`;
+		return `${data?.effect === "callback-suspended" ? "callback wait" : "AI unlock"} · ${String(data?.reasonType ?? "")} · ${String(data?.reason ?? "")}`;
 	if (data?.kind === "decision-failed")
 		return `decision-failed · ${String(data.message ?? "")}`;
 	return null;
@@ -612,7 +633,8 @@ const BLOCKER_TEXT: Readonly<Record<WatchdogTriggerBlocker, string>> = {
 	"not-main": "not main",
 	"config-loading": "config loading",
 	unlocked: "unlocked",
-	exhausted: "retry limit exhausted",
+	exhausted: "continue limit exhausted",
+	"callback-suspended": "waiting for callback",
 	"decision-failed": "decision failed",
 	"observable-agent-busy": "observable agent busy",
 	"local-agent-busy": "local agent busy",
@@ -634,7 +656,7 @@ export function formatWatchdogTriggerStatus(
 					? "locked"
 					: "unlocked"
 		}`,
-		`Attempt: ${status.attempt ?? "unavailable"}/${status.maxRetries}`,
+		`Attempt: ${status.attempt ?? "unavailable"}/${status.maxContinue}`,
 		`Trigger: ${
 			status.blocker === null
 				? "eligible"

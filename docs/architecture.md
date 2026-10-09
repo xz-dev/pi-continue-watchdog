@@ -39,19 +39,21 @@ replace timer and wait one fixed 10-second fence
           ▼
 qualify the same generation and re-check ownership/auth
           │
-          ├─ locked, budget left ─► one hidden decision inquiry (continue / wait / unlock)
-          │     ├─ prompt consumed → exactly one cw call → continue: one continuation → next turn
-          │     ├─ wait: arm the deadline, publish the shared wait event and waiting hook
-          │     ├─ unlock: shared unlock outcome event → user-ready AI_UNLOCK
+          ├─ locked, budget left, not suspended ─► one hidden decision inquiry (continue / unlock)
+          │     ├─ prompt consumed → exactly one cw call → continue: one continuation → next turn (1 unit)
+          │     ├─ unlock+WAIT_CALLBACK: keep lock, suspend (1 unit) → quiet status → user-ready WAIT_CALLBACK
+          │     │     └─ actual ordinary main work starts → resume same cycle (+0 units)
+          │     ├─ unlock: quiet unlock status → user-ready AI_UNLOCK
           │     ├─ invalid ×3 → decision-failed terminal state → user-ready DECISION_FAILED
           │     └─ deferred / stale / cancelled ───────────► no accounting, retry at next idle
-          └─ locked, exhausted ───► one exhaustion event → user-ready EXHAUSTED
+          ├─ locked, callback-suspended ─► nothing (no inquiry, timer, or poll)
+          └─ locked, exhausted, not suspended ───► one exhaustion event → user-ready EXHAUSTED
 
 during a consumed decision attempt only: model submits cw(action, …)
           │
           └─► authorize → preflight the whole batch → stage verdict or error → terminate
                          │
-                         └─► accepted: run terminates → user-ready AI_UNLOCK
+                         └─► accepted: run terminates → user-ready AI_UNLOCK / WAIT_CALLBACK
 ```
 
 ## Module map
@@ -169,12 +171,12 @@ The AI-to-extension channel is one reserved root-only function, `cw`:
 - Authorization lives in the runtime, checked before plugin action/reason validation in both the `tool_call` gate and `execute`: only the exact current main attachment's locally confirmed attempt and recorded submitting call identity may stage a result. Other calls reaching the plugin return `This function is reserved for the plugin. Please try another function.` without state changes or termination. A schema-invalid ordinary call fails natively without changing watchdog accounting or blocking unrelated ordinary tools.
 - Payloads: `action` is `continue` or `unlock` (case-insensitive after trimming); `wait` is a retired invalid action. Continue and unlock additionally require a `reason_type` matched case-insensitively against `continueReasonTypes` or `reasonTypes`; the accepted outcome records the uppercase representation while the matched configured spelling is the input identity preserved through revalidation. `reason_content` is trimmed, non-empty, at most 1000 Unicode code points (500 stated as prompt guidance). XML and prose are never parsed as a result.
 - The complete owned batch is preflighted at `message_end` before any tool runs. Malformed batches and payload-invalid singleton cw calls are both projected to a normal stop with no executable calls and count once as invalid, so Pi's native schema-error path can never request a fourth reply; suppressed calls need no per-call result. A schema-admissible singleton with a valid plan keeps its call/thinking blocks, stages its validated verdict or named error, and returns a terminating result. Neither path permits work-tool effects or unbudgeted native follow-ups.
-- An accepted `unlock` verdict unlocks through the same controller unlock semantics as other unlocks, clears pending work and wait state, ends its decision without an acknowledgement-only model request, and retains the `user-ready` `AI_UNLOCK` intent with normalized `REASON_TYPE` and trimmed `REASON` for deferred aggregate-idle publication. The shared unlock outcome event is the model-visible record; the raw inquiry traffic folds away.
-- Invalid responses follow bounded correction: at most three consumed responses per inquiry, corrections re-teach the same function contract, invalid responses never consume the continue/wait budget, and the third failure enters a decision-failed terminal state eligible for `STOP_KIND=DECISION_FAILED` at terminal idle.
+- An accepted `unlock` verdict (other than built-in `WAIT_CALLBACK`, which retains the lock as described below) unlocks through the same controller unlock semantics as other unlocks, clears pending work and wait state, ends its decision without an acknowledgement-only model request, and retains the `user-ready` `AI_UNLOCK` intent with normalized `REASON_TYPE` and trimmed `REASON` for deferred aggregate-idle publication. The shared unlock outcome event is the model-visible record; the raw inquiry traffic folds away.
+- Invalid responses follow bounded correction: at most three consumed responses per inquiry, corrections re-teach the same function contract, invalid responses never consume the `maxContinue` budget, and the third failure enters a decision-failed terminal state eligible for `STOP_KIND=DECISION_FAILED` at terminal idle.
 
 The extension-to-AI control channel is a watchdog-owned inquiry. After the fixed ten-second aggregate-idle fence qualifies and fresh idle, ownership, and process-domain guards pass, the runtime opens one hidden decision inquiry: the configured `decisionPrompt` plus the fixed outcome and function contract, sent as a trigger-turn custom message through the shared inquiry handle. Only after the exact prompt is observed in the corresponding run and plugin-local context — correlated through host metadata, never prompt-text matching — can a result act. The runtime, not Pi's ordinary tool-error follow-up, schedules at most two corrective re-asks; dispatch deferral, cancellation, or stale ownership is not an invalid model answer. Terminal `stopReason: "error"` and human abort keep their separate paths.
 
-Accepted verdicts map to controller transitions: `continue` and `wait` each consume one shared `maxRetries` attempt (`recordValidContinue` / `recordValidWait`), `unlock` consumes none (`recordValidUnlock`), and the third invalid response enters `decisionFailed` without charging the budget. A wait records one acceptance timestamp and deadline; activity defers eligibility without restarting the duration, and the first qualified inquiry after the deadline begins with the same completed-wait body visible to the human, reused unchanged by corrections. `WAIT_CALLBACK` stays an unlock reason and arms no timer.
+Accepted verdicts map to controller transitions: `continue` and an `unlock` whose matched type is the built-in `WAIT_CALLBACK` each consume one shared `maxContinue` unit (`recordValidContinue` / `recordValidCallbackSuspension`); any other `unlock` consumes none (`recordValidUnlock`), and the third invalid response enters `decisionFailed` without charging the budget. The callback transition keeps the lock, closes the decision, and sets `callbackSuspended`, which excludes the cycle from inquiry eligibility in both the controller and the runtime aggregate. The first non-internal `agent_start` on the owning main session calls `resumeFromCallback` (+0 units) and retires any still-pending `WAIT_CALLBACK` publication. Exhaustion is eligible only while not suspended. The timed `wait` action is retired and arms nothing.
 
 ## Stable tools and blocked execution
 
@@ -263,8 +265,9 @@ pi:semantic-hook:v1
 for terminal automatic idle outcomes:
 
 - `AI_UNLOCK`, with the accepted decision verdict's normalized reason type and trimmed reason;
+- `WAIT_CALLBACK`, for an accepted lock-retaining callback suspension, with normalized `REASON_TYPE` and trimmed `REASON` (no duration);
 - `ERROR_UNLOCK`, for the terminal-error automatic unlock;
-- `EXHAUSTED`, after any accepted final wait's deadline;
+- `EXHAUSTED`, after the final unit's work settles (for a final callback suspension, after the resumed callback work settles);
 - `DECISION_FAILED`, after the third invalid response of one inquiry.
 
 The producer is unaware of any consumer plugin. Delivery is best-effort, current-listener-only, with no acknowledgement, retry, or replay.
@@ -300,7 +303,7 @@ The session file is append-only. Persisted decision result-call arguments and le
 
 ## Verification
 
-`npm run check` covers lint, type checking, unit tests, and build. Focused unit/runtime coverage includes decision argument validation and case-insensitive type normalization, decision prompt construction, reserved-function registration scope (root-only, once, stable declaration and active list), authorization phases (ordinary/provisional/stale/duplicate/mixed batches), attempt accounting and exhaustion, shared continue/wait budget, bounded correction and decision-failed, wait deadlines and completed-wait facts, shared-publication rollback, unlock cleanup, manual-unlock cancellation of watchdog-owned decision and continuation runs, stale callbacks, legacy and function-based context folding, and shared human/provider body equality. `npm run test:e2e` installs the packed source artifact against stock Pi and verifies:
+`npm run check` covers lint, type checking, unit tests, and build. Focused unit/runtime coverage includes decision argument validation and case-insensitive type normalization, decision prompt construction, reserved-function registration scope (root-only, once, stable declaration and active list), authorization phases (ordinary/provisional/stale/duplicate/mixed batches), attempt accounting and exhaustion, shared `maxContinue` budget across continuations and callback suspensions, callback suspension/resume and exact wake texts, bounded correction and decision-failed, wait deadlines and completed-wait facts, shared-publication rollback, unlock cleanup, manual-unlock cancellation of watchdog-owned decision and continuation runs, stale callbacks, legacy and function-based context folding, and shared human/provider body equality. `npm run test:e2e` installs the packed source artifact against stock Pi and verifies:
 
 - the reserved `cw` function is advertised on every provider request with its minimal declaration and no usage guidance;
 - one hidden decision inquiry precedes any ordinary continuation, and completed inquiry internals are folded out of later provider requests;

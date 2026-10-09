@@ -208,7 +208,7 @@ function createHarness(options?: {
 }): Harness {
 	const config: ContinueWatchdogConfig = {
 		idleDelaySeconds: 3,
-		maxRetries: 3,
+		maxContinue: 3,
 		decisionPrompt: "Decide now.",
 		continuePrompt: "Continue compactly.",
 		reasonTypes: options?.config?.reasonTypes ?? [
@@ -923,6 +923,161 @@ test("reconsidered unlock commits without a second review", async () => {
 	await flush(harness);
 	assert.equal(calls, 1, "reconsidered answer must not be reviewed again");
 	assert.equal(harness.controller.snapshot.locked, false);
+});
+
+const CALLBACK_ENABLED = {
+	...ENABLED,
+	reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED", "WAIT_CALLBACK"],
+} as const;
+
+function enterReconsideration(harness: Harness) {
+	return (async () => {
+		harness.streaming = true;
+		await harness.fire("agent_start", { type: "agent_start" });
+		const second = harness.sent
+			.filter((e) => e.message.customType === DECISION_MESSAGE_TYPE)
+			.at(-1);
+		assert.ok(second);
+		const message = {
+			role: "custom",
+			customType: second.message.customType,
+			content: [{ type: "text", text: second.message.content }],
+			details: second.message.details,
+			timestamp: Date.now(),
+		};
+		await harness.fire("message_start", { type: "message_start", message });
+		await harness.fire("context", { type: "context", messages: [message] });
+	})();
+}
+
+test("reviewed callback candidates commit one suspension, never an unlock", async () => {
+	for (const result of [
+		async () => reviewResult("supported"),
+		async () => {
+			throw new Error("service down");
+		},
+	]) {
+		const harness = createHarness({
+			config: CALLBACK_ENABLED,
+			reviewResult: result,
+		});
+		await harness.openDecision();
+		await harness.settle(
+			harness.answer("Waiting for the child.", "WAIT_CALLBACK"),
+		);
+		await flush(harness);
+		harness.streaming = false;
+		await harness.fire("agent_settled", { type: "agent_settled" });
+		await flush(harness);
+		assert.equal(harness.reviewCalls.length, 1);
+		assert.equal(harness.controller.snapshot.locked, true);
+		assert.equal(harness.controller.snapshot.callbackSuspended, true);
+		assert.equal(harness.controller.snapshot.attempt, 1);
+	}
+});
+
+test("challenged callback reconsiders once; replacement decides the charge", async () => {
+	for (const [replacement, locked, attempt, action] of [
+		["JOB_DONE", false, 0, "unlock"],
+		["WAIT_CALLBACK", true, 1, "unlock"],
+		["WORK_REMAINS", true, 1, "continue"],
+	] as const) {
+		let calls = 0;
+		const harness = createHarness({
+			config: CALLBACK_ENABLED,
+			reviewResult: async () => {
+				calls += 1;
+				return reviewResult("challenged");
+			},
+		});
+		await harness.openDecision();
+		await harness.settle(
+			harness.answer("Waiting for the child.", "WAIT_CALLBACK"),
+		);
+		await flush(harness);
+		// Proposing/reviewing spent nothing and did not suspend.
+		assert.equal(harness.controller.snapshot.attempt, 0);
+		assert.equal(harness.controller.snapshot.callbackSuspended, false);
+		await enterReconsideration(harness);
+		await harness.settle(harness.answer("Reconsidered.", replacement, action));
+		harness.streaming = false;
+		await harness.fire("agent_settled", { type: "agent_settled" });
+		await flush(harness);
+		assert.equal(calls, 1, replacement);
+		assert.equal(harness.controller.snapshot.locked, locked, replacement);
+		assert.equal(harness.controller.snapshot.attempt, attempt, replacement);
+		assert.equal(
+			harness.controller.snapshot.callbackSuspended,
+			replacement === "WAIT_CALLBACK",
+			replacement,
+		);
+	}
+});
+
+test("disabled review and corrected responses commit callback without extra charges", async () => {
+	const disabled = createHarness({
+		config: { ...CALLBACK_ENABLED, unlockReviewEnabled: false },
+	});
+	await disabled.openDecision();
+	await disabled.settle(disabled.answer("Waiting.", "WAIT_CALLBACK"));
+	await flush(disabled);
+	assert.equal(disabled.reviewCalls.length, 0);
+	assert.equal(disabled.controller.snapshot.callbackSuspended, true);
+	assert.equal(disabled.controller.snapshot.attempt, 1);
+
+	// An invalid first response is corrected; only the final callback charges.
+	const corrected = createHarness({
+		config: CALLBACK_ENABLED,
+		reviewResult: async () => reviewResult("supported"),
+	});
+	await corrected.openDecision();
+	await corrected.settle(corrected.answerInvalid());
+	await flush(corrected);
+	assert.equal(corrected.controller.snapshot.attempt, 0);
+	assert.equal(corrected.controller.snapshot.callbackSuspended, false);
+	await enterReconsideration(corrected);
+	await corrected.settle(corrected.answer("Waiting.", "WAIT_CALLBACK"));
+	await flush(corrected);
+	corrected.streaming = false;
+	await corrected.fire("agent_settled", { type: "agent_settled" });
+	await flush(corrected);
+	assert.equal(corrected.controller.snapshot.callbackSuspended, true);
+	assert.equal(corrected.controller.snapshot.attempt, 1);
+	assert.equal(corrected.controller.snapshot.invalidDecisionAttempts, 0);
+});
+
+test("callback work during an in-flight callback review retires the candidate", async () => {
+	const harness = createHarness({
+		config: CALLBACK_ENABLED,
+		reviewDelay: true,
+	});
+	await harness.openDecision();
+	await harness.settle(harness.answer("Waiting.", "WAIT_CALLBACK"));
+	assert.equal(harness.reviewCalls.length, 1);
+	// Actual callback work starts while the review is still pending.
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: {
+			role: "user",
+			content: [{ type: "text", text: "New intercom message above." }],
+			timestamp: Date.now(),
+		},
+	});
+	(harness as Harness & { flushReviews(): void }).flushReviews();
+	await flush(harness);
+	harness.streaming = false;
+	await harness.fire("agent_settled", { type: "agent_settled" });
+	await flush(harness);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.callbackSuspended, false);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(
+		harness.entries.filter((e) => e.type === "pi-continue-watchdog:ai-unlock")
+			.length,
+		0,
+	);
 });
 
 test("user takeover during an in-flight review aborts it and blocks the fallback", async () => {

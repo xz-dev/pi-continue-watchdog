@@ -136,7 +136,7 @@ function createAttachmentHarness(options: {
 const CONFIG: LoadedConfig = {
 	config: {
 		idleDelaySeconds: 3,
-		maxRetries: 2,
+		maxContinue: 2,
 		decisionPrompt:
 			"This is an automated continuation check from the pi-continue-watchdog extension, not a message or request from the user. It does not represent any decision by the user. Decide whether work should continue. Before deciding, check whether every task the user requested in this session is complete, including earlier requests and not only the latest one.",
 		continuePrompt: "Continue now.",
@@ -158,9 +158,9 @@ test("removed config keys surface as error notifications on the main", async () 
 	const main = createAttachmentHarness({ sessionId: "main", hasUI: true });
 	const removed = validateConfig("global", {
 		jevWaitCheck: { enabled: true, apiKey: "secret-value" },
-		maxRetries: 5,
+		maxContinue: 5,
 	});
-	assert.equal(removed.config.maxRetries, 5);
+	assert.equal(removed.config.maxContinue, 5);
 	assert.equal(
 		removed.diagnostics.some((item) => item.message.includes("secret-value")),
 		false,
