@@ -1582,7 +1582,12 @@ export function createDecisionRuntime(
 		});
 		// The still-current original candidate proceeds through the unchanged
 		// commit path; incomplete is recorded, never relabelled as approval.
-		void deliverPending(ctx);
+		void deliverPending(ctx).then(() => {
+			// This settlement runs detached from any agent_settled handler; the
+			// terminal user-ready publication must be scheduled here or it waits
+			// for the next external input/hub event.
+			void maybePublishUserReady();
+		});
 	};
 
 	/**

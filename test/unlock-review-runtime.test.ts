@@ -178,6 +178,7 @@ interface Harness {
 	readonly notifications: Array<{ message: string; level?: string }>;
 	readonly reviewCalls: JudgeRequest[];
 	readonly signals: (AbortSignal | undefined)[];
+	readonly hooks: string[];
 	streaming: boolean;
 	pendingMessages: boolean;
 	triggeredTurns: number;
@@ -203,6 +204,8 @@ function createHarness(options?: {
 	readonly reviewDelay?: boolean;
 	readonly processDomain?: ProcessDomainCoordinator;
 	readonly hooks?: HarnessHooks;
+	/** Capture emitted semantic-hook envelope names. */
+	readonly onHook?: (name: string) => void;
 	/** Omit the injected service so real call-time discovery runs. */
 	readonly noInjectedService?: boolean;
 }): Harness {
@@ -259,7 +262,12 @@ function createHarness(options?: {
 	};
 
 	const pi = {
-		events: { emit(): void {} },
+		events: {
+			emit(_topic: string, envelope: { readonly name: string }): void {
+				harness.hooks.push(envelope.name);
+				options?.onHook?.(envelope.name);
+			},
+		},
 		on(name: string, handler: Handler): void {
 			const list = handlers.get(name) ?? [];
 			list.push(handler);
@@ -364,6 +372,7 @@ function createHarness(options?: {
 		notifications,
 		reviewCalls,
 		signals,
+		hooks: [],
 		streaming: false,
 		pendingMessages: false,
 		triggeredTurns: 0,
@@ -688,6 +697,43 @@ test("a valid AI unlock is the only path that performs real discovery", async ()
 });
 
 // ---------- 2.x service contract ----------
+
+test("reviewed unlock publishes user-ready without waiting for another settle or input", async () => {
+	// Regression: the async review settlement runs detached from any
+	// agent_settled handler. Before the fix, the terminal user-ready hook
+	// stayed pending until the next external input/hub event fired
+	// syncHubState (observed as minutes-late notifications).
+	for (const setup of [
+		{
+			label: "supported",
+			result: () => Promise.resolve(reviewResult("supported")),
+		},
+		{
+			label: "incomplete (service error)",
+			result: () => Promise.reject(new Error("service down")),
+		},
+	] satisfies Array<{ label: string; result: () => Promise<ReviewResult> }>) {
+		const hooks: string[] = [];
+		const harness = createHarness({
+			config: ENABLED,
+			reviewResult: setup.result,
+			onHook: (name) => hooks.push(name),
+		});
+		await harness.openDecision();
+		await harness.settle(harness.answer());
+		// Flush resolves the delayed review and lets the detached settlement
+		// chain (deliverPending -> publish) run. No extra agent_settled and no
+		// user input may be required.
+		await flush(harness);
+		await flush(harness);
+		assert.equal(harness.controller.snapshot.locked, false, setup.label);
+		assert.equal(
+			hooks.filter((name) => name === "user-ready").length,
+			1,
+			setup.label,
+		);
+	}
+});
 
 test("a supported review releases the original unlock through the existing path", async () => {
 	const harness = createHarness({ config: ENABLED });
