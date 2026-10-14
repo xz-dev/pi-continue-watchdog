@@ -15,6 +15,7 @@ import {
 import { visibleWidth } from "@earendil-works/pi-tui";
 
 import { registerMainAbortUnlock } from "../src/abort-outcome.js";
+import { registerMainUserAutoLock } from "../src/auto-lock.js";
 import {
 	HUMAN_UNLOCK_ENTRY_TYPE,
 	type HumanUnlockEntry,
@@ -120,6 +121,7 @@ interface DecisionMessageReplacement {
 		readonly content: readonly unknown[];
 		readonly stopReason?: string;
 		readonly errorMessage?: string;
+		readonly details?: { readonly piInquiry?: { readonly inquiryId?: string } };
 	};
 }
 
@@ -192,7 +194,10 @@ interface Harness {
 		images?: Array<{ type: "image"; data: string; mimeType: string }>,
 	): Promise<unknown>;
 	openDecision(options?: { readonly start?: boolean }): Promise<void>;
-	startDecision(options?: { readonly withContext?: boolean }): Promise<void>;
+	startDecision(options?: {
+		readonly withContext?: boolean;
+		readonly beforePrompt?: unknown;
+	}): Promise<void>;
 	startUnrelatedRun(message?: unknown): Promise<void>;
 	answerContinue(): unknown;
 	answerWait(waitSeconds?: number, reason?: string): unknown;
@@ -371,6 +376,7 @@ function createFenceHarness(options?: { readonly rejectReport?: boolean }) {
 
 function createHarness(options?: {
 	readonly nativeAbortGate?: boolean;
+	readonly nativeAutoLock?: boolean;
 	readonly config?: Partial<ContinueWatchdogConfig>;
 	readonly sendThrows?: boolean;
 	readonly omitPersistedEvent?: (kind: string) => boolean;
@@ -641,6 +647,14 @@ function createHarness(options?: {
 		});
 	}
 	runtime.registerLifecycle();
+	if (options?.nativeAutoLock) {
+		registerMainUserAutoLock(pi, {
+			isCurrentMain: runtime.isCurrentMain,
+			onMainUserMessageStart() {
+				runtime.restartLockCycle(undefined, { notifyLocked: false });
+			},
+		});
+	}
 
 	harness.ctx = ctx;
 	harness.runtime = runtime;
@@ -682,10 +696,17 @@ function createHarness(options?: {
 	};
 	harness.startDecision = async (startOptions?: {
 		readonly withContext?: boolean;
+		readonly beforePrompt?: unknown;
 	}) => {
 		if (decisionStarted) return;
 		harness.streaming = true;
 		await harness.fire("agent_start", { type: "agent_start" });
+		if (startOptions?.beforePrompt !== undefined) {
+			await harness.fire("message_start", {
+				type: "message_start",
+				message: startOptions.beforePrompt,
+			});
+		}
 		const decision = [...harness.sent]
 			.reverse()
 			.find((entry) => entry.message.customType === DECISION_MESSAGE_TYPE);
@@ -4250,6 +4271,243 @@ test("pending valid continue keeps reconcile inert until fold delivery", async (
 		),
 		true,
 	);
+});
+
+const presentationOnlyContents: readonly unknown[] = [
+	"",
+	" \n ",
+	[],
+	[text("")],
+	[text(" \n ")],
+];
+
+for (const phase of [
+	"before-prompt",
+	"before-context",
+	"after-context",
+] as const) {
+	for (const [index, content] of presentationOnlyContents.entries()) {
+		test(`presentation-only row ${index} ${phase} preserves exactly one owned decision`, async () => {
+			const harness = createHarness();
+			let contextEvents = 0;
+			const contextHandlers = harness.handlers.get("context");
+			assert.ok(contextHandlers);
+			contextHandlers.push(() => {
+				contextEvents += 1;
+			});
+			await startIdle(harness);
+			await harness.openDecision({ start: false });
+			const row = {
+				role: "custom",
+				customType: "other-plugin:timing",
+				content,
+				display: true,
+				timestamp: Date.now(),
+			};
+			await harness.startDecision({
+				withContext: phase === "after-context",
+				...(phase === "before-prompt" ? { beforePrompt: row } : {}),
+			});
+			assert.equal(contextEvents, phase === "after-context" ? 1 : 0);
+			if (phase !== "before-prompt") {
+				await harness.fire("message_start", {
+					type: "message_start",
+					message: row,
+				});
+			}
+			if (phase !== "after-context") {
+				const decision = harness.sent.find(
+					(entry) => entry.message.customType === DECISION_MESSAGE_TYPE,
+				);
+				assert.ok(decision);
+				await harness.fire("context", {
+					type: "context",
+					messages: [
+						{ role: "custom", ...decision.message, timestamp: Date.now() },
+					],
+				});
+			}
+			assert.equal(contextEvents, 1);
+			const answer = harness.answerUnlock();
+			const replacement = (await harness.endDecisionMessage(answer)) as
+				| DecisionMessageReplacement
+				| undefined;
+			assert.deepEqual(harness.submissionLog, ["staged"]);
+			assert.equal(
+				replacement?.message.details?.piInquiry?.inquiryId,
+				"exchange-1",
+			);
+			await harness.fire("agent_end", {
+				type: "agent_end",
+				messages: [answer],
+			});
+			harness.streaming = false;
+			await settleOnly(harness);
+			await settleOnly(harness);
+			const folds = harness.sent.filter(
+				(entry) => entry.message.customType === DECISION_FOLD_MESSAGE_TYPE,
+			);
+			assert.equal(folds.length, 1);
+			assert.equal(
+				parseDecisionFoldDetails(folds[0]?.message.details)?.watchdogOutcome,
+				"unlock",
+			);
+			assert.equal(harness.controller.snapshot.locked, false);
+		});
+	}
+}
+
+test("whitespace-only and image-bearing custom messages classify by content", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	await harness.openDecision();
+	await harness.startDecision();
+
+	// Whitespace-only text blocks carry no content: presentation, not work.
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: {
+			role: "custom",
+			customType: "other-plugin:status",
+			content: [text("   \n  ")],
+			display: true,
+			timestamp: Date.now(),
+		},
+	});
+	assert.equal(harness.controller.snapshot.decisionOpen, true);
+
+	// An image-bearing message is real content: it preempts the inquiry.
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: {
+			role: "custom",
+			customType: "other-plugin:attach",
+			content: [{ type: "image", data: "AAAA", mimeType: "image/png" }],
+			display: true,
+			timestamp: Date.now(),
+		},
+	});
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+});
+
+for (const [index, content] of presentationOnlyContents.entries()) {
+	test(`presentation-only user row ${index} stays inert through both registered handlers`, async () => {
+		const harness = createHarness({ nativeAutoLock: true });
+		await startIdle(harness);
+		await harness.openDecision();
+		await harness.fire("message_start", {
+			type: "message_start",
+			message: { role: "user", content, timestamp: Date.now() },
+		});
+		assert.equal(harness.controller.snapshot.decisionOpen, true);
+		await harness.endDecisionMessage(harness.answerUnlock());
+		assert.deepEqual(harness.submissionLog, ["staged"]);
+	});
+}
+
+test("nonempty, image and malformed user content still preempt through both handlers", async () => {
+	for (const content of [
+		"new work",
+		[text("new work")],
+		[{ type: "image", data: "AAAA", mimeType: "image/png" }],
+		undefined,
+		null,
+		[null],
+		[{ type: "text", text: 42 }],
+	]) {
+		const harness = createHarness({ nativeAutoLock: true });
+		await startIdle(harness);
+		await harness.openDecision();
+		await harness.fire("message_start", {
+			type: "message_start",
+			message: { role: "user", content, timestamp: Date.now() },
+		});
+		assert.equal(harness.controller.snapshot.decisionOpen, false);
+	}
+});
+
+for (const [withTiming, becomesBusy] of [
+	[false, false],
+	[true, false],
+	[true, true],
+] as const) {
+	test(`accepted continuation publication follows host idle state (timing=${withTiming}, busy=${becomesBusy})`, async () => {
+		const fence = createFenceHarness();
+		let hostBusy = false;
+		let harness: Harness;
+		harness = createHarness({
+			processDomain: fence.domain,
+			isIdle: () => !harness.streaming && !hostBusy,
+		});
+		await startIdle(harness);
+		await harness.openDecision();
+		await Promise.resolve();
+		await Promise.resolve();
+		await harness.startDecision();
+		const answer = harness.answerContinue();
+		await harness.endDecisionMessage(answer);
+		fence.deferConfirm();
+		await harness.fire("agent_end", { type: "agent_end", messages: [answer] });
+		harness.streaming = false;
+		const settling = harness.fire("agent_settled", { type: "agent_settled" });
+		await Promise.resolve();
+		await Promise.resolve();
+		assert.equal(fence.pendingConfirmCount(), 1);
+		fence.resolvePendingConfirm(true);
+		await Promise.resolve();
+		await Promise.resolve();
+		assert.equal(fence.pendingConfirmCount(), 1);
+		if (withTiming) {
+			// Compaction can make the host busy without starting an agent run.
+			hostBusy = becomesBusy;
+			await harness.fire("message_start", {
+				type: "message_start",
+				message: {
+					role: "custom",
+					customType: "timing",
+					content: "",
+					timestamp: Date.now(),
+				},
+			});
+		}
+		assert.equal(harness.streaming, false);
+		assert.equal(harness.ctx.isIdle(), !becomesBusy);
+		assert.equal(fence.reportedIdle.at(-1), !becomesBusy);
+		fence.resolvePendingConfirm(true);
+		await settling;
+		assert.equal(harness.controller.snapshot.attempt, becomesBusy ? 0 : 1);
+		const folds = harness.sent.filter(
+			(entry) => entry.message.customType === DECISION_FOLD_MESSAGE_TYPE,
+		);
+		assert.deepEqual(
+			folds.map(
+				(entry) =>
+					parseDecisionFoldDetails(entry.message.details)?.watchdogOutcome,
+			),
+			becomesBusy ? [] : ["continue"],
+		);
+	});
+}
+
+test("presentation-only row before continuation correlation preserves cancellation ownership", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	const fold = await startAcceptedContinuation(harness, false);
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: {
+			role: "custom",
+			customType: "timing",
+			content: "",
+			timestamp: Date.now(),
+		},
+	});
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: { role: "custom", ...fold.message, timestamp: Date.now() },
+	});
+	await harness.unlock();
+	assert.equal(harness.aborts, 1);
 });
 
 test("foreign message activity cancels and neutralizes a submitted inquiry", async () => {

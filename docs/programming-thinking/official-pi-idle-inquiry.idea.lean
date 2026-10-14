@@ -793,10 +793,38 @@ def callbackWakeTexts : List String :=
 def isKnownCallbackWake (text : String) : Bool :=
   callbackWakeTexts.contains text
 
--- A user-role message start is callback work only for an exact wake text; any other text is
--- genuine user work and starts a fresh cycle.
+-- Content-bearing user work resumes an exact callback wake or starts a fresh cycle.
+-- observeClassifiedUserMessageStart guards this transition with the shared content classification.
 def observeUserMessageStart (text : String) (state : RuntimeState) : RuntimeState :=
   if isKnownCallbackWake text then resumeFromCallback state else freshLockCycle state
+
+-- Message-start classification separates presentation-only rows from foreign input. Empty or
+-- whitespace-only text carries no model-visible content and never preempts a dispatched inquiry;
+-- a missing content field or any non-text block (e.g. an image) is real work. Host text is the
+-- opaque model-facing payload here, not a quoted prior result.
+def carriesContent (hasContentField : Bool) (textOnly : Bool)
+    (blankText : Bool) : Bool :=
+  if !hasContentField then true
+  else if !textOnly then true
+  else !blankText
+
+def classifyMessageStart (roleIsUserOrCustom : Bool) (hasContentField : Bool)
+    (textOnly : Bool) (blankText : Bool) : Bool :=
+  roleIsUserOrCustom && carriesContent hasContentField textOnly blankText
+
+-- A custom/user message_start preempts the open decision only when it carries content; a
+-- presentation-only row leaves the active window untouched.
+def preemptOnMessageStart (foreignInput : Bool) (state : RuntimeState) : RuntimeState :=
+  if foreignInput then preemptActiveDecision state else state
+
+-- The later user-only handler shares the blank-content guard, so it cannot restart an inert row.
+-- Missing or non-text payloads cannot masquerade as text-only callback wakes.
+def observeClassifiedUserMessageStart (hasContentField textOnly blankText : Bool)
+    (text : String) (state : RuntimeState) : RuntimeState :=
+  if classifyMessageStart true hasContentField textOnly blankText then
+    if hasContentField && textOnly then observeUserMessageStart text state
+    else freshLockCycle state
+  else state
 
 -- Timer expiry is separate from idle qualification; the fixed fence is the only timer.
 def timerTick (now : NowMs) (state : RuntimeState) : RuntimeState :=
@@ -1263,6 +1291,55 @@ theorem near_match_wake_is_genuine_user_work
     observeUserMessageStart "New intercom message above. " state = freshLockCycle state ∧
       observeUserMessageStart "new intercom message above." state = freshLockCycle state := by
   constructor <;> simp [observeUserMessageStart, isKnownCallbackWake, callbackWakeTexts]
+
+-- Blank text and empty text-block lists are inert; missing or non-text payloads remain work.
+-- The same classification guards both runtime takeover and the later user auto-lock handler.
+theorem empty_custom_message_does_not_preempt
+    (state : RuntimeState) :
+    preemptOnMessageStart (classifyMessageStart true true true true) state = state := by
+  simp [preemptOnMessageStart, classifyMessageStart, carriesContent]
+
+theorem whitespace_only_custom_message_does_not_preempt
+    (state : RuntimeState) :
+    preemptOnMessageStart (classifyMessageStart true true true true) state = state := by
+  simp [preemptOnMessageStart, classifyMessageStart, carriesContent]
+
+theorem content_bearing_custom_message_preempts
+    (state : RuntimeState) (attempt : ActiveDecision)
+    (h : state.active = some attempt) :
+    (preemptOnMessageStart (classifyMessageStart true true true false) state).active.isNone =
+      true ∧
+      (preemptOnMessageStart (classifyMessageStart true true true false) state).attempt =
+        state.attempt := by
+  simp [preemptOnMessageStart, classifyMessageStart, carriesContent, h,
+    preemptActiveDecision]
+
+theorem image_bearing_custom_message_preempts
+    (state : RuntimeState) (attempt : ActiveDecision)
+    (h : state.active = some attempt) :
+    (preemptOnMessageStart (classifyMessageStart true true false true) state).active.isNone =
+      true ∧
+      (preemptOnMessageStart (classifyMessageStart true true false true) state).attempt =
+        state.attempt := by
+  simp [preemptOnMessageStart, classifyMessageStart, carriesContent, h,
+    preemptActiveDecision]
+
+theorem non_user_or_custom_message_never_preempts
+    (state : RuntimeState) (hasContentField textOnly blankText : Bool) :
+    preemptOnMessageStart
+      (classifyMessageStart false hasContentField textOnly blankText) state = state := by
+  simp [preemptOnMessageStart, classifyMessageStart]
+
+theorem empty_user_message_is_inert_through_both_handlers
+    (text : String) (state : RuntimeState) :
+    observeClassifiedUserMessageStart true true true text
+      (preemptOnMessageStart (classifyMessageStart true true true true) state) = state := by
+  simp [observeClassifiedUserMessageStart, preemptOnMessageStart,
+    classifyMessageStart, carriesContent]
+
+theorem missing_payload_is_foreign (textOnly blankText : Bool) :
+    classifyMessageStart true false textOnly blankText = true := by
+  simp [classifyMessageStart, carriesContent]
 
 theorem early_invalid_reasks_with_fresh_evidence
     (now : NowMs) (state : RuntimeState) (attempt : ActiveDecision)
@@ -1927,7 +2004,8 @@ theorem final_callback_unit_waits_before_exhaustion
 
 -- Whole-inquiry correctness combines safety, unauthorized inertness, context revocation, bounded progress,
 -- and callback suspension: quiet waiting, exact-wake resumption, and final-unit waiting before exhaustion.
--- Runtime scheduling, metadata authenticity, parser correctness, and durable I/O remain external obligations.
+-- Scheduling, metadata authenticity, parsing, durable I/O, concrete activity generations, and continuation
+-- handles remain host-adapter obligations; live busy observations are separate transitions.
 theorem process_is_correct : ProcessSafety ∧
     (∀ state attempt, state.active = some attempt → consumedEvidence attempt = false →
       ∀ blocks callId verdict now,
@@ -1979,13 +2057,30 @@ theorem process_is_correct : ProcessSafety ∧
     (∀ state,
       observeUserMessageStart "New intercom message above. " state = freshLockCycle state ∧
         observeUserMessageStart "new intercom message above." state =
-          freshLockCycle state) :=
+          freshLockCycle state) ∧
+    (∀ state,
+      preemptOnMessageStart (classifyMessageStart true true true true) state = state) ∧
+    (∀ state attempt, state.active = some attempt →
+      (preemptOnMessageStart (classifyMessageStart true true true false) state).active.isNone =
+        true) ∧
+    (∀ state hasContentField textOnly blankText,
+      preemptOnMessageStart
+        (classifyMessageStart false hasContentField textOnly blankText) state = state) ∧
+    (∀ text state,
+      observeClassifiedUserMessageStart true true true text
+        (preemptOnMessageStart (classifyMessageStart true true true true) state) = state) ∧
+    (∀ textOnly blankText, classifyMessageStart true false textOnly blankText = true) :=
   ⟨transition_invariants, unconsumed_pipeline_is_inert, foreign_context_does_not_confirm,
     guarded_inquiry_terminates, three_invalid_responses_fail_the_decision,
     provider_failures_preserve_budgets, native_transport_is_guarded,
     staged_validation_is_error, unreadable_receipt_preserves_budget,
     suspension_blocks_inquiry_and_exhaustion, final_callback_unit_waits_before_exhaustion,
-    callback_wake_resumes_without_charge, near_match_wake_is_genuine_user_work⟩
+    callback_wake_resumes_without_charge, near_match_wake_is_genuine_user_work,
+    empty_custom_message_does_not_preempt,
+    fun state attempt h =>
+      (content_bearing_custom_message_preempts state attempt h).1,
+    non_user_or_custom_message_never_preempts,
+    empty_user_message_is_inert_through_both_handlers, missing_payload_is_foreign⟩
 
 end OfficialPiIdleInquiry
 
@@ -2005,8 +2100,12 @@ def main : IO Unit := do
   let invalid1 := OfficialPiIdleInquiry.runGuardedInvalidResponse environment 0 initial
   let invalid2 := OfficialPiIdleInquiry.runGuardedInvalidResponse environment 0 invalid1.2
   let invalid3 := OfficialPiIdleInquiry.runGuardedInvalidResponse environment 0 invalid2.2
-  let resumed := OfficialPiIdleInquiry.observeUserMessageStart "New intercom message above." callback.2
-  let human := OfficialPiIdleInquiry.observeUserMessageStart "New intercom message above. " callback.2
+  let resumed := OfficialPiIdleInquiry.observeClassifiedUserMessageStart true true false "New intercom message above." callback.2
+  let human := OfficialPiIdleInquiry.observeClassifiedUserMessageStart true true false "New intercom message above. " callback.2
+  let blank := OfficialPiIdleInquiry.observeClassifiedUserMessageStart true true true ""
+    (OfficialPiIdleInquiry.preemptOnMessageStart
+      (OfficialPiIdleInquiry.classifyMessageStart true true true true) callback.2)
+  IO.println s!"blank row through both handlers: preservesState={decide (blank = callback.2)}"
   IO.println s!"continue: attempt={continued.2.attempt}; callback: outcome={repr callback.1}, locked={callback.2.locked}, attempt={callback.2.attempt}, suspended={callback.2.callbackSuspended}, exhaustionEligible={OfficialPiIdleInquiry.exhaustionEligible callback.2}"
   IO.println s!"exact wake: attempt={resumed.attempt}, suspended={resumed.callbackSuspended}, exhaustionEligible={OfficialPiIdleInquiry.exhaustionEligible resumed}; near match: attempt={human.attempt}, suspended={human.callbackSuspended}"
   IO.println s!"unlock: locked={unlocked.2.locked}, attempt={unlocked.2.attempt}; three invalid: failed={invalid3.2.decisionFailed}, attempt={invalid3.2.attempt}"

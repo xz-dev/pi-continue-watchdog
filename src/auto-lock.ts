@@ -49,6 +49,18 @@ function messageText(content: unknown): string | null {
 	return text;
 }
 
+/** Empty user/custom text is presentation; missing or non-text payloads are work. */
+export function isPresentationOnlyMessage(message: unknown): boolean {
+	if (message === null || typeof message !== "object") return false;
+	const input = message as {
+		readonly role?: unknown;
+		readonly content?: unknown;
+	};
+	if (input.role !== "user" && input.role !== "custom") return false;
+	const text = messageText(input.content);
+	return text !== null && text.trim() === "";
+}
+
 /** True when a user-role message is exactly a known callback wake text. */
 export function isKnownCallbackWake(event: MessageStartEvent): boolean {
 	const text = messageText(
@@ -74,7 +86,8 @@ export function registerMainUserAutoLock(
 ): void {
 	pi.on("message_start", (event) => {
 		if (!isUserRoleMessageStart(event) || !binding.isCurrentMain()) return;
-		if (isKnownCallbackWake(event)) return;
+		if (isPresentationOnlyMessage(event.message) || isKnownCallbackWake(event))
+			return;
 		binding.onMainUserMessageStart();
 	});
 }

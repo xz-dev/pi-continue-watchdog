@@ -23,6 +23,7 @@ import {
 	type ActivityGeneration,
 	createActivityGraceCoordinator,
 } from "./activity-grace.js";
+import { isPresentationOnlyMessage } from "./auto-lock.js";
 import {
 	AI_UNLOCK_ENTRY_TYPE,
 	type AiUnlockEntry,
@@ -4014,18 +4015,22 @@ export function createDecisionRuntime(
 		event: { readonly message: unknown },
 		ctx?: ExtensionContext,
 	): Promise<void> => {
-		const message = event.message as {
-			readonly role?: unknown;
-			readonly customType?: unknown;
-			readonly details?: {
-				readonly inquiryId?: unknown;
-				readonly attempt?: unknown;
-			};
-		};
-		if (
-			pendingContinuationPublication?.confirmed === null &&
-			(message.role === "user" || message.role === "custom")
-		) {
+		const message = event.message as
+			| {
+					readonly role?: unknown;
+					readonly customType?: unknown;
+					readonly content?: unknown;
+					readonly details?: {
+						readonly inquiryId?: unknown;
+						readonly attempt?: unknown;
+					};
+			  }
+			| undefined;
+		const presentationOnly = isPresentationOnlyMessage(message);
+		const isForeignInput =
+			(message?.role === "user" || message?.role === "custom") &&
+			!presentationOnly;
+		if (pendingContinuationPublication?.confirmed === null && isForeignInput) {
 			clearOperationalPendingWork();
 		}
 		const current = activeDecision;
@@ -4034,8 +4039,11 @@ export function createDecisionRuntime(
 				preserveGeneration:
 					current?.inquiry.matchesPrompt(message) === true ||
 					(current !== null && selfRunFor(current)),
+				preserveUnchangedGeneration: presentationOnly,
 			});
 		}
+		// Observe actual host busy changes, but blank rows cannot change message ownership.
+		if (presentationOnly) return;
 		if (quarantinedDecision !== null) {
 			// Once the exact custom input has correlated this quarantine to a Pi run,
 			// retain it across every assistant/tool-result message until agent_settled.
@@ -4043,19 +4051,16 @@ export function createDecisionRuntime(
 			// unrelated run can never have its assistant redacted.
 			if (quarantinedDecision.inputObserved) return;
 			const matchesQuarantine =
-				message.role === "custom" &&
-				message.customType === "pi-continue-watchdog:inquiry" &&
-				message.details?.inquiryId === quarantinedDecision.exchangeId &&
-				message.details?.attempt === quarantinedDecision.cycleId;
+				message?.role === "custom" &&
+				message?.customType === "pi-continue-watchdog:inquiry" &&
+				message?.details?.inquiryId === quarantinedDecision.exchangeId &&
+				message?.details?.attempt === quarantinedDecision.cycleId;
 			if (matchesQuarantine) quarantinedDecision.inputObserved = true;
 			else quarantinedDecision = null;
 			return;
 		}
 		const ownedRun = watchdogOwnedRun;
-		if (
-			ownedRun?.phase === "running" &&
-			(message.role === "user" || message.role === "custom")
-		) {
+		if (ownedRun?.phase === "running" && isForeignInput) {
 			// A foreign input can start inside the same Pi agent lifecycle, without a
 			// new agent_start/agent_settled pair. From this message onward the active
 			// run is no longer solely watchdog-owned, so a later manual unlock must
@@ -4064,8 +4069,8 @@ export function createDecisionRuntime(
 		}
 		if (ownedRun?.phase === "pending-start") {
 			const fold =
-				message.role === "custom" &&
-				message.customType === DECISION_FOLD_MESSAGE_TYPE
+				message?.role === "custom" &&
+				message?.customType === DECISION_FOLD_MESSAGE_TYPE
 					? parseDecisionFoldDetails(message.details)
 					: undefined;
 			if (
@@ -4083,11 +4088,7 @@ export function createDecisionRuntime(
 		const active = activeDecision;
 		if (active === null || active.invalidated || !owns(active.claim)) return;
 		const isCurrentDecision = active.inquiry.matchesPrompt(message);
-		if (
-			active.submitted &&
-			!isCurrentDecision &&
-			(message.role === "user" || message.role === "custom")
-		) {
+		if (active.submitted && !isCurrentDecision && isForeignInput) {
 			deferDecisionOnBusy(
 				active,
 				active.isReconsideration ? "preempted" : undefined,
@@ -4147,13 +4148,19 @@ export function createDecisionRuntime(
 
 	const observeLiveState = (
 		ctx = sessionContext,
-		observationOptions?: { readonly preserveGeneration?: boolean },
+		observationOptions?: {
+			readonly preserveGeneration?: boolean;
+			readonly preserveUnchangedGeneration?: boolean;
+		},
 	): boolean => {
 		if (ctx === null || stopped) return false;
 		retryInquiryCleanup();
 		const { idle, busy } = probePiAgentState(ctx);
+		const preserveGeneration =
+			observationOptions?.preserveGeneration ||
+			(observationOptions?.preserveUnchangedGeneration && busy === localAiBusy);
 		localAiBusy = busy;
-		if (!observationOptions?.preserveGeneration) localActivityGeneration += 1;
+		if (!preserveGeneration) localActivityGeneration += 1;
 		if (attachment !== null) {
 			publishingOwnHubObservation = true;
 			try {
