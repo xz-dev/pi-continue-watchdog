@@ -555,8 +555,14 @@ export interface ReviewHistoryRecord {
 	/** Correlation shared by all records of this attempt. */
 	readonly exchangeId: string;
 	readonly cycleId: number;
-	/** Session entry id of the hidden inquiry marker. */
+	/** Native identity anchor: legacy marker or first private transport record. */
 	readonly markerEntryId: string;
+	readonly transport?: "private-file";
+	readonly childSessionId?: string;
+	readonly privateInquiry?: "initial" | "reconsideration";
+	readonly privateAttempt?: number;
+	/** Captured bounded input view, never a source of live authority. */
+	readonly sourceView?: string;
 	/** Session entry id of the owned inquiry prompt, if found on ancestry. */
 	readonly promptEntryId?: string;
 	/** Session entry id of the owned (neutralized) assistant, if present. */
@@ -667,6 +673,15 @@ export function readReviewHistory(manager: ReviewHistorySource): ReviewHistory {
 		cycleId: number;
 		markerEntryId: string;
 		markerData: Record<string, unknown>;
+		file?: {
+			sessionId: string;
+			inquiry: "initial" | "reconsideration";
+			started?: boolean;
+			attempt?: number;
+			view?: string;
+			outcome?: "continue" | "unlock" | "invalid";
+			issues: string[];
+		};
 		promptEntryId?: string;
 		assistantEntryId?: string;
 		auditEntryId?: string;
@@ -683,6 +698,114 @@ export function readReviewHistory(manager: ReviewHistorySource): ReviewHistory {
 
 	for (const entry of branch) {
 		if (entry.type === "custom") {
+			if (
+				(entry.customType === "pi-continue-watchdog:private-decision" ||
+					entry.customType === "pi-continue-watchdog:private-response") &&
+				isObject(entry.data)
+			) {
+				const data = entry.data;
+				if (
+					data.version !== 1 ||
+					typeof data.exchangeId !== "string" ||
+					data.exchangeId.length === 0
+				)
+					continue;
+				const cycleId = data.cycleId ?? 1;
+				if (
+					typeof cycleId !== "number" ||
+					!Number.isSafeInteger(cycleId) ||
+					cycleId < 1
+				)
+					continue;
+				const started =
+					entry.customType === "pi-continue-watchdog:private-decision";
+				const child = started ? data.childSessionId : data.sessionId;
+				if (
+					typeof child !== "string" ||
+					child.length === 0 ||
+					(data.inquiry !== "initial" && data.inquiry !== "reconsideration")
+				)
+					continue;
+				const k = key(data.exchangeId, cycleId);
+				let accum = byKey.get(k);
+				if (accum === undefined) {
+					accum = {
+						exchangeId: data.exchangeId,
+						cycleId,
+						markerEntryId: entry.id,
+						markerData: data,
+					};
+					byKey.set(k, accum);
+					order.push(accum);
+				}
+				accum.file ??= { sessionId: child, inquiry: data.inquiry, issues: [] };
+				if (accum.file.sessionId !== child) {
+					accum.file.issues.push("private child association mismatch");
+					continue;
+				}
+				if (
+					!started &&
+					(accum.file.started !== true || accum.file.inquiry !== data.inquiry)
+				) {
+					accum.file.issues.push(
+						"private response inquiry association mismatch",
+					);
+					continue;
+				}
+				if (started) {
+					if (data.phase !== "started") {
+						accum.file.issues.push("unknown private operation phase");
+						continue;
+					}
+					accum.file.inquiry = data.inquiry;
+					accum.file.started = true;
+					if (
+						typeof data.sourceView === "string" &&
+						codePointCount(data.sourceView) <= REVIEW_VIEW_MAX_CODE_POINTS
+					)
+						accum.file.view ??= data.sourceView;
+					else accum.file.issues.push("private input view unavailable");
+					if (
+						!Object.hasOwn(accum.markerData, "review") &&
+						Object.hasOwn(data, "review")
+					)
+						accum.markerData = { ...accum.markerData, review: data.review };
+				} else {
+					if (
+						typeof data.attempt !== "number" ||
+						!Number.isSafeInteger(data.attempt) ||
+						data.attempt < 1 ||
+						data.attempt > 3 ||
+						!isObject(data.outcome)
+					) {
+						accum.file.issues.push("private response association malformed");
+						continue;
+					}
+					let outcome: "continue" | "unlock" | "invalid" | undefined;
+					if (
+						data.outcome.kind === "invalid" &&
+						typeof data.outcome.error === "string"
+					)
+						outcome = "invalid";
+					if (
+						data.outcome.kind === "valid" &&
+						isObject(data.outcome.decision) &&
+						(data.outcome.decision.kind === "continue" ||
+							data.outcome.decision.kind === "unlock") &&
+						typeof data.outcome.decision.reasonType === "string" &&
+						typeof data.outcome.decision.reason === "string"
+					)
+						outcome = data.outcome.decision.kind;
+					if (outcome === undefined) {
+						accum.file.issues.push("private response outcome malformed");
+						continue;
+					}
+					accum.file.attempt = data.attempt;
+					accum.file.outcome = outcome;
+					accum.auditEntryId = entry.id;
+				}
+				continue;
+			}
 			if (entry.customType === AI_UNLOCK_ENTRY_TYPE && isObject(entry.data)) {
 				// Quiet records have no version field; reuse exact native identity
 				// parsing and require the normalized reason carried by this artifact.
@@ -795,7 +918,10 @@ export function readReviewHistory(manager: ReviewHistorySource): ReviewHistory {
 				? ({ state: "absent" } as const)
 				: reviewField(accum.auditData);
 		const responseOutcome =
-			accum.auditData === undefined ? undefined : auditOutcome(accum.auditData);
+			accum.file?.outcome ??
+			(accum.auditData === undefined
+				? undefined
+				: auditOutcome(accum.auditData));
 		const missingUnlockStatus =
 			accum.quietUnlock === true && accum.unlockEntryId === undefined;
 		const publishedOutcome =
@@ -815,7 +941,7 @@ export function readReviewHistory(manager: ReviewHistorySource): ReviewHistory {
 							accum.assistantEntryId !== undefined
 						? "responded"
 						: "pending";
-		const problems: string[] = [];
+		const problems: string[] = [...(accum.file?.issues ?? [])];
 		if (missingUnlockStatus)
 			problems.push("quiet unlock publication unavailable");
 		if (accum.unlockEntryId !== undefined && accum.foldOutcome !== "unlock")
@@ -831,7 +957,7 @@ export function readReviewHistory(manager: ReviewHistorySource): ReviewHistory {
 			reviewMetadata = "unknown-version";
 			problems.push("unsupported review metadata or projection version");
 		} else if (markerReview.state === "ok" || auditReview.state === "ok") {
-			if (accum.promptEntryId === undefined)
+			if (accum.file === undefined && accum.promptEntryId === undefined)
 				problems.push("inquiry unavailable");
 			const markerPosition = sourcePositions.get(accum.markerEntryId) ?? -1;
 			const sourceEntry = (id: unknown): SessionEntry | undefined => {
@@ -884,11 +1010,20 @@ export function readReviewHistory(manager: ReviewHistorySource): ReviewHistory {
 			const interrupted =
 				accum.foldOutcome === "preempted" ||
 				accum.foldOutcome === "invalidated";
-			if (accum.auditData === undefined) {
+			if (accum.file !== undefined) {
+				if (accum.file.view === undefined)
+					problems.push("private input view unavailable");
+				if (
+					accum.foldEntryId !== undefined &&
+					accum.auditEntryId === undefined &&
+					!interrupted
+				)
+					problems.push("response audit unavailable");
+			} else if (accum.auditData === undefined) {
 				if (!interrupted) problems.push("response audit unavailable");
 			} else if (auditReview.state !== "ok")
 				problems.push("audit review association unavailable");
-			if (auditReview.state === "ok") {
+			if (accum.file === undefined && auditReview.state === "ok") {
 				const association = auditReview.value;
 				for (const [field, expected] of [
 					["markerEntryId", accum.markerEntryId],
@@ -913,6 +1048,15 @@ export function readReviewHistory(manager: ReviewHistorySource): ReviewHistory {
 			exchangeId: accum.exchangeId,
 			cycleId: accum.cycleId,
 			markerEntryId: accum.markerEntryId,
+			...(accum.file === undefined
+				? {}
+				: {
+						transport: "private-file" as const,
+						childSessionId: accum.file.sessionId,
+						privateInquiry: accum.file.inquiry,
+						privateAttempt: accum.file.attempt,
+						sourceView: accum.file.view,
+					}),
 			...(accum.promptEntryId === undefined
 				? {}
 				: { promptEntryId: accum.promptEntryId }),

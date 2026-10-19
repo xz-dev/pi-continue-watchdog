@@ -29,7 +29,6 @@ import {
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const TOOL_NAME = "cw";
 
 interface RequestRecord {
 	readonly receivedAt: number;
@@ -233,17 +232,16 @@ async function readProbeRecords(probeOut: string): Promise<ProbeRecord[]> {
 }
 
 function textOf(message: RequestRecord["messages"][number]): string {
-	return JSON.stringify(message.content);
+	if (typeof message.content === "string") return message.content;
+	return Array.isArray(message.content)
+		? message.content.map((block) => block?.text ?? "").join("\n")
+		: "";
 }
 
-/** True when the request was triggered by the hidden watchdog decision inquiry. */
+/** Only an actual private file task is a decision request. */
 function isDecisionRequest(request: RequestRecord): boolean {
-	const last = request.messages.at(-1);
-	return (
-		last?.role === "user" &&
-		textOf(last).includes(
-			"automated continuation check from the pi-continue-watchdog",
-		)
+	return request.messages.some((message) =>
+		textOf(message).includes("<watchdog_result_file>"),
 	);
 }
 
@@ -323,10 +321,24 @@ async function startMockServer(
 				return;
 			}
 			if (reply.kind === "unlock") {
+				const resultMarker = payload.messages
+					.flatMap((message) => [
+						...textOf(message).matchAll(
+							/<watchdog_result_file>(.*?)<\/watchdog_result_file>/gs,
+						),
+					])
+					.at(-1)?.[1];
+				assert.ok(
+					resultMarker,
+					"unlock fixture requires a real private result path",
+				);
 				const argumentsJson = JSON.stringify({
-					action: "unlock",
-					reason_type: reply.reasonType ?? "JOB_DONE",
-					reason_content: reply.reason ?? "finished",
+					path: JSON.parse(resultMarker),
+					content: JSON.stringify({
+						action: "unlock",
+						reason_type: reply.reasonType ?? "JOB_DONE",
+						reason_content: reply.reason ?? "finished",
+					}),
 				});
 				sendSse(response, [
 					{
@@ -343,7 +355,7 @@ async function startMockServer(
 											id: `call-${requests.length}`,
 											type: "function",
 											function: {
-												name: TOOL_NAME,
+												name: "write",
 												arguments: argumentsJson,
 											},
 										},
@@ -356,7 +368,7 @@ async function startMockServer(
 					{
 						id,
 						model: "watchdog-e2e",
-						choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+						choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
 					},
 				]);
 				return;
@@ -493,7 +505,9 @@ async function createSession(
 			modelRuntime,
 			model,
 			resourceLoader: loader,
-			sessionManager: options?.sessionManager ?? SessionManager.inMemory(),
+			sessionManager:
+				options?.sessionManager ??
+				SessionManager.create(cwd, join(fixture.root, "sessions")),
 		});
 		await session.bindExtensions(
 			options?.uiContext === undefined
@@ -863,6 +877,14 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		modelId: "root-process-model",
 		uiContext: createRpcUiContext(),
 	});
+	const rootPublication = (count: number) => () =>
+		root.session.sessionManager
+			.getBranch()
+			.filter(
+				(entry) =>
+					entry.type === "custom" &&
+					entry.customType === "pi-continue-watchdog:ai-unlock",
+			).length === count;
 	t.after(() => shutdownSession(root.session));
 	assert.equal(
 		root.domainEnv.PI_CONTINUE_WATCHDOG_ROOT_PID,
@@ -940,7 +962,7 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		15_000,
 		"busy-child disconnect continuation",
 	);
-	await waitForSessionIdle(root.session, 3_000, "disconnect root unlock");
+	await waitFor(rootPublication(1), 5_000, "disconnect root terminal receipt");
 	const firstContinuation = requests.find(isDecisionRequest);
 	assert.ok(firstContinuation);
 	assert.equal(firstContinuation.model, "root-process-model");
@@ -1001,7 +1023,7 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		15_000,
 		"reconnected child live-idle continuation",
 	);
-	await waitForSessionIdle(root.session, 5_000, "reconnect recovery unlock");
+	await waitFor(rootPublication(2), 5_000, "reconnect root terminal receipt");
 	const reconnectContinuation = requests.filter(isDecisionRequest)[1];
 	assert.ok(reconnectContinuation);
 	assert.equal(reconnectContinuation.model, "root-process-model");
@@ -1049,7 +1071,7 @@ test("packed stock Pi coordinates busy and decision epochs across an OS child", 
 		15_000,
 		"final child-idle continuation",
 	);
-	await waitForSessionIdle(root.session, 5_000, "final continuation unlock");
+	await waitFor(rootPublication(3), 5_000, "final root terminal receipt");
 	const continuations = requests.filter(isDecisionRequest);
 	assert.equal(continuations.length, 3);
 	assert.ok(

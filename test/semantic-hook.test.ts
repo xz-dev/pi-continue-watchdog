@@ -6,6 +6,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { createEventBus } from "@earendil-works/pi-coding-agent";
 
+import { AI_UNLOCK_ENTRY_TYPE } from "../src/commands.js";
 import type { ContinueWatchdogConfig } from "../src/config.js";
 import { createLockDecisionController } from "../src/controller.js";
 import {
@@ -31,6 +32,13 @@ import {
 	USER_READY_HOOK_NAME,
 	WATCHDOG_CONTINUED_HOOK_NAME,
 } from "../src/semantic-hook.js";
+import {
+	awaitPrivateOperation,
+	awaitPrivatePrompt,
+	createPrivateDriver,
+	type PrivateDriver,
+	settlePrivateDecision,
+} from "./fixtures/private-decision-driver.js";
 
 interface TimerRecord {
 	callback: () => void;
@@ -96,20 +104,11 @@ interface SemanticHarness {
 	fire(name: string, event: unknown): Promise<void>;
 	openDecision(): Promise<void>;
 	startDecision(): Promise<void>;
-	decisionToolDefinition: {
-		readonly execute: (
-			toolCallId: string,
-			args: unknown,
-		) => Promise<{
-			readonly content: Array<{ type: string; text?: string }>;
-			readonly details?: { readonly outcome?: string };
-			readonly terminate?: boolean;
-		}>;
-	} | null;
-	submitDecisionTool(toolCallId: string, args: unknown): Promise<unknown>;
-	answerContinue(): unknown;
-	answerWait(waitSeconds?: number, reason?: string): unknown;
-	answerUnlock(reason?: string, reasonType?: string): unknown;
+	readonly driver: PrivateDriver;
+	readonly registeredTools: string[];
+	answerContinue(): string;
+	answerWait(waitSeconds?: number, reason?: string): string;
+	answerUnlock(reason?: string, reasonType?: string): string;
 	snapshotController(): {
 		locked: boolean;
 		exhausted: boolean;
@@ -120,16 +119,6 @@ interface SemanticHarness {
 
 function assistant(content: unknown[], stopReason = "stop"): unknown {
 	return { role: "assistant", content, stopReason };
-}
-
-let nextDecisionCallId = 0;
-
-function cwCall(args: Record<string, unknown>): unknown {
-	nextDecisionCallId += 1;
-	const toolCallId = `cw-${nextDecisionCallId}`;
-	return assistant([
-		{ type: "toolCall", id: toolCallId, name: "cw", arguments: args },
-	]);
 }
 
 function continueArgs(
@@ -231,6 +220,7 @@ function createSemanticHarness(options?: {
 	) => void;
 	readonly appendThrows?: string;
 	readonly sendThrows?: string;
+	readonly sendWithoutReceipt?: string;
 	readonly listen?: boolean;
 	readonly eventBus?: ReturnType<typeof createEventBus>;
 }): SemanticHarness {
@@ -260,17 +250,32 @@ function createSemanticHarness(options?: {
 	const bus = options?.eventBus ?? createEventBus();
 	const notifications: Array<{ message: string; level?: string }> = [];
 	const sentTypes: string[] = [];
+	const driver = createPrivateDriver();
+	const registeredTools: string[] = [];
+	let pendingMessages = false;
 	const branch: Array<{
 		id: string;
-		type: "custom_message" | "custom";
-		customType: string;
+		type: "message" | "custom_message" | "custom";
+		customType?: string;
+		message?: unknown;
 		details?: unknown;
 		data?: unknown;
-	}> = [];
-	let runtime: ReturnType<typeof createDecisionRuntime>;
-	let lastDecisionMessage: { customType?: string; details?: unknown } | null =
-		null;
-	let startedDecisionDetails: unknown = null;
+	}> = [
+		{
+			id: "source-user",
+			type: "message",
+			message: {
+				role: "user",
+				content: "Finish requested work.",
+				timestamp: 1,
+			},
+		},
+		{
+			id: "source-assistant",
+			type: "message",
+			message: assistant([{ type: "text", text: "Work checkpoint." }]),
+		},
+	];
 
 	if (options?.listen !== false) {
 		bus.on(SEMANTIC_HOOK_CHANNEL, (data) => {
@@ -287,6 +292,8 @@ function createSemanticHarness(options?: {
 		bus,
 		notifications,
 		sentTypes,
+		driver,
+		registeredTools,
 		streaming: false,
 	} as SemanticHarness;
 
@@ -297,14 +304,16 @@ function createSemanticHarness(options?: {
 			handlers.set(name, list);
 		},
 		events: bus,
-		sendMessage(message: { customType?: string; details?: unknown }): void {
+		sendMessage(
+			message: { customType?: string; details?: unknown },
+			delivery?: { triggerTurn?: boolean },
+		): void {
 			const customType = message.customType ?? "unknown";
 			sentTypes.push(customType);
-			if (message.customType === "pi-continue-watchdog:inquiry") {
-				lastDecisionMessage = message;
-			}
 			options?.onSend?.(customType, hub);
 			if (customType === options?.sendThrows) throw new Error("send failed");
+			if (delivery?.triggerTurn) pendingMessages = true;
+			if (customType === options?.sendWithoutReceipt) return;
 			branch.push({
 				id: `message-${branch.length + 1}`,
 				type: "custom_message",
@@ -315,7 +324,8 @@ function createSemanticHarness(options?: {
 				(message.details as { watchdogOutcome?: unknown } | undefined)
 					?.watchdogOutcome === "continue"
 			) {
-				// A later lifecycle observation, after persistence, acknowledges delivery.
+				// Parent continuation observation acknowledges persisted delivery.
+				// Private generation never emits parent context events.
 				queueMicrotask(() => {
 					void harness.fire("context", { type: "context", messages: [] });
 				});
@@ -332,18 +342,26 @@ function createSemanticHarness(options?: {
 			});
 		},
 		registerTool(definition: { readonly name: string }): void {
-			harness.decisionToolDefinition = definition as unknown as NonNullable<
-				SemanticHarness["decisionToolDefinition"]
-			>;
+			registeredTools.push(definition.name);
 		},
+		getThinkingLevel: () => "off",
 	} as unknown as ExtensionAPI;
 
 	const ctx = {
 		hasUI: options?.hasUI ?? true,
 		cwd: "/project",
 		isIdle: () => options?.isIdle?.() ?? !harness.streaming,
+		hasPendingMessages: () => pendingMessages,
 		isProjectTrusted: () => true,
-		sessionManager: { getSessionId: () => "main", getBranch: () => branch },
+		model: { provider: "fake", id: "local" },
+		modelRegistry: {},
+		sessionManager: {
+			getSessionId: () => "main",
+			getSessionFile: () => undefined,
+			getLeafId: () => branch.at(-1)?.id ?? null,
+			getBranch: () => branch,
+			buildContextEntries: () => branch,
+		},
 		ui: {
 			notify(message: string, level?: string): void {
 				notifications.push({ message, level });
@@ -351,7 +369,7 @@ function createSemanticHarness(options?: {
 		},
 	} as unknown as ExtensionContext;
 
-	runtime = createDecisionRuntime({
+	const runtime = createDecisionRuntime({
 		pi,
 		hub,
 		processDomain: options?.processDomain,
@@ -360,13 +378,15 @@ function createSemanticHarness(options?: {
 		injectedController: true,
 		initialConfig: config,
 		clock,
-		createExchangeId: () => "exchange-semantic",
+		createExchangeId: () => `exchange-semantic-${driver.operations.length + 1}`,
+		executePrivateDecision: driver.execute,
 	});
 	runtime.registerLifecycle();
 
 	harness.ctx = ctx;
 	harness.runtime = runtime;
 	harness.fire = async (name, event) => {
+		if (name === "agent_start") pendingMessages = false;
 		if (name === "message_start") {
 			await runtime.handleMessageStart(event as { readonly message: unknown });
 		}
@@ -380,59 +400,41 @@ function createSemanticHarness(options?: {
 		}
 	};
 	harness.openDecision = async () => {
+		const index = driver.operations.length;
 		runtime.applyTransition(controller.lock(), undefined, {
 			suppressNotify: true,
 		});
 		runtime.reconcileIdle();
 		clock.fire(clock.records.length - 1);
-		for (
-			let attempt = 0;
-			attempt < 50 && lastDecisionMessage === null;
-			attempt += 1
-		) {
-			await Promise.resolve();
-		}
+		await awaitPrivateOperation(driver, { index });
 		await harness.startDecision();
 	};
 	harness.startDecision = async () => {
-		assert.ok(lastDecisionMessage, "expected dispatched decision message");
-		if (startedDecisionDetails === lastDecisionMessage.details) return;
-		harness.streaming = true;
-		await harness.fire("agent_start", { type: "agent_start" });
-		await harness.fire("message_start", {
-			type: "message_start",
-			message: {
-				role: "custom",
-				customType: lastDecisionMessage.customType,
-				details: lastDecisionMessage.details,
-			},
+		const previous = driver.current;
+		await awaitPrivateOperation(driver, {
+			index: previous?.settled
+				? driver.operations.length
+				: Math.max(0, driver.operations.length - 1),
 		});
-		// The provider-bound context projection carrying this attempt's exact
-		// prompt: the consumption evidence required before any result can act.
-		await harness.fire("context", {
-			type: "context",
-			messages: [
-				{
-					role: "custom",
-					customType: lastDecisionMessage.customType,
-					content: [{ type: "text", text: "decision prompt body" }],
-					details: lastDecisionMessage.details,
-					timestamp: Date.now(),
-				},
-			],
-		});
-		startedDecisionDetails = lastDecisionMessage.details;
+		await awaitPrivatePrompt(driver);
+		assert.equal(
+			harness.streaming,
+			false,
+			"private generation leaves main idle",
+		);
+		assert.equal(ctx.isIdle(), true);
+		assert.deepEqual(registeredTools, [], "no decision-result tool registered");
+		assert.equal(sentTypes.includes("pi-continue-watchdog:inquiry"), false);
+		assert.equal(driver.forkInputs.at(-1)?.parent, ctx.sessionManager);
+		assert.equal(driver.forkInputs.at(-1)?.model, "fake/local:off");
 	};
-	harness.answerContinue = () => cwCall(continueArgs());
+	harness.answerContinue = () => JSON.stringify(continueArgs());
 	harness.answerWait = (waitSeconds = 30, reason = "Waiting for automation.") =>
-		cwCall(waitArgs(waitSeconds, reason));
+		JSON.stringify(waitArgs(waitSeconds, reason));
 	harness.answerUnlock = (
 		reason = "All requested work is complete.",
 		reasonType = "JOB_DONE",
-	) => cwCall(unlockArgs(reasonType, reason));
-	harness.decisionToolDefinition = null;
-	harness.submitDecisionTool = async (toolCallId, args) =>
-		harness.decisionToolDefinition?.execute(toolCallId, args);
+	) => JSON.stringify(unlockArgs(reasonType, reason));
 	harness.snapshotController = () => ({
 		locked: controller.snapshot.locked,
 		exhausted: controller.snapshot.exhausted,
@@ -446,8 +448,9 @@ function createSemanticHarness(options?: {
 async function waitForPendingConfirm(
 	fence: ReturnType<typeof deferredDomain>,
 ): Promise<void> {
-	for (let attempt = 0; attempt < 50 && !fence.hasPending(); attempt += 1) {
-		await new Promise<void>((resolve) => setImmediate(resolve));
+	for (let attempt = 0; attempt < 2000 && !fence.hasPending(); attempt += 1) {
+		// Private decision finalization follows real filesystem work.
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
 	}
 	assert.equal(
 		fence.hasPending(),
@@ -460,7 +463,7 @@ async function startIdle(harness: SemanticHarness): Promise<void> {
 	await harness.fire("session_start", { type: "session_start" });
 }
 
-/** agent_settled itself is the authoritative finalization boundary. */
+/** Observe ordinary main settlement; never substitute for private completion. */
 async function settleOnly(harness: SemanticHarness): Promise<void> {
 	await harness.fire("agent_settled", { type: "agent_settled" });
 	await Promise.resolve();
@@ -469,30 +472,19 @@ async function settleOnly(harness: SemanticHarness): Promise<void> {
 
 async function settleResponse(
 	harness: SemanticHarness,
-	message: unknown,
+	write?: string,
 ): Promise<void> {
 	await harness.startDecision();
-	// Mirror Pi ordering: message_end preflight, then the reserved call's
-	// execute stages the verdict, then agent_end carries the terminal message.
-	await harness.fire("message_end", message);
-	const content =
-		message !== null &&
-		typeof message === "object" &&
-		Array.isArray((message as { content?: unknown }).content)
-			? ((message as { content: unknown[] }).content as Array<
-					Record<string, unknown>
-				>)
-			: [];
-	for (const block of content) {
-		if (block.type !== "toolCall" || block.name !== "cw") continue;
-		await harness.submitDecisionTool(String(block.id), block.arguments);
+	harness.driver.respond(write === undefined ? {} : { write });
+	for (let attempt = 0; attempt < 2000; attempt += 1) {
+		if (harness.driver.current?.settled) {
+			await settlePrivateDecision(harness.driver);
+			return;
+		}
+		if (harness.driver.awaitingResponse) return;
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
 	}
-	await harness.fire("agent_end", {
-		type: "agent_end",
-		messages: [message],
-	});
-	harness.streaming = false;
-	await settleOnly(harness);
+	assert.fail("private response neither settled nor requested correction");
 }
 
 function assertFrozenEnvelope(envelope: SemanticHookEnvelope): void {
@@ -593,13 +585,19 @@ test("AI decision unlock publishes exact validated reasonType and reason once at
 	assert.equal(harness.received.length, 1);
 });
 
-test("exhausted and decisionFailed publish exact STOP_KIND envelopes once", async () => {
+test("exhausted publishes exact STOP_KIND once after continuation settles", async () => {
 	const exhausted = createSemanticHarness({ config: { maxContinue: 1 } });
 	await startIdle(exhausted);
 	await exhausted.openDecision();
 	await settleResponse(exhausted, exhausted.answerContinue());
 	assert.equal(exhausted.received[0]?.name, "watchdog-continued");
 	assert.equal(exhausted.snapshotController().exhausted, true);
+	assert.equal(exhausted.ctx.hasPendingMessages(), true);
+	assert.deepEqual(
+		exhausted.received.map((envelope) => envelope.name),
+		["watchdog-continued"],
+		"EXHAUSTED must wait for queued continuation work to settle",
+	);
 	// Continue turn settles into terminal exhausted idle.
 	exhausted.streaming = true;
 	await exhausted.fire("agent_start", { type: "agent_start" });
@@ -632,15 +630,14 @@ test("exhausted and decisionFailed publish exact STOP_KIND envelopes once", asyn
 			.length,
 		1,
 	);
+});
 
+test("decisionFailed publishes exact STOP_KIND once after three private responses", async () => {
 	const failed = createSemanticHarness();
 	await startIdle(failed);
 	await failed.openDecision();
 	for (let attempt = 0; attempt < 3; attempt += 1) {
-		await settleResponse(
-			failed,
-			assistant([{ type: "text", text: "done" }], "stop"),
-		);
+		await settleResponse(failed);
 	}
 	assert.equal(failed.snapshotController().decisionFailed, true);
 	assert.equal(failed.received.length, 1);
@@ -676,11 +673,13 @@ test("retired wait submissions publish no waiting hook and charge no attempt", a
 		false,
 	);
 	assert.equal(harness.sentTypes.includes("pi-continue-watchdog:wait"), false);
-	// The retired wait is one invalid response: its re-ask stays internal.
-	const decisionCount = harness.sentTypes.filter(
-		(type) => type === "pi-continue-watchdog:inquiry",
-	).length;
-	assert.ok(decisionCount >= 1);
+	// Retired wait consumes one private response; correction stays in same child.
+	assert.equal(harness.driver.children.length, 1);
+	assert.equal(harness.driver.children[0]?.prompts.length, 2);
+	assert.equal(harness.driver.awaitingResponse, true);
+	assert.deepEqual(harness.sentTypes, []);
+	await harness.runtime.shutdown();
+	await settlePrivateDecision(harness.driver);
 });
 
 test("three retired wait submissions decision-fail without any waiting hook", async () => {
@@ -690,6 +689,10 @@ test("three retired wait submissions decision-fail without any waiting hook", as
 	for (let attempt = 0; attempt < 3; attempt += 1) {
 		await settleResponse(harness, harness.answerWait(30, "Waiting for CI."));
 	}
+	assert.equal(harness.driver.children.length, 1);
+	assert.equal(harness.driver.children[0]?.prompts.length, 3);
+	assert.deepEqual(harness.driver.children[0]?.fileStates, ["{}", "{}", "{}"]);
+	assert.equal(harness.driver.awaitingResponse, false);
 	assert.equal(harness.snapshotController().decisionFailed, true);
 	assert.equal(harness.snapshotController().attempt, 0);
 	assert.equal(
@@ -846,10 +849,91 @@ test("continue shared-fold failure publishes no hook and dispatches no continuat
 	assert.equal(harness.received.length, 0);
 	assert.deepEqual(harness.sentTypes.slice(sentBefore), [
 		"pi-continue-watchdog:inquiry-fold",
-		"pi-continue-watchdog:inquiry-fold",
 	]);
+	// Failed outcome has no receipt; private work needs no parent cleanup fold.
+	assert.equal(harness.driver.children[0]?.disposed, true);
 	assert.equal(harness.controller.snapshot.locked, false);
 	assert.equal(harness.controller.snapshot.attempt, 0);
+});
+
+test("private correction publishes only final file-owned outcome without parent prompt traffic", async () => {
+	const harness = createSemanticHarness();
+	await startIdle(harness);
+	await harness.openDecision();
+	await settleResponse(harness, "private invalid body: do not publish");
+	assert.deepEqual(harness.received, []);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	await settleResponse(
+		harness,
+		harness.answerUnlock("Need approval.", "wait_user"),
+	);
+	assert.equal(harness.driver.children.length, 1);
+	assert.equal(harness.driver.children[0]?.prompts.length, 2);
+	assert.deepEqual(harness.driver.children[0]?.fileStates, ["{}", "{}"]);
+	assert.deepEqual(harness.received, [
+		{
+			version: 1,
+			name: "user-ready",
+			values: {
+				STOP_KIND: "AI_UNLOCK",
+				REASON_TYPE: "WAIT_USER",
+				REASON: "Need approval.",
+			},
+		},
+	]);
+	const parentHistory = JSON.stringify(harness.ctx.sessionManager.getBranch());
+	assert.equal(parentHistory.includes("private invalid body"), false);
+	assert.equal(parentHistory.includes("watchdog_result_file"), false);
+	for (const input of harness.driver.forkInputs) {
+		assert.equal(parentHistory.includes(input.resultFile), false);
+	}
+	assert.equal(
+		harness.sentTypes.includes("pi-continue-watchdog:inquiry"),
+		false,
+	);
+	await settleOnly(harness);
+	assert.equal(harness.received.length, 1);
+});
+
+test("continued hook requires actual parent receipt and absent publication refunds budget", async () => {
+	const harness = createSemanticHarness({
+		sendWithoutReceipt: "pi-continue-watchdog:inquiry-fold",
+	});
+	await startIdle(harness);
+	await harness.openDecision();
+	await settleResponse(harness, harness.answerContinue());
+	assert.deepEqual(harness.sentTypes, ["pi-continue-watchdog:inquiry-fold"]);
+	assert.deepEqual(harness.received, []);
+	// Void send return is not persistence. A real main lifecycle observation
+	// confirms absence and rolls the charge back without a continued hook.
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.fire("agent_end", {
+		type: "agent_end",
+		messages: [assistant([{ type: "text", text: "ordinary work" }])],
+	});
+	harness.streaming = false;
+	await settleOnly(harness);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.deepEqual(harness.received, []);
+});
+
+test("AI unlock hook waits for exact human status receipt, not only valid private file", async () => {
+	const harness = createSemanticHarness({ appendThrows: AI_UNLOCK_ENTRY_TYPE });
+	await startIdle(harness);
+	await harness.openDecision();
+	await settleResponse(
+		harness,
+		harness.answerUnlock("Need approval.", "WAIT_USER"),
+	);
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.driver.current?.settled, true);
+	assert.deepEqual(harness.sentTypes, ["pi-continue-watchdog:inquiry-fold"]);
+	assert.deepEqual(harness.received, []);
+	await settleOnly(harness);
+	assert.deepEqual(harness.received, []);
+	await harness.runtime.shutdown();
 });
 
 test("accepted continue publishes its typed reason while unlock-free idle stays quiet", async () => {
@@ -895,7 +979,7 @@ test("accepted continue publishes its typed reason while unlock-free idle stays 
 	await continued.openDecision();
 	await settleResponse(
 		continued,
-		cwCall(continueArgs("verifying", "Tests still need to run.")),
+		JSON.stringify(continueArgs("verifying", "Tests still need to run.")),
 	);
 	assert.deepEqual(continued.received, [
 		{
@@ -959,24 +1043,19 @@ test("AI unlock intent is retained until publication confirmation succeeds", asy
 	await startIdle(harness);
 	fence.setDeferred(false);
 	await harness.openDecision();
-	for (
-		let attempt = 0;
-		attempt < 100 && harness.sentTypes.length === 0;
-		attempt += 1
-	) {
-		await new Promise<void>((resolve) => setImmediate(resolve));
-	}
-	assert.equal(harness.sentTypes.length, 1);
+	assert.deepEqual(
+		harness.sentTypes,
+		[],
+		"private prompt never reaches parent",
+	);
+	assert.equal(harness.driver.awaitingResponse, true);
 	fence.setDeferred(true);
 
-	// Finalization's first fence succeeds; publication's fence remains pending.
-	await harness.fire("agent_end", {
-		type: "agent_end",
-		messages: [harness.answerUnlock("Need approval.", "WAIT_USER")],
+	// File result crosses finalization's fence while main stays idle; publication
+	// then waits at its independent domain confirmation.
+	harness.driver.respond({
+		write: harness.answerUnlock("Need approval.", "WAIT_USER"),
 	});
-	harness.streaming = false;
-	const settling = harness.fire("agent_settled", { type: "agent_settled" });
-	await new Promise<void>((resolve) => setImmediate(resolve));
 	// Resolve deferred finalization confirmations while local Pi remains idle,
 	// stopping as soon as the unlock has committed. The next pending confirmation
 	// is therefore publication C2 and must remain unresolved here.
@@ -1000,7 +1079,7 @@ test("AI unlock intent is retained until publication confirmation succeeds", asy
 	}).attachment;
 	harness.hub.markBusy(child);
 	fence.resolve(true);
-	await settling;
+	await settlePrivateDecision(harness.driver);
 	assert.equal(harness.received.length, 0);
 
 	// That AI's later idle edge with immediate confirmation publishes once.
@@ -1049,17 +1128,56 @@ test("main-only ownership, stale demotion, and reload/shutdown publish nothing",
 	const reloaded = createSemanticHarness();
 	await startIdle(reloaded);
 	await reloaded.openDecision();
-	// Shutdown before settle clears ownership generation bookkeeping.
-	reloaded.runtime.shutdown();
-	await reloaded.fire("agent_end", {
-		type: "agent_end",
-		messages: [reloaded.answerUnlock("will reload", "JOB_DONE")],
+	// Shutdown revokes exact child's authority before a queued valid file wins.
+	reloaded.driver.respond({
+		write: reloaded.answerUnlock("will reload", "JOB_DONE"),
 	});
+	await reloaded.runtime.shutdown();
+	const cancelled = await settlePrivateDecision(reloaded.driver);
+	assert.equal(cancelled?.kind, "cancelled");
+	assert.equal(reloaded.driver.children[0]?.aborted, true);
+	assert.equal(reloaded.driver.children[0]?.disposed, true);
 	// Shutdown stops lifecycle; settled handlers may still run but must not publish.
 	const timersBefore = reloaded.clock.records.length;
 	await reloaded.fire("agent_settled", { type: "agent_settled" });
 	assert.equal(reloaded.clock.records.length, timersBefore);
 	assert.equal(reloaded.received.length, 0);
+});
+
+test("stale private owner or source cannot publish a hook from an otherwise valid file", async () => {
+	for (const invalidation of ["owner", "source"] as const) {
+		const harness = createSemanticHarness({ hasUI: false });
+		await startIdle(harness);
+		await harness.openDecision();
+		const child = harness.driver.children[0];
+		assert.ok(child);
+		harness.driver.respond({ write: harness.answerUnlock("stale verdict") });
+		if (invalidation === "owner") {
+			harness.hub.bind({
+				instance: createHubAttachmentInstance(),
+				sessionId: "replacement-main",
+				hasUI: true,
+				initialBusy: false,
+			});
+			assert.equal(harness.runtime.isCurrentMain(), false);
+		} else {
+			harness.ctx.sessionManager.getBranch().push({
+				id: "external-source-change",
+				parentId: harness.ctx.sessionManager.getLeafId(),
+				timestamp: new Date().toISOString(),
+				type: "message",
+				message: { role: "user", content: "New work.", timestamp: Date.now() },
+			});
+		}
+		const result = await settlePrivateDecision(harness.driver);
+		assert.equal(result?.kind, "cancelled", invalidation);
+		assert.equal(child.aborted, true, invalidation);
+		assert.equal(child.disposed, true, invalidation);
+		assert.equal(harness.controller.snapshot.attempt, 0, invalidation);
+		assert.deepEqual(harness.received, [], invalidation);
+		assert.deepEqual(harness.sentTypes, [], invalidation);
+		await harness.runtime.shutdown();
+	}
 });
 
 test("absent and throwing consumers leave controller and results unchanged", async () => {
@@ -1180,8 +1298,7 @@ function aiUnlockCount(received: readonly SemanticHookEnvelope[]): number {
 
 test("pending AI unlock intent is cleared by external lock/ownership transitions", async () => {
 	// Human/manual unlock seam: controller unlock first, then operational cleanup.
-	// Canonical abort uses the same post-transition cleanup seam; the semantic
-	// harness has no sessionManager branch surface for a full abort capture.
+	// Same cleanup seam clears pending hook authority after manual abort.
 	{
 		const { harness, child } = await establishPendingAiUnlock(
 			"pending then human unlock",

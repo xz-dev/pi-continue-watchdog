@@ -590,7 +590,7 @@ test("native summary seam records serialized provider requests", {
 }, async (t) => {
 	const fixture = await makePackedFixture(t);
 	const { baseUrl, requests } = await startMockServer(t);
-	assert.equal(HOST_VERSION, "0.85.1", "pinned host version recorded");
+	assert.equal(HOST_VERSION, "1.3.0", "pinned host version recorded");
 
 	const sm = SessionManager.inMemory(fixture.cwd);
 	userEntry(sm, "Implement the widget task.", 1);
@@ -854,7 +854,7 @@ test("automatic split-turn compaction projects both regions", {
 	// never reached the provider rather than a missing case.
 	assert.ok(
 		!autoRequests.some((request) =>
-			messageText(request).includes("PREFIX of a turn"),
+			messageText(request).includes("Later messages are stored separately"),
 		),
 		"emptied owned turn-prefix produced no prefix request",
 	);
@@ -1227,7 +1227,7 @@ test("owned continue fold inside a split prefix preserves ordinary prefix work",
 	const prefixRequest = requests
 		.slice(before)
 		.map(messageText)
-		.find((text) => text.includes("PREFIX of a turn"));
+		.find((text) => text.includes("Later messages are stored separately"));
 	assert.ok(
 		prefixRequest,
 		"non-empty replacement produced a real turn-prefix request",

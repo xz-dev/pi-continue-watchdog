@@ -3,14 +3,21 @@ import { isDeepStrictEqual } from "node:util";
 
 import {
 	type AgentEndEvent,
+	convertToLlm,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
 	getAgentDir,
 	type InputEvent,
 	type MessageEndEvent,
+	sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+	Key,
+	matchesKey,
+	truncateToWidth,
+	visibleWidth,
+} from "@earendil-works/pi-tui";
 import { probePiAgentState } from "pi-extension-utils/pi-agent-state";
 import {
 	createInquiryRuntime,
@@ -18,6 +25,7 @@ import {
 	type InquiryFoldMessage,
 } from "pi-extension-utils/pi-inquiry";
 import { PreemptTakeover } from "pi-extension-utils/preempt-takeover";
+import { createWatchdogRuntime } from "watchdog-subagents-runtime/watchdog-runtime";
 
 import {
 	type ActivityGeneration,
@@ -41,6 +49,7 @@ import {
 	findCancelledContinuationAssistantEntryId,
 	findDecisionAssistantEntryId,
 	findPreemptedDecisionAssistantEntryIds,
+	foldDecisionContext,
 	INQUIRY_MARKER_ENTRY_TYPE,
 	markerDetails,
 	neutralizeDecisionAssistant,
@@ -54,25 +63,23 @@ import {
 	type LockDecisionController,
 } from "./controller.js";
 import {
+	buildDecisionFilePrompt,
+	buildDecisionFileReaskPrompt,
 	buildDecisionPrompt,
 	buildDecisionReaskPrompt,
 	createDecisionProtocolSession,
-	DECISION_TOOL_BLOCK_REASON,
 	DECISION_TOOL_NAME,
 	type DecisionProtocolPlan,
 	type DecisionProtocolSession,
 	type DecisionValidation,
 	formatDecisionFailedNotification,
+	isWaitCallbackReasonType,
 	MALFORMED_DECISION_RESPONSE_ERROR,
 	MISSING_DECISION_CALL_ERROR,
 	normalizeAssistantDecisionResponse,
+	type ValidDecision,
 	validateDecisionArguments,
 } from "./decision-protocol.js";
-import {
-	createDecisionToolDefinition,
-	type DecisionToolHost,
-	registerDecisionTool,
-} from "./decision-tool.js";
 import type { FatalExitAdapter } from "./fatal-exit.js";
 import type {
 	HubAttachment,
@@ -80,6 +87,7 @@ import type {
 	HubMainClaim,
 	ObservableAgentHub,
 } from "./hub.js";
+import { runPrivateDecision } from "./private-decision.js";
 import {
 	type DomainFence,
 	isProcessDomainFatalError,
@@ -177,6 +185,13 @@ interface ActiveDecision {
 	readonly claim: HubMainClaim;
 	protocol: DecisionProtocolSession;
 	readonly domainFence: DomainFence;
+	privateRun?: {
+		readonly abort: AbortController;
+		completed: boolean;
+		isCurrent?: () => boolean;
+		sessionId?: string;
+		inquiry?: "initial" | "reconsideration";
+	};
 	inquiry: InquiryAttemptHandle;
 	aggregateGeneration: ActivityGeneration;
 	invalidated: boolean;
@@ -210,7 +225,7 @@ interface ActiveDecision {
 	 */
 	readonly logicalRootExchangeId: string;
 	/** True when this inquiry is the single permitted semantic reconsideration. */
-	readonly isReconsideration: boolean;
+	isReconsideration: boolean;
 	/** Review disposition of the superseded candidate, for audit/history. */
 	readonly challengedByReview?: UnlockReviewRecord;
 	/** Challenge feedback text carried by this reconsideration inquiry. */
@@ -360,6 +375,8 @@ export interface DecisionRuntimeOptions {
 	 * leave this unset so call-time `getJudgmentService()` discovery runs.
 	 */
 	readonly reviewService?: import("./unlock-review.js").ReviewServiceLike;
+	/** Lifecycle-test seam; production always uses the private file operation. */
+	readonly executePrivateDecision?: typeof runPrivateDecision;
 }
 
 export type WatchdogTriggerBlocker =
@@ -535,6 +552,8 @@ export function createDecisionRuntime(
 	let localAiBusy = true;
 	let stopped = false;
 	let activeDecision: ActiveDecision | null = null;
+	let privateRuntime: ReturnType<typeof createWatchdogRuntime> | null = null;
+	let unsubscribeTerminalInput: (() => void) | undefined;
 	let selfDecisionRun: SelfDecisionRun = { kind: "none" };
 	/** Suppress an aborted internal decision after user takeover or domain failure. */
 	let suppressDecisionAbort = false;
@@ -951,6 +970,10 @@ export function createDecisionRuntime(
 		active: ActiveDecision,
 		watchdogOutcome: "invalidated" | "preempted" = "invalidated",
 	): InquiryFoldMessage | null => {
+		if (active.privateRun !== undefined) {
+			active.privateRun.abort.abort();
+			return null;
+		}
 		const fold = active.inquiry.cancel();
 		if (fold === null) return null;
 		pendingInquiryCleanup = {
@@ -1187,11 +1210,14 @@ export function createDecisionRuntime(
 			active !== null &&
 			!active.invalidated &&
 			active.submitted &&
-			active.contextConfirmed &&
 			quarantinedDecision === null &&
 			owns(active.claim) &&
-			selfDecisionRun.kind === "confirmed" &&
-			selfRunFor(active)
+			(active.privateRun !== undefined
+				? active.privateRun.completed &&
+					active.privateRun.isCurrent?.() === true
+				: active.contextConfirmed &&
+					selfDecisionRun.kind === "confirmed" &&
+					selfRunFor(active))
 			? active
 			: null;
 	};
@@ -1244,7 +1270,7 @@ export function createDecisionRuntime(
 		// generation/ownership replacement still takes the invalidation path.
 		if (
 			cleanupOutcome === undefined &&
-			active.isReconsideration &&
+			(active.isReconsideration || active.privateRun?.completed === true) &&
 			pending?.active === active &&
 			pending.cycleId === active.protocol.currentCycleId &&
 			pending.plan.outcome !== "ignored" &&
@@ -1254,6 +1280,7 @@ export function createDecisionRuntime(
 		) {
 			return;
 		}
+		active.privateRun?.abort.abort();
 		// Do not preserve a phase across a lifecycle/currentness replacement.
 		if (
 			cleanupOutcome === "preempted" ||
@@ -1347,6 +1374,10 @@ export function createDecisionRuntime(
 		if (!owns(claim)) return;
 		let target: CancellationTarget | null = null;
 		const active = activeDecision;
+		if (active?.privateRun !== undefined) {
+			clearOperationalPendingWork();
+			return;
+		}
 		if (active?.submitted && owns(active.claim)) {
 			target = {
 				kind: "decision",
@@ -1737,7 +1768,11 @@ export function createDecisionRuntime(
 					sessionId: ctx.sessionManager.getSessionId(),
 					sessionFile: ctx.sessionManager.getSessionFile(),
 				});
-				return { prompt: `${decisionPrompt}\n\n${view.text}`, metadata };
+				return {
+					prompt: `${decisionPrompt}\n\n${view.text}`,
+					metadata,
+					supplement: view.text,
+				};
 			} catch {
 				if (owns(active.claim))
 					appendStatus({
@@ -1761,6 +1796,7 @@ export function createDecisionRuntime(
 			if (sendOptions?.deferOnBusy !== false) deferDecisionOnBusy(active);
 			return false;
 		}
+		active.reviewMetadata = review?.metadata ?? null;
 		try {
 			options.pi.appendEntry<InquiryMarkerEntry>(INQUIRY_MARKER_ENTRY_TYPE, {
 				version: 1,
@@ -1768,7 +1804,6 @@ export function createDecisionRuntime(
 				cycleId,
 				...(review === null ? {} : { review: review.metadata }),
 			});
-			active.reviewMetadata = review?.metadata ?? null;
 			active.markerEntryId = null;
 			active.promptEntryId = null;
 			if (ctx !== null) {
@@ -1792,35 +1827,355 @@ export function createDecisionRuntime(
 					// Optional association id stays unresolved.
 				}
 			}
-		} catch (error) {
-			active.dispatchPending = false;
-			throw error;
+		} catch {
+			try {
+				ctx?.ui.notify("Private decision history incomplete.", "warning");
+			} catch {
+				/* Optional association must not gate file execution. */
+			}
 		}
-		try {
-			const prompt = active.inquiry.prompt(
-				review === null ? decisionPrompt : review.prompt,
+		if (ctx === null)
+			throw new Error("A private decision requires its owning session.");
+		active.dispatchPending = false;
+		void startPrivateDecision(active, ctx, review?.supplement ?? "");
+		return true;
+	};
+
+	const startPrivateDecision = async (
+		active: ActiveDecision,
+		ctx: ExtensionContext,
+		supplement: string,
+	): Promise<void> => {
+		const operation = active.privateRun;
+		const controller = options.controllerHolder.controller;
+		if (operation === undefined || controller === null) return;
+		const sourceSession = ctx.sessionManager.getSessionId();
+		const sourceLeaf = ctx.sessionManager.getLeafId();
+		const sourceModel =
+			ctx.model === undefined
+				? undefined
+				: `${ctx.model.provider}/${ctx.model.id}`;
+		const sourceThinking = options.pi.getThinkingLevel();
+		const sourceCurrent = (): boolean => {
+			if (
+				sessionContext?.sessionManager.getSessionId() !== sourceSession ||
+				sourceLeaf === null
+			)
+				return false;
+			if (
+				(ctx.model === undefined
+					? undefined
+					: `${ctx.model.provider}/${ctx.model.id}`) !== sourceModel ||
+				options.pi.getThinkingLevel() !== sourceThinking
+			)
+				return false;
+			const branch = ctx.sessionManager.getBranch();
+			const index = branch.findIndex((entry) => entry.id === sourceLeaf);
+			// Context-excluded audit/usage metadata is not a new model source.
+			return (
+				index >= 0 &&
+				branch
+					.slice(index + 1)
+					.every((entry) =>
+						sessionEntryToContextMessages(entry).every(
+							(message) => convertToLlm([message]).length === 0,
+						),
+					)
 			);
-			if (!active.inquiry.markSent()) {
-				return false;
+		};
+		const scopeCurrent = (): boolean =>
+			!stopped &&
+			activeDecision === active &&
+			!active.invalidated &&
+			!operation.abort.signal.aborted &&
+			owns(active.claim) &&
+			options.controllerHolder.controller === controller &&
+			controller.snapshot.decisionOpen &&
+			activeGenerationCurrent(active) &&
+			sourceCurrent();
+		const current = (): boolean =>
+			scopeCurrent() && allIdleForClaim(active.claim);
+		operation.isCurrent = () =>
+			operation.completed ? scopeCurrent() : current();
+		let historyWarned = false;
+		const audit = (type: string, data: Record<string, unknown>): void => {
+			try {
+				options.pi.appendEntry(type, data);
+			} catch {
+				if (!historyWarned) {
+					historyWarned = true;
+					try {
+						ctx.ui.notify("Private decision history incomplete.", "warning");
+					} catch {
+						/* Optional history never gates execution. */
+					}
+				}
 			}
-			options.pi.sendMessage(prompt, {
-				triggerTurn: true,
-				deliverAs: "steer",
+		};
+		const planFor = (decision: ValidDecision): DecisionProtocolPlan =>
+			decision.kind === "continue"
+				? {
+						outcome: "continue",
+						cycleId: active.protocol.currentCycleId,
+						reasonType: decision.reasonType,
+						reason: decision.reason,
+					}
+				: {
+						outcome: "unlock",
+						cycleId: active.protocol.currentCycleId,
+						reasonType: decision.reasonType,
+						reason: decision.reason,
+						callback: isWaitCallbackReasonType(decision.matchedReasonType),
+					};
+		let macro: UnlockReviewProjection | undefined;
+		if (config.unlockReviewEnabled) {
+			try {
+				macro = buildUnlockReviewProjection(
+					ctx.sessionManager.buildContextEntries(),
+				);
+			} catch {
+				/* Incomplete review releases the current candidate. */
+			}
+		}
+		let reviewDisposition:
+			| "supported"
+			| "challenged"
+			| "incomplete"
+			| undefined;
+		try {
+			if (!ctx.model)
+				throw new Error("The main session has no selected model.");
+			privateRuntime ??= createWatchdogRuntime();
+			const result = await (
+				options.executePrivateDecision ?? runPrivateDecision
+			)({
+				runtime: privateRuntime,
+				fork: {
+					parent: ctx.sessionManager,
+					parentProviderRegistry: ctx.modelRegistry,
+					cwd: ctx.cwd,
+					model: `${ctx.model.provider}/${ctx.model.id}:${options.pi.getThinkingLevel()}`,
+					signal: operation.abort.signal,
+					projectContext: (messages) => foldDecisionContext(messages),
+				},
+				reasonTypes: config.reasonTypes,
+				continueReasonTypes: config.continueReasonTypes,
+				signal: operation.abort.signal,
+				isCurrent: current,
+				prompt: (file, feedback) =>
+					buildDecisionFilePrompt(
+						config.decisionPrompt,
+						config.reasonTypes,
+						config.continueReasonTypes,
+						file,
+					) +
+					(supplement ? `\n\n${supplement}` : "") +
+					(feedback ? `\n\n${feedback}` : ""),
+				correction: (error, file) =>
+					buildDecisionFileReaskPrompt(
+						config.decisionPrompt,
+						config.reasonTypes,
+						config.continueReasonTypes,
+						file,
+						error,
+					),
+				onStarted: ({ inquiry, sessionId }) => {
+					if (!current()) return;
+					if (
+						(operation.sessionId !== undefined &&
+							operation.sessionId !== sessionId) ||
+						(inquiry === "initial" && operation.inquiry !== undefined) ||
+						(inquiry === "reconsideration" && operation.inquiry !== "initial")
+					) {
+						deferDecisionOnBusy(active);
+						return;
+					}
+					operation.sessionId = sessionId;
+					operation.inquiry = inquiry;
+					active.isReconsideration = inquiry === "reconsideration";
+					active.submitted = true;
+					controller.restoreInvalidDecisionAttempts(active.decisionId, 0, null);
+					audit("pi-continue-watchdog:private-decision", {
+						version: 1,
+						exchangeId: active.exchangeId,
+						childSessionId: sessionId,
+						cycleId: active.protocol.currentCycleId,
+						inquiry,
+						phase: "started",
+						sourceView: supplement,
+						...(active.reviewMetadata === null
+							? {}
+							: { review: active.reviewMetadata }),
+					});
+				},
+				onResponse: (observation) => {
+					if (!current()) return;
+					if (
+						observation.sessionId !== operation.sessionId ||
+						observation.inquiry !== operation.inquiry
+					) {
+						deferDecisionOnBusy(active);
+						return;
+					}
+					if (observation.outcome.kind === "invalid" && observation.attempt < 3)
+						controller.restoreInvalidDecisionAttempts(
+							active.decisionId,
+							observation.attempt,
+							observation.outcome.error,
+						);
+					audit("pi-continue-watchdog:private-response", {
+						version: 1,
+						exchangeId: active.exchangeId,
+						cycleId: active.protocol.currentCycleId,
+						...observation,
+					});
+				},
+				review: config.unlockReviewEnabled
+					? async (candidate) => {
+							if (!current() || candidate.kind !== "unlock") return undefined;
+							const discovery =
+								options.reviewService !== undefined
+									? {
+											status: "available" as const,
+											service: options.reviewService,
+										}
+									: discoverUnlockReviewService();
+							const base = {
+								version: 1,
+								projectionVersion: UNLOCK_REVIEW_PROJECTION_VERSION,
+								exchangeId: active.exchangeId,
+								cycleId: active.protocol.currentCycleId,
+								childSessionId: operation.sessionId,
+							};
+							if (discovery.status !== "available" || macro === undefined) {
+								const reason =
+									discovery.status === "available" ? "error" : discovery.status;
+								reviewDisposition = "incomplete";
+								warnReviewSkipped(ctx, reason);
+								audit(UNLOCK_REVIEW_ENTRY_TYPE, {
+									...base,
+									outcome: "incomplete",
+									incompleteReason: reason,
+								});
+								return undefined;
+							}
+							const plan = planFor(candidate);
+							if (plan.outcome !== "unlock") return undefined;
+							const state: PendingUnlockReview = {
+								active,
+								cycleId: active.protocol.currentCycleId,
+								plan,
+								abort: operation.abort,
+								settled: false,
+							};
+							pendingUnlockReview = state;
+							const report = await runUnlockReview(
+								discovery.service,
+								buildUnlockReviewRequest(macro, {
+									action: "unlock",
+									reasonType: candidate.reasonType,
+									reason: candidate.reason,
+								}),
+								operation.abort.signal,
+							);
+							state.settled = true;
+							if (pendingUnlockReview === state) pendingUnlockReview = null;
+							if (!current()) return undefined;
+							reviewDisposition =
+								report.outcome.kind === "challenged"
+									? "challenged"
+									: report.outcome.kind === "supported"
+										? "supported"
+										: "incomplete";
+							if (report.outcome.kind === "incomplete")
+								warnReviewSkipped(ctx, report.outcome.reason);
+							audit(UNLOCK_REVIEW_ENTRY_TYPE, {
+								...base,
+								outcome: reviewDisposition,
+								...(report.outcome.kind === "incomplete"
+									? { incompleteReason: report.outcome.reason }
+									: {}),
+								backend: report.backend,
+								model: report.model,
+								attemptCount: report.attemptCount,
+								observationCoverage: report.observationCoverage,
+								usage: report.usage,
+							});
+							return report.outcome.kind === "challenged"
+								? `An independent reviewer challenged your previous unlock (${candidate.reasonType}: ${candidate.reason}). The reviewer's challenge is an opinion, not new evidence or a user decision; it may be wrong. Recheck the original permitted facts, then write the replacement result under the same file contract. The reviewer does not choose your action.`
+								: undefined;
+						}
+					: undefined,
 			});
-			if (hasPendingMessages() || !activeGenerationCurrent(active)) {
-				if (sendOptions?.deferOnBusy !== false) deferDecisionOnBusy(active);
-				return false;
+			if (!scopeCurrent()) {
+				if (
+					activeDecision === active &&
+					!active.invalidated &&
+					owns(active.claim)
+				)
+					deferDecisionOnBusy(active);
+				return;
 			}
-			return true;
-		} catch (error) {
-			active.dispatchPending = false;
-			if (!allIdleForClaim(active.claim)) {
-				// Final TOCTOU: Pi or an observable child became busy. Silent defer.
-				if (sendOptions?.deferOnBusy !== false) deferDecisionOnBusy(active);
-				return false;
+			if (result.kind === "cancelled") {
+				deferDecisionOnBusy(active);
+				return;
 			}
-			// Genuine dispatch failure while still idle: fail closed with evidence.
-			throw error;
+			if (result.kind === "execution-error")
+				throw new Error("Private decision execution failed.");
+			if (
+				!active.submitted ||
+				result.sessionId !== operation.sessionId ||
+				result.reconsidered !== (operation.inquiry === "reconsideration")
+			)
+				throw new Error("Private decision owner mismatch.");
+			operation.completed = true;
+			let plan: DecisionProtocolPlan;
+			if (result.kind === "decision-failed") {
+				controller.restoreInvalidDecisionAttempts(
+					active.decisionId,
+					2,
+					result.error,
+				);
+				plan = {
+					outcome: "invalid",
+					cycleId: active.protocol.currentCycleId,
+					error: result.error,
+				};
+			} else {
+				const validation = validateDecisionArguments(
+					{
+						action: result.decision.kind,
+						reason_type: result.decision.matchedReasonType,
+						reason_content: result.decision.reason,
+					},
+					config.reasonTypes,
+					config.continueReasonTypes,
+				);
+				if (!validation.valid)
+					throw new Error(
+						"The private decision no longer satisfies the active reason policy.",
+					);
+				plan = planFor(validation.decision);
+			}
+			pendingFinalization = {
+				active,
+				cycleId: active.protocol.currentCycleId,
+				plan,
+				reconsidered: result.reconsidered,
+				reviewSettled: true,
+				reviewDisposition,
+			};
+			await deliverPending(ctx);
+			await maybePublishUserReady();
+		} catch {
+			if (activeDecision !== active || !owns(active.claim)) return;
+			appendStatus({
+				kind: "other-error",
+				exchangeId: active.exchangeId,
+				cycleId: active.protocol.currentCycleId,
+				message: "Private decision execution failed; no outcome was accepted.",
+			});
+			silentlyAbandonDecision();
 		}
 	};
 
@@ -1907,6 +2262,7 @@ export function createDecisionRuntime(
 			exchangeId,
 			claim,
 			domainFence,
+			privateRun: { abort: new AbortController(), completed: false },
 			inquiry: createInquiryRuntime(DECISION_INQUIRY_NAMESPACE, {
 				inquiryId: exchangeId,
 			}).attempt(protocol.currentCycleId),
@@ -2441,92 +2797,6 @@ export function createDecisionRuntime(
 	};
 
 	/** Check attempt and recorded call identity before validating arguments. */
-	const submitDecisionResult = (call: {
-		readonly toolCallId: string;
-		readonly argumentsValue: unknown;
-	}): ReturnType<DecisionToolHost["submitDecisionResult"]> => {
-		const active = currentConsumedDecision();
-		if (
-			active === null ||
-			pendingFinalization !== null ||
-			!active.responseToolCallIds.has(call.toolCallId)
-		) {
-			return { outcome: "unauthorized" };
-		}
-		if (active.stagedResult !== null) {
-			return { outcome: "duplicate" };
-		}
-		// Own inquiry activity makes the main run busy by design; do not require
-		// global idle here. Fresh ownership and activity are rechecked at
-		// settlement before any committed effect.
-		const validation = validateDecisionArguments(
-			call.argumentsValue,
-			config.reasonTypes,
-			config.continueReasonTypes,
-		);
-		active.stagedResult = {
-			toolCallId: call.toolCallId,
-			validation,
-		};
-		return {
-			outcome: "staged",
-			validation: validation.valid
-				? { valid: true }
-				: { valid: false, error: validation.error },
-		};
-	};
-
-	// Presentation-only ownership evidence: exact recorded call identity of the
-	// current owned decision attempt. Renderers use this to hide owned internal
-	// traffic; unauthorized ordinary calls never match and stay visible.
-	const isOwnedDecisionCall = (toolCallId: string): boolean => {
-		const active = activeDecision;
-		return (
-			active !== null &&
-			!active.invalidated &&
-			owns(active.claim) &&
-			active.responseToolCallIds.has(toolCallId)
-		);
-	};
-
-	const decisionToolHost: DecisionToolHost = {
-		submitDecisionResult,
-		isOwnedDecisionCall,
-	};
-
-	/**
-	 * Register the reserved decision function in the root process only. The
-	 * same named declaration is refreshed only when an existing lifecycle
-	 * config load changes its effective reason constraints; equal effective
-	 * constraints keep the original declaration, and no phase transition ever
-	 * adds, removes, or swaps tools. Re-registration of the same name updates
-	 * the shared declaration while preserving its active membership.
-	 */
-	let decisionToolConstraints: string | null = null;
-	const registerRuntimeDecisionTool = (): void => {
-		if (!isRootProcess()) return;
-		const constraints = JSON.stringify([
-			config.reasonTypes,
-			config.continueReasonTypes,
-		]);
-		if (decisionToolConstraints === constraints) return;
-		// Only an actual replacement preserves pre-refresh active membership
-		// (the allowlisted native refresh would otherwise reactivate a
-		// registered-but-disabled `cw`). Initial registration keeps the native
-		// membership behavior unchanged.
-		const replacing = decisionToolConstraints !== null;
-		decisionToolConstraints = constraints;
-		registerDecisionTool(
-			options.pi,
-			createDecisionToolDefinition(
-				decisionToolHost,
-				config.reasonTypes,
-				config.continueReasonTypes,
-			),
-			replacing ? { preserveActiveMembership: true } : undefined,
-		);
-	};
-
 	const acquireControl = (claim: HubMainClaim): void => {
 		if (stopped || !options.hub.isCurrentMain(claim)) return;
 		ownedClaim = claim;
@@ -2535,7 +2805,6 @@ export function createDecisionRuntime(
 			configReady = injectedController !== null;
 			if (configReady) {
 				options.onConfigReady?.(config);
-				registerRuntimeDecisionTool();
 			}
 			syncHubState();
 			return;
@@ -2571,7 +2840,6 @@ export function createDecisionRuntime(
 			options.controllerHolder.controller =
 				createLockDecisionController(config);
 			configReady = true;
-			registerRuntimeDecisionTool();
 			for (const diagnostic of loaded.diagnostics) {
 				if (!owns(claim)) {
 					dropControl();
@@ -2636,6 +2904,7 @@ export function createDecisionRuntime(
 		const active = activeDecision;
 		const controller = options.controllerHolder.controller;
 		if (active === null || active.invalidated || controller === null) return;
+		active.privateRun?.abort.abort();
 		if (pendingUnlockReview?.active === active) {
 			pendingUnlockReview.abort.abort();
 			pendingUnlockReview = null;
@@ -2650,7 +2919,10 @@ export function createDecisionRuntime(
 		) {
 			return;
 		}
-		if (active.submitted || selfRunFor(active)) {
+		if (
+			active.privateRun === undefined &&
+			(active.submitted || selfRunFor(active))
+		) {
 			// Invalidating the decision rejects its outcome, but an assistant run that
 			// has already started still belongs to this internal exchange. Retain only
 			// its redaction identity until message_end/agent_settled so stale XML cannot
@@ -2687,12 +2959,7 @@ export function createDecisionRuntime(
 			const active = activeDecision;
 			invalidateActiveDecision();
 			// A submitted check already spent a model response; say why it vanished.
-			if (
-				active !== null &&
-				active.invalidated &&
-				active.submitted &&
-				owns(active.claim)
-			)
+			if (active?.invalidated && active.submitted && owns(active.claim))
 				appendStatus({
 					kind: "other-error",
 					exchangeId: active.exchangeId,
@@ -3085,7 +3352,10 @@ export function createDecisionRuntime(
 		const defer = (): false => {
 			if (!current()) return discard();
 			refund();
-			if (!pending.active.isReconsideration) {
+			if (
+				!pending.active.isReconsideration &&
+				pending.active.privateRun?.completed !== true
+			) {
 				pending.active.invalidated = true;
 				if (pendingContinuationPublication === pending)
 					pendingContinuationPublication = null;
@@ -3214,6 +3484,7 @@ export function createDecisionRuntime(
 			return false;
 		}
 		const readyToFinalize = (): boolean =>
+			(active.privateRun?.isCurrent?.() ?? true) &&
 			activeGenerationCurrent(active) &&
 			owns(active.claim) &&
 			domainIdle() &&
@@ -3683,6 +3954,7 @@ export function createDecisionRuntime(
 		event: MessageEndEvent,
 		ctx?: ExtensionContext,
 	) => {
+		if (activeDecision?.privateRun !== undefined) return;
 		if (ctx !== undefined) {
 			retryInquiryCleanup();
 			observeLiveState(ctx, {
@@ -4126,7 +4398,7 @@ export function createDecisionRuntime(
 	const handleContextProjection = (event: {
 		readonly messages?: unknown;
 	}): void => {
-		if (stopped) return;
+		if (stopped || activeDecision?.privateRun !== undefined) return;
 		confirmContinuationPublication();
 		const active = activeDecision;
 		if (
@@ -4184,6 +4456,8 @@ export function createDecisionRuntime(
 
 	const registerLifecycle = (): void => {
 		options.pi.on("session_start", async (_event, ctx: ExtensionContext) => {
+			unsubscribeTerminalInput?.();
+			unsubscribeTerminalInput = undefined;
 			++lifecycleGeneration;
 			localActivityGeneration += 1;
 			sessionContext = ctx;
@@ -4245,6 +4519,30 @@ export function createDecisionRuntime(
 			// timers, dispatch, or staged actions. A read failure or unsupported
 			// record stays diagnostic; nothing is repaired, migrated, or staged.
 			reportReviewHistory(ctx);
+			if (ctx.mode === "tui" && sessionContext === ctx && !stopped) {
+				unsubscribeTerminalInput = ctx.ui.onTerminalInput((data) => {
+					const active = activeDecision;
+					if (
+						!matchesKey(data, Key.escape) ||
+						sessionContext !== ctx ||
+						stopped ||
+						active?.privateRun === undefined ||
+						active.privateRun.completed ||
+						active.invalidated ||
+						!owns(active.claim) ||
+						!probePiAgentState(ctx).idle
+					)
+						return undefined;
+					const controller = currentController(active.claim);
+					if (!controller?.snapshot.decisionOpen) return undefined;
+					// Native main Escape sees this session as idle. Revoke only the
+					// exact private operation; ordinary/main continuation keys pass through.
+					const transition = controller.unlock();
+					clearOperationalPendingWork();
+					applyTransition(transition, ctx, { claim: active.claim });
+					return { consume: true };
+				});
+			}
 		});
 
 		options.pi.on("agent_start", async (_event, ctx) => {
@@ -4255,6 +4553,8 @@ export function createDecisionRuntime(
 			// Defer the provisional decision so this run is never captured as the
 			// decision answer and never marked internal in the process domain.
 			const active = activeDecision;
+			if (active?.privateRun !== undefined)
+				deferDecisionOnBusy(active, "preempted");
 			if (
 				active !== null &&
 				!active.invalidated &&
@@ -4314,8 +4614,19 @@ export function createDecisionRuntime(
 		// Reissue it once after settlement, without reading private queues.
 		options.pi.on("input", (event, ctx) => {
 			const active = activeDecision;
-			if (event.source !== "interactive" && event.source !== "rpc") {
+			if (
+				active?.privateRun !== undefined &&
+				(event.source === "interactive" || event.source === "rpc")
+			) {
+				deferDecisionOnBusy(active, "preempted");
 				observeLiveState(ctx);
+				return { action: "continue" };
+			}
+			if (event.source !== "interactive" && event.source !== "rpc") {
+				observeLiveState(ctx, {
+					preserveGeneration:
+						active?.privateRun !== undefined && probePiAgentState(ctx).idle,
+				});
 				return;
 			}
 			if (pendingContinuationPublication?.confirmed === null)
@@ -4389,53 +4700,12 @@ export function createDecisionRuntime(
 			handleAgentEnd(event);
 		});
 
-		// While a decision is confirmed, only the reserved result function may
-		// execute. Unrelated tools are blocked before side effects; a malformed
-		// batch (zero, duplicate, or mixed calls) additionally terminates so no
-		// follow-up model request runs for a response counted once as invalid.
-		options.pi.on("tool_call", (event, ctx) => {
-			const toolCallId = (event as { readonly toolCallId?: unknown })
-				.toolCallId;
-			const toolName = (event as { readonly toolName?: unknown }).toolName;
-			observeLiveState(ctx, {
-				preserveGeneration: selfDecisionRun.kind !== "none",
-			});
-			if (quarantinedDecision !== null) {
-				return {
-					block: true,
-					reason: DECISION_TOOL_BLOCK_REASON,
-					terminate: true,
-				};
-			}
-			const active = currentConsumedDecision();
-			if (active === null || pendingFinalization !== null) return;
-			// The batch shape is recorded at message_end before any tool runs.
-			// Exactly one authorized cw call executes; every other recorded call,
-			// including extra cw calls, is part of a malformed batch.
-			const recorded = active.responseToolCallIds;
-			const authorizedCall =
-				recorded.size === 1 &&
-				recorded.has(typeof toolCallId === "string" ? toolCallId : "") &&
-				toolName === DECISION_TOOL_NAME;
-			if (authorizedCall) return;
-			return {
-				block: true,
-				reason: DECISION_TOOL_BLOCK_REASON,
-				terminate: true,
-			};
+		// Main tools belong to ordinary work; file-write enforcement is child-local.
+		options.pi.on("tool_call", (_event, ctx) => {
+			observeLiveState(ctx);
 		});
-
-		// Pi treats normal execute returns as successful. Project the error flag
-		// only for our current staged invalid call; do not trust public details.
-		options.pi.on("tool_result", (event) => {
-			const active = currentConsumedDecision();
-			if (
-				event.toolName === DECISION_TOOL_NAME &&
-				active?.stagedResult?.toolCallId === event.toolCallId &&
-				!active.stagedResult.validation.valid
-			) {
-				return { isError: true };
-			}
+		options.pi.on("tool_result", (_event, ctx) => {
+			observeLiveState(ctx);
 		});
 
 		options.pi.on("agent_settled", async (_event, ctx: ExtensionContext) => {
@@ -4450,7 +4720,21 @@ export function createDecisionRuntime(
 				manualCancellation = null;
 				suppressDecisionAbort = false;
 			}
-			const preserveGeneration = selfDecisionRun.kind !== "none";
+			const privateFinalization =
+				pendingFinalization?.active.privateRun?.completed === true &&
+				currentConsumedDecision() === pendingFinalization.active;
+			const continuation = pendingContinuationPublication;
+			const privateContinuation =
+				continuation?.active.privateRun?.completed === true &&
+				!continuation.active.invalidated &&
+				owns(continuation.active.claim) &&
+				continuation.controller === options.controllerHolder.controller &&
+				continuation.publicationCycle === publicationCycle &&
+				continuation.lifecycleGeneration === lifecycleGeneration;
+			const preserveGeneration =
+				selfDecisionRun.kind !== "none" ||
+				privateFinalization ||
+				privateContinuation;
 			if (stopped || !observeLiveState(ctx, { preserveGeneration })) return;
 
 			if (quarantinedDecision !== null) {
@@ -4511,6 +4795,8 @@ export function createDecisionRuntime(
 		if (stopped) return;
 		const detachedIdle = ctx === undefined ? true : probePiAgentState(ctx).idle;
 		stopped = true;
+		unsubscribeTerminalInput?.();
+		unsubscribeTerminalInput = undefined;
 		lifecycleGeneration += 1;
 		localActivityGeneration += 1;
 		quarantinedDecision = null;
@@ -4523,6 +4809,8 @@ export function createDecisionRuntime(
 		if (detached !== null) options.hub.detach(detached);
 		// Hub ownership invalidation happens before local cleanup effects.
 		dropControl();
+		await privateRuntime?.dispose();
+		privateRuntime = null;
 		attachment = null;
 		sessionContext = null;
 		unsubscribe();

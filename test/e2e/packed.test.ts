@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { once } from "node:events";
+import { readFileSync } from "node:fs";
 import {
+	access,
 	mkdir,
 	mkdtemp,
 	readdir,
@@ -34,6 +36,7 @@ const TOOL_NAME = "cw";
 
 interface RequestRecord {
 	readonly receivedAt: number;
+	readonly model?: string;
 	readonly messages: Array<{
 		readonly role?: string;
 		readonly content?: unknown;
@@ -56,20 +59,23 @@ interface MockReply {
 	readonly kind:
 		| "text"
 		| "cw"
+		| "write"
 		| "cw-invalid"
 		| "cw-mixed"
 		| "delayed"
 		| "connection-error";
 	readonly action?: "continue" | "unlock";
 	readonly mixedToolName?: string;
+	readonly mixedToolArguments?: Record<string, unknown>;
 	readonly reasonType?: string;
 	readonly reason?: string;
 	/**
-	 * Raw cw argument object serialized verbatim. Overrides the action/
-	 * reasonType/reason shorthand for both valid and invalid cw replies.
+	 * Raw decision JSON. Legacy cw/cw-invalid shorthand becomes a stock write
+	 * only for a private result-file request; ordinary cw stays an ordinary tool.
 	 */
 	readonly args?: Record<string, unknown>;
 	readonly started?: () => void;
+	readonly closed?: () => void;
 	readonly text?: string;
 }
 
@@ -161,7 +167,7 @@ async function makePackedFixture(
 			// narrower `allow-git=root` policy verified separately in CI.
 			"--allow-git=all",
 			tarball,
-			// Pin only the fixture host; production peer ranges remain unchanged.
+			// Use the declared exact SDK baseline for the isolated fixture host.
 			...["@earendil-works/pi-coding-agent", "@earendil-works/pi-tui"].map(
 				(name) => `${name}@${manifest.devDependencies[name]}`,
 			),
@@ -294,6 +300,7 @@ async function startMockServer(
 				return;
 			}
 			if (reply.kind === "delayed") {
+				response.on("close", () => reply.closed?.());
 				response.writeHead(200, {
 					"content-type": "text/event-stream",
 					connection: "keep-alive",
@@ -304,12 +311,14 @@ async function startMockServer(
 				);
 				return;
 			}
-			if (reply.kind === "cw" || reply.kind === "cw-invalid") {
-				// Visible text and function arguments are deliberately separate:
-				// a singleton cw call with empty visible content reaches payload
-				// validation instead of being rejected at batch preflight as
-				// visible prose.
-				const argumentsJson =
+			if (
+				reply.kind === "cw" ||
+				reply.kind === "cw-invalid" ||
+				reply.kind === "cw-mixed" ||
+				reply.kind === "write"
+			) {
+				// Keep visible text separate from tool arguments for legacy and file results.
+				let argumentsJson =
 					reply.args !== undefined
 						? JSON.stringify(reply.args)
 						: reply.kind === "cw-invalid"
@@ -320,6 +329,42 @@ async function startMockServer(
 									reason_content:
 										reply.reason ?? "All requested work is complete.",
 								});
+				const privateFileResponse =
+					reply.kind === "write" ||
+					payload.messages.some((message) =>
+						contentText(message).includes("<watchdog_result_file>"),
+					);
+				if (privateFileResponse) {
+					const text = payload.messages
+						.map((message) => {
+							if (typeof message.content === "string") return message.content;
+							if (!Array.isArray(message.content)) return "";
+							return message.content
+								.flatMap((block) =>
+									typeof block?.text === "string" ? [block.text] : [],
+								)
+								.join("\n");
+						})
+						.join("\n");
+					const marker = [
+						...text.matchAll(
+							/<watchdog_result_file>(.*?)<\/watchdog_result_file>/gs,
+						),
+					].at(-1)?.[1];
+					if (marker === undefined) {
+						response.writeHead(400).end(
+							JSON.stringify({
+								error: { message: "Missing private result file marker" },
+							}),
+						);
+						return;
+					}
+					argumentsJson = JSON.stringify({
+						path: JSON.parse(marker),
+						content: argumentsJson,
+					});
+					reply.started?.();
+				}
 				sendSse(response, [
 					{
 						id,
@@ -328,17 +373,34 @@ async function startMockServer(
 							{
 								index: 0,
 								delta: {
-									content: "",
+									content: reply.kind === "cw-mixed" ? (reply.text ?? "") : "",
 									tool_calls: [
 										{
 											index: 0,
 											id: `call-${requests.length}`,
 											type: "function",
 											function: {
-												name: TOOL_NAME,
+												name: privateFileResponse ? "write" : TOOL_NAME,
 												arguments: argumentsJson,
 											},
 										},
+										...(reply.kind === "cw-mixed"
+											? [
+													{
+														index: 1,
+														id: `other-${requests.length}`,
+														type: "function",
+														function: {
+															name: reply.mixedToolName ?? "bash",
+															arguments: JSON.stringify(
+																reply.mixedToolArguments ?? {
+																	command: "echo side-effect",
+																},
+															),
+														},
+													},
+												]
+											: []),
 									],
 								},
 								finish_reason: null,
@@ -353,54 +415,7 @@ async function startMockServer(
 				]);
 				return;
 			}
-			if (reply.kind === "cw-mixed") {
-				const argumentsJson = JSON.stringify({
-					action: "unlock",
-					reason_type: reply.reasonType ?? "JOB_DONE",
-					reason_content: reply.reason ?? "Mixed batch result.",
-				});
-				sendSse(response, [
-					{
-						id,
-						model: "watchdog-e2e",
-						choices: [
-							{
-								index: 0,
-								delta: {
-									content: reply.text ?? "",
-									tool_calls: [
-										{
-											index: 0,
-											id: `call-${requests.length}`,
-											type: "function",
-											function: {
-												name: TOOL_NAME,
-												arguments: argumentsJson,
-											},
-										},
-										{
-											index: 1,
-											id: `bash-${requests.length}`,
-											type: "function",
-											function: {
-												name: reply.mixedToolName ?? "bash",
-												arguments: '{"command":"echo side-effect"}',
-											},
-										},
-									],
-								},
-								finish_reason: null,
-							},
-						],
-					},
-					{
-						id,
-						model: "watchdog-e2e",
-						choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-					},
-				]);
-				return;
-			}
+
 			sendSse(response, [
 				{
 					id,
@@ -483,10 +498,8 @@ async function createSession(
 		assert.deepEqual(loader.getExtensions().errors, []);
 		const loaded = loader
 			.getExtensions()
-			.extensions.find(
-				(extension) =>
-					extension.path.startsWith(fixture.packageDir) ||
-					options?.additionalExtensionPaths?.includes(extension.path),
+			.extensions.find((extension) =>
+				extension.path.startsWith(fixture.packageDir),
 			);
 		assert.ok(loaded);
 		assert.equal(loaded.path.startsWith(fixture.packageDir), true);
@@ -517,7 +530,9 @@ async function createSession(
 			modelRuntime,
 			model,
 			resourceLoader: loader,
-			sessionManager: options?.sessionManager ?? SessionManager.inMemory(),
+			sessionManager:
+				options?.sessionManager ??
+				SessionManager.create(cwd, join(fixture.root, "sessions")),
 		});
 		await session.bindExtensions(
 			options?.abortHandler !== undefined
@@ -616,7 +631,31 @@ const DECISION_PROMPT_MARKER =
 
 function isDecisionRequest(request: RequestRecord): boolean {
 	return request.messages.some((message) =>
-		contentText(message).includes(DECISION_PROMPT_MARKER),
+		contentText(message).includes("<watchdog_result_file>"),
+	);
+}
+
+async function waitForReady(
+	fixture: PackedFixture & { readonly probeOut?: string },
+	stopKind = "AI_UNLOCK",
+): Promise<void> {
+	assert.ok(fixture.probeOut, "terminal receipt requires a semantic probe");
+	const probeOut = fixture.probeOut;
+	await waitFor(
+		() =>
+			readFileSync(probeOut, "utf8")
+				.split("\n")
+				.filter(Boolean)
+				.some((line) => {
+					const record = JSON.parse(line);
+					return (
+						record.kind === "semantic-hook" &&
+						record.data?.name === "user-ready" &&
+						record.data?.values?.STOP_KIND === stopKind
+					);
+				}),
+		45_000,
+		`private ${stopKind} publication`,
 	);
 }
 
@@ -625,19 +664,13 @@ test("packed native abort hides only the owned assistant notice through real Pi 
 }, async (t) => {
 	initTheme("dark", false);
 	const fixture = await makePackedFixture(t);
-	for (const kind of [
-		"decision",
-		"correction",
-		"continuation",
-		"empty-decision",
-		"ordinary",
-	] as const) {
+	// Private decisions have no parent assistant to render or abort. Their
+	// cancellation/non-disclosure is covered by the private-stream cases below.
+	for (const kind of ["continuation", "ordinary"] as const) {
 		await t.test(kind, { timeout: 35_000 }, async (sub) => {
 			const replies: MockReply[] = [];
 			if (kind !== "ordinary")
 				replies.push({ kind: "text", text: "Initial work." });
-			if (kind === "correction")
-				replies.push({ kind: "cw-invalid", text: "{}" });
 			if (kind === "continuation")
 				replies.push({
 					kind: "cw",
@@ -647,7 +680,7 @@ test("packed native abort hides only the owned assistant notice through real Pi 
 				});
 			replies.push({
 				kind: "delayed",
-				text: kind === "empty-decision" ? "" : "partial native output",
+				text: "partial native output",
 			});
 			const { baseUrl, requests } = await startMockServer(sub, replies);
 			const notifications: string[] = [];
@@ -696,14 +729,11 @@ test("packed native abort hides only the owned assistant notice through real Pi 
 					25_000,
 					`${kind} target request`,
 				);
-				if (kind !== "empty-decision") {
-					await waitFor(
-						() =>
-							rendered.some((view) => view.includes("partial native output")),
-						5_000,
-						"partial rendering",
-					);
-				}
+				await waitFor(
+					() => rendered.some((view) => view.includes("partial native output")),
+					5_000,
+					"partial rendering",
+				);
 				await session.abort();
 				await prompt;
 				await waitForSessionIdle(session, 5_000, `${kind} abort`);
@@ -720,7 +750,7 @@ test("packed native abort hides only the owned assistant notice through real Pi 
 				);
 				assert.equal(
 					terminal.length,
-					replies.length,
+					kind === "continuation" ? 2 : 1,
 					"each response must reach final rendering",
 				);
 				assert.equal(
@@ -739,11 +769,9 @@ test("packed native abort hides only the owned assistant notice through real Pi 
 				// The user accepts transient streaming notices; preserve evidence
 				// instead of treating a quiet final view as proof of zero flashes.
 				sub.diagnostic(
-					`Pi 0.85.1 abort frames: ${JSON.stringify(abortFrames)}`,
+					`Pi native abort frames: ${JSON.stringify(abortFrames)}`,
 				);
-				if (kind === "continuation" || kind === "ordinary")
-					assert.match(finalView, /partial native output/);
-				else assert.doesNotMatch(finalView, /partial native output/);
+				assert.match(finalView, /partial native output/);
 				await session.prompt("/status-continue-watchdog");
 				assert.match(notifications.at(-1) ?? "", /Lock: unlocked/);
 				assert.match(notifications.at(-1) ?? "", /Trigger: blocked · unlocked/);
@@ -757,10 +785,10 @@ test("packed native abort hides only the owned assistant notice through real Pi 
 	}
 });
 
-test("packed reserved function is advertised with its structural contract to every request", {
+test("packed ordinary and private requests expose no watchdog result function", {
 	timeout: 180_000,
 }, async (t) => {
-	const fixture = await makePackedFixture(t);
+	const fixture = await makePackedFixture(t, { withSemanticProbe: true });
 	const { baseUrl, requests } = await startMockServer(t, [
 		{ kind: "text", text: "Working." },
 		{ kind: "cw", action: "unlock" },
@@ -769,68 +797,30 @@ test("packed reserved function is advertised with its structural contract to eve
 	try {
 		await session.prompt("Do the work.");
 		await waitForSessionIdle(session, 30_000, "first turn");
-		await waitFor(() => requests.length >= 2, 120_000, "decision request");
+		await waitFor(() => requests.length >= 2, 45_000, "decision request");
 		for (const request of requests) {
-			const declared = (request.tools ?? []).find(
-				(tool) => tool.function?.name === TOOL_NAME,
+			assert.equal(
+				(request.tools ?? []).some((tool) => tool.function?.name === TOOL_NAME),
+				false,
 			);
-			assert.ok(declared, `expected ${TOOL_NAME} in request tools`);
-			assert.equal(declared.function?.description, "don't use unless ask");
-			const parameters = declared.function?.parameters as {
-				type?: string;
-				required?: string[];
-				additionalProperties?: boolean;
-				properties?: Record<
-					string,
-					{
-						type?: string;
-						enum?: string[];
-						minLength?: number;
-						maxLength?: number;
-						pattern?: string;
-						description?: string;
-						title?: string;
-						examples?: unknown;
-						default?: unknown;
-					}
-				>;
-			};
-			assert.ok(parameters, "expected a serialized parameter schema");
-			assert.equal(parameters.type, "object");
-			assert.equal(parameters.additionalProperties, true);
-			assert.deepEqual([...(parameters.required ?? [])].sort(), [
-				"action",
-				"reason_content",
-				"reason_type",
-			]);
-			assert.deepEqual(
-				[...(parameters.properties?.action?.enum ?? [])].sort(),
-				["continue", "unlock"],
+			assert.equal(
+				(request.tools ?? []).some(
+					(tool) => tool.function?.name === "structured_output",
+				),
+				false,
 			);
-			assert.deepEqual(parameters.properties?.reason_type?.enum, [
-				"JOB_DONE",
-				"WAIT_USER",
-				"JOB_BLOCKED",
-				"WAIT_CALLBACK",
-				"WORK_REMAINS",
-				"VERIFYING",
-			]);
-			const reasonContent = parameters.properties?.reason_content;
-			assert.equal(reasonContent?.type, "string");
-			assert.equal(reasonContent?.minLength, 1);
-			assert.equal(reasonContent?.maxLength, 1000);
-			assert.equal(reasonContent?.pattern, "\\S");
-			// Structural constraints reach the model without explanatory
-			// annotations: no parameter description, title, example, or default.
-			for (const [name, property] of Object.entries(
-				parameters.properties ?? {},
-			)) {
-				assert.equal(property.description, undefined, name);
-				assert.equal(property.title, undefined, name);
-				assert.equal(property.examples, undefined, name);
-				assert.equal(property.default, undefined, name);
-			}
+			assert.ok(
+				(request.tools ?? []).some((tool) => tool.function?.name === "write"),
+			);
 		}
+		assert.doesNotMatch(
+			JSON.stringify(requests[0].messages),
+			/<watchdog_result_file>/,
+		);
+		assert.match(
+			JSON.stringify(requests[1].messages),
+			/<watchdog_result_file>/,
+		);
 		// No startup usage guidance advertises the protocol in ordinary requests.
 		for (const request of requests) {
 			for (const message of request.messages) {
@@ -840,6 +830,7 @@ test("packed reserved function is advertised with its structural contract to eve
 				);
 			}
 		}
+		await waitForReady(fixture);
 	} finally {
 		await shutdownSession(session);
 	}
@@ -848,7 +839,7 @@ test("packed reserved function is advertised with its structural contract to eve
 test("packed idle settlement opens one inquiry before continuation", {
 	timeout: 300_000,
 }, async (t) => {
-	const fixture = await makePackedFixture(t);
+	const fixture = await makePackedFixture(t, { withSemanticProbe: true });
 	const { baseUrl, requests } = await startMockServer(t, [
 		{ kind: "text", text: "First ordinary answer." },
 		{ kind: "cw", action: "continue", reasonType: "WORK_REMAINS" },
@@ -859,16 +850,15 @@ test("packed idle settlement opens one inquiry before continuation", {
 	try {
 		await session.prompt("Start the task.");
 		await waitForSessionIdle(session, 30_000, "first turn");
-		await waitFor(() => requests.length >= 2, 120_000, "decision request");
+		await waitFor(() => requests.length >= 2, 45_000, "decision request");
 		const decisionRequest = requests[1];
 		assert.ok(isDecisionRequest(decisionRequest), "request 2 is the inquiry");
 		assert.match(
 			contentText(decisionRequest.messages.at(-1) ?? ({ role: "" } as never)),
 			new RegExp(DECISION_PROMPT_MARKER),
 		);
-		await waitForSessionIdle(session, 30_000, "decision turn");
 		// The accepted continue publishes one ordinary continuation turn.
-		await waitFor(() => requests.length >= 3, 120_000, "continuation request");
+		await waitFor(() => requests.length >= 3, 15_000, "continuation request");
 		const continuationRequest = requests[2];
 		const continuationMessage = continuationRequest.messages.find(
 			(message) =>
@@ -895,7 +885,7 @@ test("packed idle settlement opens one inquiry before continuation", {
 		// Later ordinary requests contain one canonical continuation event and
 		// no raw decision instructions or result calls.
 		await waitForSessionIdle(session, 30_000, "second ordinary turn");
-		await waitFor(() => requests.length >= 4, 120_000, "next decision");
+		await waitFor(() => requests.length >= 4, 45_000, "next decision");
 		// The continuation request (3) contains no decision internals, and later
 		// inquiry requests carry only their own newest prompt: completed
 		// exchanges fold into the one shared outcome event.
@@ -914,19 +904,20 @@ test("packed idle settlement opens one inquiry before continuation", {
 				`request carried ${markerCount} inquiry bodies`,
 			);
 		}
+		await waitForReady(fixture);
 	} finally {
 		await shutdownSession(session);
 	}
 });
 
-test("packed unauthorized proactive call returns the reserved error and continues", {
+test("packed unowned ordinary cw stays a native unknown tool and ordinary work continues", {
 	timeout: 300_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t, { withSemanticProbe: true });
 	const { baseUrl, requests } = await startMockServer(t, [
 		// Ordinary run tries to stop through cw before any decision exists.
 		{ kind: "cw", action: "unlock", reason: "Stopping proactively." },
-		// The run continues after the reserved error; the next turn settles.
+		// Native unknown-tool handling, not watchdog reservation, resumes work.
 		{ kind: "text", text: "Continued ordinary work." },
 		{ kind: "cw", action: "unlock" },
 	]);
@@ -934,10 +925,27 @@ test("packed unauthorized proactive call returns the reserved error and continue
 	try {
 		await session.prompt("Try to stop early.");
 		await waitForSessionIdle(session, 60_000, "first turn");
-		// The reserved error does not terminate the run: Pi follows up normally.
-		await waitFor(() => requests.length >= 2, 120_000, "follow-up request");
+		// Unknown tool does not terminate the run: Pi follows up normally.
+		await waitFor(() => requests.length >= 2, 45_000, "follow-up request");
 		await waitForSessionIdle(session, 30_000, "second turn");
-		// No unlock hook fired for the out-of-phase call.
+		const nativeError = requests[1].messages.find(
+			(message) => message.role === "tool" && message.tool_call_id,
+		);
+		assert.ok(nativeError);
+		assert.match(contentText(nativeError), /Tool cw not found/);
+		assert.doesNotMatch(contentText(nativeError), /reserved for the plugin/);
+		assert.equal(requests.slice(0, 2).some(isDecisionRequest), false);
+		assert.equal(
+			session.sessionManager
+				.getBranch()
+				.some(
+					(entry) =>
+						entry.type === "custom" &&
+						entry.customType === "pi-continue-watchdog:private-response",
+				),
+			false,
+		);
+		// No unlock hook fired for the unowned call.
 		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
 		assert.equal(
 			envelopes.some((envelope) => envelope.name === "user-ready"),
@@ -979,7 +987,7 @@ test("packed malformed ordinary cw receives a native error and ordinary work con
 			nativeError,
 			"follow-up must receive the actual native tool result",
 		);
-		assert.match(contentText(nativeError), /Validation failed for tool "cw"/);
+		assert.match(contentText(nativeError), /Tool cw not found/);
 		assert.doesNotMatch(contentText(nativeError), /reserved for the plugin/);
 		const branch = session.sessionManager.getBranch();
 		assert.ok(
@@ -1021,6 +1029,329 @@ test("packed malformed ordinary cw receives a native error and ordinary work con
 	}
 });
 
+test("packed foreign cw ownership survives ordinary work and private decisions", {
+	timeout: 150_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t, { withSemanticProbe: true });
+	const foreignPath = join(fixture.root, "foreign-cw.mjs");
+	const callsPath = join(fixture.root, "foreign-calls.jsonl");
+	await writeFile(callsPath, "");
+	await writeFile(
+		foreignPath,
+		`
+import { appendFileSync } from "node:fs";
+export default function (pi) {
+  pi.registerTool({
+    name: "cw", label: "Foreign cw", description: "Foreign owned work tool",
+    parameters: { type: "object", properties: { action: { type: "string" } } },
+    async execute(_id, args) {
+      appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + "\\n");
+      return { content: [{ type: "text", text: "FOREIGN_CW_RESULT" }], details: {} };
+    },
+  });
+}
+`,
+	);
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "cw", action: "unlock", reason: "Foreign tool, not a decision." },
+		{ kind: "text", text: "Ordinary work after foreign result." },
+		{ kind: "cw", action: "unlock", reason: "Private decision accepted." },
+	]);
+	const { session } = await createSession(fixture, baseUrl, {
+		additionalExtensionPaths: [foreignPath],
+	});
+	try {
+		await session.prompt("Use the foreign work tool, then deliver the report.");
+		assert.equal(requests.length, 2);
+		assert.match(requestPromptText(requests[1]), /FOREIGN_CW_RESULT/);
+		assert.doesNotMatch(
+			requestPromptText(requests[1]),
+			/reserved for the plugin/,
+		);
+		assert.equal(
+			(await readFile(callsPath, "utf8")).trim().split("\n").length,
+			1,
+		);
+		assert.equal((await readProbeEnvelopes(fixture.probeOut ?? "")).length, 0);
+		await waitForReady(fixture);
+		assert.equal(requests.length, 3);
+		assert.ok(isDecisionRequest(requests[2]));
+		for (const request of requests) {
+			const declared = request.tools?.filter(
+				(tool) => tool.function?.name === TOOL_NAME,
+			);
+			assert.equal(declared?.length, 1);
+			assert.equal(
+				declared?.[0].function?.description,
+				"Foreign owned work tool",
+			);
+		}
+		assert.equal(
+			(await readFile(callsPath, "utf8")).trim().split("\n").length,
+			1,
+		);
+		const ready = (await readProbeEnvelopes(fixture.probeOut ?? "")).filter(
+			(entry) => entry.name === "user-ready",
+		);
+		assert.equal(ready.length, 1);
+		assert.equal(
+			(ready[0].values as { REASON?: string }).REASON,
+			"Private decision accepted.",
+		);
+	} finally {
+		await shutdownSession(session);
+	}
+});
+
+test("packed independent public pi-subagents keeps its surface and cannot select the private agent", {
+	timeout: 180_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t, {
+		withSemanticProbe: true,
+		watchdogConfig: { unlockReviewEnabled: false },
+	});
+	await execFileAsync(
+		"npm",
+		[
+			"install",
+			"--prefer-offline",
+			"--no-audit",
+			"--no-fund",
+			"--allow-git=all",
+			"--save-exact",
+			"pi-subagents@0.79.0",
+		],
+		{ cwd: fixture.installRoot, timeout: 120_000, maxBuffer: 8 * 1024 * 1024 },
+	);
+	const publicDir = join(fixture.installRoot, "node_modules", "pi-subagents");
+	const publicManifest = JSON.parse(
+		await readFile(join(publicDir, "package.json"), "utf8"),
+	);
+	assert.equal(publicManifest.version, "0.79.0");
+	assert.ok(publicManifest.pi?.extensions?.length > 0);
+	const agentDir = join(fixture.agentDir, "agents");
+	await mkdir(agentDir, { recursive: true });
+	await writeFile(
+		join(agentDir, "watchdog-decision.md"),
+		"---\nname: watchdog-decision\ndescription: Public same-name fixture\nmodel: unavailable-public-model\ntools: bash\n---\nPUBLIC_AGENT_PROFILE_MUST_NOT_SELECT_PRIVATE_MODEL\n",
+	);
+	const { baseUrl, requests } = await startMockServer(t, [
+		{
+			kind: "text",
+			text: "Ordinary work delivered with public subagents installed.",
+		},
+		{
+			kind: "write",
+			action: "unlock",
+			reason: "Private co-installed decision.",
+		},
+	]);
+	const { session } = await createSession(fixture, baseUrl, {
+		additionalExtensionPaths: [
+			join(publicDir, publicManifest.pi.extensions[0]),
+		],
+	});
+	try {
+		const before = session
+			.getAllTools()
+			.map((tool) => tool.name)
+			.sort();
+		assert.ok(
+			before.some((name) => name.startsWith("subagent")),
+			"independent public extension really registered its surface",
+		);
+		assert.equal(new Set(before).size, before.length);
+		assert.equal(
+			before.includes("cw") || before.includes("structured_output"),
+			false,
+		);
+		await session.prompt("Deliver the authorized report.");
+		await waitForReady(fixture);
+		assert.equal(
+			requests.length,
+			2,
+			"public install adds no private dispatch or follow-up",
+		);
+		assert.equal(requests[0].model, "watchdog-e2e");
+		assert.equal(requests[1].model, requests[0].model);
+		assert.ok(isDecisionRequest(requests[1]));
+		assert.doesNotMatch(
+			JSON.stringify(requests[1]),
+			/unavailable-public-model/,
+		);
+		assert.deepEqual(
+			session
+				.getAllTools()
+				.map((tool) => tool.name)
+				.sort(),
+			before,
+		);
+		assert.doesNotMatch(
+			JSON.stringify(session.sessionManager.getBranch()),
+			/watchdog_result_file|subagent_instructions/,
+		);
+		const privateManifest = JSON.parse(
+			await readFile(
+				join(
+					fixture.packageDir,
+					"node_modules",
+					"watchdog-subagents-runtime",
+					"package.json",
+				),
+				"utf8",
+			),
+		);
+		assert.deepEqual(Object.keys(privateManifest.exports), [
+			"./watchdog-runtime",
+		]);
+		assert.equal(privateManifest.pi, undefined);
+		assert.ok(
+			publicManifest.pi.extensions.length > 0,
+			"private preparation did not strip public package metadata",
+		);
+	} finally {
+		await shutdownSession(session);
+	}
+});
+
+test("packed private mixed tools and reply-only JSON require file correction without effects", {
+	timeout: 180_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t, {
+		withSemanticProbe: true,
+		watchdogConfig: { unlockReviewEnabled: false },
+	});
+	for (const kind of ["bash", "unknown-work-tool", "reply-only"] as const) {
+		await t.test(kind, { timeout: 50_000 }, async (sub) => {
+			await writeFile(fixture.probeOut ?? "", "");
+			let beforeCorrection: string | undefined;
+			const sideEffect = join(fixture.root, `forbidden-${kind}`);
+			const { baseUrl, requests } = await startMockServer(sub, [
+				{ kind: "text", text: "Ordinary work delivered." },
+				kind === "reply-only"
+					? {
+							kind: "text",
+							text: '{"action":"unlock","reason_type":"JOB_DONE","reason_content":"Prose is not a result."}',
+						}
+					: {
+							kind: "cw-mixed",
+							mixedToolName: kind,
+							mixedToolArguments: {
+								command: `touch ${JSON.stringify(sideEffect)}`,
+							},
+						},
+				{
+					kind: "cw",
+					action: "unlock",
+					reason: "File corrected.",
+					started: () => {
+						const marker = [
+							...requestPromptText(requests[1]).matchAll(
+								/<watchdog_result_file>(.*?)<\/watchdog_result_file>/gs,
+							),
+						].at(-1)?.[1];
+						assert.ok(marker);
+						beforeCorrection = readFileSync(JSON.parse(marker), "utf8");
+					},
+				},
+			]);
+			const { session } = await createSession(fixture, baseUrl);
+			try {
+				await session.prompt("Deliver the authorized work only.");
+				await waitForReady(fixture);
+				assert.equal(
+					requests.length,
+					3,
+					"one invalid response, one private correction, no tool follow-up",
+				);
+				assert.equal(
+					beforeCorrection,
+					"{}",
+					"correction starts with reset result file",
+				);
+				await assert.rejects(access(sideEffect), { code: "ENOENT" });
+				const correction = requestPromptText(requests[2]);
+				assert.match(correction, /failed validation/);
+				assert.match(
+					correction,
+					kind === "reply-only"
+						? /action/
+						: /Expected exactly one write call to the designated decision result file/,
+				);
+				const branch = session.sessionManager.getBranch();
+				const responses = branch.filter(
+					(entry) =>
+						entry.type === "custom" &&
+						entry.customType === "pi-continue-watchdog:private-response",
+				);
+				assert.equal(responses.length, 2);
+				const audits = responses.map(
+					(entry) =>
+						(
+							entry as {
+								data: {
+									sessionId: string;
+									attempt: number;
+									outcome: { kind: string };
+								};
+							}
+						).data,
+				);
+				assert.equal(audits[0].sessionId, audits[1].sessionId);
+				const sessionDir = join(fixture.root, "sessions");
+				const transcripts = await Promise.all(
+					(await readdir(sessionDir, { recursive: true }))
+						.filter((path) => path.endsWith(".jsonl"))
+						.map(async (path) =>
+							(await readFile(join(sessionDir, path), "utf8"))
+								.split("\n")
+								.filter(Boolean)
+								.map((line) => JSON.parse(line)),
+						),
+				);
+				const child = transcripts.find(
+					(rows) => rows[0]?.id === audits[0].sessionId,
+				);
+				assert.ok(child, "private transcript must identify the audited child");
+				const toolResults = child.filter(
+					(row) => row.type === "message" && row.message?.role === "toolResult",
+				);
+				assert.equal(
+					toolResults.some((row) =>
+						["call-2", "other-2"].includes(row.message.toolCallId),
+					),
+					false,
+					"invalid batch executes neither result write nor other tool",
+				);
+				assert.ok(
+					toolResults.some((row) => row.message.toolCallId === "call-3"),
+					"valid correction write really executes",
+				);
+				assert.deepEqual(
+					audits.map((audit) => [audit.attempt, audit.outcome.kind]),
+					[
+						[1, "invalid"],
+						[2, "valid"],
+					],
+				);
+				assert.doesNotMatch(
+					JSON.stringify(branch),
+					/watchdog_result_file|subagent_instructions|side-effect|Prose is not a result/,
+				);
+				assert.equal(
+					branch.filter(
+						(entry) =>
+							entry.type === "message" && entry.message.role === "assistant",
+					).length,
+					1,
+				);
+			} finally {
+				await shutdownSession(session);
+			}
+		});
+	}
+});
+
 test("packed decision unlock ends the cycle and publishes typed user-ready once", {
 	timeout: 300_000,
 }, async (t) => {
@@ -1038,8 +1369,8 @@ test("packed decision unlock ends the cycle and publishes typed user-ready once"
 	try {
 		await session.prompt("Approve the deploy.");
 		await waitForSessionIdle(session, 60_000, "first turn");
-		await waitFor(() => requests.length >= 2, 120_000, "decision request");
-		await waitForSessionIdle(session, 60_000, "decision turn");
+		await waitFor(() => requests.length >= 2, 45_000, "decision request");
+		await waitForReady(fixture, "AI_UNLOCK");
 		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
 		const ready = envelopes.filter(
 			(envelope) => envelope.name === "user-ready",
@@ -1153,7 +1484,7 @@ async function captureDecisionRequest(
 		// Fixture-ending reply only. Never treated as judgment evidence.
 		{ kind: "cw", action: "unlock", reason: "Fixture capture complete." },
 	]);
-	const sm = SessionManager.inMemory(fixture.cwd);
+	const sm = SessionManager.create(fixture.cwd, join(fixture.root, "sessions"));
 	options.seed(sm);
 	const { session } = await createSession(fixture, baseUrl, {
 		sessionManager: sm,
@@ -1161,7 +1492,7 @@ async function captureDecisionRequest(
 	try {
 		await session.prompt("Kick off the ordinary turn.");
 		await waitForSessionIdle(session, 60_000, "first turn");
-		await waitFor(() => requests.length >= 2, 180_000, "decision request");
+		await waitFor(() => requests.length >= 2, 45_000, "decision request");
 		const decisionRequest = requests.find((request) =>
 			isDecisionRequest(request),
 		);
@@ -1537,7 +1868,7 @@ test("packed A15d later read-only restriction overrides earlier grant", {
 test("packed next ordinary request after AI unlock has no unlock text or control exchange", {
 	timeout: 360_000,
 }, async (t) => {
-	const fixture = await makePackedFixture(t);
+	const fixture = await makePackedFixture(t, { withSemanticProbe: true });
 	const { baseUrl, requests } = await startMockServer(t, [
 		{ kind: "text", text: "Deploy work done." },
 		{
@@ -1552,8 +1883,8 @@ test("packed next ordinary request after AI unlock has no unlock text or control
 	try {
 		await session.prompt("Do the analysis.");
 		await waitForSessionIdle(session, 60_000, "first turn");
-		await waitFor(() => requests.length >= 2, 120_000, "decision request");
-		await waitForSessionIdle(session, 60_000, "decision turn");
+		await waitFor(() => requests.length >= 2, 45_000, "decision request");
+		await waitForReady(fixture);
 		// Exactly one quiet UI-only unlock status in stored session entries.
 		const branch = session.sessionManager.getBranch();
 		const statuses = branch.filter(
@@ -1602,14 +1933,12 @@ test("packed retired wait action is rejected as invalid without waiting effects"
 	try {
 		await session.prompt("Wait for the job.");
 		await waitForSessionIdle(session, 60_000, "first turn");
-		await waitFor(() => requests.length >= 2, 120_000, "decision request");
-		await waitForSessionIdle(session, 60_000, "decision turn");
+		await waitFor(() => requests.length >= 2, 45_000, "decision request");
 		// The retired wait is one invalid response: a correction re-ask follows.
-		await waitFor(() => requests.length >= 3, 120_000, "correction request");
-		await waitForSessionIdle(session, 60_000, "correction turn");
+		await waitFor(() => requests.length >= 3, 15_000, "correction request");
 		// The rejection came from the retired-action validator, not from batch
-		// preflight treating duplicated visible JSON as prose: the singleton cw
-		// call carried empty visible content, so the correction must carry the
+		// preflight: the stock write carried only the result file, so correction
+		// must carry the
 		// retired-action diagnostic itself.
 		const correction = requests[2];
 		assert.ok(isDecisionRequest(correction), "request 3 is the correction");
@@ -1618,6 +1947,7 @@ test("packed retired wait action is rejected as invalid without waiting effects"
 			/wait is no longer an accepted action\./,
 			"correction carries RETIRED_WAIT_ACTION_ERROR",
 		);
+		await waitForReady(fixture, "AI_UNLOCK");
 		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
 		assert.equal(
 			envelopes.some((envelope) => envelope.name === "watchdog-waiting"),
@@ -1660,18 +1990,19 @@ test("packed invalid decisions correct twice then decision-fail", {
 	const { baseUrl, requests } = await startMockServer(t, [
 		{ kind: "text", text: "Work settles." },
 		{ kind: "cw-invalid", text: "" },
-		{ kind: "cw-invalid", text: "" },
-		{ kind: "cw-invalid", text: "" },
+		{ kind: "cw-invalid", text: "[]" },
+		{ kind: "cw-invalid", text: "{}" },
 	]);
 	const { session } = await createSession(fixture, baseUrl);
 	try {
 		await session.prompt("Do the work.");
 		await waitForSessionIdle(session, 30_000, "first turn");
-		await waitFor(() => requests.length >= 2, 120_000, "first decision");
-		await waitFor(() => requests.length >= 4, 240_000, "corrections");
-		await waitForSessionIdle(session, 60_000, "final decision turn");
+		await waitFor(() => requests.length >= 2, 45_000, "first decision");
+		await waitFor(() => requests.length >= 4, 15_000, "corrections");
+
 		const decisionRequests = requests.filter((r) => isDecisionRequest(r));
 		assert.equal(decisionRequests.length, 3);
+		await waitForReady(fixture, "DECISION_FAILED");
 		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
 		assert.ok(
 			envelopes.some(
@@ -1691,13 +2022,10 @@ test("packed invalid decisions correct twice then decision-fail", {
 });
 
 /**
- * Native three-response regression for the retired action: three structurally
- * valid singleton cw calls whose payload selects the retired wait action must
- * stop after exactly three invalid decisions with no fourth native follow-up.
- * The mock keeps visible content empty so each response reaches payload
- * validation instead of dying at batch preflight.
+ * Three retired-action files consume exactly three private responses, with
+ * concrete validator feedback and no fourth response or ordinary work.
  */
-test("packed singleton retired waits stop without native follow-up", {
+test("packed singleton retired wait files stop without native follow-up", {
 	timeout: 360_000,
 }, async (t) => {
 	const outputRoot = await mkdtemp(join(tmpdir(), "cw-retired-waits-"));
@@ -1724,9 +2052,8 @@ test("packed singleton retired waits stop without native follow-up", {
 	try {
 		await session.prompt("Do the work.");
 		await waitForSessionIdle(session, 30_000, "first turn");
-		await waitFor(() => requests.length >= 2, 120_000, "first decision");
-		await waitFor(() => requests.length >= 4, 240_000, "corrections");
-		await waitForSessionIdle(session, 60_000, "final decision turn");
+		await waitFor(() => requests.length >= 2, 45_000, "first decision");
+		await waitFor(() => requests.length >= 4, 15_000, "corrections");
 		const decisionRequests = requests.filter((request) =>
 			isDecisionRequest(request),
 		);
@@ -1739,6 +2066,7 @@ test("packed singleton retired waits stop without native follow-up", {
 				/wait is no longer an accepted action\./,
 			);
 		}
+		await waitForReady(fixture, "DECISION_FAILED");
 		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
 		assert.equal(
 			envelopes.some((envelope) => envelope.name === "watchdog-waiting"),
@@ -1797,25 +2125,19 @@ test("packed custom reasonTypes are matched case-insensitively in the decision",
 	try {
 		await session.prompt("Ship it.");
 		await waitForSessionIdle(session, 30_000, "first turn");
-		await waitFor(() => requests.length >= 2, 120_000, "decision request");
-		await waitForSessionIdle(session, 60_000, "decision turn");
-		// The effective custom reason spelling reaches the serialized schema;
-		// preparation normalizes the compatible padded/mixed-case input before
-		// native enum validation, so the configured casing still completes.
-		const declared = requests
-			.flatMap((request) => request.tools ?? [])
-			.find((tool) => tool.function?.name === TOOL_NAME);
-		const reasonTypeEnum = (
-			declared?.function?.parameters as {
-				properties?: { reason_type?: { enum?: string[] } };
-			}
-		)?.properties?.reason_type?.enum;
-		assert.deepEqual(reasonTypeEnum, [
-			"NeedReview",
-			"shipped",
-			"WORK_REMAINS",
-			"VERIFYING",
-		]);
+		await waitFor(() => requests.length >= 2, 45_000, "decision request");
+		await waitForReady(fixture);
+		// Effective reason spelling is guidance for file validation, never a
+		// public result-function schema. Padded/mixed-case JSON still normalizes.
+		const prompt = requestPromptText(requests[1]);
+		for (const reason of ["NeedReview", "shipped", "WORK_REMAINS", "VERIFYING"])
+			assert.ok(prompt.includes(reason), `private guidance includes ${reason}`);
+		assert.equal(
+			requests
+				.flatMap((request) => request.tools ?? [])
+				.some((tool) => tool.function?.name === TOOL_NAME),
+			false,
+		);
 		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
 		const ready = envelopes.filter(
 			(envelope) => envelope.name === "user-ready",
@@ -1834,15 +2156,9 @@ test("packed custom reasonTypes are matched case-insensitively in the decision",
 	}
 });
 
-/**
- * Native invalid-payload regression (S7/S8): three singleton cw calls whose
- * arguments are missing or carry an invalid action, then one valid
- * correction. The owned message_end preflight must stop each invalid payload
- * before native schema-error follow-up: exactly three decision inquiries,
- * two corrections with the safe validator diagnostic, no fourth request, and
- * the valid correction executes/stages/settles once.
- */
-test("packed invalid cw payloads stop before native schema follow-up", {
+/** Invalid JSON fields consume bounded private corrections, never native
+ * schema-error follow-ups or ordinary continuation budget. */
+test("packed invalid file payloads stop before native follow-up", {
 	timeout: 360_000,
 }, async (t) => {
 	const outputRoot = await mkdtemp(join(tmpdir(), "cw-invalid-payloads-"));
@@ -1852,9 +2168,9 @@ test("packed invalid cw payloads stop before native schema follow-up", {
 	const fixture = await makePackedFixture(t, { withSemanticProbe: true });
 	const { baseUrl, requests } = await startMockServer(t, [
 		{ kind: "text", text: "Work settles." },
-		// Attempt 1: singleton cw call missing every field.
+		// Attempt 1: result file missing every field.
 		{ kind: "cw-invalid", text: "{}" },
-		// Attempt 2: singleton cw call with an invalid action enum value.
+		// Attempt 2: result file with an invalid action value.
 		{
 			kind: "cw-invalid",
 			text: '{"action":"bogus","reason_type":"JOB_DONE","reason_content":"Bad action."}',
@@ -1869,9 +2185,8 @@ test("packed invalid cw payloads stop before native schema follow-up", {
 	try {
 		await session.prompt("Do the work.");
 		await waitForSessionIdle(session, 30_000, "first turn");
-		await waitFor(() => requests.length >= 2, 120_000, "first decision");
-		await waitFor(() => requests.length >= 4, 240_000, "corrections");
-		await waitForSessionIdle(session, 60_000, "final decision turn");
+		await waitFor(() => requests.length >= 2, 45_000, "first decision");
+		await waitFor(() => requests.length >= 4, 15_000, "corrections");
 		const decisionRequests = requests.filter((request) =>
 			isDecisionRequest(request),
 		);
@@ -1879,15 +2194,13 @@ test("packed invalid cw payloads stop before native schema follow-up", {
 		// Corrections carry the safe validator diagnostic, never the raw
 		// invalid payload or a native JSON-schema error dump.
 		for (const correction of decisionRequests.slice(1)) {
-			assert.match(
-				JSON.stringify(correction.messages),
-				/previous decision response was invalid/,
-			);
+			assert.match(JSON.stringify(correction.messages), /failed validation/);
 			assert.doesNotMatch(
 				JSON.stringify(correction.messages),
 				/Validation failed for tool/,
 			);
 		}
+		await waitForReady(fixture, "DECISION_FAILED");
 		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
 		assert.ok(
 			envelopes.some(
@@ -1912,19 +2225,14 @@ test("packed invalid cw payloads stop before native schema follow-up", {
 	}
 });
 
-/**
- * S8: one schema-invalid owned response then a valid correction. The invalid
- * payload must not generate a native schema-error follow-up request: the
- * correction arrives exactly once as the bounded re-ask, and the valid call
- * executes/stages/settles once.
- */
-test("packed schema-invalid payload then valid correction settles once", {
+/** One invalid file plus one valid correction publishes exactly once. */
+test("packed invalid file payload then valid correction settles once", {
 	timeout: 360_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t, { withSemanticProbe: true });
 	const { baseUrl, requests } = await startMockServer(t, [
 		{ kind: "text", text: "Work settles." },
-		// Schema-invalid under the constrained contract: action enum violation.
+		// File-invalid under the contract: action enum violation.
 		{
 			kind: "cw-invalid",
 			text: '{"action":"bogus","reason_type":"JOB_DONE","reason_content":"Wrong action."}',
@@ -1935,9 +2243,8 @@ test("packed schema-invalid payload then valid correction settles once", {
 	try {
 		await session.prompt("Do the work.");
 		await waitForSessionIdle(session, 30_000, "first turn");
-		await waitFor(() => requests.length >= 2, 120_000, "first decision");
-		await waitFor(() => requests.length >= 3, 120_000, "correction");
-		await waitForSessionIdle(session, 60_000, "correction turn");
+		await waitFor(() => requests.length >= 2, 45_000, "first decision");
+		await waitFor(() => requests.length >= 3, 15_000, "correction");
 		const decisionRequests = requests.filter((request) =>
 			isDecisionRequest(request),
 		);
@@ -1946,8 +2253,9 @@ test("packed schema-invalid payload then valid correction settles once", {
 		// native schema error or the raw invalid arguments.
 		assert.match(
 			JSON.stringify(decisionRequests[1].messages),
-			/previous decision response was invalid/,
+			/failed validation/,
 		);
+		await waitForReady(fixture, "AI_UNLOCK");
 		const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
 		const ready = envelopes.filter(
 			(envelope) => envelope.name === "user-ready",
@@ -1994,7 +2302,7 @@ async function captureContinuationRequest(
 		{ kind: "text", text: "Continuation ordinary turn." },
 		{ kind: "cw", action: "unlock" },
 	]);
-	const sm = SessionManager.inMemory(fixture.cwd);
+	const sm = SessionManager.create(fixture.cwd, join(fixture.root, "sessions"));
 	options.seed(sm);
 	const { session } = await createSession(fixture, baseUrl, {
 		sessionManager: sm,
@@ -2002,9 +2310,8 @@ async function captureContinuationRequest(
 	try {
 		await session.prompt("Kick off the ordinary turn.");
 		await waitForSessionIdle(session, 60_000, "first turn");
-		await waitFor(() => requests.length >= 2, 180_000, "decision request");
-		await waitForSessionIdle(session, 60_000, "decision turn");
-		await waitFor(() => requests.length >= 3, 180_000, "continuation request");
+		await waitFor(() => requests.length >= 2, 45_000, "decision request");
+		await waitFor(() => requests.length >= 3, 15_000, "continuation request");
 		const continuationRequest = requests[2];
 		assert.ok(continuationRequest, "expected a continuation request");
 		assert.ok(
@@ -2059,6 +2366,11 @@ function assertNoDecisionInternals(request: RequestRecord): void {
 		/Your entire response must be exactly one cw function call/,
 	);
 	assert.doesNotMatch(body, /"name":"cw"/);
+	assert.doesNotMatch(
+		body,
+		/<watchdog_result_file>|<subagent_instructions>|\/decision\.json/,
+	);
+	assert.doesNotMatch(body, /Source evidence \(bounded excerpts/);
 }
 
 // A13 continuation — a real user grant plus the assistant's redundant
@@ -2239,18 +2551,21 @@ test("packed A15 continuation request keeps every genuine user boundary", {
 
 /**
  * 2.1/2.2/3.1 — real disk-backed same-JSONL association. A completed exchange
- * persists the bounded view in the owned inquiry body, nested review metadata
- * on the hidden marker, the normalized response on the hidden audit, and the
- * canonical fold — all under the same attempt, readable after a fresh-process
- * reopen of the exact same session file. Deterministic localhost fixture
- * provider only; input fidelity is asserted, not model accuracy.
+ * persists the bounded view, source references, private child/response and
+ * accepted outcome in context-excluded native records. Fresh-process reopen,
+ * real resume and native compaction must preserve ordinary facts without
+ * copying private prompts or file traffic. Localhost fixture only.
  */
-test("packed disk-backed session persists and reopens the review association", {
-	timeout: 360_000,
+test("packed disk-backed session persists private review association through reopen and summary", {
+	timeout: 180_000,
 }, async (t) => {
-	const fixture = await makePackedFixture(t);
-	const sessionDir = join(fixture.root, "sessions");
-	await mkdir(sessionDir, { recursive: true });
+	const fixture = await makePackedFixture(t, {
+		withSemanticProbe: true,
+		piSettings: {
+			compaction: { enabled: false, reserveTokens: 128, keepRecentTokens: 5 },
+			retry: { enabled: false },
+		},
+	});
 	const { baseUrl, requests } = await startMockServer(t, [
 		{ kind: "text", text: "Delivered the migration report." },
 		{
@@ -2259,8 +2574,11 @@ test("packed disk-backed session persists and reopens the review association", {
 			reasonType: "JOB_DONE",
 			reason: "Migration report delivered.",
 		},
+		{ kind: "text", text: "Resumed ordinary work." },
+		{ kind: "text", text: "Native summary of authorized migration work." },
+		{ kind: "text", text: "Native summary of authorized migration work." },
 	]);
-	const sm = SessionManager.create(fixture.cwd, sessionDir);
+	const sm = SessionManager.create(fixture.cwd, join(fixture.root, "sessions"));
 	const excludedId = sm.appendMessage({
 		role: "bashExecution",
 		command: "echo LOCAL_ONLY_COMMAND_SENTINEL",
@@ -2280,22 +2598,15 @@ test("packed disk-backed session persists and reopens the review association", {
 		truncated: false,
 		timestamp: 2,
 	});
-	let session: AgentSession | undefined;
+	let { session } = await createSession(fixture, baseUrl, {
+		sessionManager: sm,
+	});
 	try {
-		({ session } = await createSession(fixture, baseUrl, {
-			sessionManager: sm,
-		}));
 		await session.prompt("Report the migration status.");
-		await waitForSessionIdle(session, 60_000, "first turn");
-		await waitFor(() => requests.length >= 2, 120_000, "decision request");
-		await waitForSessionIdle(session, 60_000, "decision turn");
-
-		const decisionRequest = requests.find((request) =>
-			isDecisionRequest(request),
-		);
-		assert.ok(decisionRequest, "expected a serialized inquiry request");
+		await waitForReady(fixture);
+		const decisionRequest = requests.find(isDecisionRequest);
+		assert.ok(decisionRequest, "expected a serialized private request");
 		const inquiryBody = requestPromptText(decisionRequest);
-		// The same inquiry carries the bounded provenance-labelled view.
 		assert.match(
 			inquiryBody,
 			/Source evidence \(bounded excerpts; omissions are not proof of absence/,
@@ -2308,51 +2619,74 @@ test("packed disk-backed session persists and reopens the review association", {
 			JSON.stringify(requests),
 			/LOCAL_ONLY_(COMMAND|OUTPUT)_SENTINEL/,
 		);
-		assert.ok(
-			sm.getEntry(excludedId),
-			"native excluded record is retained locally",
-		);
-
+		assert.ok(sm.getEntry(excludedId), "excluded source remains local");
 		const sessionFile = sm.getSessionFile();
-		assert.ok(sessionFile !== undefined, "session must be disk-backed");
-		// Fresh-process reopen: a separate Node/tsx process, running from the
-		// fixture install root where @earendil-works/pi-coding-agent resolves,
-		// reads the same JSONL with zero shared memory. Any assertion failure
-		// inside surfaces as a non-zero exit code on execFileAsync.
+		assert.ok(sessionFile, "session must be disk-backed");
+		const mainId = sm.getSessionId();
+		await shutdownSession(session);
+
+		// Fresh process reconstructs association from native parent records only:
+		// no runtime helper, temporary file, child transcript, or process memory.
 		const verifyScript = join(fixture.installRoot, "verify-reopen.mts");
 		await writeFile(
 			verifyScript,
-			`import assert from "node:assert/strict";\n` +
-				`import { SessionManager } from "@earendil-works/pi-coding-agent";\n` +
-				`import { readReviewHistory } from ${JSON.stringify(join(fixture.packageDir, "src", "review-context.ts"))};\n` +
-				`const sm = SessionManager.open(process.argv[2]);\n` +
-				`const branch = sm.getBranch();\n` +
-				`const markers = branch.filter((e) => e.type === "custom" && e.customType === "pi-continue-watchdog:inquiry-marker");\n` +
-				`assert.equal(markers.length, 1, "marker survives fresh-process reopen");\n` +
-				`const review = markers[0].data?.review;\n` +
-				`assert.ok(review, "review metadata survives reopen");\n` +
-				`assert.equal(review.version, 1);\n` +
-				`const audits = branch.filter((e) => e.type === "custom" && e.customType === "pi-continue-watchdog:decision-audit");\n` +
-				`assert.equal(audits.length, 1, "audit survives reopen");\n` +
-				`assert.equal(audits[0].data?.review?.markerEntryId, markers[0].id);\n` +
-				`const folds = branch.filter((e) => e.type === "custom_message" && e.customType === "pi-continue-watchdog:inquiry-fold");\n` +
-				`assert.equal(folds.length, 1, "canonical fold survives reopen");\n` +
-				`assert.notEqual(sm.getSessionId(), "", "reopened session has identity");\n` +
-				`const history = readReviewHistory(sm);\n` +
-				`assert.equal(history.records.length, 1);\n` +
-				`assert.equal(history.records[0].reviewMetadata, "ok");\n` +
-				`assert.equal(history.records[0].responseOutcome, "unlock");\n` +
-				`assert.equal(history.records[0].publishedOutcome, "unlock");\n` +
-				`assert.equal(history.records[0].status, "published");\n` +
-				`const quietUnlock = sm.getEntry(history.records[0].unlockEntryId);\n` +
-				`assert.equal(quietUnlock?.customType, "pi-continue-watchdog:ai-unlock");\n` +
-				`assert.equal(quietUnlock.data.exchangeId, history.records[0].exchangeId);\n` +
-				`assert.equal(quietUnlock.data.cycleId, history.records[0].cycleId);\n` +
-				`const prompt = sm.getEntry(history.records[0].promptEntryId);\n` +
-				`assert.ok(prompt?.content.includes("Source evidence (bounded excerpts"));\n` +
-				`console.log("fresh-process reopen assertions passed");\n`,
+			String.raw`
+import assert from "node:assert/strict";
+import { SessionManager, convertToLlm, sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
+import { readReviewHistory } from ${JSON.stringify(join(fixture.packageDir, "src", "review-context.ts"))};
+const sm = SessionManager.open(process.argv[2]);
+const branch = sm.getBranch();
+const ofType = (type) => branch.filter(e => e.type === "custom" && e.customType === type);
+const markers = ofType("pi-continue-watchdog:inquiry-marker");
+const decisions = ofType("pi-continue-watchdog:private-decision");
+const responses = ofType("pi-continue-watchdog:private-response");
+const unlocks = ofType("pi-continue-watchdog:ai-unlock");
+assert.equal(markers.length, 1);
+assert.equal(decisions.length, 1);
+assert.equal(responses.length, 1);
+assert.equal(unlocks.length, 1);
+const marker = markers[0].data;
+const decision = decisions[0].data;
+const response = responses[0].data;
+const unlock = unlocks[0].data;
+const history = readReviewHistory(sm);
+assert.equal(history.records.length, 1);
+assert.equal(history.records[0].reviewMetadata, "ok");
+assert.equal(history.records[0].responseOutcome, "unlock");
+assert.equal(history.records[0].publishedOutcome, "unlock");
+assert.equal(history.records[0].status, "published");
+const reviewEntries = ofType("pi-continue-watchdog:unlock-review");
+assert.equal(reviewEntries.length, 1);
+assert.equal(reviewEntries[0].data.incompleteReason, "unavailable");
+for (const entry of [marker, decision, response]) assert.equal(entry.version, 1);
+for (const entry of [marker, decision, response, unlock]) {
+  assert.equal(entry.exchangeId, marker.exchangeId);
+  assert.equal(entry.cycleId, marker.cycleId);
+}
+assert.equal(decision.inquiry, "initial");
+assert.equal(decision.phase, "started");
+assert.notEqual(decision.childSessionId, sm.getSessionId());
+assert.equal(response.sessionId, decision.childSessionId);
+assert.equal(response.inquiry, "initial");
+assert.equal(response.attempt, 1);
+assert.equal(response.outcome.kind, "valid");
+assert.equal(response.outcome.decision.kind, "unlock");
+assert.equal(response.outcome.decision.reason, "Migration report delivered.");
+assert.equal(unlock.reason, "Migration report delivered.");
+assert.equal(decision.review.version, 1);
+assert.deepEqual(decision.review, marker.review);
+assert.ok(decision.review.selectedSources.some(source => source.id === ${JSON.stringify(includedId)}));
+assert.ok(decision.review.selectedSources.every(source => source.id !== ${JSON.stringify(excludedId)}));
+assert.match(decision.sourceView, /Source evidence \(bounded excerpts/);
+assert.match(decision.sourceView, /Delivered the migration report/);
+const context = JSON.stringify(convertToLlm(branch.flatMap(sessionEntryToContextMessages)));
+assert.doesNotMatch(context, /Source evidence|watchdog_result_file|subagent_instructions|Migration report delivered\./);
+assert.doesNotMatch(JSON.stringify(branch), /watchdog_result_file|subagent_instructions|\/decision\.json/);
+assert.equal(branch.some(e => e.type === "custom_message" && e.customType === "pi-continue-watchdog:inquiry"), false);
+console.log("fresh-process private association assertions passed");
+`,
 		);
-		const { stdout: reopenOut } = await execFileAsync(
+		const { stdout } = await execFileAsync(
 			process.execPath,
 			[
 				"--import",
@@ -2360,103 +2694,605 @@ test("packed disk-backed session persists and reopens the review association", {
 				verifyScript,
 				sessionFile,
 			],
-			{ cwd: fixture.installRoot, timeout: 60_000 },
+			{ cwd: fixture.installRoot, timeout: 30_000 },
 		);
-		assert.match(reopenOut, /fresh-process reopen assertions passed/);
-		const branch = sm.getBranch();
-		const storedInquiry = branch.find(
-			(entry) =>
-				entry.type === "custom_message" &&
-				entry.customType === "pi-continue-watchdog:inquiry",
+		assert.match(stdout, /fresh-process private association assertions passed/);
+
+		const resumed = SessionManager.open(sessionFile);
+		assert.equal(resumed.getSessionId(), mainId);
+		({ session } = await createSession(fixture, baseUrl, {
+			sessionManager: resumed,
+		}));
+		await session.prompt("Resume authorized migration work.");
+		assert.equal(requests.length, 3);
+		assert.match(
+			requestPromptText(requests[2]),
+			/Report the migration status\./,
 		);
-		assert.ok(
-			storedInquiry?.type === "custom_message" &&
-				typeof storedInquiry.content === "string",
+		assert.match(
+			requestPromptText(requests[2]),
+			/Delivered the migration report\./,
 		);
-		assert.ok(
-			inquiryBody.includes(storedInquiry.content),
-			"persisted inquiry equals the assembled model-facing input",
+		assertNoDecisionInternals(requests[2]);
+		assert.doesNotMatch(
+			requestPromptText(requests[2]),
+			/Source evidence|Migration report delivered\./,
 		);
-		const markers = branch.filter(
-			(entry) =>
-				entry.type === "custom" &&
-				entry.customType === "pi-continue-watchdog:inquiry-marker",
-		);
-		assert.equal(markers.length, 1);
-		const markerData = (markers[0] as { data?: unknown }).data as Record<
-			string,
-			unknown
-		>;
-		const markerReview = markerData.review as
-			| Record<string, unknown>
-			| undefined;
-		assert.ok(markerReview, "marker carries nested review metadata");
-		assert.equal(markerReview.version, 1);
-		assert.ok(
-			Array.isArray(markerReview.selectedSources) &&
-				(markerReview.selectedSources as unknown[]).length > 0,
-			"review records selected source ids",
-		);
-		const selectedSources = markerReview.selectedSources as { id: string }[];
-		assert.ok(selectedSources.some((source) => source.id === includedId));
-		assert.ok(selectedSources.every((source) => source.id !== excludedId));
-		assert.notEqual(markerReview.sourceHeadId, excludedId);
-		const audits = branch.filter(
-			(entry) =>
-				entry.type === "custom" &&
-				entry.customType === "pi-continue-watchdog:decision-audit",
-		);
-		assert.equal(audits.length, 1);
-		const auditData = (audits[0] as { data?: unknown }).data as Record<
-			string,
-			unknown
-		>;
-		assert.equal(auditData.exchangeId, markerData.exchangeId);
-		assert.equal(auditData.outcome, "unlock");
-		const auditReview = auditData.review as Record<string, unknown> | undefined;
-		assert.ok(auditReview, "audit carries the review association");
-		assert.equal(auditReview.version, 1);
-		assert.equal(auditReview.markerEntryId, markers[0].id);
-		// Canonical fold correlates the published outcome on the same attempt.
-		const folds = branch.filter(
-			(entry) =>
-				entry.type === "custom_message" &&
-				entry.customType === "pi-continue-watchdog:inquiry-fold",
-		);
-		assert.equal(folds.length, 1);
-		const foldDetails = (folds[0] as { details?: unknown }).details as Record<
-			string,
-			unknown
-		>;
-		assert.equal(foldDetails.watchdogOutcome, "unlock");
-		// Default-on unlock review with no jev loaded: exactly one skipped
-		// record; no other review entry type, sidecar, or second model request.
-		const reviewEntries = branch.filter(
-			(entry) =>
-				entry.type === "custom" &&
-				String((entry as { customType?: unknown }).customType).includes(
-					"review",
-				),
-		);
-		assert.equal(reviewEntries.length, 1);
+		const result = await session.compact();
+		assert.match(result.summary, /Native summary of authorized migration work/);
 		assert.equal(
-			(reviewEntries[0] as { customType?: unknown }).customType,
-			"pi-continue-watchdog:unlock-review",
+			requests.length,
+			5,
+			"only explicit resume and the two native summary regions add requests",
 		);
-		assert.equal(
-			(
-				(reviewEntries[0] as { data?: unknown }).data as {
-					incompleteReason?: unknown;
-				}
-			).incompleteReason,
-			"unavailable",
+		const summaries = requests.slice(3);
+		const summaryBody = summaries.map(requestPromptText).join("\n");
+		assert.match(summaryBody, /Report the migration status\./);
+		assert.match(summaryBody, /Delivered the migration report\./);
+		for (const request of summaries) assertNoDecisionInternals(request);
+		assert.doesNotMatch(
+			summaryBody,
+			/Source evidence|Migration report delivered\.|LOCAL_ONLY_(COMMAND|OUTPUT)_SENTINEL/,
 		);
-		assert.equal(requests.filter(isDecisionRequest).length, 1);
+		assert.ok(resumed.getBranch().some((entry) => entry.type === "compaction"));
 	} finally {
-		// Real cleanup on the live session, then reopen assertions run against
-		// the persisted file — never mask a mid-test failure behind them.
-		if (session !== undefined) {
-			await shutdownSession(session);
-		}
+		await shutdownSession(session);
 	}
 });
+
+test("packed private runtime creates a full fork without a developer checkout or public subagents", {
+	timeout: 180_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t, { includeWatchdog: false });
+	await execFileAsync(
+		process.execPath,
+		["scripts/prepare-private-runtime.mjs"],
+		{
+			cwd: fixture.packageDir,
+			timeout: 30_000,
+		},
+	);
+	const privateDir = join(
+		fixture.packageDir,
+		"node_modules",
+		"watchdog-subagents-runtime",
+	);
+	const metadata = JSON.parse(
+		await readFile(join(privateDir, "package.json"), "utf8"),
+	);
+	assert.deepEqual(Object.keys(metadata.exports), ["./watchdog-runtime"]);
+	assert.equal(metadata.pi, undefined);
+	await assert.rejects(
+		access(join(fixture.installRoot, "node_modules", "pi-subagents")),
+	);
+	for (const name of ["pi-coding-agent", "pi-agent-core", "pi-ai", "pi-tui"]) {
+		await assert.rejects(
+			access(join(fixture.packageDir, "node_modules", "@earendil-works", name)),
+		);
+		await assert.rejects(
+			access(join(privateDir, "node_modules", "@earendil-works", name)),
+		);
+	}
+	const probePath = join(fixture.packageDir, "private-runtime-probe.ts");
+	const output = join(fixture.root, "private-runtime-result.json");
+	const privateAgentDir = join(fixture.root, "private-agent");
+	await writeFile(
+		probePath,
+		`
+import { mkdir, writeFile } from "node:fs/promises";
+import { createWatchdogRuntime } from "watchdog-subagents-runtime/watchdog-runtime";
+export default function (pi) {
+  pi.on("session_start", async (_event, ctx) => {
+    const runtime = createWatchdogRuntime();
+    const before = pi.getAllTools().map(tool => tool.name);
+    let result;
+    try {
+      await mkdir(${JSON.stringify(privateAgentDir)}, { recursive: true });
+      const file = ${JSON.stringify(join(privateAgentDir, "decision.json"))};
+      await writeFile(file, "{}", { mode: 0o600 });
+      const child = await runtime.fork({
+        parent: ctx.sessionManager, parentProviderRegistry: ctx.modelRegistry,
+        cwd: ctx.cwd, agentDir: ${JSON.stringify(privateAgentDir)}, resultFile: file,
+        model: ctx.model.provider + "/" + ctx.model.id,
+      });
+      result = { main: ctx.sessionManager.getSessionId(), child: child.sessionId,
+        model: child.modelId, before, after: pi.getAllTools().map(tool => tool.name) };
+      await child.dispose();
+    } finally { await runtime.dispose(); }
+    await writeFile(${JSON.stringify(output)}, JSON.stringify(result));
+  });
+}
+`,
+	);
+	const manager = SessionManager.create(
+		fixture.cwd,
+		join(fixture.root, "sessions"),
+	);
+	const timestamp = Date.now() - 1000;
+	manager.appendMessage({
+		role: "system",
+		content: "Packed parent instructions",
+		toolsAdded: [],
+		timestamp,
+	});
+	manager.appendMessage({
+		role: "user",
+		content: "Authorized work",
+		timestamp,
+	});
+	manager.appendMessage({
+		role: "assistant",
+		content: [{ type: "text", text: "Delivered" }],
+		provider: "watchdog-e2e",
+		api: "openai-completions",
+		model: "watchdog-e2e",
+		timestamp,
+		stopReason: "stop",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+	});
+	const { session } = await createSession(fixture, "http://127.0.0.1:1/v1", {
+		additionalExtensionPaths: [probePath],
+		sessionManager: manager,
+	});
+	try {
+		const result = JSON.parse(await readFile(output, "utf8"));
+		assert.notEqual(result.child, result.main);
+		assert.equal(result.model, "watchdog-e2e/watchdog-e2e");
+		assert.deepEqual(result.after, result.before);
+		assert.equal(result.after.includes("subagent"), false);
+		assert.equal(result.after.includes("cw"), false);
+	} finally {
+		await shutdownSession(session);
+	}
+});
+
+test("packed production watchdog accepts a private file decision without a main-model round trip", {
+	timeout: 180_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t, {
+		withSemanticProbe: true,
+		watchdogConfig: { unlockReviewEnabled: false },
+		piSettings: { compaction: { enabled: false }, retry: { enabled: false } },
+	});
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "text", text: "The requested summary is delivered." },
+		{
+			kind: "write",
+			action: "unlock",
+			reasonType: "JOB_DONE",
+			reason: "Summary delivered.",
+		},
+	]);
+	const manager = SessionManager.create(
+		fixture.cwd,
+		join(fixture.root, "sessions"),
+	);
+	const { session } = await createSession(fixture, baseUrl, {
+		sessionManager: manager,
+	});
+	const mainId = session.sessionId;
+	try {
+		await session.prompt("Give the requested summary.");
+		assert.equal(requests.length, 1);
+		assert.equal(
+			requests[0].tools?.some((tool) => tool.function?.name === "cw"),
+			false,
+			"ordinary requests must not expose a watchdog result function",
+		);
+		await waitFor(
+			() =>
+				readFileSync(fixture.probeOut ?? "", "utf8")
+					.split("\n")
+					.filter(Boolean)
+					.some((line) => {
+						const record = JSON.parse(line);
+						return (
+							record.kind === "semantic-hook" &&
+							record.data?.name === "user-ready" &&
+							record.data?.values?.STOP_KIND === "AI_UNLOCK"
+						);
+					}),
+			45_000,
+			"private file decision publication",
+		);
+		const ready = (await readProbeEnvelopes(fixture.probeOut ?? "")).filter(
+			(envelope) => envelope.name === "user-ready",
+		);
+		assert.equal(ready.length, 1);
+		assert.deepEqual(ready[0].values, {
+			STOP_KIND: "AI_UNLOCK",
+			REASON_TYPE: "JOB_DONE",
+			REASON: "Summary delivered.",
+		});
+		assert.equal(
+			requests.length,
+			2,
+			"only ordinary work and one private write response are needed",
+		);
+		assert.equal(
+			requests[1].messages.some((message) =>
+				JSON.stringify(message.content).includes("<watchdog_result_file>"),
+			),
+			true,
+		);
+		assert.equal(session.sessionId, mainId);
+		const parentFile = manager.getSessionFile();
+		assert.ok(parentFile);
+		const childHeaders = await Promise.all(
+			(await readdir(join(fixture.root, "sessions"), { recursive: true }))
+				.filter((path) => path.endsWith(".jsonl"))
+				.map(async (path) =>
+					JSON.parse(
+						(
+							await readFile(join(fixture.root, "sessions", path), "utf8")
+						).split("\n")[0],
+					),
+				),
+		);
+		const forks = childHeaders.filter(
+			(header) => header.parentSession === parentFile,
+		);
+		assert.equal(forks.length, 1);
+		assert.notEqual(forks[0].id, mainId);
+		assert.doesNotMatch(
+			JSON.stringify(manager.getBranch()),
+			/<watchdog_result_file>|<subagent_instructions>|\/decision\.json/,
+		);
+	} finally {
+		await shutdownSession(session);
+	}
+});
+
+const SUBAGENT_CALLBACK_WAKE =
+	"Inspect subagent updates above. Answer pending supervisor requests within your authority. For completed work, read saved results and resume the already-authorized parent task, or report completion. If approval is required, explicitly ask the user. Do not silently yield, rerun completed work, or infer new authorization.";
+
+for (const callback of [false, true]) {
+	test(`packed private ${callback ? "callback suspension preserves" : "continuation spends"} the final shared budget unit`, {
+		timeout: 180_000,
+	}, async (t) => {
+		const fixture = await makePackedFixture(t, {
+			withSemanticProbe: true,
+			watchdogConfig: { unlockReviewEnabled: false, maxContinue: 1 },
+			piSettings: { compaction: { enabled: false }, retry: { enabled: false } },
+		});
+		const { baseUrl, requests } = await startMockServer(t, [
+			{ kind: "text", text: "Work status assessed." },
+			{
+				kind: "write",
+				action: callback ? "unlock" : "continue",
+				reasonType: callback ? "WAIT_CALLBACK" : "VERIFYING",
+				reason: callback
+					? "Waiting for the known callback."
+					: "Complete the requested check.",
+			},
+			{ kind: "text", text: "Final ordinary work completed." },
+		]);
+		const manager = SessionManager.create(
+			fixture.cwd,
+			join(fixture.root, "sessions"),
+		);
+		const { session } = await createSession(fixture, baseUrl, {
+			sessionManager: manager,
+		});
+		const hasStop = (stop: string) =>
+			readFileSync(fixture.probeOut ?? "", "utf8")
+				.split("\n")
+				.filter(Boolean)
+				.some((line) => {
+					const record = JSON.parse(line);
+					return (
+						record.kind === "semantic-hook" &&
+						record.data?.name === "user-ready" &&
+						record.data?.values?.STOP_KIND === stop
+					);
+				});
+		try {
+			await session.prompt(
+				"Complete the requested work, including its callback when needed.",
+			);
+			if (callback) {
+				await waitFor(
+					() => hasStop("WAIT_CALLBACK"),
+					45_000,
+					"callback suspension",
+				);
+				assert.equal(requests.length, 2);
+				await new Promise((resolve) => setTimeout(resolve, 12_000));
+				assert.equal(
+					requests.length,
+					2,
+					"suspension must not poll or spend a new response",
+				);
+				assert.equal(hasStop("EXHAUSTED"), false);
+				await session.prompt(SUBAGENT_CALLBACK_WAKE);
+			}
+			await waitFor(
+				() => hasStop("EXHAUSTED"),
+				45_000,
+				"final unit exhaustion after actual ordinary work",
+			);
+			assert.equal(
+				requests.length,
+				3,
+				"the final ordinary work runs with no additional private inquiry",
+			);
+			const envelopes = await readProbeEnvelopes(fixture.probeOut ?? "");
+			assert.equal(
+				envelopes.filter((entry) => entry.name === "watchdog-continued").length,
+				callback ? 0 : 1,
+			);
+			assert.equal(
+				envelopes.filter((entry) => entry.name === "user-ready").length,
+				callback ? 2 : 1,
+			);
+			assert.doesNotMatch(
+				JSON.stringify(requests[2].messages),
+				/<watchdog_result_file>|<subagent_instructions>/,
+			);
+			assert.equal(
+				manager
+					.getBranch()
+					.filter(
+						(entry) =>
+							entry.type === "message" && entry.message.role === "assistant",
+					).length,
+				2,
+			);
+		} finally {
+			await shutdownSession(session);
+		}
+	});
+}
+
+test("packed manual unlock cancels private initial, correction, and empty streams without aborting main", {
+	timeout: 180_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t, {
+		withSemanticProbe: true,
+		watchdogConfig: { unlockReviewEnabled: false },
+	});
+	for (const kind of ["initial", "correction", "empty"] as const) {
+		await t.test(kind, { timeout: 50_000 }, async (sub) => {
+			await writeFile(fixture.probeOut ?? "", "");
+			let privateStarted = false;
+			let privateClosed = false;
+			const { baseUrl, requests } = await startMockServer(sub, [
+				{ kind: "text", text: "Ordinary work delivered." },
+				...(kind === "correction"
+					? [{ kind: "cw-invalid", text: "{}" } as const]
+					: []),
+				{
+					kind: "delayed",
+					text: kind === "empty" ? "" : "private partial output",
+					started: () => {
+						privateStarted = true;
+					},
+					closed: () => {
+						privateClosed = true;
+					},
+				},
+			]);
+			const { session } = await createSession(fixture, baseUrl);
+			let mainAborts = 0;
+			const unsubscribe = session.subscribe((event) => {
+				if (
+					event.type === "message_end" &&
+					event.message.role === "assistant" &&
+					event.message.stopReason === "aborted"
+				)
+					mainAborts++;
+			});
+			try {
+				await session.prompt("Give the requested report.");
+				await waitFor(() => privateStarted, 35_000, "private stream started");
+				assert.equal(
+					session.isStreaming,
+					false,
+					"private generation must not occupy main run",
+				);
+				await session.prompt("/unlock-continue-watchdog");
+				await waitFor(
+					() => privateClosed,
+					10_000,
+					"exact private stream cancellation",
+				);
+				await waitForSessionIdle(
+					session,
+					10_000,
+					"manual unlock main readiness",
+				);
+				assert.equal(requests.length, kind === "correction" ? 3 : 2);
+				assert.equal(
+					mainAborts,
+					0,
+					"private cancellation is not parent assistant abort",
+				);
+				assert.equal(
+					(await readProbeEnvelopes(fixture.probeOut ?? "")).filter(
+						(entry) => entry.name === "user-ready",
+					).length,
+					0,
+				);
+				assert.doesNotMatch(
+					JSON.stringify(session.sessionManager.getBranch()),
+					/private partial output|Operation aborted|<watchdog_result_file>/,
+				);
+			} finally {
+				unsubscribe();
+				await shutdownSession(session);
+			}
+		});
+	}
+});
+
+const privateFileCases: Array<{
+	name: string;
+	outputs: Record<string, unknown>[];
+	values: Record<string, string>;
+	foreignAudit?: boolean;
+}> = [
+	{
+		name: "context-excluded foreign metadata does not invalidate the source",
+		outputs: [
+			{
+				action: "unlock",
+				reason_type: "JOB_DONE",
+				reason_content: "Metadata ignored.",
+			},
+		],
+		values: {
+			STOP_KIND: "AI_UNLOCK",
+			REASON_TYPE: "JOB_DONE",
+			REASON: "Metadata ignored.",
+		},
+		foreignAudit: true,
+	},
+	{
+		name: "invalid file is corrected in the same child",
+		outputs: [
+			{ reason_type: "JOB_DONE", reason_content: "Missing action." },
+			{
+				action: "unlock",
+				reason_type: "JOB_DONE",
+				reason_content: "Corrected.",
+			},
+		],
+		values: {
+			STOP_KIND: "AI_UNLOCK",
+			REASON_TYPE: "JOB_DONE",
+			REASON: "Corrected.",
+		},
+	},
+	{
+		name: "third invalid file fails without a fourth response",
+		outputs: [{ action: "wait" }, { action: "wait" }, { action: "wait" }],
+		values: { STOP_KIND: "DECISION_FAILED" },
+	},
+];
+
+for (const scenario of privateFileCases) {
+	test(`packed production file ${scenario.name}`, {
+		timeout: 180_000,
+	}, async (t) => {
+		const fixture = await makePackedFixture(t, {
+			withSemanticProbe: true,
+			watchdogConfig: { unlockReviewEnabled: false, maxContinue: 1 },
+			piSettings: { compaction: { enabled: false }, retry: { enabled: false } },
+		});
+		const { baseUrl, requests } = await startMockServer(t, [
+			{ kind: "text", text: "The requested summary is delivered." },
+			...scenario.outputs.map(
+				(args): MockReply => ({
+					kind: "write",
+					args,
+					started: scenario.foreignAudit
+						? () => {
+								manager.appendCustomEntry("foreign:diagnostic", { test: true });
+							}
+						: undefined,
+				}),
+			),
+		]);
+		const manager = SessionManager.create(
+			fixture.cwd,
+			join(fixture.root, "sessions"),
+		);
+		const { session } = await createSession(fixture, baseUrl, {
+			sessionManager: manager,
+		});
+		const mainId = session.sessionId;
+		let phase = "ordinary reply";
+		try {
+			await session.prompt("Give the requested summary.");
+			assert.equal(
+				requests[0].tools?.some((tool) => tool.function?.name === "cw"),
+				false,
+			);
+			phase = "private terminal publication";
+			await waitFor(
+				() =>
+					readFileSync(fixture.probeOut ?? "", "utf8")
+						.split("\n")
+						.filter(Boolean)
+						.some((line) => {
+							const record = JSON.parse(line);
+							return (
+								record.kind === "semantic-hook" &&
+								record.data?.name === "user-ready" &&
+								record.data?.values?.STOP_KIND === scenario.values.STOP_KIND
+							);
+						}),
+				45_000,
+				scenario.name,
+			);
+			phase = "terminal assertions";
+			assert.equal(requests.length, scenario.outputs.length + 1);
+			const ready = (await readProbeEnvelopes(fixture.probeOut ?? "")).filter(
+				(envelope) => envelope.name === "user-ready",
+			);
+			assert.equal(ready.length, 1);
+			assert.deepEqual(ready[0].values, scenario.values);
+			assert.equal(session.sessionId, mainId);
+			if (scenario.outputs.length > 1)
+				assert.match(JSON.stringify(requests[2].messages), /failed validation/);
+			const responseEntries = manager
+				.getBranch()
+				.filter(
+					(entry) =>
+						entry.type === "custom" &&
+						entry.customType === "pi-continue-watchdog:private-response",
+				);
+			assert.equal(responseEntries.length, scenario.outputs.length);
+			const childIds = new Set<string>();
+			for (const entry of responseEntries) {
+				assert.ok(
+					entry.type === "custom" &&
+						entry.data &&
+						typeof entry.data === "object" &&
+						"sessionId" in entry.data,
+				);
+				assert.ok(typeof entry.data.sessionId === "string");
+				childIds.add(entry.data.sessionId);
+			}
+			assert.equal(childIds.size, 1);
+			assert.equal(childIds.has(mainId), false);
+			assert.equal(
+				manager
+					.getBranch()
+					.filter(
+						(entry) =>
+							entry.type === "message" && entry.message.role === "assistant",
+					).length,
+				1,
+			);
+			assert.doesNotMatch(
+				JSON.stringify(manager.getBranch()),
+				/<watchdog_result_file>|<subagent_instructions>|\/decision\.json/,
+			);
+		} catch (error) {
+			console.error(
+				"Private file fixture failure:",
+				phase,
+				"requests:",
+				requests.length,
+				manager
+					.getBranch()
+					.slice(-5)
+					.map((entry) => ({
+						type: entry.type,
+						customType: "customType" in entry ? entry.customType : undefined,
+					})),
+			);
+			throw error;
+		} finally {
+			await shutdownSession(session);
+		}
+	});
+}

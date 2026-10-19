@@ -33,7 +33,7 @@ import {
 
 /**
  * Minimal structural shapes of the public host preparation objects. The
- * pinned 0.85.1 surface exposes these through the session_before_compact and
+ * pinned 1.3.0 surface exposes these through the session_before_compact and
  * session_before_tree events; only the fields this projection reads are
  * declared.
  */

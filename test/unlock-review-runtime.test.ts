@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import test from "node:test";
-
-import type {
-	ExtensionAPI,
-	ExtensionContext,
+import test, { afterEach } from "node:test";
+import {
+	buildSessionProjection,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-
 import { handleUnlock, type MainCommandRuntime } from "../src/commands.js";
 import type { ContinueWatchdogConfig } from "../src/config.js";
 import {
@@ -13,10 +13,7 @@ import {
 	DECISION_MESSAGE_TYPE,
 } from "../src/context-fold.js";
 import { createLockDecisionController } from "../src/controller.js";
-import {
-	buildDecisionPrompt,
-	MISSING_DECISION_CALL_ERROR,
-} from "../src/decision-protocol.js";
+import { buildDecisionFilePrompt } from "../src/decision-protocol.js";
 import {
 	createHubAttachmentInstance,
 	createObservableAgentHub,
@@ -33,11 +30,13 @@ import {
 	type RuntimeTimerHandle,
 	UNLOCK_REVIEW_ENTRY_TYPE,
 } from "../src/runtime.js";
+import { UNLOCK_REVIEW_QUESTION_ID } from "../src/unlock-review.js";
 import {
-	UNLOCK_REVIEW_PROJECTION_VERSION,
-	UNLOCK_REVIEW_QUESTION_ID,
-	type UnlockReviewProjection,
-} from "../src/unlock-review.js";
+	createPrivateDriver,
+	type DriverReply,
+	type PrivateDriver,
+	settlePrivateDecision,
+} from "./fixtures/private-decision-driver.js";
 
 interface TimerRecord {
 	callback: () => void;
@@ -80,14 +79,6 @@ class FakeClock implements RuntimeClock {
 }
 
 type Handler = (event: never, ctx: ExtensionContext) => unknown;
-
-const _EMPTY_PROJECTION: UnlockReviewProjection = {
-	projectionVersion: UNLOCK_REVIEW_PROJECTION_VERSION,
-	rows: [],
-	gaps: [],
-	sourceHeadId: null,
-	compactionBoundaryId: null,
-};
 
 function reviewResult(
 	choice: string,
@@ -133,21 +124,8 @@ function reviewResult(
 	};
 }
 
-interface CwTool {
-	readonly execute: (
-		toolCallId: string,
-		args: unknown,
-		options?: unknown,
-		context?: { readonly toolCallId?: string },
-	) => Promise<{
-		readonly content: Array<{ type: string; text?: string }>;
-		readonly details?: { readonly outcome?: string };
-	}>;
-}
-
 interface HarnessHooks {
 	readonly onAppend?: (type: string, data: unknown, harness: Harness) => void;
-	readonly onSend?: (message: unknown, harness: Harness) => void;
 	readonly onContext?: (harness: Harness) => void;
 	readonly onWidget?: (value: unknown, harness: Harness) => void;
 	readonly onBranch?: (harness: Harness) => void;
@@ -171,7 +149,7 @@ interface Harness {
 		customType?: string;
 		data?: unknown;
 		details?: unknown;
-		message?: { role: string };
+		message?: { role: string; content?: unknown[]; timestamp?: number };
 	}>;
 	readonly clock: FakeClock;
 	readonly controller: ReturnType<typeof createLockDecisionController>;
@@ -182,21 +160,32 @@ interface Harness {
 	streaming: boolean;
 	pendingMessages: boolean;
 	triggeredTurns: number;
-	cwTool: CwTool | null;
+	parentAborts: number;
+	readonly driver: PrivateDriver;
+	reviewPending: boolean;
 	readonly userMessages: unknown[];
 	readonly runtime: ReturnType<typeof createDecisionRuntime>;
 	loseOwnership(): void;
 	fire(name: string, event: unknown): Promise<void>;
 	openDecision(): Promise<void>;
-	settle(message: unknown): Promise<void>;
+	settle(message: DriverReply): Promise<void>;
 	answer(
 		reason?: string,
 		reasonType?: string,
 		action?: "unlock" | "continue",
-	): unknown;
-	answerInvalid(): unknown;
+	): DriverReply;
+	answerInvalid(): DriverReply;
 	unlock(): Promise<void>;
+	flushReviews(): void;
 }
+
+const harnesses: Harness[] = [];
+afterEach(async () => {
+	for (const harness of harnesses.splice(0)) {
+		await harness.runtime.shutdown();
+		harness.flushReviews();
+	}
+});
 
 function createHarness(options?: {
 	readonly config?: Partial<ContinueWatchdogConfig>;
@@ -211,7 +200,7 @@ function createHarness(options?: {
 }): Harness {
 	const config: ContinueWatchdogConfig = {
 		idleDelaySeconds: 3,
-		maxContinue: 3,
+		maxContinue: options?.config?.maxContinue ?? 3,
 		decisionPrompt: "Decide now.",
 		continuePrompt: "Continue compactly.",
 		reasonTypes: options?.config?.reasonTypes ?? [
@@ -234,7 +223,14 @@ function createHarness(options?: {
 	const clock = new FakeClock();
 	const sent: Harness["sent"] = [];
 	const entries: Harness["entries"] = [];
-	const branch: Harness["branch"] = [];
+	const branch: Harness["branch"] = [
+		{
+			id: "source-root",
+			type: "message",
+			message: { role: "user", content: [], timestamp: 0 },
+		},
+	];
+	const driver = createPrivateDriver();
 	const notifications: Harness["notifications"] = [];
 	const reviewCalls: JudgeRequest[] = [];
 	const signals: (AbortSignal | undefined)[] = [];
@@ -251,13 +247,23 @@ function createHarness(options?: {
 		},
 		review: async (req, opts) => {
 			reviewCalls.push(req);
+			harness.reviewPending = true;
 			signals.push(opts?.signal);
 			if (options?.reviewDelay) {
-				await new Promise<void>((resolve) => pendingResolvers.push(resolve));
+				await new Promise<void>((resolve) =>
+					pendingResolvers.push(() => {
+						harness.reviewPending = false;
+						resolve();
+					}),
+				);
 			}
-			return (
-				options?.reviewResult ?? (async () => reviewResult("supported"))
-			)();
+			try {
+				return await (
+					options?.reviewResult ?? (async () => reviewResult("supported"))
+				)();
+			} finally {
+				harness.reviewPending = false;
+			}
 		},
 	};
 
@@ -280,7 +286,6 @@ function createHarness(options?: {
 			message: Harness["sent"][number]["message"],
 			sendOptions?: Harness["sent"][number]["options"],
 		): void {
-			options?.hooks?.onSend?.(message, harness);
 			sent.push({
 				message,
 				options: sendOptions,
@@ -300,8 +305,9 @@ function createHarness(options?: {
 			if (sendOptions?.triggerTurn && !harness.streaming)
 				harness.triggeredTurns += 1;
 		},
-		registerTool(definition: { readonly name: string }): void {
-			if (definition.name === "cw") harness.cwTool = definition as never;
+		getThinkingLevel: () => "off",
+		registerTool(): never {
+			assert.fail("private decisions must not register public tools");
 		},
 		appendEntry(type: string, data: unknown): void {
 			options?.hooks?.onAppend?.(type, data, harness);
@@ -319,12 +325,18 @@ function createHarness(options?: {
 		mode: "tui",
 		hasUI: true,
 		cwd: "/project",
+		model: { provider: "fake", id: "local" },
+		modelRegistry: {},
 		isIdle: () => !harness.streaming,
 		hasPendingMessages: () => harness.pendingMessages,
 		isProjectTrusted: () => true,
 		sessionManager: {
 			getSessionId: () => "main",
 			getSessionFile: () => undefined,
+			getEntries: () => [...branch],
+			getEntry: (id: string) => branch.find((entry) => entry.id === id),
+			buildSessionProjection: () =>
+				buildSessionProjection(branch as SessionEntry[]),
 			getLeafId: () => branch.at(-1)?.id ?? null,
 			getBranch: () => {
 				options?.hooks?.onBranch?.(harness);
@@ -336,6 +348,9 @@ function createHarness(options?: {
 			},
 		},
 		ui: {
+			onTerminalInput() {
+				return () => {};
+			},
 			notify(message: string, level?: string): void {
 				notifications.push({ message, level });
 			},
@@ -343,7 +358,9 @@ function createHarness(options?: {
 				options?.hooks?.onWidget?.(value, harness);
 			},
 		},
-		abort(): void {},
+		abort(): void {
+			harness.parentAborts += 1;
+		},
 	} as unknown as ExtensionContext;
 
 	const runtime = createDecisionRuntime({
@@ -354,6 +371,7 @@ function createHarness(options?: {
 		injectedController: true,
 		initialConfig: config,
 		clock,
+		executePrivateDecision: driver.execute,
 		createExchangeId: (() => {
 			let n = 0;
 			return () => `exchange-${++n}`;
@@ -376,7 +394,9 @@ function createHarness(options?: {
 		streaming: false,
 		pendingMessages: false,
 		triggeredTurns: 0,
-		cwTool: null,
+		parentAborts: 0,
+		driver,
+		reviewPending: false,
 		userMessages: [],
 		runtime,
 		loseOwnership: () => {
@@ -401,119 +421,45 @@ function createHarness(options?: {
 			});
 			runtime.reconcileIdle();
 			clock.fire(clock.records.length - 1);
-			await Promise.resolve();
-			await Promise.resolve();
-			harness.streaming = true;
-			await harness.fire("agent_start", { type: "agent_start" });
-			const decision = sent.at(-1);
-			assert.equal(decision?.message.customType, DECISION_MESSAGE_TYPE);
-			branch.push({
-				id: `decision-${branch.length + 1}`,
-				type: "custom_message",
-				customType: decision.message.customType,
-				details: decision.message.details,
-			});
-			await harness.fire("message_start", {
-				type: "message_start",
-				message: {
-					role: "custom",
-					customType: decision.message.customType,
-					content: [{ type: "text", text: decision.message.content }],
-					details: decision.message.details,
-					timestamp: Date.now(),
-				},
-			});
-			await harness.fire("context", {
-				type: "context",
-				messages: [
-					{
-						role: "custom",
-						customType: decision.message.customType,
-						content: [{ type: "text", text: decision.message.content }],
-						details: decision.message.details,
-						timestamp: Date.now(),
-					},
-				],
-			});
-		},
-		settle: async (message) => {
-			// message_end captures the plan; endDecisionMessage-equivalent: run
-			// tool_call gate + cw execute for each toolCall block, then agent_end
-			// and agent_settled finalize through deliverPending.
-			const replaced = await (async () => {
-				let result: unknown;
-				for (const handler of handlers.get("message_end") ?? []) {
-					result = await handler(
-						{ type: "message_end", message } as never,
-						ctx,
-					);
-				}
-				return result;
-			})();
-			const dispatched =
-				(replaced as { message?: { content?: unknown[] } } | undefined)
-					?.message ?? (message as { content?: unknown[] });
-			for (const block of (
-				dispatched as { content?: Array<Record<string, unknown>> }
-			).content ?? []) {
-				if (block?.type !== "toolCall") continue;
-				let gate: unknown;
-				for (const handler of handlers.get("tool_call") ?? []) {
-					gate = await handler(
-						{
-							type: "tool_call",
-							toolCallId: block.id,
-							toolName: block.name,
-							input: block.arguments,
-						} as never,
-						ctx,
-					);
-				}
+			for (let turn = 0; turn < 2000; turn += 1) {
 				if (
-					gate !== null &&
-					typeof gate === "object" &&
-					(gate as { block?: boolean }).block === true
+					driver.awaitingResponse ||
+					driver.current?.settled ||
+					!controller.snapshot.decisionOpen
 				)
-					continue;
-				if (block.name === "cw" && harness.cwTool) {
-					await harness.cwTool.execute(
-						String(block.id),
-						block.arguments,
-						undefined,
-						{ toolCallId: String(block.id) },
-					);
-				}
+					break;
+				await new Promise<void>((resolve) => setTimeout(resolve, 1));
 			}
-			await harness.fire("agent_end", {
-				type: "agent_end",
-				messages: [message],
-			});
-			harness.streaming = false;
-			await harness.fire("agent_settled", { type: "agent_settled" });
-			await Promise.resolve();
-			await Promise.resolve();
+			assert.ok(
+				driver.awaitingResponse ||
+					driver.current?.settled ||
+					!controller.snapshot.decisionOpen,
+			);
+			assert.equal(
+				harness.streaming,
+				false,
+				"private generation leaves parent idle",
+			);
+			assert.equal(
+				sent.some((e) => e.message.customType === DECISION_MESSAGE_TYPE),
+				false,
+			);
+		},
+		settle: async (reply) => {
+			driver.respond(reply);
+			await drain(harness);
 		},
 		answer: (reason = "Done.", reasonType = "JOB_DONE", action = "unlock") => ({
-			role: "assistant",
-			content: [
-				{
-					type: "toolCall",
-					id: `cw-${Math.random()}`,
-					name: "cw",
-					arguments: {
-						action,
-						reason_type: reasonType,
-						reason_content: reason,
-					},
-				},
-			],
-			stopReason: "stop",
+			write: JSON.stringify({
+				action,
+				reason_type: reasonType,
+				reason_content: reason,
+			}),
 		}),
-		answerInvalid: () => ({
-			role: "assistant",
-			content: [{ type: "text", text: "prose" }],
-			stopReason: "stop",
-		}),
+		answerInvalid: () => ({ write: "{}" }),
+		flushReviews: () => {
+			for (const resolve of pendingResolvers.splice(0)) resolve();
+		},
 		unlock: async () => {
 			const commandRuntime: MainCommandRuntime = {
 				get controller() {
@@ -532,50 +478,65 @@ function createHarness(options?: {
 			await handleUnlock(pi, commandRuntime, "", ctx as never);
 		},
 	};
-	// Resolve any pending delayed reviews between macro-steps.
-	(harness as Harness & { flushReviews(): void }).flushReviews = () => {
-		for (const resolve of pendingResolvers.splice(0)) resolve();
-	};
+	harnesses.push(harness);
 	return harness;
 }
 
-async function flush(harness: Harness): Promise<void> {
-	(harness as Harness & { flushReviews(): void }).flushReviews();
-	await Promise.resolve();
-	await Promise.resolve();
-	await Promise.resolve();
-}
-
-function latestInquiry(harness: Harness) {
-	const inquiry = harness.sent.findLast(
-		(entry) => entry.message.customType === DECISION_MESSAGE_TYPE,
+// Filesystem-backed child work needs event-loop turns, not synthetic parent lifecycle.
+async function drain(harness: Harness): Promise<void> {
+	for (let turn = 0; turn < 2000; turn += 1) {
+		if (
+			harness.driver.current?.settled ||
+			harness.driver.awaitingResponse ||
+			harness.reviewPending
+		) {
+			if (harness.driver.current?.settled)
+				await settlePrivateDecision(harness.driver);
+			assert.equal(
+				harness.sent.some(
+					(row) => row.message.customType === DECISION_MESSAGE_TYPE,
+				),
+				false,
+				"private prompts never enter parent messages",
+			);
+			const parentHistory = JSON.stringify([harness.sent, harness.entries]);
+			assert.equal(parentHistory.includes("watchdog_result_file"), false);
+			for (const fork of harness.driver.forkInputs)
+				assert.equal(parentHistory.includes(fork.resultFile), false);
+			return;
+		}
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
+	}
+	assert.fail(
+		"private decision did not reach next response/review/terminal boundary",
 	);
-	assert.ok(inquiry);
-	return inquiry.message;
 }
 
-async function authorizeLatestInquiry(harness: Harness): Promise<void> {
-	const message = latestInquiry(harness);
-	const wire = {
-		role: "custom",
-		customType: message.customType,
-		content: [{ type: "text", text: message.content }],
-		details: message.details,
-		timestamp: Date.now(),
-	};
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
-	await harness.fire("message_start", { type: "message_start", message: wire });
-	await harness.fire("context", { type: "context", messages: [wire] });
+async function flush(harness: Harness): Promise<void> {
+	harness.flushReviews();
+	await drain(harness);
+}
+
+function latestPrivatePrompt(harness: Harness) {
+	const child = harness.driver.children.at(-1);
+	assert.ok(child);
+	return { content: child.prompts.at(-1) ?? "" };
+}
+
+async function expectPrivateResponsePending(harness: Harness): Promise<void> {
+	assert.equal(harness.streaming, false);
+	assert.equal(harness.driver.awaitingResponse, true);
 }
 
 async function openReconsideration(harness: Harness, reasonType = "JOB_DONE") {
 	await harness.openDecision();
 	await harness.settle(harness.answer("Original unlock claim.", reasonType));
 	await flush(harness);
-	const inquiry = latestInquiry(harness);
+	const inquiry = latestPrivatePrompt(harness);
 	assert.match(inquiry.content, /challenged/);
 	assert.equal(harness.reviewCalls.length, 1);
+	assert.equal(harness.driver.children.length, 1);
+	assert.equal(harness.driver.children[0]?.fileStates.at(-1), "{}");
 	return inquiry;
 }
 
@@ -595,31 +556,25 @@ test("disabled config performs zero service discovery or requests", async () => 
 test("continue candidates never reach the service", async () => {
 	const harness = createHarness({ config: ENABLED });
 	await harness.openDecision();
-	await harness.settle({
-		role: "assistant",
-		content: [
-			{
-				type: "toolCall",
-				id: "cw-1",
-				name: "cw",
-				arguments: {
-					action: "continue",
-					reason_type: "WORK_REMAINS",
-					reason_content: "work",
-				},
-			},
-		],
-		stopReason: "stop",
-	});
+	await harness.settle(harness.answer("work", "WORK_REMAINS", "continue"));
 	assert.equal(harness.reviewCalls.length, 0);
 	assert.equal(harness.controller.snapshot.attempt, 1);
 });
 
-test("manual unlock never reaches the service", async () => {
+test("manual unlock cancels exact private child, never parent or review service", async () => {
 	const harness = createHarness({ config: ENABLED });
 	await harness.openDecision();
+	const child = harness.driver.children[0];
+	assert.ok(child);
 	await harness.unlock();
+	await settlePrivateDecision(harness.driver);
+	assert.equal(child.aborted, true);
+	assert.equal(child.disposed, true);
+	assert.equal(harness.parentAborts, 0);
+	assert.equal(harness.controller.snapshot.locked, false);
 	assert.equal(harness.reviewCalls.length, 0);
+	assert.equal(harness.driver.children.length, 1);
+	assert.equal(harness.triggeredTurns, 0);
 });
 
 // Spy on the real call-time discovery registry used by the sealed client.
@@ -644,21 +599,17 @@ function withDiscoverySpy(run: () => Promise<void>): Promise<number> {
 }
 
 test("invalid, aborted and terminal-error decision responses perform no service lookup", async () => {
-	const cases: Array<[string, unknown]> = [
+	const cases: Array<[string, DriverReply | undefined]> = [
 		["invalid", undefined],
 		[
 			"aborted",
 			{
-				role: "assistant",
-				content: [{ type: "text", text: "partial" }],
 				stopReason: "aborted",
 			},
 		],
 		[
 			"terminal error",
 			{
-				role: "assistant",
-				content: [{ type: "text", text: "provider failed" }],
 				stopReason: "error",
 			},
 		],
@@ -740,7 +691,7 @@ test("a supported review releases the original unlock through the existing path"
 	await harness.openDecision();
 	await harness.settle(harness.answer("All done.", "JOB_DONE"));
 	await flush(harness);
-	// After the review resolves, another settle commits the still-current candidate.
+	// Extra idle notifications cannot duplicate committed candidate.
 	harness.streaming = false;
 	await harness.fire("agent_settled", { type: "agent_settled" });
 	await flush(harness);
@@ -758,9 +709,7 @@ test("a supported review releases the original unlock through the existing path"
 });
 
 test("an unavailable service yields an incomplete review and still releases the current unlock", async () => {
-	const _harness = createHarness({ config: ENABLED });
-	// Remove the injected service by pointing reviewService at a throwing one? We test
-	// incomplete on service error instead — separate test covers absent via status.
+	// Service exception is incomplete, never a semantic approval.
 	const unavailable = createHarness({
 		config: ENABLED,
 		reviewResult: async () => {
@@ -895,8 +844,7 @@ test("a challenged unlock opens exactly one reconsideration and never republishe
 	await harness.openDecision();
 	await harness.settle(harness.answer("Done.", "JOB_DONE"));
 	await flush(harness);
-	// The challenge settles during settle() itself: the superseded candidate
-	// is replaced by exactly one reconsideration inquiry in the same settle.
+	// Outer operation remains pending across same-child reconsideration.
 	assert.equal(harness.controller.snapshot.locked, true);
 	assert.equal(harness.controller.snapshot.decisionOpen, true);
 	// The challenged candidate never published a quiet unlock status entry.
@@ -913,13 +861,12 @@ test("a challenged unlock opens exactly one reconsideration and never republishe
 		(reviewRecord.data as { outcome?: string }).outcome,
 		"challenged",
 	);
-	// The reconsideration prompt carries the challenge feedback.
-	const reconsiderPrompt = harness.sent.findLast(
-		(e) => e.message.customType === DECISION_MESSAGE_TYPE,
-	);
-	assert.ok(reconsiderPrompt);
-	assert.match(reconsiderPrompt.message.content, /challenged/i);
-	assert.match(reconsiderPrompt.message.content, /JOB_DONE/);
+	const reconsiderPrompt = latestPrivatePrompt(harness).content;
+	assert.match(reconsiderPrompt, /challenged/i);
+	assert.match(reconsiderPrompt, /JOB_DONE/);
+	assert.equal(harness.driver.children.length, 1);
+	assert.equal(harness.driver.children[0]?.prompts.length, 2);
+	assert.equal(harness.driver.children[0]?.fileStates.at(-1), "{}");
 });
 
 test("reconsidered unlock commits without a second review", async () => {
@@ -934,35 +881,8 @@ test("reconsidered unlock commits without a second review", async () => {
 	await harness.openDecision();
 	await harness.settle(harness.answer("Done.", "JOB_DONE"));
 	await flush(harness);
-	// Reconsideration run: answer unlock again — committed directly, no second review.
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
-	const second = harness.sent
-		.filter((e) => e.message.customType === DECISION_MESSAGE_TYPE)
-		.at(-1);
-	assert.ok(second);
-	await harness.fire("message_start", {
-		type: "message_start",
-		message: {
-			role: "custom",
-			customType: second.message.customType,
-			content: [{ type: "text", text: second.message.content }],
-			details: second.message.details,
-			timestamp: Date.now(),
-		},
-	});
-	await harness.fire("context", {
-		type: "context",
-		messages: [
-			{
-				role: "custom",
-				customType: second.message.customType,
-				content: [{ type: "text", text: second.message.content }],
-				details: second.message.details,
-				timestamp: Date.now(),
-			},
-		],
-	});
+	// Replacement file is written by same child; parent remains idle.
+	await expectPrivateResponsePending(harness);
 	await harness.settle(harness.answer("Still done.", "JOB_DONE"));
 	harness.streaming = false;
 	await harness.fire("agent_settled", { type: "agent_settled" });
@@ -976,25 +896,7 @@ const CALLBACK_ENABLED = {
 	reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED", "WAIT_CALLBACK"],
 } as const;
 
-function enterReconsideration(harness: Harness) {
-	return (async () => {
-		harness.streaming = true;
-		await harness.fire("agent_start", { type: "agent_start" });
-		const second = harness.sent
-			.filter((e) => e.message.customType === DECISION_MESSAGE_TYPE)
-			.at(-1);
-		assert.ok(second);
-		const message = {
-			role: "custom",
-			customType: second.message.customType,
-			content: [{ type: "text", text: second.message.content }],
-			details: second.message.details,
-			timestamp: Date.now(),
-		};
-		await harness.fire("message_start", { type: "message_start", message });
-		await harness.fire("context", { type: "context", messages: [message] });
-	})();
-}
+const enterReconsideration = expectPrivateResponsePending;
 
 test("reviewed callback candidates commit one suspension, never an unlock", async () => {
 	for (const result of [
@@ -1111,7 +1013,7 @@ test("callback work during an in-flight callback review retires the candidate", 
 			timestamp: Date.now(),
 		},
 	});
-	(harness as Harness & { flushReviews(): void }).flushReviews();
+	harness.flushReviews();
 	await flush(harness);
 	harness.streaming = false;
 	await harness.fire("agent_settled", { type: "agent_settled" });
@@ -1133,7 +1035,7 @@ test("user takeover during an in-flight review aborts it and blocks the fallback
 	// Review in flight; user takes over before it resolves.
 	await harness.unlock();
 	// Resolve the delayed review: stale callback cannot publish or relock.
-	(harness as Harness & { flushReviews(): void }).flushReviews();
+	harness.flushReviews();
 	await flush(harness);
 	harness.streaming = false;
 	await harness.fire("agent_settled", { type: "agent_settled" });
@@ -1146,17 +1048,18 @@ test("user takeover during an in-flight review aborts it and blocks the fallback
 	);
 });
 
-test("manual unlock while a never-settling review is in flight aborts it; late settle is inert", async () => {
+test("manual unlock aborts an unbounded in-flight review; late settle is inert", async () => {
 	// The consumer adds no outer timer: the service may legitimately wait
 	// without a fixed total bound. Manual unlock must abort the request
 	// immediately via the lifecycle-linked AbortController, and a late
 	// settlement callback must never publish, relock, or charge.
 	const abortStates: boolean[] = [];
+	let resolveReview: ((result: ReviewResult) => void) | undefined;
 	const harness = createHarness({
 		config: ENABLED,
 		reviewResult: () =>
-			new Promise<ReviewResult>(() => {
-				/* never settles */
+			new Promise<ReviewResult>((resolve) => {
+				resolveReview = resolve;
 			}),
 	});
 	await harness.openDecision();
@@ -1176,6 +1079,21 @@ test("manual unlock while a never-settling review is in flight aborts it; late s
 		harness.entries.filter((e) => e.type === UNLOCK_REVIEW_ENTRY_TYPE).length,
 		0,
 	);
+	const child = harness.driver.children[0];
+	assert.ok(child);
+	assert.equal(child.aborted, true);
+	assert.ok(resolveReview);
+	resolveReview(reviewResult("supported"));
+	await settlePrivateDecision(harness.driver);
+	assert.equal(child.disposed, true);
+	assert.equal(
+		harness.entries.some(
+			(entry) => entry.type === "pi-continue-watchdog:ai-unlock",
+		),
+		false,
+	);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.parentAborts, 0);
 });
 
 // ---------- repair batch 1 regressions ----------
@@ -1186,7 +1104,7 @@ test("interactive input during idle pending-review retires the decision and proc
 	await harness.settle(harness.answer());
 	await Promise.resolve();
 	assert.equal(harness.reviewCalls.length, 1);
-	// The original agent_settled already returned; host is idle again.
+	// Private work never made parent busy.
 	assert.equal(harness.streaming, false);
 	// A genuine interactive input must not be captured-and-stranded: the
 	// pending review is aborted, the stale unlock candidate retires, and
@@ -1213,7 +1131,7 @@ test("interactive input during idle pending-review retires the decision and proc
 		"input should not be captured for reissue",
 	);
 	// Late review resolution is inert: no unlock, no relock, no second inquiry.
-	(harness as Harness & { flushReviews(): void }).flushReviews();
+	harness.flushReviews();
 	await flush(harness);
 	await harness.fire("agent_settled", { type: "agent_settled" });
 	await flush(harness);
@@ -1225,8 +1143,7 @@ test("interactive input during idle pending-review retires the decision and proc
 });
 
 test("reentrant buildContextEntries cancellation prevents stale review start (F2)", async () => {
-	// A synchronous manual unlock fired from inside the snapshot boundary
-	// must retire the candidate before the pending review is installed.
+	// Snapshot-boundary manual unlock retires private source before review starts.
 	let armed = false;
 	let canceled = false;
 	const harness = createHarness({
@@ -1241,10 +1158,8 @@ test("reentrant buildContextEntries cancellation prevents stale review start (F2
 			},
 		},
 	});
-	await harness.openDecision();
 	armed = true;
-	await harness.settle(harness.answer());
-	await flush(harness);
+	await harness.openDecision();
 	assert.equal(canceled, true);
 	assert.equal(
 		harness.reviewCalls.length,
@@ -1260,21 +1175,15 @@ test("reentrant buildContextEntries cancellation prevents stale review start (F2
 });
 
 test("stale challenge cannot open work on a reentrantly replaced lock cycle (F2)", async () => {
-	// challenge cleanup dispatches the old inquiry fold; a synchronous
-	// restartLockCycle inside sendMessage must leave the stale challenge
-	// unable to open exchange-2 on the replacement cycle.
-	let armed = false;
 	let fired = false;
 	const harness = createHarness({
-		config: ENABLED,
 		reviewResult: async () => reviewResult("challenged"),
 		hooks: {
-			onSend: (message, h) => {
+			onAppend(type, data, h) {
 				if (
-					armed &&
 					!fired &&
-					(message as { customType?: string }).customType ===
-						"pi-continue-watchdog:inquiry-fold"
+					type === UNLOCK_REVIEW_ENTRY_TYPE &&
+					(data as { outcome?: string }).outcome === "challenged"
 				) {
 					fired = true;
 					h.runtime.restartLockCycle();
@@ -1283,254 +1192,105 @@ test("stale challenge cannot open work on a reentrantly replaced lock cycle (F2)
 		},
 	});
 	await harness.openDecision();
-	armed = true;
 	await harness.settle(harness.answer());
 	await flush(harness);
 	assert.equal(fired, true);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.driver.children.length, 1);
+	assert.equal(harness.driver.children[0]?.prompts.length, 1);
+	assert.equal(harness.driver.children[0]?.aborted, true);
 	assert.equal(
-		harness.controller.snapshot.decisionOpen,
+		harness.entries.some(
+			(entry) => entry.type === "pi-continue-watchdog:ai-unlock",
+		),
 		false,
-		"stale challenge must not open a decision in the replacement cycle",
-	);
-	assert.equal(
-		harness.sent.filter((e) => e.message.customType === DECISION_MESSAGE_TYPE)
-			.length,
-		1,
-		"only the initial inquiry was ever dispatched",
 	);
 });
 
-test("reconsideration keeps the same fixed cw contract and configured reason lists (F9)", async () => {
-	const customUnlock = ["CUSTOM_JOB_DONE_X7"];
-	const customContinue = ["CUSTOM_WORK_REMAINS_X7"];
+test("reconsideration keeps fixed file contract and configured reason lists (F9)", async () => {
+	const reasonTypes = ["CUSTOM_JOB_DONE_X7"];
+	const continueReasonTypes = ["CUSTOM_WORK_REMAINS_X7"];
 	const harness = createHarness({
-		config: {
-			unlockReviewEnabled: true,
-			reasonTypes: customUnlock,
-			continueReasonTypes: customContinue,
-		},
+		config: { unlockReviewEnabled: true, reasonTypes, continueReasonTypes },
 		reviewResult: async () => reviewResult("challenged"),
 	});
-	await harness.openDecision();
-	await harness.settle(harness.answer("Done.", "CUSTOM_JOB_DONE_X7"));
-	await flush(harness);
-	// The last decision-type dispatch is the reconsideration inquiry.
-	const allDecisionDispatches = harness.sent.filter(
-		(e) => e.message.customType === DECISION_MESSAGE_TYPE,
+	const reconsideration = await openReconsideration(
+		harness,
+		"CUSTOM_JOB_DONE_X7",
 	);
-	assert.equal(
-		allDecisionDispatches.length,
-		2,
-		"initial + exactly one reconsideration inquiry",
-	);
-	const reconsideration = allDecisionDispatches[1];
-	const content = reconsideration.message.content;
-	// Challenge feedback is present.
-	assert.match(content, /challenged/i);
-	assert.match(content, /CUSTOM_JOB_DONE_X7/);
-	// Fixed protocol guidance must still be present: configured reason lists,
-	// field-size limit, assessment-first and delivery-boundary wording.
-	assert.match(content, /CUSTOM_WORK_REMAINS_X7/);
-	assert.match(content, /CUSTOM_JOB_DONE_X7/);
-	assert.match(content, /assessment/i);
-	assert.match(content, /reason_content/i);
-	assert.match(content, /cw/i);
-});
-
-test("busy dispatch deferral preserves the one-reconsideration bound (F3)", async () => {
-	// Defer the reconsideration inquiry dispatch once via pendingMessages,
-	// then resume on genuine idle: the same semantic phase must resume
-	// without a fresh initial inquiry and without a second review call.
-	let deferred = false;
-	const harness = createHarness({
-		config: ENABLED,
-		reviewResult: async () => reviewResult("challenged"),
-		hooks: {
-			onSend: (message, h) => {
-				if (
-					!deferred &&
-					(message as { customType?: string }).customType ===
-						DECISION_MESSAGE_TYPE &&
-					String((message as { content?: string }).content).includes(
-						"challenged",
-					)
-				) {
-					deferred = true;
-					h.pendingMessages = true;
-				}
-			},
-		},
-	});
-	await harness.openDecision();
-	await harness.settle(harness.answer("Done.", "JOB_DONE"));
-	await flush(harness);
-	assert.equal(deferred, true);
-	assert.equal(harness.reviewCalls.length, 1);
-	// The deferred inquiry never dispatched its turn while busy. Release.
-	harness.pendingMessages = false;
-	await harness.fire("agent_settled", { type: "agent_settled" });
-	harness.clock.fire(harness.clock.records.length - 1);
-	await Promise.resolve();
-	await Promise.resolve();
-	const inquiries = harness.sent.filter(
-		(e) => e.message.customType === DECISION_MESSAGE_TYPE,
-	);
-	const lastInquiry = inquiries.at(-1);
-	assert.ok(lastInquiry);
-	assert.match(
-		lastInquiry.message.content,
-		/challenged/i,
-		"resumed inquiry must carry the same challenge feedback",
-	);
-	// Initial inquiry + deferred reconsideration dispatch + resume reopen =
-	// at most 3 total dispatches; the semantic bound is that only ONE
-	// review ran and no fresh initial inquiry appeared in its place.
+	const child = harness.driver.children[0];
+	assert.ok(child);
+	const input = harness.driver.forkInputs[0];
+	assert.ok(input);
+	assert.equal(child.prompts.length, 2);
 	assert.ok(
-		inquiries.length <= 3,
-		`expected at most 3 inquiry dispatches, got ${inquiries.length}`,
-	);
-	// Drive the resumed reconsideration to a valid unlock: it commits
-	// directly, without a second service call.
-	harness.streaming = true;
-	await harness.fire("agent_start", { type: "agent_start" });
-	await harness.fire("message_start", {
-		type: "message_start",
-		message: {
-			role: "custom",
-			customType: lastInquiry.message.customType,
-			content: [{ type: "text", text: lastInquiry.message.content }],
-			details: lastInquiry.message.details,
-			timestamp: Date.now(),
-		},
-	});
-	await harness.fire("context", {
-		type: "context",
-		messages: [
-			{
-				role: "custom",
-				customType: lastInquiry.message.customType,
-				content: [{ type: "text", text: lastInquiry.message.content }],
-				details: lastInquiry.message.details,
-				timestamp: Date.now(),
-			},
-		],
-	});
-	await harness.settle(harness.answer("Still done.", "JOB_DONE"));
-	await flush(harness);
-	assert.equal(
-		harness.reviewCalls.length,
-		1,
-		"deferred-then-resumed reconsidered unlock must not be re-reviewed",
-	);
-	assert.equal(harness.controller.snapshot.locked, false);
-});
-
-for (const gap of ["dispatch", "unconsumed"] as const) {
-	for (const consumed of [1, 2]) {
-		test(`F3-B1: ${consumed} consumed invalid replacements survive ${gap} deferral`, async () => {
-			let deferred = false;
-			const reasonTypes = ["SHIPPED", "NEEDS_INPUT"];
-			const continueReasonTypes = ["DO_WORK", "VERIFY"];
-			const harness = createHarness({
-				config: { ...ENABLED, reasonTypes, continueReasonTypes },
-				reviewResult: async () => reviewResult("challenged"),
-				hooks: {
-					onSend: (message, h) => {
-						const prompt = message as {
-							customType?: string;
-							content?: string;
-							details?: { attempt?: number };
-						};
-						if (
-							gap === "dispatch" &&
-							!deferred &&
-							prompt.customType === DECISION_MESSAGE_TYPE &&
-							prompt.content?.includes("challenged") &&
-							prompt.details?.attempt === consumed + 1
-						) {
-							deferred = true;
-							h.pendingMessages = true;
-						}
-					},
-				},
-			});
-			const reconsideration = await openReconsideration(harness, "SHIPPED");
-			const fixed = buildDecisionPrompt(
+		reconsideration.content.startsWith(
+			buildDecisionFilePrompt(
 				"Decide now.",
 				reasonTypes,
 				continueReasonTypes,
-			);
-			assert.ok(reconsideration.content.startsWith(fixed));
-			for (let count = 0; count < consumed; count += 1) {
-				await authorizeLatestInquiry(harness);
-				await harness.settle(harness.answerInvalid());
-				await flush(harness);
-			}
-			if (gap === "unconsumed") {
-				harness.pendingMessages = true;
-				await harness.fire("agent_settled", { type: "agent_settled" });
-			} else {
-				assert.equal(deferred, true, "correction send crossed BUSY boundary");
-			}
-			assert.equal(harness.controller.snapshot.locked, true);
-			assert.equal(harness.controller.snapshot.decisionOpen, false);
-			assert.equal(
-				harness.controller.snapshot.invalidDecisionAttempts,
-				consumed,
-			);
-			assert.equal(harness.controller.snapshot.attempt, 0);
+				input.resultFile,
+			),
+		),
+	);
+	for (const pattern of [
+		/challenged/i,
+		/CUSTOM_JOB_DONE_X7/,
+		/CUSTOM_WORK_REMAINS_X7/,
+		/assessment/i,
+		/reason_content/i,
+		/opinion, not new evidence/,
+		/write/i,
+	])
+		assert.match(reconsideration.content, pattern);
+	assert.doesNotMatch(reconsideration.content, /cw function|structured_output/);
+	await harness.settle(harness.answerInvalid());
+	const correction = latestPrivatePrompt(harness).content;
+	assert.match(correction, /failed validation/i);
+	assert.match(correction, /CUSTOM_JOB_DONE_X7/);
+	assert.match(correction, /CUSTOM_WORK_REMAINS_X7/);
+	assert.ok(correction.includes(input.resultFile));
+	assert.match(child.prompts[1] ?? "", /challenged/i);
+	assert.equal(harness.driver.children.length, 1);
+	await harness.settle(harness.answer("Still complete.", "CUSTOM_JOB_DONE_X7"));
+	assert.equal(harness.reviewCalls.length, 1);
+	assert.equal(harness.controller.snapshot.locked, false);
+});
 
-			harness.pendingMessages = false;
-			await harness.fire("agent_settled", { type: "agent_settled" });
-			harness.clock.fire(harness.clock.records.length - 1);
-			await flush(harness);
-			const resumed = latestInquiry(harness);
-			assert.equal(
-				(resumed.details as { attempt: number }).attempt,
-				consumed + 1,
-			);
-			assert.ok(
-				resumed.content.startsWith(reconsideration.content),
-				"fixed contract, custom lists and exact original challenge survive together",
-			);
-			assert.ok(
-				resumed.content.includes(
-					`Your previous decision response was invalid: ${MISSING_DECISION_CALL_ERROR}`,
-				),
-			);
+// Removed: main-query dispatch/unconsumed replay. Private prompts never cross
+// that boundary. Retain cancellation, consumed format budget and no-fourth fences.
+for (const consumed of [0, 1, 2]) {
+	for (const external of ["pending-messages", "parent-work"] as const) {
+		test(`F3-B1: ${external} after ${consumed} invalid replacements cancels exact child`, async () => {
+			const harness = createHarness({
+				reviewResult: async () => reviewResult("challenged"),
+			});
+			await openReconsideration(harness);
+			for (let count = 0; count < consumed; count += 1)
+				await harness.settle(harness.answerInvalid());
 			assert.equal(
 				harness.controller.snapshot.invalidDecisionAttempts,
 				consumed,
 			);
-			for (let count = consumed + 1; count <= 3; count += 1) {
-				await authorizeLatestInquiry(harness);
-				await harness.settle(harness.answerInvalid());
-				await flush(harness);
-				assert.equal(
-					harness.controller.snapshot.invalidDecisionAttempts,
-					count,
-				);
-				assert.equal(harness.controller.snapshot.decisionFailed, count === 3);
+			const child = harness.driver.children[0];
+			assert.ok(child);
+			if (external === "pending-messages") harness.pendingMessages = true;
+			else {
+				harness.streaming = true;
+				await harness.fire("agent_start", { type: "agent_start" });
 			}
-			const sentBeforeFourth = harness.sent.length;
-			assert.equal(harness.controller.snapshot.decisionOpen, false);
-			assert.equal(
-				harness.sent.some(
-					(entry) =>
-						entry.message.customType === DECISION_MESSAGE_TYPE &&
-						(entry.message.details as { attempt: number }).attempt > 3,
-				),
-				false,
-				"no fourth correction dispatched",
-			);
-			// Replaying the last prompt cannot authorize a fourth valid result.
-			await authorizeLatestInquiry(harness);
-			await harness.settle(harness.answer("Stale fourth response.", "SHIPPED"));
-			assert.equal(harness.sent.length, sentBeforeFourth);
-			assert.equal(harness.controller.snapshot.locked, true);
-			assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 3);
+			// A late valid file must lose authority when real work appears.
+			await harness.settle(harness.answer("Late result."));
+			await flush(harness);
+			assert.equal(child.aborted, true);
+			assert.equal(child.disposed, true);
+			assert.equal((await harness.driver.current?.result)?.kind, "cancelled");
 			assert.equal(harness.controller.snapshot.attempt, 0);
+			assert.equal(harness.controller.snapshot.locked, true);
 			assert.equal(harness.reviewCalls.length, 1);
+			assert.equal(harness.driver.children.length, 1);
 			assert.equal(
 				harness.entries.some(
 					(e) => e.type === "pi-continue-watchdog:ai-unlock",
@@ -1541,57 +1301,40 @@ for (const gap of ["dispatch", "unconsumed"] as const) {
 	}
 }
 
-test("F3-B1: BUSY before invalid commit retains the consumed response and safe diagnostic", async () => {
-	let armed = false;
-	let deferred = false;
+test("F3-B1: reconsideration consumes three invalid files, never a fourth or superseded unlock", async () => {
 	const harness = createHarness({
 		reviewResult: async () => reviewResult("challenged"),
-		hooks: {
-			onAppend: (type, data, h) => {
-				if (
-					armed &&
-					!deferred &&
-					type === "pi-continue-watchdog:decision-audit" &&
-					(data as { outcome?: string }).outcome === "invalid"
-				) {
-					deferred = true;
-					h.pendingMessages = true;
-				}
-			},
-		},
 	});
 	await openReconsideration(harness);
-	await authorizeLatestInquiry(harness);
-	await harness.settle(harness.answerInvalid());
-	await authorizeLatestInquiry(harness);
-	armed = true;
-	await harness.settle(harness.answerInvalid());
-	assert.equal(deferred, true);
-	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
-	const inquiriesBefore = harness.sent.filter(
-		(e) => e.message.customType === DECISION_MESSAGE_TYPE,
-	).length;
-	harness.pendingMessages = false;
-	await harness.fire("agent_settled", { type: "agent_settled" });
-	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 2);
+	for (let count = 1; count <= 3; count += 1) {
+		await harness.settle(harness.answerInvalid());
+		assert.equal(harness.controller.snapshot.invalidDecisionAttempts, count);
+		assert.equal(harness.controller.snapshot.decisionFailed, count === 3);
+	}
+	const child = harness.driver.children[0];
+	assert.ok(child);
 	assert.equal(
-		harness.sent.filter((e) => e.message.customType === DECISION_MESSAGE_TYPE)
-			.length,
-		inquiriesBefore + 1,
+		child.prompts.length,
+		4,
+		"one initial plus three reconsideration responses",
 	);
-	assert.equal(
-		(latestInquiry(harness).details as { attempt: number }).attempt,
-		3,
-	);
-	assert.ok(
-		latestInquiry(harness).content.includes(MISSING_DECISION_CALL_ERROR),
-	);
-	await authorizeLatestInquiry(harness);
-	await harness.settle(harness.answerInvalid());
-	assert.equal(harness.controller.snapshot.decisionFailed, true);
-	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 3);
-	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.deepEqual(child.fileStates, ["{}", "{}", "{}", "{}"]);
+	assert.match(child.prompts[2] ?? "", /failed validation/i);
+	assert.doesNotMatch(child.prompts[2] ?? "", /cw function/);
+	assert.equal(harness.driver.children.length, 1);
 	assert.equal(harness.reviewCalls.length, 1);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.decisionOpen, false);
+	assert.equal((await harness.driver.current?.result)?.kind, "decision-failed");
+	assert.equal(harness.driver.current?.options.isCurrent(), false);
+	assert.equal(child.disposed, true);
+	await harness.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(child.prompts.length, 4);
+	assert.equal(
+		harness.entries.some((e) => e.type === "pi-continue-watchdog:ai-unlock"),
+		false,
+	);
 });
 
 for (const action of ["unlock", "continue"] as const) {
@@ -1602,16 +1345,11 @@ for (const action of ["unlock", "continue"] as const) {
 				config: ENABLED,
 				reviewResult: async () => reviewResult("challenged"),
 				hooks: {
-					onAppend: (type, data, h) => {
+					onBranch: (h) => {
 						if (
 							!armed &&
-							type === "pi-continue-watchdog:decision-audit" &&
-							(data as { outcome?: string }).outcome === action &&
-							h.sent.some(
-								(e) =>
-									e.message.customType === DECISION_MESSAGE_TYPE &&
-									e.message.content.includes("challenged"),
-							)
+							h.driver.current?.settled &&
+							h.controller.snapshot.decisionOpen
 						) {
 							armed = true;
 							h.pendingMessages = true;
@@ -1621,10 +1359,10 @@ for (const action of ["unlock", "continue"] as const) {
 			});
 			await openReconsideration(harness);
 			for (let count = 0; count < consumed; count += 1) {
-				await authorizeLatestInquiry(harness);
+				await expectPrivateResponsePending(harness);
 				await harness.settle(harness.answerInvalid());
 			}
-			await authorizeLatestInquiry(harness);
+			await expectPrivateResponsePending(harness);
 			await harness.settle(
 				harness.answer(
 					"Already validated replacement.",
@@ -1634,8 +1372,15 @@ for (const action of ["unlock", "continue"] as const) {
 			);
 			await flush(harness);
 			assert.equal(armed, true);
-			const inquiriesBefore = harness.sent.filter(
-				(e) => e.message.customType === DECISION_MESSAGE_TYPE,
+			const terminal = await harness.driver.current?.result;
+			assert.equal(
+				terminal?.kind,
+				"decision",
+				"BUSY occurred after private result settled",
+			);
+			assert.equal(harness.driver.children.length, 1);
+			const inquiriesBefore = harness.driver.children.flatMap(
+				(child) => child.prompts,
 			).length;
 			const triggeredBefore = harness.triggeredTurns;
 			assert.equal(inquiriesBefore, 2 + consumed);
@@ -1674,9 +1419,7 @@ for (const action of ["unlock", "continue"] as const) {
 				triggeredBefore + (action === "continue" ? 1 : 0),
 			);
 			assert.equal(
-				harness.sent.filter(
-					(e) => e.message.customType === DECISION_MESSAGE_TYPE,
-				).length,
+				harness.driver.children.flatMap((child) => child.prompts).length,
 				inquiriesBefore,
 			);
 			assert.equal(
@@ -1722,25 +1465,30 @@ for (const cancel of [
 ] as const) {
 	test(`F3-B2: ${cancel} in BUSY gap discards accepted pending plan`, async () => {
 		let armed = false;
+		let busy = false;
 		const harness = createHarness({
 			reviewResult: async () => reviewResult("challenged"),
 			hooks: {
-				onAppend: (type, data, h) => {
+				onBranch: (h) => {
 					if (
 						armed &&
-						type === "pi-continue-watchdog:decision-audit" &&
-						(data as { outcome?: string }).outcome === "continue"
-					)
+						h.driver.current?.settled &&
+						h.controller.snapshot.decisionOpen
+					) {
+						busy = true;
 						h.pendingMessages = true;
+					}
 				},
 			},
 		});
 		await openReconsideration(harness);
-		await authorizeLatestInquiry(harness);
+		await expectPrivateResponsePending(harness);
 		armed = true;
 		await harness.settle(
 			harness.answer("Original pending work.", "WORK_REMAINS", "continue"),
 		);
+		assert.equal(busy, true, "accepted result crossed BUSY boundary");
+		assert.equal((await harness.driver.current?.result)?.kind, "decision");
 		assert.equal(harness.controller.snapshot.attempt, 0);
 		if (cancel === "manual") await harness.unlock();
 		else if (cancel === "restart") harness.runtime.restartLockCycle();
@@ -1798,8 +1546,11 @@ test("F3-B2 postcommit: UI BUSY retains accepted continuation until real idle", 
 		},
 	});
 	await openReconsideration(harness);
-	await authorizeLatestInquiry(harness);
-	const original = latestInquiry(harness).details;
+	await expectPrivateResponsePending(harness);
+	const original = harness.entries.find(
+		(entry) => entry.type === "pi-continue-watchdog:private-decision",
+	);
+	assert.ok(original);
 	await harness.settle(
 		harness.answer(
 			"Preserve accepted continuation.",
@@ -1807,12 +1558,15 @@ test("F3-B2 postcommit: UI BUSY retains accepted continuation until real idle", 
 			"continue",
 		),
 	);
-	assert.equal(fired, true, "BUSY introduced only after valid cw commit");
+	assert.equal(
+		fired,
+		true,
+		"BUSY introduced only after valid private result commit",
+	);
 	assert.equal(harness.controller.snapshot.attempt, 0);
 	assert.equal(harness.controller.snapshot.locked, true);
 	assert.equal(
-		harness.sent.filter((e) => e.message.customType === DECISION_MESSAGE_TYPE)
-			.length,
+		harness.driver.children.flatMap((child) => child.prompts).length,
 		2,
 	);
 	assert.equal(
@@ -1837,7 +1591,7 @@ test("F3-B2 postcommit: UI BUSY retains accepted continuation until real idle", 
 	assert.ok(continuations[0]);
 	assert.equal(
 		(continuations[0].message.details as { inquiryId?: string }).inquiryId,
-		(original as { inquiryId?: string }).inquiryId,
+		(original.data as { exchangeId: string }).exchangeId,
 	);
 	assert.equal(harness.controller.snapshot.attempt, 1);
 	const sent = harness.sent.length;
@@ -1847,8 +1601,7 @@ test("F3-B2 postcommit: UI BUSY retains accepted continuation until real idle", 
 	assert.equal(harness.controller.snapshot.attempt, 1);
 	assert.equal(harness.reviewCalls.length, 1);
 	assert.equal(
-		harness.sent.filter((e) => e.message.customType === DECISION_MESSAGE_TYPE)
-			.length,
+		harness.driver.children.flatMap((child) => child.prompts).length,
 		2,
 	);
 });
@@ -1879,7 +1632,7 @@ test("F3-B2 postcommit: a second readiness race refunds reapply without replacin
 		},
 	});
 	await openReconsideration(harness);
-	await authorizeLatestInquiry(harness);
+	await expectPrivateResponsePending(harness);
 	await harness.settle(
 		harness.answer("Same intent.", "WORK_REMAINS", "continue"),
 	);
@@ -1901,8 +1654,7 @@ test("F3-B2 postcommit: a second readiness race refunds reapply without replacin
 		1,
 	);
 	assert.equal(
-		harness.sent.filter((e) => e.message.customType === DECISION_MESSAGE_TYPE)
-			.length,
+		harness.driver.children.flatMap((child) => child.prompts).length,
 		2,
 	);
 	assert.equal(harness.reviewCalls.length, 1);
@@ -1940,7 +1692,7 @@ test("F3-B2 postcommit: unchanged process fence false-confirm retains accepted c
 		reviewResult: async () => reviewResult("challenged"),
 	});
 	await openReconsideration(harness);
-	await authorizeLatestInquiry(harness);
+	await expectPrivateResponsePending(harness);
 	await harness.settle(
 		harness.answer("Await confirmation.", "WORK_REMAINS", "continue"),
 	);
@@ -1966,8 +1718,7 @@ test("F3-B2 postcommit: unchanged process fence false-confirm retains accepted c
 		1,
 	);
 	assert.equal(
-		harness.sent.filter((e) => e.message.customType === DECISION_MESSAGE_TYPE)
-			.length,
+		harness.driver.children.flatMap((child) => child.prompts).length,
 		2,
 	);
 	assert.equal(harness.reviewCalls.length, 1);
@@ -1999,7 +1750,7 @@ for (const cancel of [
 			},
 		});
 		await openReconsideration(harness);
-		await authorizeLatestInquiry(harness);
+		await expectPrivateResponsePending(harness);
 		await harness.settle(
 			harness.answer(
 				"Must not survive replacement.",
@@ -2099,9 +1850,7 @@ test("F5 runtime: unsupported content skips legal challenge and publishes curren
 	assert.equal(harness.controller.snapshot.locked, false);
 	assert.equal(harness.controller.snapshot.attempt, 0);
 	assert.equal(
-		harness.sent.filter(
-			(row) => row.message.customType === DECISION_MESSAGE_TYPE,
-		).length,
+		harness.driver.children.flatMap((child) => child.prompts).length,
 		1,
 	);
 	assert.equal(
@@ -2171,9 +1920,7 @@ test("F5/F6 runtime: reentrant replacement during zero-call incomplete admission
 		false,
 	);
 	assert.equal(
-		harness.sent.filter(
-			(row) => row.message.customType === DECISION_MESSAGE_TYPE,
-		).length,
+		harness.driver.children.flatMap((child) => child.prompts).length,
 		1,
 	);
 });
@@ -2221,9 +1968,7 @@ test("F4 runtime: captured whole ordered fixed snapshot survives overflow fallba
 		1,
 	);
 	assert.equal(
-		harness.sent.filter(
-			(entry) => entry.message.customType === DECISION_MESSAGE_TYPE,
-		).length,
+		harness.driver.children.flatMap((child) => child.prompts).length,
 		1,
 	);
 });
@@ -2267,8 +2012,7 @@ for (const kind of [
 		assert.equal(harness.controller.snapshot.attempt, 0);
 		assert.equal(harness.reviewCalls.length, 1);
 		assert.equal(
-			harness.sent.filter((e) => e.message.customType === DECISION_MESSAGE_TYPE)
-				.length,
+			harness.driver.children.flatMap((child) => child.prompts).length,
 			1,
 		);
 		assert.equal(
@@ -2305,8 +2049,7 @@ for (const cancel of ["manual", "restart"] as const) {
 			false,
 		);
 		assert.equal(
-			harness.sent.filter((e) => e.message.customType === DECISION_MESSAGE_TYPE)
-				.length,
+			harness.driver.children.flatMap((child) => child.prompts).length,
 			1,
 		);
 	});
@@ -2366,7 +2109,226 @@ test("review association record carries service identity and accounting", async 
 	assert.ok(record);
 	const data = record?.data as Record<string, unknown>;
 	assert.equal(data?.backend, "classifier");
+	assert.equal(data?.childSessionId, harness.driver.children[0]?.sessionId);
+	const association = harness.entries.find(
+		(entry) => entry.type === "pi-continue-watchdog:private-decision",
+	);
+	assert.ok(association);
+	assert.equal(
+		data?.exchangeId,
+		(association.data as { exchangeId: string }).exchangeId,
+	);
 	assert.equal(data?.model, "typesafe/jev-1.13");
 	assert.equal(data?.attemptCount, 3);
 	assert.equal((data?.usage as { missing?: number })?.missing, 3);
+});
+
+test("review freezes parent macro evidence before private correction/reconsideration traffic", async () => {
+	const harness = createHarness({
+		reviewResult: async () => reviewResult("challenged"),
+	});
+	const texts = [
+		"ORIGINAL_SCOPE",
+		"PUBLIC_DELIVERY_REPORT",
+		"LATER_PERMISSION_LIMIT",
+	];
+	const messages = texts.map((text, index) => ({
+		role: index === 1 ? "assistant" : "user",
+		content: [{ type: "text", text }],
+		timestamp: index,
+	}));
+	for (const [index, message] of messages.entries()) {
+		harness.branch.push({ id: `macro-${index}`, type: "message", message });
+	}
+	await harness.openDecision();
+	// Projection must not alias mutable host entry objects after capture.
+	messages[0].content[0].text = "MUTATED_AFTER_CAPTURE";
+	await harness.settle({
+		write: JSON.stringify({
+			action: "unlock",
+			reason_type: "UNKNOWN",
+			reason_content: "PRIVATE_INVALID_BODY",
+		}),
+	});
+	assert.equal(harness.reviewCalls.length, 0);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
+	await harness.settle(harness.answer("CANDIDATE_CLAIM_ONLY"));
+	const request = harness.reviewCalls[0];
+	assert.ok(request);
+	const macro = request.state.macroSnapshot as {
+		rows: Array<{ text: string }>;
+	};
+	assert.deepEqual(
+		macro.rows.map((row) => row.text),
+		texts,
+	);
+	const json = JSON.stringify(request);
+	for (const privateValue of [
+		"MUTATED_AFTER_CAPTURE",
+		"PRIVATE_INVALID_BODY",
+		"watchdog_result_file",
+		harness.driver.forkInputs[0]?.resultFile ?? "missing-result-file",
+	])
+		assert.equal(json.includes(privateValue), false, privateValue);
+	assert.equal(
+		macro.rows.some((row) => row.text.includes("CANDIDATE_CLAIM_ONLY")),
+		false,
+	);
+	assert.ok(json.includes("CANDIDATE_CLAIM_ONLY"));
+	assert.match(
+		latestPrivatePrompt(harness).content,
+		/opinion, not new evidence/,
+	);
+	await harness.settle(
+		harness.answer("Actual work remains.", "WORK_REMAINS", "continue"),
+	);
+	assert.equal(harness.reviewCalls.length, 1);
+	assert.equal(harness.driver.children.length, 1);
+	assert.equal(harness.driver.children[0]?.prompts.length, 3);
+	assert.equal(harness.controller.snapshot.attempt, 1);
+	assert.equal(harness.triggeredTurns, 1);
+	assert.equal(
+		harness.sent.some(
+			(row) => row.message.customType === DECISION_MESSAGE_TYPE,
+		),
+		false,
+	);
+});
+
+for (const action of ["continue", "callback"] as const) {
+	test(`reviewed replacement ${action} spends last shared budget unit exactly once`, async () => {
+		const harness = createHarness({
+			config: { ...CALLBACK_ENABLED, maxContinue: 1 },
+			reviewResult: async () => reviewResult("challenged"),
+		});
+		await openReconsideration(harness);
+		assert.equal(harness.controller.snapshot.attempt, 0);
+		assert.equal(harness.controller.snapshot.callbackSuspended, false);
+		await harness.settle(
+			harness.answer(
+				"Final accepted work boundary.",
+				action === "callback" ? "WAIT_CALLBACK" : "WORK_REMAINS",
+				action === "callback" ? "unlock" : "continue",
+			),
+		);
+		assert.equal(harness.controller.snapshot.attempt, 1);
+		assert.equal(harness.controller.snapshot.exhausted, true);
+		assert.equal(harness.controller.snapshot.locked, true);
+		assert.equal(
+			harness.controller.snapshot.callbackSuspended,
+			action === "callback",
+		);
+		assert.equal(harness.triggeredTurns, action === "continue" ? 1 : 0);
+		assert.equal(harness.reviewCalls.length, 1);
+		assert.equal(harness.driver.children.length, 1);
+		const publications = harness.sent.length;
+		await harness.fire("agent_settled", { type: "agent_settled" });
+		await harness.fire("agent_settled", { type: "agent_settled" });
+		assert.equal(harness.controller.snapshot.attempt, 1);
+		assert.equal(harness.sent.length, publications);
+	});
+}
+
+test("manual unlock still aborts ordinary main continuation after private review completes", async () => {
+	const harness = createHarness({
+		reviewResult: async () => reviewResult("challenged"),
+	});
+	await openReconsideration(harness);
+	await harness.settle(
+		harness.answer("Continue ordinary work.", "WORK_REMAINS", "continue"),
+	);
+	assert.equal(harness.triggeredTurns, 1);
+	const child = harness.driver.children[0];
+	assert.ok(child);
+	assert.equal(child.disposed, true);
+	// This parent start represents published ordinary continuation, not child work.
+	const continuation = harness.sent.find(
+		(row) =>
+			(row.message.details as { watchdogOutcome?: string }).watchdogOutcome ===
+			"continue",
+	);
+	assert.ok(continuation);
+	harness.streaming = true;
+	await harness.fire("agent_start", { type: "agent_start" });
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: {
+			role: "custom",
+			customType: continuation.message.customType,
+			content: [{ type: "text", text: continuation.message.content }],
+			details: continuation.message.details,
+			timestamp: 1,
+		},
+	});
+	await harness.unlock();
+	assert.equal(harness.parentAborts, 1);
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.reviewCalls.length, 1);
+});
+
+test("non-owned source append during review cancels private file authority", async () => {
+	const harness = createHarness({ reviewDelay: true });
+	await harness.openDecision();
+	await harness.settle(harness.answer("Stale original unlock."));
+	assert.equal(harness.reviewCalls.length, 1);
+	harness.branch.push({
+		id: "new-public-source",
+		type: "message",
+		message: {
+			role: "user",
+			content: [{ type: "text", text: "Changed scope." }],
+			timestamp: 1,
+		},
+	});
+	harness.flushReviews();
+	const result = await settlePrivateDecision(harness.driver);
+	assert.equal(result?.kind, "cancelled");
+	assert.equal(harness.driver.children[0]?.aborted, true);
+	assert.equal(harness.driver.children[0]?.disposed, true);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(
+		harness.entries.some(
+			(entry) => entry.type === "pi-continue-watchdog:ai-unlock",
+		),
+		false,
+	);
+	assert.equal(harness.parentAborts, 0);
+});
+
+test("optional private/review history failures never add responses, gate unlock or charge budget", async () => {
+	for (const failedType of [
+		"pi-continue-watchdog:private-decision",
+		"pi-continue-watchdog:private-response",
+		UNLOCK_REVIEW_ENTRY_TYPE,
+	]) {
+		const harness = createHarness({
+			hooks: {
+				onAppend(type) {
+					if (type === failedType)
+						throw new Error("optional history unavailable");
+				},
+			},
+		});
+		await harness.openDecision();
+		await harness.settle(harness.answer());
+		assert.equal(harness.reviewCalls.length, 1, failedType);
+		assert.equal(harness.driver.children.length, 1, failedType);
+		assert.equal(harness.driver.children[0]?.prompts.length, 1, failedType);
+		assert.equal(harness.controller.snapshot.locked, false, failedType);
+		assert.equal(harness.controller.snapshot.attempt, 0, failedType);
+		assert.equal(
+			harness.entries.filter(
+				(row) => row.type === "pi-continue-watchdog:ai-unlock",
+			).length,
+			1,
+			failedType,
+		);
+		assert.ok(
+			harness.notifications.some((row) =>
+				/history incomplete/i.test(row.message),
+			),
+			failedType,
+		);
+	}
 });

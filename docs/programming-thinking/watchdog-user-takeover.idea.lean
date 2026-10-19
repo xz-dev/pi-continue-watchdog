@@ -1,947 +1,896 @@
--- Core Lean support provides finite data, equality decisions, and deterministic executable summaries.
+-- This cancellation and outcome-boundary slice uses Std only; actions are data and main performs deterministic stdout only.
 import Std
-
-/-
-Residue/exactly-once takeover submodel. The authoritative combined lifecycle,
-busy-child set, disconnect, fixed-ten-second fence, cancellation, and shared
-automatic-event timeline model is `official-pi-idle-inquiry.idea.lean`.
-Production realizes cleanup through a shared terminal inquiry handle whose
-idempotent remove-fold is retried after send failure; successful result folds
-retain one canonical human/model event body, while preempted/cancelled folds
-remain remove-only. The Pi adapter alone calls public `ctx.abort()` and passes
-the original input through exactly once.
--/
 
 set_option autoImplicit false
 
 namespace WatchdogUserTakeover
 
--- Process vocabulary separates visible decision streaming, takeover synchronization, user work, and completion.
-inductive Phase where
-  | decisionStreaming
-  | takeoverPending
-  | userWork
-  | complete
+-- Exact operation, child, resource, source and ownership identities fence every callback and cleanup action.
+-- Source classification and identity freshness are host observations; this does not verify the production classifier.
+structure Scope where
+  operation : Nat
+  child : Nat
+  directory : Nat
+  claim : Nat
+  session : Nat
+  sourceAnchor : Nat
+  model : Nat
+  thinking : Nat
+  controller : Nat
+  cycle : Nat
+  externalGeneration : Nat
   deriving DecidableEq, Repr
 
--- Process data records transient presentation, persistent/context residue, fold evidence, user delivery, notices, and lock ownership.
-structure ProcessState where
-  phase : Phase
-  hiddenPresentationRequested : Bool
-  decisionStreamVisible : Bool
-  assistantFinalDecisionStored : Bool
-  sessionDecisionContentStored : Bool
-  futureModelDecisionContent : Bool
-  foldMarkerStored : Bool
-  pendingUserMessage : Bool
-  abortRequested : Bool
-  userMessageStarted : Bool
-  userMessageDeliveryCount : Nat
-  userCycleStarted : Bool
-  userOutputVisible : Bool
-  operationAbortedVisible : Bool
-  watchdogUnlockedVisible : Bool
-  watchdogLocked : Bool
+inductive SourceAppend where
+  | ownedExcludedAudit (operation : Nat)
+  | foreignOrModelContent
   deriving DecidableEq, Repr
 
--- Environmental assumptions bound liveness to host completion of abort-safe terminal cleanup, the aborted decision, and the subsequent user run.
-structure EnvironmentAssumptions where
-  uninterruptibleCleanupRuns : Bool
-  abortedDecisionEnds : Bool
-  userRunSettles : Bool
+structure SourceView where
+  scope : Scope
+  descendants : List SourceAppend
   deriving DecidableEq, Repr
 
-def environmentAdmitted (environment : EnvironmentAssumptions) : Prop :=
-  environment.uninterruptibleCleanupRuns = true ∧
-    environment.abortedDecisionEnds = true ∧
-    environment.userRunSettles = true
-
--- Named states make the complete object flow explicit; only the in-flight decision may expose transient streamed content, which finalization clears.
-def decisionState (streamVisible : Bool) : ProcessState :=
-  {
-    phase := .decisionStreaming
-    hiddenPresentationRequested := false
-    decisionStreamVisible := streamVisible
-    assistantFinalDecisionStored := false
-    sessionDecisionContentStored := false
-    futureModelDecisionContent := false
-    foldMarkerStored := false
-    pendingUserMessage := false
-    abortRequested := false
-    userMessageStarted := false
-    userMessageDeliveryCount := 0
-    userCycleStarted := false
-    userOutputVisible := false
-    operationAbortedVisible := false
-    watchdogUnlockedVisible := false
-    watchdogLocked := true
-  }
-
-def takeoverPendingState : ProcessState :=
-  {
-    phase := .takeoverPending
-    hiddenPresentationRequested := false
-    decisionStreamVisible := false
-    assistantFinalDecisionStored := false
-    sessionDecisionContentStored := false
-    futureModelDecisionContent := false
-    foldMarkerStored := true
-    pendingUserMessage := true
-    abortRequested := true
-    userMessageStarted := false
-    userMessageDeliveryCount := 0
-    userCycleStarted := true
-    userOutputVisible := false
-    operationAbortedVisible := false
-    watchdogUnlockedVisible := false
-    watchdogLocked := true
-  }
-
-def userWorkState : ProcessState :=
-  {
-    phase := .userWork
-    hiddenPresentationRequested := false
-    decisionStreamVisible := false
-    assistantFinalDecisionStored := false
-    sessionDecisionContentStored := false
-    futureModelDecisionContent := false
-    foldMarkerStored := true
-    pendingUserMessage := false
-    abortRequested := true
-    userMessageStarted := true
-    userMessageDeliveryCount := 1
-    userCycleStarted := true
-    userOutputVisible := false
-    operationAbortedVisible := false
-    watchdogUnlockedVisible := false
-    watchdogLocked := true
-  }
-
-def completedUserWorkState : ProcessState :=
-  {
-    phase := .complete
-    hiddenPresentationRequested := false
-    decisionStreamVisible := false
-    assistantFinalDecisionStored := false
-    sessionDecisionContentStored := false
-    futureModelDecisionContent := false
-    foldMarkerStored := true
-    pendingUserMessage := false
-    abortRequested := true
-    userMessageStarted := true
-    userMessageDeliveryCount := 1
-    userCycleStarted := true
-    userOutputVisible := true
-    operationAbortedVisible := false
-    watchdogUnlockedVisible := false
-    watchdogLocked := true
-  }
-
--- Final, safety, residue, takeover, and output predicates define the allowed result and every prohibited persistent artifact.
-def finalState (state : ProcessState) : Prop :=
-  state = completedUserWorkState
-
-def forbiddenTakeoverResidue (state : ProcessState) : Prop :=
-  state.phase ≠ .decisionStreaming ∧
-    (state.decisionStreamVisible = true ∨
-      state.assistantFinalDecisionStored = true ∨
-      state.sessionDecisionContentStored = true ∨
-      state.futureModelDecisionContent = true)
-
-def processSafety (state : ProcessState) : Prop :=
-  state.hiddenPresentationRequested = false ∧
-    ¬forbiddenTakeoverResidue state ∧
-    state.operationAbortedVisible = false ∧
-    state.watchdogUnlockedVisible = false ∧
-    state.userMessageDeliveryCount ≤ 1 ∧
-    (state.userMessageStarted = true →
-      state.userMessageDeliveryCount = 1 ∧
-        state.userCycleStarted = true ∧
-        state.watchdogLocked = true)
-
-def takeoverPostcondition (state : ProcessState) : Prop :=
-  state.phase = .takeoverPending ∧
-    state.hiddenPresentationRequested = false ∧
-    state.decisionStreamVisible = false ∧
-    state.assistantFinalDecisionStored = false ∧
-    state.sessionDecisionContentStored = false ∧
-    state.futureModelDecisionContent = false ∧
-    state.foldMarkerStored = true ∧
-    state.pendingUserMessage = true ∧
-    state.abortRequested = true ∧
-    state.userCycleStarted = true ∧
-    state.operationAbortedVisible = false ∧
-    state.watchdogUnlockedVisible = false ∧
-    state.watchdogLocked = true
-
-def outputPostcondition (state : ProcessState) : Prop :=
-  state.phase = .complete ∧
-    state.hiddenPresentationRequested = false ∧
-    state.decisionStreamVisible = false ∧
-    state.assistantFinalDecisionStored = false ∧
-    state.sessionDecisionContentStored = false ∧
-    state.futureModelDecisionContent = false ∧
-    state.foldMarkerStored = true ∧
-    state.pendingUserMessage = false ∧
-    state.userMessageStarted = true ∧
-    state.userMessageDeliveryCount = 1 ∧
-    state.userCycleStarted = true ∧
-    state.userOutputVisible = true ∧
-    state.operationAbortedVisible = false ∧
-    state.watchdogUnlockedVisible = false ∧
-    state.watchdogLocked = true
-
--- The invariant restricts reachable states to decision, cleaned takeover, exactly-once user work, and clean completion.
-def processInvariant (streamWasVisible : Bool) (state : ProcessState) : Prop :=
-  state = decisionState streamWasVisible ∨
-    state = takeoverPendingState ∨
-    state = userWorkState ∨
-    state = completedUserWorkState
-
--- The deterministic transition models abort-safe public message-end replacement clearing decision content and records the fold before waiting for abort completion and user work.
-def takeoverStep
-    (environment : EnvironmentAssumptions)
-    (state : ProcessState) : ProcessState :=
-  match state.phase with
-  | .decisionStreaming =>
-      if environment.uninterruptibleCleanupRuns = true then
-        takeoverPendingState
-      else
-        state
-  | .takeoverPending =>
-      if environment.abortedDecisionEnds = true then
-        userWorkState
-      else
-        takeoverPendingState
-  | .userWork =>
-      if environment.userRunSettles = true then
-        completedUserWorkState
-      else
-        userWorkState
-  | .complete => state
-
--- Bounded iteration expresses complete traces without introducing an implementation workflow engine.
-def iterate
-    (step : ProcessState → ProcessState) : Nat → ProcessState → ProcessState
-  | 0, state => state
-  | count + 1, state => step (iterate step count state)
-
--- Phase guards form a complete and mutually exclusive branch partition for every process state.
-def decisionIsStreaming (state : ProcessState) : Prop :=
-  state.phase = .decisionStreaming
-
-def waitingForAbortedDecisionEnd (state : ProcessState) : Prop :=
-  state.phase = .takeoverPending
-
-def processingUserWork (state : ProcessState) : Prop :=
-  state.phase = .userWork
-
-def processFinished (state : ProcessState) : Prop :=
-  state.phase = .complete
-
-def phaseGuardsCompleteAndExclusive (state : ProcessState) : Prop :=
-  (decisionIsStreaming state ∨
-      waitingForAbortedDecisionEnd state ∨
-      processingUserWork state ∨
-      processFinished state) ∧
-    ¬(decisionIsStreaming state ∧ waitingForAbortedDecisionEnd state) ∧
-    ¬(decisionIsStreaming state ∧ processingUserWork state) ∧
-    ¬(decisionIsStreaming state ∧ processFinished state) ∧
-    ¬(waitingForAbortedDecisionEnd state ∧ processingUserWork state) ∧
-    ¬(waitingForAbortedDecisionEnd state ∧ processFinished state) ∧
-    ¬(processingUserWork state ∧ processFinished state)
-
--- Guard proof establishes that exactly one phase branch applies at every decision point.
-theorem phase_guards_complete_and_exclusive (state : ProcessState) :
-    phaseGuardsCompleteAndExclusive state := by
-  cases state with
-  | mk phase hiddenPresentationRequested decisionStreamVisible
-      assistantFinalDecisionStored sessionDecisionContentStored
-      futureModelDecisionContent foldMarkerStored pendingUserMessage
-      abortRequested userMessageStarted userMessageDeliveryCount
-      userCycleStarted userOutputVisible operationAbortedVisible
-      watchdogUnlockedVisible watchdogLocked =>
-      cases phase <;>
-        simp [phaseGuardsCompleteAndExclusive, decisionIsStreaming,
-          waitingForAbortedDecisionEnd, processingUserWork, processFinished]
-
--- Supporting proofs establish initialization, preservation, safety, immediate cleanup, progress, termination, and the output contract.
-theorem initialization (streamWasVisible : Bool) :
-    processInvariant streamWasVisible (decisionState streamWasVisible) := by
-  simp [processInvariant]
-
-theorem takeover_step_preserves_invariant
-    (environment : EnvironmentAssumptions)
-    (streamWasVisible : Bool)
-    (state : ProcessState)
-    (invariant : processInvariant streamWasVisible state) :
-    processInvariant streamWasVisible (takeoverStep environment state) := by
-  rcases invariant with rfl | rfl | rfl | rfl
-  · cases cleanupRuns : environment.uninterruptibleCleanupRuns <;>
-      simp [takeoverStep, processInvariant, decisionState, cleanupRuns]
-  · cases decisionEnds : environment.abortedDecisionEnds <;>
-      simp [takeoverStep, processInvariant, takeoverPendingState, decisionEnds]
-  · cases userSettles : environment.userRunSettles <;>
-      simp [takeoverStep, processInvariant, userWorkState, userSettles]
-  · simp [takeoverStep, processInvariant, completedUserWorkState]
-
-theorem invariant_implies_safety
-    (streamWasVisible : Bool)
-    (state : ProcessState)
-    (invariant : processInvariant streamWasVisible state) :
-    processSafety state := by
-  rcases invariant with rfl | rfl | rfl | rfl <;>
-    simp [processSafety, forbiddenTakeoverResidue, decisionState,
-      takeoverPendingState, userWorkState, completedUserWorkState]
-
-theorem invariant_after_every_step
-    (environment : EnvironmentAssumptions)
-    (streamWasVisible : Bool)
-    (count : Nat) :
-    processInvariant streamWasVisible
-      (iterate (takeoverStep environment) count
-        (decisionState streamWasVisible)) := by
-  induction count with
-  | zero => exact initialization streamWasVisible
-  | succ count inductionHypothesis =>
-      exact takeover_step_preserves_invariant environment streamWasVisible _
-        inductionHypothesis
-
-theorem safety_after_every_step
-    (environment : EnvironmentAssumptions)
-    (streamWasVisible : Bool)
-    (count : Nat) :
-    processSafety
-      (iterate (takeoverStep environment) count
-        (decisionState streamWasVisible)) :=
-  invariant_implies_safety streamWasVisible _
-    (invariant_after_every_step environment streamWasVisible count)
-
-theorem immediate_takeover_cleanup
-    (environment : EnvironmentAssumptions)
-    (assumptions : environmentAdmitted environment)
-    (streamWasVisible : Bool) :
-    takeoverPostcondition
-      (takeoverStep environment (decisionState streamWasVisible)) := by
-  simp [takeoverStep, assumptions.1, takeoverPostcondition, decisionState,
-    takeoverPendingState]
-
-theorem progress
-    (environment : EnvironmentAssumptions)
-    (assumptions : environmentAdmitted environment)
-    (streamWasVisible : Bool)
-    (state : ProcessState)
-    (invariant : processInvariant streamWasVisible state)
-    (notFinal : ¬finalState state) :
-    takeoverStep environment state ≠ state := by
-  rcases invariant with rfl | rfl | rfl | rfl <;>
-    simp [takeoverStep, assumptions.1, assumptions.2.1, assumptions.2.2, finalState,
-      decisionState, takeoverPendingState, userWorkState,
-      completedUserWorkState] at *
-
-theorem termination
-    (environment : EnvironmentAssumptions)
-    (assumptions : environmentAdmitted environment)
-    (streamWasVisible : Bool) :
-    iterate (takeoverStep environment) 3 (decisionState streamWasVisible) =
-      completedUserWorkState := by
-  simp [iterate, takeoverStep, assumptions.1, assumptions.2.1,
-    assumptions.2.2,
-    decisionState, takeoverPendingState, userWorkState]
-
-theorem postcondition
-    (environment : EnvironmentAssumptions)
-    (assumptions : environmentAdmitted environment)
-    (streamWasVisible : Bool) :
-    outputPostcondition
-      (iterate (takeoverStep environment) 3
-        (decisionState streamWasVisible)) := by
-  rw [termination environment assumptions streamWasVisible]
-  simp [outputPostcondition, completedUserWorkState]
-
--- Inquiry correlation models one logical exchange/cycle boundary and permits arbitrary unrelated plugin entries without granting them watchdog ownership.
-structure CorrelationKey where
-  exchangeId : Nat
-  cycleId : Nat
-  deriving DecidableEq, Repr
-
-structure InquiryTrace where
-  marker : CorrelationKey
-  decision : CorrelationKey
-  fold : CorrelationKey
-  assistant : CorrelationKey
-  assistantContentEmpty : Bool
-  assistantStopReasonStop : Bool
-  assistantPreemptedMarker : Bool
-  interleavedPluginEntries : Nat
-  preservedPluginEntries : Nat
-  assistantSpliced : Bool
-  deriving DecidableEq, Repr
-
-def exactInquiryAssociation (trace : InquiryTrace) : Bool :=
-  trace.marker == trace.decision &&
-    trace.decision == trace.fold &&
-    trace.assistant == trace.marker
-
-def safePreemptedAssistant (trace : InquiryTrace) : Bool :=
-  trace.assistantContentEmpty &&
-    trace.assistantStopReasonStop &&
-    trace.assistantPreemptedMarker
-
-def eligibleForIdleSplice (trace : InquiryTrace) : Bool :=
-  exactInquiryAssociation trace && safePreemptedAssistant trace
-
-def idleSplice (trace : InquiryTrace) : InquiryTrace :=
-  if eligibleForIdleSplice trace then
-    { trace with
-      preservedPluginEntries := trace.interleavedPluginEntries
-      assistantSpliced := true }
-  else
-    trace
-
--- Correlation proofs show exact marked cleanup preserves every interleaved plugin entry and rejects mismatched or unmarked candidates.
-theorem eligible_idle_splice_is_exact_and_preserves_plugins
-    (trace : InquiryTrace)
-    (eligible : eligibleForIdleSplice trace = true) :
-    (idleSplice trace).assistantSpliced = true ∧
-      (idleSplice trace).preservedPluginEntries =
-        trace.interleavedPluginEntries := by
-  simp [idleSplice, eligible]
-
-theorem mismatched_marker_is_not_spliced
-    (trace : InquiryTrace)
-    (mismatch : trace.marker ≠ trace.decision) :
-    idleSplice trace = trace := by
-  have associationFalse : exactInquiryAssociation trace = false := by
-    simp only [exactInquiryAssociation, Bool.and_eq_false_iff]
-    left
-    simp [mismatch]
-  simp [idleSplice, eligibleForIdleSplice, associationFalse]
-
-theorem mismatched_fold_is_not_spliced
-    (trace : InquiryTrace)
-    (mismatch : trace.decision ≠ trace.fold) :
-    idleSplice trace = trace := by
-  have associationFalse : exactInquiryAssociation trace = false := by
-    simp only [exactInquiryAssociation, Bool.and_eq_false_iff]
-    left
-    right
-    simp [mismatch]
-  simp [idleSplice, eligibleForIdleSplice, associationFalse]
-
-theorem unmarked_assistant_is_not_spliced
-    (trace : InquiryTrace)
-    (notMarked : trace.assistantPreemptedMarker = false) :
-    idleSplice trace = trace := by
-  have safeFalse : safePreemptedAssistant trace = false := by
-    simp [safePreemptedAssistant, notMarked]
-  simp [idleSplice, eligibleForIdleSplice, safeFalse]
-
--- Marker guarantees collect the exact-association, preservation, and fail-closed splice obligations.
-structure InquiryMarkerGuarantees : Prop where
-  exactCleanup : ∀ trace, eligibleForIdleSplice trace = true →
-    (idleSplice trace).assistantSpliced = true
-  pluginPreservation : ∀ trace, eligibleForIdleSplice trace = true →
-    (idleSplice trace).preservedPluginEntries =
-      trace.interleavedPluginEntries
-  markerBoundary : ∀ trace, trace.marker ≠ trace.decision →
-    idleSplice trace = trace
-  foldBoundary : ∀ trace, trace.decision ≠ trace.fold →
-    idleSplice trace = trace
-  assistantMarker : ∀ trace, trace.assistantPreemptedMarker = false →
-    idleSplice trace = trace
-
-theorem inquiry_marker_is_correct : InquiryMarkerGuarantees := by
-  exact {
-    exactCleanup := fun trace eligible =>
-      (eligible_idle_splice_is_exact_and_preserves_plugins trace eligible).1
-    pluginPreservation := fun trace eligible =>
-      (eligible_idle_splice_is_exact_and_preserves_plugins trace eligible).2
-    markerBoundary := mismatched_marker_is_not_spliced
-    foldBoundary := mismatched_fold_is_not_spliced
-    assistantMarker := unmarked_assistant_is_not_spliced
-  }
-
--- Continue evidence expresses conditional snapshot consistency, not configured authorization or temporal I/O ordering.
-inductive ContinueReasonType where
-  | workRemains
-  | verifying
-  | waitAutomation
-  deriving DecidableEq, Repr
-
-structure ContinueEvidence where
-  reasonType : ContinueReasonType
-  reasonLength : Nat
-  userDecisionMade : Bool
-  auditStored : Bool
-  sharedEventStored : Bool
-  hookPublished : Bool
-  continuationDispatched : Bool
-  deriving DecidableEq, Repr
-
-def validContinueReason (evidence : ContinueEvidence) : Prop :=
-  evidence.reasonLength > 0 ∧ evidence.reasonLength ≤ 1000
-
-def continueEvidenceOrdered (evidence : ContinueEvidence) : Prop :=
-  (evidence.hookPublished = true → evidence.sharedEventStored = true) ∧
-    (evidence.continuationDispatched = true → evidence.sharedEventStored = true)
-
-structure ContinueGuarantees : Prop where
-  accepted : ∀ evidence, validContinueReason evidence →
-    evidence.userDecisionMade = false →
-    evidence.auditStored = true →
-    evidence.sharedEventStored = true →
-    evidence.hookPublished = true →
-    evidence.continuationDispatched = true →
-    continueEvidenceOrdered evidence
-  persistenceFailureClosed : ∀ evidence,
-    evidence.sharedEventStored = false →
-    evidence.hookPublished = false →
-    evidence.continuationDispatched = false →
-    continueEvidenceOrdered evidence
-
-def protocolContinueEvidence (reasonType : ContinueReasonType) (reasonLength : Nat) : ContinueEvidence :=
-  {
-    reasonType
-    reasonLength
-    userDecisionMade := false
-    auditStored := false
-    sharedEventStored := false
-    hookPublished := false
-    continuationDispatched := false
-  }
-
-theorem protocol_continue_makes_no_user_decision
-    (reasonType : ContinueReasonType)
-    (reasonLength : Nat) :
-    (protocolContinueEvidence reasonType reasonLength).userDecisionMade = false := by
-  rfl
-
-theorem typed_continue_is_correct : ContinueGuarantees := by
-  exact {
-    accepted := by
-      intro evidence validReason noUserDecision auditStored sharedStored hookPublished dispatched
-      simp [continueEvidenceOrdered, sharedStored]
-    persistenceFailureClosed := by
-      intro evidence sharedMissing hookMissing dispatchMissing
-      simp [continueEvidenceOrdered, hookMissing, dispatchMissing]
-  }
-
--- Manual cancellation models watchdog ownership, transfer to genuine user work, explicit unlock, and authoritative settlement without private queue replay.
-inductive ManualRunKind where
-  | decision
-  | continuation
-  | ordinary
-  deriving DecidableEq, Repr
-
-inductive ManualOwner where
-  | watchdog
-  | user
-  deriving DecidableEq, Repr
-
-inductive ManualPhase where
-  | running
-  | cancelling
-  | settled
-  deriving DecidableEq, Repr
-
-structure ManualCancellationState where
-  runKind : ManualRunKind
-  owner : ManualOwner
-  phase : ManualPhase
-  watchdogLocked : Bool
-  abortRequested : Bool
-  visibleResidue : Bool
-  futureModelResidue : Bool
-  operationAbortedVisible : Bool
-  replacementTurnStarted : Bool
-  privateQueueReplayAttempted : Bool
-  duplicateUnlockVisible : Bool
-  deriving DecidableEq, Repr
-
-def manualRunningState (runKind : ManualRunKind) : ManualCancellationState :=
-  {
-    runKind
-    owner := if runKind == .ordinary then .user else .watchdog
-    phase := .running
-    watchdogLocked := true
-    abortRequested := false
-    visibleResidue := false
-    futureModelResidue := false
-    operationAbortedVisible := false
-    replacementTurnStarted := false
-    privateQueueReplayAttempted := false
-    duplicateUnlockVisible := false
-  }
-
-def startForeignUserWork (state : ManualCancellationState) : ManualCancellationState :=
-  if state.runKind == .continuation ∧ state.owner == .watchdog then
-    { state with runKind := .ordinary, owner := .user }
-  else
-    state
-
-def manualUnlockStep (state : ManualCancellationState) : ManualCancellationState :=
-  {
-    state with
-    phase := if state.owner == .watchdog then .cancelling else .settled
-    watchdogLocked := false
-    abortRequested := state.owner == .watchdog
-    visibleResidue := false
-    futureModelResidue := false
-    operationAbortedVisible := false
-    replacementTurnStarted := false
-    privateQueueReplayAttempted := false
-    duplicateUnlockVisible := false
-  }
-
-def manualSettleStep (state : ManualCancellationState) : ManualCancellationState :=
-  { state with phase := .settled }
-
-def runManualCancellation (runKind : ManualRunKind) : ManualCancellationState :=
-  manualSettleStep (manualUnlockStep (manualRunningState runKind))
-
-def runContinuationAfterForeignInput : ManualCancellationState :=
-  manualSettleStep
-    (manualUnlockStep (startForeignUserWork (manualRunningState .continuation)))
-
-def manualCancellationPostcondition
-    (expectedAbort : Bool)
-    (state : ManualCancellationState) : Prop :=
-  state.phase = .settled ∧
-    state.watchdogLocked = false ∧
-    state.abortRequested = expectedAbort ∧
-    state.visibleResidue = false ∧
-    state.futureModelResidue = false ∧
-    state.operationAbortedVisible = false ∧
-    state.replacementTurnStarted = false ∧
-    state.privateQueueReplayAttempted = false ∧
-    state.duplicateUnlockVisible = false
-
--- Manual-cancellation proofs establish owned-run abort, foreign-user ownership transfer, ordinary-run preservation, clean residue, and host-owned queue behavior.
-theorem manual_owned_decision_cancels :
-    manualCancellationPostcondition true (runManualCancellation .decision) := by
-  simp [manualCancellationPostcondition, runManualCancellation,
-    manualSettleStep, manualUnlockStep, manualRunningState]
-
-theorem manual_owned_continuation_cancels :
-    manualCancellationPostcondition true
-      (runManualCancellation .continuation) := by
-  simp [manualCancellationPostcondition, runManualCancellation,
-    manualSettleStep, manualUnlockStep, manualRunningState]
-
-theorem manual_ordinary_run_is_preserved :
-    manualCancellationPostcondition false (runManualCancellation .ordinary) := by
-  simp [manualCancellationPostcondition, runManualCancellation,
-    manualSettleStep, manualUnlockStep, manualRunningState]
-
-theorem foreign_user_work_clears_continuation_ownership :
-    manualCancellationPostcondition false runContinuationAfterForeignInput := by
-  simp [manualCancellationPostcondition, runContinuationAfterForeignInput,
-    manualSettleStep, manualUnlockStep, startForeignUserWork,
-    manualRunningState]
-
-structure ManualCancellationGuarantees : Prop where
-  decisionAborts :
-    manualCancellationPostcondition true (runManualCancellation .decision)
-  continuationAborts :
-    manualCancellationPostcondition true
-      (runManualCancellation .continuation)
-  ordinaryPreserved :
-    manualCancellationPostcondition false (runManualCancellation .ordinary)
-  foreignUserPreserved :
-    manualCancellationPostcondition false runContinuationAfterForeignInput
-
- theorem manual_cancellation_is_correct : ManualCancellationGuarantees := by
-  exact {
-    decisionAborts := manual_owned_decision_cancels
-    continuationAborts := manual_owned_continuation_cancels
-    ordinaryPreserved := manual_ordinary_run_is_preserved
-    foreignUserPreserved := foreign_user_work_clears_continuation_ownership
-  }
-
--- Finalized abort text is independent of the host's unchanged aborted outcome; live streaming frames and blank spacing are outside this model.
--- Current ownership/claim and branch-boundary inputs stand for the runtime's correlation checks, not a proof of those checks.
-structure NativeAbortState where
-  hostAborted : Bool
-  currentOwned : Bool
-  claimCurrent : Bool
-  boundaryPresent : Bool
-  noticeVisible : Bool
-  partialOutput : String
+def sourceCurrent (captured : Scope) (view : SourceView) : Bool :=
+  captured == view.scope && view.descendants.all
+    (fun entry => entry == .ownedExcludedAudit captured.operation)
+
+-- Admission assumes the observed idle gate and private runner contract, including full effective context, {} resets and bounded same-child responses.
+-- These are runtime/provider/filesystem observations, not conclusions of the cancellation proof.
+structure EntryObservations where
+  idleMilliseconds : Nat
   locked : Bool
-  unlockCount : Nat
-  abortRequests : Nat
-  settled : Bool
+  callbackSuspended : Bool
+  exhausted : Bool
+  decisionOpen : Bool
+  fullEffectiveFork : Bool
+  privateFactoryWithoutPublicRegistration : Bool
+  guardedWriterOnly : Bool
+  oneResponseIncludingSettledWrite : Bool
+  sameChildThreeResponsesPerInquiryAndOneReconsideration : Bool
+  uniqueOwnerOnlyDirectory : Bool
+  hostDeliversOriginalInput : Bool
+  resultFileResetToEmptyObject : Bool
   deriving DecidableEq, Repr
 
-def nativeAbortInitial (owned : Bool) (output : String) : NativeAbortState :=
-  { hostAborted := true, currentOwned := owned, claimCurrent := true,
-    boundaryPresent := true, noticeVisible := true,
-    partialOutput := output, locked := true, unlockCount := 0,
-    abortRequests := 0, settled := false }
+def admitted (entry : EntryObservations) : Prop :=
+  10000 ≤ entry.idleMilliseconds ∧ entry.locked = true ∧
+    entry.callbackSuspended = false ∧ entry.exhausted = false ∧
+    entry.decisionOpen = false ∧ entry.fullEffectiveFork = true ∧
+    entry.privateFactoryWithoutPublicRegistration = true ∧ entry.guardedWriterOnly = true ∧
+    entry.oneResponseIncludingSettledWrite = true ∧
+    entry.sameChildThreeResponsesPerInquiryAndOneReconsideration = true ∧
+    entry.uniqueOwnerOnlyDirectory = true ∧ entry.hostDeliversOriginalInput = true ∧
+    entry.resultFileResetToEmptyObject = true
 
--- Presentation leaves the host abort guard intact; the existing settlement gate uses that same outcome, never display visibility.
-def projectNativeAbort (state : NativeAbortState) : NativeAbortState :=
-  { state with noticeVisible := state.hostAborted &&
-      !(state.currentOwned && state.claimCurrent) }
+-- Main work remains host-owned; a private decision grants no ownership over an ordinary main run or the complete incoming payload.
+inductive MainRun where
+  | idle
+  | foreign (identity : Nat)
+  | ownedContinuation (scope : Scope)
+  deriving DecidableEq, Repr
 
-def hostMayContinueAfterMessage (state : NativeAbortState) : Bool :=
-  !state.hostAborted
-
-def settleNativeAbort (state : NativeAbortState) : NativeAbortState :=
-  if state.settled then state else
-    let unlock := state.claimCurrent && state.boundaryPresent && state.hostAborted
-    { state with
-      settled := true
-      locked := if unlock then false else state.locked
-      unlockCount := state.unlockCount + (if unlock then 1 else 0) }
-
-def completeNativeAbort (owned : Bool) (output : String) : NativeAbortState :=
-  settleNativeAbort (projectNativeAbort (nativeAbortInitial owned output))
-
--- These guarantees cover quiet final presentation, unchanged host guard/output, idempotent replay and once-only fenced unlock in this model.
-structure NativeAbortGuarantees : Prop where
-  completion : ∀ owned output,
-    (completeNativeAbort owned output).settled = true ∧
-      (completeNativeAbort owned output).locked = false ∧
-      (completeNativeAbort owned output).unlockCount = 1 ∧
-      (completeNativeAbort owned output).noticeVisible = !owned ∧
-      (completeNativeAbort owned output).hostAborted = true ∧
-      (completeNativeAbort owned output).partialOutput = output ∧
-      (completeNativeAbort owned output).abortRequests = 0
-  hostControlPreserved : ∀ state,
-    hostMayContinueAfterMessage (projectNativeAbort state) =
-      hostMayContinueAfterMessage state
-  replaySafe : ∀ state,
-    projectNativeAbort (projectNativeAbort state) = projectNativeAbort state
-  exactlyOnce : ∀ state,
-    settleNativeAbort (settleNativeAbort state) = settleNativeAbort state
-  outputPreserved : ∀ state,
-    (settleNativeAbort (projectNativeAbort state)).partialOutput = state.partialOutput
-  fencedSettlement : ∀ state,
-    state.claimCurrent = false ∨ state.boundaryPresent = false ∨ state.hostAborted = false →
-    (settleNativeAbort state).unlockCount = state.unlockCount
-
-theorem native_abort_presentation_is_correct : NativeAbortGuarantees := by
-  constructor
-  · intro owned output
-    cases owned <;> simp [completeNativeAbort, settleNativeAbort,
-      projectNativeAbort, nativeAbortInitial]
-  · intro state
-    rfl
-  · intro state
-    rfl
-  · intro state
-    by_cases settled : state.settled = true <;>
-      simp [settleNativeAbort, settled]
-  · intro state
-    by_cases settled : state.settled = true <;>
-      simp [settleNativeAbort, projectNativeAbort, settled]
-  · intro state fence
-    by_cases settled : state.settled = true
-    · simp [settleNativeAbort, settled]
-    · rcases fence with claim | boundary | outcome <;>
-        simp_all [settleNativeAbort]
-
--- The guarantee record gathers all whole-process obligations under abort-safe cleanup and the two explicit host-settlement assumptions.
-structure TakeoverGuarantees
-    (environment : EnvironmentAssumptions)
-    (streamWasVisible : Bool) : Prop where
-  initialization : processInvariant streamWasVisible
-    (decisionState streamWasVisible)
-  preservation : ∀ state, processInvariant streamWasVisible state →
-    processInvariant streamWasVisible (takeoverStep environment state)
-  guardDiscipline : ∀ state, phaseGuardsCompleteAndExclusive state
-  immediateCleanup : takeoverPostcondition
-    (takeoverStep environment (decisionState streamWasVisible))
-  safety : ∀ count, processSafety
-    (iterate (takeoverStep environment) count
-      (decisionState streamWasVisible))
-  progress : ∀ state, processInvariant streamWasVisible state →
-    ¬finalState state → takeoverStep environment state ≠ state
-  termination : iterate (takeoverStep environment) 3
-    (decisionState streamWasVisible) = completedUserWorkState
-  postcondition : outputPostcondition
-    (iterate (takeoverStep environment) 3
-      (decisionState streamWasVisible))
-
--- Top-level correctness proves the gathered obligations for either visible or not-yet-visible in-flight decision streaming; no finalized decision content survives.
-theorem takeover_process_is_correct
-    (environment : EnvironmentAssumptions)
-    (assumptions : environmentAdmitted environment)
-    (streamWasVisible : Bool) :
-    TakeoverGuarantees environment streamWasVisible := by
-  exact {
-    initialization := initialization streamWasVisible
-    preservation := takeover_step_preserves_invariant environment streamWasVisible
-    guardDiscipline := phase_guards_complete_and_exclusive
-    immediateCleanup := immediate_takeover_cleanup environment assumptions streamWasVisible
-    safety := safety_after_every_step environment streamWasVisible
-    progress := progress environment assumptions streamWasVisible
-    termination := termination environment assumptions streamWasVisible
-    postcondition := postcondition environment assumptions streamWasVisible
-  }
-
--- Payload flow is coupled to the lifecycle: capture text and opaque image blocks at takeover,
--- then move the complete value exactly once when the aborted decision settles.
 structure UserPayload where
   text : String
   images : List (String × String)
   deriving DecidableEq, Repr
 
-structure PayloadState where
-  lifecycle : ProcessState
-  input : UserPayload
-  pending : Option UserPayload
-  delivered : Option UserPayload
+structure ParentState where
+  run : MainRun
+  context : List String
+  spent : Nat
+  callbackSuspended : Bool
+  locked : Bool
   deriving DecidableEq, Repr
 
-def initialPayloadState (visible : Bool) (payload : UserPayload) : PayloadState :=
-  ⟨decisionState visible, payload, none, none⟩
+-- Cancellation has a separate resource lifecycle; callback kinds describe completion notices, not requests for extra model responses.
+inductive Phase where
+  | active
+  | revoked
+  | drained
+  | disposed
+  deriving DecidableEq, Repr
 
-def finishedPayloadState (payload : UserPayload) : PayloadState :=
-  ⟨completedUserWorkState, payload, none, some payload⟩
+-- Host maps Escape directed to current private work while main is idle to nativeChildAbort;
+-- keyboard routing and lifecycle subscription are observed host boundaries, not extra modeled states.
+inductive CancelCause where
+  | manualUnlock
+  | nativeChildAbort
+  | userTakeover
+  | externalWork
+  | lifecycleReplacement
+  | shutdown
+  deriving DecidableEq, Repr
 
-def payloadStep (environment : EnvironmentAssumptions) (state : PayloadState) : PayloadState :=
-  let next := takeoverStep environment state.lifecycle
-  match state.lifecycle.phase, next.phase with
-  | .decisionStreaming, .takeoverPending =>
-      { state with lifecycle := next, pending := some state.input }
-  | .takeoverPending, .userWork =>
-      { state with lifecycle := next, pending := none, delivered := state.pending }
-  | _, _ => { state with lifecycle := next }
+inductive PrivateCallback where
+  | formatCorrection
+  | reviewReconsideration
+  | fileWrite
+  | validResult
+  | terminalSettlement
+  deriving DecidableEq, Repr
 
-def iteratePayload (environment : EnvironmentAssumptions) : Nat → PayloadState → PayloadState
-  | 0, state => state
-  | n + 1, state => payloadStep environment (iteratePayload environment n state)
+structure ProcessState where
+  scope : Scope
+  source : SourceView
+  phase : Phase
+  authority : Bool
+  childAbortRequested : Bool
+  fileResultAccepted : Bool
+  callbacksAccepted : Nat
+  parent : ParentState
+  deriving DecidableEq, Repr
 
-def PayloadGuarantees (environment : EnvironmentAssumptions) : Prop :=
-  ∀ visible payload count,
-    iteratePayload environment (3 + count) (initialPayloadState visible payload) =
-      finishedPayloadState payload
+-- Actions name only the exact child/resources and a direct host input pass; no main abort, model call, input capture or replay exists here.
+inductive Action where
+  | signalChild (child : Nat)
+  | drainOrQuarantineWrites (child : Nat)
+  | disposeOwnedResources (child directory : Nat)
+  | passOriginalInput (payload : UserPayload)
+  deriving DecidableEq, Repr
 
--- Three admitted steps deliver the original payload; every subsequent completed-state step
--- preserves both that payload and the lifecycle's single-delivery count.
-theorem payload_flow_is_correct
-    (environment : EnvironmentAssumptions)
-    (assumptions : environmentAdmitted environment) : PayloadGuarantees environment := by
-  intro visible payload count
-  induction count with
-  | zero =>
-      simp [iteratePayload, payloadStep, initialPayloadState, finishedPayloadState,
-        takeoverStep, decisionState, takeoverPendingState, userWorkState,
-        assumptions.1, assumptions.2.1, assumptions.2.2]
-  | succ count ih =>
-      simp [iteratePayload, ih, payloadStep, finishedPayloadState,
-        completedUserWorkState, takeoverStep]
+structure Transition where
+  state : ProcessState
+  actions : List Action
+  deriving DecidableEq, Repr
 
-theorem process_is_correct
-    (environment : EnvironmentAssumptions)
-    (assumptions : environmentAdmitted environment)
-    (streamWasVisible : Bool) :
-    TakeoverGuarantees environment streamWasVisible ∧
-      InquiryMarkerGuarantees ∧
-      ContinueGuarantees ∧
-      ManualCancellationGuarantees ∧
-      PayloadGuarantees environment ∧
-      NativeAbortGuarantees := by
-  exact ⟨takeover_process_is_correct environment assumptions streamWasVisible,
-    inquiry_marker_is_correct,
-    typed_continue_is_correct,
-    manual_cancellation_is_correct,
-    payload_flow_is_correct environment assumptions,
-    native_abort_presentation_is_correct⟩
+-- Live authority admits callbacks only while the captured source is current; revocation precedes all emitted cancellation/cleanup actions.
+-- Manual unlock and actual native-child abort unlock; takeover, external work and lifecycle invalidation do not impersonate those causes.
+def initial (scope : Scope) (parent : ParentState) : ProcessState :=
+  { scope, source := ⟨scope, []⟩, phase := .active, authority := true,
+    childAbortRequested := false, fileResultAccepted := false,
+    callbacksAccepted := 0, parent }
 
--- Executable projections expose deterministic summaries of immediate cleanup and clean exactly-once completion.
-def takeoverPostconditionBool (state : ProcessState) : Bool :=
-  state.phase == .takeoverPending &&
-    !state.hiddenPresentationRequested &&
-    !state.decisionStreamVisible &&
-    !state.assistantFinalDecisionStored &&
-    !state.sessionDecisionContentStored &&
-    !state.futureModelDecisionContent &&
-    state.foldMarkerStored &&
-    state.pendingUserMessage &&
-    state.abortRequested &&
-    state.userCycleStarted &&
-    !state.operationAbortedVisible &&
-    !state.watchdogUnlockedVisible &&
-    state.watchdogLocked
+def canAccept (state : ProcessState) : Bool :=
+  state.phase == .active && state.authority && sourceCurrent state.scope state.source
 
-def continueEvidenceOrderedBool (evidence : ContinueEvidence) : Bool :=
-  (!evidence.hookPublished || evidence.sharedEventStored) &&
-    (!evidence.continuationDispatched || evidence.sharedEventStored)
+def unlockFor (cause : CancelCause) : Bool :=
+  cause == .manualUnlock || cause == .nativeChildAbort
 
-def manualCancellationPostconditionBool
-    (expectedAbort : Bool)
-    (state : ManualCancellationState) : Bool :=
-  state.phase == .settled &&
-    !state.watchdogLocked &&
-    state.abortRequested == expectedAbort &&
-    !state.visibleResidue &&
-    !state.futureModelResidue &&
-    !state.operationAbortedVisible &&
-    !state.replacementTurnStarted &&
-    !state.privateQueueReplayAttempted &&
-    !state.duplicateUnlockVisible
+def revoke (scope : Scope) (cause : CancelCause) (state : ProcessState) : Transition :=
+  if scope != state.scope then ⟨state, []⟩ else
+    if state.phase != .active then ⟨state, []⟩ else
+      ⟨{ state with
+          phase := .revoked
+          authority := false
+          childAbortRequested := true
+          parent := if unlockFor cause then { state.parent with locked := false }
+            else state.parent },
+        [.signalChild scope.child, .drainOrQuarantineWrites scope.child]⟩
 
-def outputPostconditionBool (state : ProcessState) : Bool :=
-  state.phase == .complete &&
-    !state.hiddenPresentationRequested &&
-    !state.decisionStreamVisible &&
-    !state.assistantFinalDecisionStored &&
-    !state.sessionDecisionContentStored &&
-    !state.futureModelDecisionContent &&
-    state.foldMarkerStored &&
-    !state.pendingUserMessage &&
-    state.userMessageStarted &&
-    state.userMessageDeliveryCount == 1 &&
-    state.userCycleStarted &&
-    state.userOutputVisible &&
-    !state.operationAbortedVisible &&
-    !state.watchdogUnlockedVisible &&
-    state.watchdogLocked
+-- Takeover passes the full original value once in this transition, without waiting for the private child or retaining a queue slot.
+def takeover (scope : Scope) (payload : UserPayload) (state : ProcessState) : Transition :=
+  let cancelled := revoke scope .userTakeover state
+  { cancelled with actions := cancelled.actions ++ [.passOriginalInput payload] }
+
+-- Cleanup requires observed write drain/permanent quarantine before disposal; scheduling the two successful cleanup steps is an explicit liveness premise.
+-- No wall-clock, hardware, detached-work termination or rollback of completed tool effects is asserted.
+structure CleanupObservations where
+  writesDrainedOrPermanentlyQuarantined : Bool
+  disposalSettles : Bool
+  deriving DecidableEq, Repr
+
+def cleanup (scope : Scope) (host : CleanupObservations)
+    (state : ProcessState) : Transition :=
+  if scope != state.scope then ⟨state, []⟩ else
+    match state.phase with
+    | .revoked =>
+        if host.writesDrainedOrPermanentlyQuarantined then
+          ⟨{ state with phase := .drained }, []⟩
+        else ⟨state, []⟩
+    | .drained =>
+        if host.disposalSettles then
+          ⟨{ state with phase := .disposed },
+            [.disposeOwnedResources scope.child scope.directory]⟩
+        else ⟨state, []⟩
+    | _ => ⟨state, []⟩
+
+-- Only current completion notices gain authority; ignored late notices do not imply their physical writes were rolled back.
+-- Observing an incompatible source revokes the operation, while exact owned excluded-audit appends retain its source.
+def callback (scope : Scope) (event : PrivateCallback)
+    (state : ProcessState) : ProcessState :=
+  if scope != state.scope then state else
+    if canAccept state then
+      { state with
+        callbacksAccepted := state.callbacksAccepted + 1
+        fileResultAccepted := state.fileResultAccepted || event == .fileWrite }
+    else state
+
+def observeSource (scope : Scope) (view : SourceView) (state : ProcessState) : ProcessState :=
+  if scope != state.scope then state else
+    if sourceCurrent state.scope view then { state with source := view }
+    else (revoke scope .lifecycleReplacement { state with source := view }).state
+
+-- Finite traces admit arbitrary interleavings of source observations, callbacks, cancellation and cleanup for a fixed operation identity.
+inductive Event where
+  | cancel (cause : CancelCause)
+  | cleanup (host : CleanupObservations)
+  | callback (event : PrivateCallback)
+  | sourceChanged (view : SourceView)
+  deriving DecidableEq, Repr
+
+def step (scope : Scope) (event : Event) (state : ProcessState) : ProcessState :=
+  match event with
+  | .cancel cause => (revoke scope cause state).state
+  | .cleanup host => (cleanup scope host state).state
+  | .callback event => callback scope event state
+  | .sourceChanged view => observeSource scope view state
+
+def run (scope : Scope) (events : List Event) (state : ProcessState) : ProcessState :=
+  events.foldl (fun state event => step scope event state) state
+
+-- Safety ties authority to the live phase and keeps private completion/cancellation out of main work, context, budget and callback suspension.
+def invariant (state : ProcessState) : Prop :=
+  (state.phase = .active ↔ state.authority = true) ∧
+    (state.phase ≠ .active → state.childAbortRequested = true)
+
+def privateIsolation (before after : ProcessState) : Prop :=
+  after.parent.run = before.parent.run ∧
+    after.parent.context = before.parent.context ∧
+    after.parent.spent = before.parent.spent ∧
+    after.parent.callbackSuspended = before.parent.callbackSuspended
+
+def noFurtherAuthority (state : ProcessState) : Prop :=
+  state.phase ≠ .active ∧ state.authority = false ∧ canAccept state = false
+
+-- Initialization, exact targeting and the callback guard establish the local cancellation contract for both current and foreign identities.
+theorem initial_invariant (scope : Scope) (parent : ParentState) :
+    invariant (initial scope parent) := by
+  simp [invariant, initial]
+
+theorem revoke_current (state : ProcessState) (cause : CancelCause)
+    (active : state.phase = .active) :
+    noFurtherAuthority (revoke state.scope cause state).state ∧
+      (revoke state.scope cause state).state.childAbortRequested = true ∧
+      (revoke state.scope cause state).actions =
+        [.signalChild state.scope.child, .drainOrQuarantineWrites state.scope.child] := by
+  simp [revoke, active, noFurtherAuthority, canAccept]
+
+theorem targeted_signal_and_cause (state : ProcessState) (cause : CancelCause)
+    (active : state.phase = .active) :
+    (revoke state.scope cause state).actions =
+      [.signalChild state.scope.child, .drainOrQuarantineWrites state.scope.child] ∧
+    (revoke state.scope cause state).state.parent.locked =
+      if unlockFor cause then false else state.parent.locked := by
+  cases unlock : unlockFor cause <;> simp [revoke, active, unlock]
+
+theorem callback_guard_sound_and_complete (state : ProcessState) :
+    canAccept state = true ↔ state.phase = .active ∧ state.authority = true ∧
+      sourceCurrent state.scope state.source = true := by
+  simp [canAccept, Bool.and_eq_true, and_assoc]
+
+theorem callback_revoked (scope : Scope) (event : PrivateCallback)
+    (state : ProcessState) (revoked : noFurtherAuthority state) :
+    callback scope event state = state := by
+  simp [callback, revoked.2.2]
+
+theorem foreign_events_inert (incoming : Scope) (event : Event)
+    (state : ProcessState) (foreign : incoming ≠ state.scope) :
+    step incoming event state = state := by
+  cases event <;> simp [step, revoke, cleanup, callback, observeSource, foreign]
+
+-- Every permitted event preserves the lifecycle invariant and parent isolation, including source replacement and repeated completion notices.
+theorem step_preserves_invariant (scope : Scope) (event : Event)
+    (state : ProcessState) (valid : invariant state) :
+    invariant (step scope event state) := by
+  cases event with
+  | cancel cause =>
+      by_cases same : scope = state.scope
+      · by_cases active : state.phase = .active
+        · simp [step, revoke, same, active, invariant]
+        · simpa [step, revoke, same, active] using valid
+      · simpa [step, revoke, same] using valid
+  | callback event =>
+      by_cases same : scope = state.scope <;>
+        by_cases accept : canAccept state = true <;>
+        simpa [step, callback, same, accept, invariant] using valid
+  | sourceChanged view =>
+      by_cases same : scope = state.scope <;>
+        by_cases current : sourceCurrent state.scope view = true <;>
+        by_cases active : state.phase = .active <;>
+        simp_all [step, observeSource, revoke, invariant]
+  | cleanup host =>
+      by_cases same : scope = state.scope
+      · cases phase : state.phase <;>
+          cases writes : host.writesDrainedOrPermanentlyQuarantined <;>
+          cases disposed : host.disposalSettles <;>
+          simp_all [step, cleanup, invariant]
+      · simpa [step, cleanup, same] using valid
+
+theorem step_isolates_parent (scope : Scope) (event : Event) (state : ProcessState) :
+    privateIsolation state (step scope event state) := by
+  cases event with
+  | cancel cause =>
+      by_cases same : scope = state.scope <;>
+        by_cases active : state.phase = .active <;>
+        cases unlock : unlockFor cause <;>
+        simp [step, revoke, same, active, unlock, privateIsolation]
+  | callback event =>
+      by_cases same : scope = state.scope <;>
+        cases accept : canAccept state <;>
+        simp [step, callback, same, accept, privateIsolation]
+  | sourceChanged view =>
+      by_cases same : scope = state.scope <;>
+        by_cases current : sourceCurrent state.scope view = true <;>
+        by_cases active : state.phase = .active <;>
+        simp [step, observeSource, revoke, same, current, active, unlockFor, privateIsolation]
+  | cleanup host =>
+      by_cases same : scope = state.scope <;>
+        cases phase : state.phase <;>
+        cases writes : host.writesDrainedOrPermanentlyQuarantined <;>
+        cases disposed : host.disposalSettles <;>
+        simp [step, cleanup, same, phase, writes, disposed, privateIsolation]
+
+theorem run_preserves_invariant (scope : Scope) (events : List Event)
+    (state : ProcessState) (valid : invariant state) :
+    invariant (run scope events state) := by
+  induction events generalizing state with
+  | nil => exact valid
+  | cons event events ih =>
+      exact ih _ (step_preserves_invariant scope event state valid)
+
+theorem run_isolates_parent (scope : Scope) (events : List Event) (state : ProcessState) :
+    privateIsolation state (run scope events state) := by
+  induction events generalizing state with
+  | nil => simp [run, privateIsolation]
+  | cons event events ih =>
+      have first := step_isolates_parent scope event state
+      have rest := ih (step scope event state)
+      exact ⟨rest.1.trans first.1, rest.2.1.trans first.2.1,
+        rest.2.2.1.trans first.2.2.1, rest.2.2.2.trans first.2.2.2⟩
+
+-- Revocation is permanent across every finite event interleaving; repeated cancellation emits no further owned actions.
+theorem repeated_cancellation_is_inert (scope : Scope) (cause : CancelCause)
+    (state : ProcessState) (revoked : noFurtherAuthority state) :
+    revoke scope cause state = ⟨state, []⟩ := by
+  simp [revoke, revoked.1]
+
+theorem step_preserves_revocation (scope : Scope) (event : Event)
+    (state : ProcessState) (revoked : noFurtherAuthority state) :
+    noFurtherAuthority (step scope event state) := by
+  cases event with
+  | cancel cause => simpa [step, revoke, revoked.1] using revoked
+  | callback event => simpa [step, callback_revoked scope event state revoked] using revoked
+  | sourceChanged view =>
+      by_cases same : scope = state.scope <;>
+        by_cases current : sourceCurrent state.scope view = true <;>
+        simp_all [step, observeSource, revoke, noFurtherAuthority, canAccept]
+  | cleanup host =>
+      by_cases same : scope = state.scope
+      · cases phase : state.phase <;>
+          cases writes : host.writesDrainedOrPermanentlyQuarantined <;>
+          cases disposed : host.disposalSettles <;>
+          simp_all [step, cleanup, noFurtherAuthority, canAccept]
+      · simpa [step, cleanup, same] using revoked
+
+theorem revoked_for_every_interleaving (scope : Scope) (events : List Event)
+    (state : ProcessState) (revoked : noFurtherAuthority state) :
+    noFurtherAuthority (run scope events state) := by
+  induction events generalizing state with
+  | nil => exact revoked
+  | cons event events ih =>
+      exact ih _ (step_preserves_revocation scope event state revoked)
+
+-- Takeover preserves main state and emits one complete host input pass; cleanup progresses only after its explicit observations.
+-- Termination proves the two-step admitted cleanup path, not termination under a scheduler that never runs cleanup.
+theorem takeover_passes_complete_payload_once (state : ProcessState)
+    (payload : UserPayload) (active : state.phase = .active) :
+    (takeover state.scope payload state).actions =
+      [.signalChild state.scope.child, .drainOrQuarantineWrites state.scope.child,
+        .passOriginalInput payload] ∧
+      (takeover state.scope payload state).state.parent = state.parent := by
+  simp [takeover, revoke, active, unlockFor]
+
+theorem cleanup_waits_for_writes (state : ProcessState)
+    (revoked : state.phase = .revoked) (host : CleanupObservations)
+    (notDrained : host.writesDrainedOrPermanentlyQuarantined = false) :
+    cleanup state.scope host state = ⟨state, []⟩ := by
+  simp [cleanup, revoked, notDrained]
+
+theorem disposal_requires_drain (scope : Scope) (state : ProcessState)
+    (host : CleanupObservations)
+    (disposes : Action.disposeOwnedResources scope.child scope.directory ∈
+      (cleanup scope host state).actions) :
+    scope = state.scope ∧ state.phase = .drained := by
+  by_cases same : scope = state.scope
+  · cases phase : state.phase <;>
+      cases writes : host.writesDrainedOrPermanentlyQuarantined <;>
+      cases disposed : host.disposalSettles <;>
+      simp_all [cleanup]
+  · simp [cleanup, same] at disposes
+
+theorem cleanup_progress_and_termination (state : ProcessState)
+    (active : state.phase = .active) (cause : CancelCause)
+    (host : CleanupObservations)
+    (drains : host.writesDrainedOrPermanentlyQuarantined = true)
+    (settles : host.disposalSettles = true) :
+    let revoked := (revoke state.scope cause state).state
+    let drained := (cleanup state.scope host revoked).state
+    let disposed := (cleanup state.scope host drained).state
+    revoked.phase = .revoked ∧ drained.phase = .drained ∧
+      disposed.phase = .disposed ∧ noFurtherAuthority disposed := by
+  simp [revoke, active, cleanup, drains, settles, noFurtherAuthority, canAccept]
+
+-- Source fences reject changed identities and foreign/model-content appends without making exact owned audit descendants stale against themselves.
+theorem source_mismatch_blocks_acceptance (state : ProcessState)
+    (mismatch : state.scope ≠ state.source.scope) :
+    canAccept state = false := by
+  simp [canAccept, sourceCurrent, mismatch]
+
+theorem exact_owned_audit_keeps_source (scope : Scope) (entries : List SourceAppend)
+    (valid : sourceCurrent scope ⟨scope, entries⟩ = true) :
+    sourceCurrent scope ⟨scope, entries ++ [.ownedExcludedAudit scope.operation]⟩ = true := by
+  simpa [sourceCurrent, List.all_append] using valid
+
+theorem foreign_append_blocks_source (scope : Scope) (entries : List SourceAppend) :
+    sourceCurrent scope ⟨scope, entries ++ [.foreignOrModelContent]⟩ = false := by
+  simp [sourceCurrent, List.all_append]
+
+-- The separate ordinary-work path may abort only an exactly owned main continuation; genuine user work clears that ownership.
+inductive AbortTarget where
+  | none
+  | main (scope : Scope)
+  deriving DecidableEq, Repr
+
+def ordinaryManualUnlockTarget (claim : Scope) (run : MainRun) : AbortTarget :=
+  match run with
+  | .ownedContinuation owner => if owner == claim then .main owner else .none
+  | _ => .none
+
+def foreignUserTakesContinuation (_run : MainRun) (newIdentity : Nat) : MainRun :=
+  .foreign newIdentity
+
+theorem ordinary_cancellation_exact (scope owner : Scope) (identity : Nat) :
+    ordinaryManualUnlockTarget scope (.ownedContinuation scope) = .main scope ∧
+    (owner ≠ scope → ordinaryManualUnlockTarget scope (.ownedContinuation owner) = .none) ∧
+    ordinaryManualUnlockTarget scope (.foreign identity) = .none ∧
+    ordinaryManualUnlockTarget scope
+      (foreignUserTakesContinuation (.ownedContinuation scope) identity) = .none := by
+  simp [ordinaryManualUnlockTarget, foreignUserTakesContinuation]
+
+-- Terminality, normalized validation and confirmed parent receipts are explicit boundary observations, never inferred from a readable private result file.
+-- A transaction is the authoritative owned publication state; replay uses its updated charge/application flags, not a reconstructed old snapshot.
+inductive Outcome where
+  | continueWork
+  | waitCallback
+  | unlock
+  deriving DecidableEq, Repr
+
+structure Publication where
+  scope : Scope
+  outcome : Outcome
+  terminal : Bool
+  normalized : Bool
+  confirmedReceipt : Bool
+  charged : Bool
+  applied : Bool
+  deriving DecidableEq, Repr
+
+def costsUnit (outcome : Outcome) : Bool := outcome != .unlock
+
+structure Transaction where
+  publication : Publication
+  state : ProcessState
+  deriving DecidableEq, Repr
+
+-- Final continue and callback outcomes share one unit; only unconfirmed, unapplied continuation reservations can be refunded.
+-- Applying an outcome requires current scope, a terminal validated candidate and an actual observed receipt.
+def reserve (transaction : Transaction) : Transaction :=
+  let publication := transaction.publication
+  let state := transaction.state
+  if publication.scope == state.scope && canAccept state &&
+      publication.terminal && publication.normalized && !publication.charged &&
+      costsUnit publication.outcome then
+    { publication := { publication with charged := true }
+      state := { state with parent := { state.parent with spent := state.parent.spent + 1 } } }
+  else transaction
+
+def rollback (transaction : Transaction) : Transaction :=
+  let publication := transaction.publication
+  let state := transaction.state
+  if publication.scope == state.scope && publication.charged &&
+      !publication.confirmedReceipt && !publication.applied &&
+      publication.outcome == .continueWork then
+    { publication := { publication with charged := false }
+      state := { state with parent := { state.parent with spent := state.parent.spent - 1 } } }
+  else transaction
+
+def applyPublished (transaction : Transaction) : Transaction :=
+  let publication := transaction.publication
+  let state := transaction.state
+  if publication.scope == state.scope && canAccept state &&
+      publication.terminal && publication.normalized && publication.confirmedReceipt &&
+      !publication.applied && (!costsUnit publication.outcome || publication.charged) then
+    let parent := match publication.outcome with
+      | .continueWork => { state.parent with run := .ownedContinuation state.scope }
+      | .waitCallback => { state.parent with callbackSuspended := true }
+      | .unlock => { state.parent with locked := false }
+    { publication := { publication with applied := true }
+      state := { state with parent } }
+  else transaction
+
+def resumeCallback (parent : ParentState) : ParentState :=
+  { parent with callbackSuspended := false }
+
+-- These boundary proofs reject intermediate, stale, revoked or unreceipted effects and establish once-only charge/apply/refund behavior.
+theorem no_receipt_no_effect (transaction : Transaction)
+    (missing : transaction.publication.confirmedReceipt = false) :
+    applyPublished transaction = transaction := by
+  simp [applyPublished, missing]
+
+theorem no_intermediate_parent_effect (transaction : Transaction)
+    (intermediate : transaction.publication.terminal = false) :
+    applyPublished transaction = transaction ∧ reserve transaction = transaction := by
+  simp [applyPublished, reserve, intermediate]
+
+theorem revoked_has_no_publication (transaction : Transaction)
+    (revoked : noFurtherAuthority transaction.state) :
+    applyPublished transaction = transaction ∧ reserve transaction = transaction := by
+  simp [applyPublished, reserve, revoked.2.2]
+
+theorem stale_publication_inert (transaction : Transaction)
+    (stale : transaction.publication.scope ≠ transaction.state.scope) :
+    applyPublished transaction = transaction ∧ reserve transaction = transaction ∧
+      rollback transaction = transaction := by
+  simp [applyPublished, reserve, rollback, stale]
+
+theorem confirmed_receipt_not_refunded (transaction : Transaction)
+    (confirmed : transaction.publication.confirmedReceipt = true) :
+    rollback transaction = transaction := by
+  simp [rollback, confirmed]
+
+theorem callback_not_refunded (transaction : Transaction)
+    (callbackOutcome : transaction.publication.outcome = .waitCallback) :
+    rollback transaction = transaction := by
+  simp [rollback, callbackOutcome]
+
+theorem shared_budget_unit (transaction : Transaction)
+    (same : transaction.publication.scope = transaction.state.scope)
+    (current : canAccept transaction.state = true)
+    (terminal : transaction.publication.terminal = true)
+    (normalized : transaction.publication.normalized = true)
+    (notCharged : transaction.publication.charged = false) :
+    (reserve transaction).state.parent.spent =
+      transaction.state.parent.spent + if costsUnit transaction.publication.outcome then 1 else 0 := by
+  cases cost : costsUnit transaction.publication.outcome <;>
+    simp [reserve, same, current, terminal, normalized, notCharged, cost]
+
+theorem unsent_continuation_rollback (transaction : Transaction)
+    (same : transaction.publication.scope = transaction.state.scope)
+    (charged : transaction.publication.charged = true)
+    (unconfirmed : transaction.publication.confirmedReceipt = false)
+    (unapplied : transaction.publication.applied = false)
+    (outcome : transaction.publication.outcome = .continueWork)
+    (previousSpent : Nat) (count : transaction.state.parent.spent = previousSpent + 1) :
+    (rollback transaction).state.parent.spent = previousSpent := by
+  simp [rollback, same, charged, unconfirmed, unapplied, outcome, count]
+
+theorem transaction_replay_is_inert (transaction : Transaction) :
+    reserve (reserve transaction) = reserve transaction ∧
+      rollback (rollback transaction) = rollback transaction ∧
+      applyPublished (applyPublished transaction) = applyPublished transaction := by
+  constructor
+  · unfold reserve
+    dsimp only
+    split <;> simp_all
+  constructor
+  · unfold rollback
+    dsimp only
+    split <;> simp_all
+  · unfold applyPublished
+    dsimp only
+    split <;> simp_all
+
+theorem callback_resume_costs_zero (parent : ParentState) :
+    (resumeCallback parent).spent = parent.spent ∧
+      (resumeCallback parent).callbackSuspended = false := by
+  simp [resumeCallback]
+
+-- Native main-abort presentation is fenced by actual aborted outcome and exact current continuation ownership, not text or a child notice.
+structure NativeAbort where
+  run : MainRun
+  claim : Scope
+  actualAborted : Bool
+  noticeVisible : Bool
+  partialOutput : String
+  toolResults : List String
+  settled : Bool
+  unlockCount : Nat
+  locked : Bool
+  deriving DecidableEq, Repr
+
+def quietNativeAbort (state : NativeAbort) : NativeAbort :=
+  if state.actualAborted && ordinaryManualUnlockTarget state.claim state.run != .none then
+    { state with noticeVisible := false }
+  else state
+
+theorem exact_native_abort_hides_notice (state : NativeAbort)
+    (aborted : state.actualAborted = true)
+    (owned : ordinaryManualUnlockTarget state.claim state.run ≠ .none) :
+    (quietNativeAbort state).noticeVisible = false := by
+  simp [quietNativeAbort, aborted, owned]
+
+theorem native_abort_exact_and_control_preserved (state : NativeAbort) :
+    (quietNativeAbort state).actualAborted = state.actualAborted ∧
+    (quietNativeAbort state).partialOutput = state.partialOutput ∧
+    (quietNativeAbort state).toolResults = state.toolResults ∧
+    (state.actualAborted = false → quietNativeAbort state = state) ∧
+    (ordinaryManualUnlockTarget state.claim state.run = .none →
+      quietNativeAbort state = state) ∧
+    quietNativeAbort (quietNativeAbort state) = quietNativeAbort state := by
+  by_cases abort : state.actualAborted = true <;>
+    by_cases target : ordinaryManualUnlockTarget state.claim state.run = .none <;>
+    simp_all [quietNativeAbort]
+
+-- Native settlement records its handled bit before another callback can unlock again; actual abort state and prior output/tool results survive.
+def settleNativeAbort (state : NativeAbort) : NativeAbort :=
+  if state.settled then state else
+    if state.actualAborted && ordinaryManualUnlockTarget state.claim state.run != .none then
+      { state with settled := true, unlockCount := state.unlockCount + 1, locked := false }
+    else { state with settled := true }
+
+theorem exact_native_abort_unlocks_once (state : NativeAbort)
+    (unhandled : state.settled = false) (aborted : state.actualAborted = true)
+    (owned : ordinaryManualUnlockTarget state.claim state.run ≠ .none) :
+    (settleNativeAbort state).settled = true ∧
+      (settleNativeAbort state).unlockCount = state.unlockCount + 1 ∧
+      (settleNativeAbort state).locked = false := by
+  simp [settleNativeAbort, unhandled, aborted, owned]
+
+theorem native_settlement_is_once_and_fenced (state : NativeAbort) :
+    settleNativeAbort (settleNativeAbort state) = settleNativeAbort state ∧
+    (ordinaryManualUnlockTarget state.claim state.run = .none →
+      (settleNativeAbort state).unlockCount = state.unlockCount ∧
+      (settleNativeAbort state).locked = state.locked) ∧
+    (settleNativeAbort state).actualAborted = state.actualAborted ∧
+    (settleNativeAbort state).partialOutput = state.partialOutput ∧
+    (settleNativeAbort state).toolResults = state.toolResults := by
+  by_cases settled : state.settled = true <;>
+    by_cases abort : state.actualAborted = true <;>
+    by_cases target : ordinaryManualUnlockTarget state.claim state.run = .none <;>
+    simp_all [settleNativeAbort]
+
+-- Historical projection removes only exactly classified owned residue; unrelated plugin/user records remain available unchanged.
+-- Entry classification is an input contract, not a proof of the real legacy parser or persisted byte format.
+structure LegacyEntry where
+  owner : Option Scope
+  internalInquiryOrOwnedCancellationResidue : Bool
+  content : String
+  deriving DecidableEq, Repr
+
+def legacyProjection (scope : Scope) (entries : List LegacyEntry) : List LegacyEntry :=
+  entries.filter (fun entry => !(entry.owner == some scope &&
+    entry.internalInquiryOrOwnedCancellationResidue))
+
+theorem unrelated_legacy_entries_preserved (scope : Scope) (entry : LegacyEntry)
+    (entries : List LegacyEntry) (foreign : entry.owner ≠ some scope) :
+    entry ∈ legacyProjection scope entries ↔ entry ∈ entries := by
+  simp [legacyProjection, foreign]
+
+theorem exact_legacy_residue_removed (scope : Scope) (entry : LegacyEntry)
+    (entries : List LegacyEntry) (same : entry.owner = some scope)
+    (internalEntry : entry.internalInquiryOrOwnedCancellationResidue = true) :
+    entry ∉ legacyProjection scope entries := by
+  simp [legacyProjection, same, internalEntry]
+
+-- Recovery restores safe audit history only, with no child, lock, result path authority, retry allowance or publication to resume.
+-- Ordinary conversation is supplied separately from context-excluded private/legacy history.
+structure History where
+  safeAudit : List String
+  legacyInquiry : List String
+  privatePromptAndToolTraffic : List String
+  deriving DecidableEq, Repr
+
+structure Recovered where
+  audit : List String
+  activeChild : Option Scope
+  resultAuthority : Bool
+  locked : Bool
+  retryAllowance : Nat
+  publication : Option Publication
+  deriving DecidableEq, Repr
+
+def recover (history : History) : Recovered :=
+  ⟨history.safeAudit, none, false, false, 0, none⟩
+
+def mainContextProjection (ordinary : List String) (_history : History) : List String :=
+  ordinary
+
+theorem history_only_recovery (history : History) (ordinary : List String) :
+    (recover history).activeChild = none ∧
+      (recover history).resultAuthority = false ∧
+      (recover history).locked = false ∧
+      (recover history).retryAllowance = 0 ∧
+      (recover history).publication = none ∧
+      mainContextProjection ordinary history = ordinary := by
+  simp [recover, mainContextProjection]
+
+-- The cancellation guarantee record collects initialization, preservation, trace safety, replacement isolation, pass-through and conditional cleanup progress.
+structure CancellationGuarantees (scope : Scope) (parent : ParentState) : Prop where
+  initialization : invariant (initial scope parent)
+  preservation : ∀ state event, invariant state → invariant (step scope event state)
+  safety : ∀ events, invariant (run scope events (initial scope parent))
+  privateIsolation : ∀ state event, WatchdogUserTakeover.privateIsolation state (step scope event state)
+  traceIsolation : ∀ state events, WatchdogUserTakeover.privateIsolation state (run scope events state)
+  repeatedCancellation : ∀ state cause, noFurtherAuthority state →
+    revoke scope cause state = ⟨state, []⟩
+  immediateRevocation : ∀ state cause, state.phase = .active →
+    noFurtherAuthority (revoke state.scope cause state).state
+  targetedSignal : ∀ state cause, state.phase = .active →
+    (revoke state.scope cause state).actions =
+      [.signalChild state.scope.child, .drainOrQuarantineWrites state.scope.child] ∧
+    (revoke state.scope cause state).state.parent.locked =
+      if unlockFor cause then false else state.parent.locked
+  callbackGuard : ∀ state, canAccept state = true ↔
+    state.phase = .active ∧ state.authority = true ∧ sourceCurrent state.scope state.source = true
+  allInterleavings : ∀ state events, noFurtherAuthority state →
+    noFurtherAuthority (run scope events state)
+  replacementScope : ∀ incoming state event, incoming ≠ state.scope →
+    step incoming event state = state
+  hostInputPassThrough : ∀ state payload, state.phase = .active →
+    (takeover state.scope payload state).actions =
+      [.signalChild state.scope.child, .drainOrQuarantineWrites state.scope.child,
+        .passOriginalInput payload] ∧
+      (takeover state.scope payload state).state.parent = state.parent
+  disposalAfterDrain : ∀ state host,
+    Action.disposeOwnedResources scope.child scope.directory ∈
+      (cleanup scope host state).actions → scope = state.scope ∧ state.phase = .drained
+  conditionalTermination : ∀ state cause host, state.phase = .active →
+    host.writesDrainedOrPermanentlyQuarantined = true → host.disposalSettles = true →
+    let revoked := (revoke state.scope cause state).state
+    let drained := (cleanup state.scope host revoked).state
+    let disposed := (cleanup state.scope host drained).state
+    revoked.phase = .revoked ∧ drained.phase = .drained ∧
+      disposed.phase = .disposed ∧ noFurtherAuthority disposed
+
+-- This theorem closes every modeled cancellation obligation for arbitrary parent snapshots and finite event traces.
+theorem cancellation_is_correct (scope : Scope) (parent : ParentState) :
+    CancellationGuarantees scope parent := by
+  exact {
+    initialization := initial_invariant scope parent
+    preservation := fun state event valid => step_preserves_invariant scope event state valid
+    safety := fun events => run_preserves_invariant scope events _ (initial_invariant scope parent)
+    privateIsolation := fun state event => step_isolates_parent scope event state
+    traceIsolation := fun state events => run_isolates_parent scope events state
+    repeatedCancellation := fun state cause revoked =>
+      repeated_cancellation_is_inert scope cause state revoked
+    immediateRevocation := fun state cause active => (revoke_current state cause active).1
+    targetedSignal := targeted_signal_and_cause
+    callbackGuard := callback_guard_sound_and_complete
+    allInterleavings := fun state events revoked =>
+      revoked_for_every_interleaving scope events state revoked
+    replacementScope := fun incoming state event foreign =>
+      foreign_events_inert incoming event state foreign
+    hostInputPassThrough := takeover_passes_complete_payload_once
+    disposalAfterDrain := fun state host disposes => disposal_requires_drain scope state host disposes
+    conditionalTermination := fun state cause host active drains settles =>
+      cleanup_progress_and_termination state active cause host drains settles }
+
+-- Boundary obligations retain exact ownership/source checks, receipt/refund accounting, callback behavior, native abort safety and history-only recovery.
+structure BoundaryGuarantees : Prop where
+  sourceMismatch : ∀ state, state.scope ≠ state.source.scope → canAccept state = false
+  ownedAudit : ∀ scope entries, sourceCurrent scope ⟨scope, entries⟩ = true →
+    sourceCurrent scope ⟨scope, entries ++ [.ownedExcludedAudit scope.operation]⟩ = true
+  foreignSource : ∀ scope entries,
+    sourceCurrent scope ⟨scope, entries ++ [.foreignOrModelContent]⟩ = false
+  exactMainTarget : ∀ scope owner identity,
+    ordinaryManualUnlockTarget scope (.ownedContinuation scope) = .main scope ∧
+    (owner ≠ scope → ordinaryManualUnlockTarget scope (.ownedContinuation owner) = .none) ∧
+    ordinaryManualUnlockTarget scope (.foreign identity) = .none ∧
+    ordinaryManualUnlockTarget scope
+      (foreignUserTakesContinuation (.ownedContinuation scope) identity) = .none
+  receiptRequired : ∀ transaction, transaction.publication.confirmedReceipt = false →
+    applyPublished transaction = transaction
+  terminalOnly : ∀ transaction, transaction.publication.terminal = false →
+    applyPublished transaction = transaction ∧ reserve transaction = transaction
+  revokedPublication : ∀ transaction, noFurtherAuthority transaction.state →
+    applyPublished transaction = transaction ∧ reserve transaction = transaction
+  stalePublication : ∀ transaction, transaction.publication.scope ≠ transaction.state.scope →
+    applyPublished transaction = transaction ∧ reserve transaction = transaction ∧
+      rollback transaction = transaction
+  confirmedNotRefunded : ∀ transaction, transaction.publication.confirmedReceipt = true →
+    rollback transaction = transaction
+  callbackNotRefunded : ∀ transaction, transaction.publication.outcome = .waitCallback →
+    rollback transaction = transaction
+  sharedBudget : ∀ transaction, transaction.publication.scope = transaction.state.scope →
+    canAccept transaction.state = true → transaction.publication.terminal = true →
+    transaction.publication.normalized = true → transaction.publication.charged = false →
+    (reserve transaction).state.parent.spent = transaction.state.parent.spent +
+      if costsUnit transaction.publication.outcome then 1 else 0
+  unsentRollback : ∀ transaction previousSpent,
+    transaction.publication.scope = transaction.state.scope →
+    transaction.publication.charged = true → transaction.publication.confirmedReceipt = false →
+    transaction.publication.applied = false → transaction.publication.outcome = .continueWork →
+    transaction.state.parent.spent = previousSpent + 1 →
+    (rollback transaction).state.parent.spent = previousSpent
+  transactionReplay : ∀ transaction,
+    reserve (reserve transaction) = reserve transaction ∧
+    rollback (rollback transaction) = rollback transaction ∧
+    applyPublished (applyPublished transaction) = applyPublished transaction
+  callbackResume : ∀ parent, (resumeCallback parent).spent = parent.spent ∧
+    (resumeCallback parent).callbackSuspended = false
+  nativeNoticeHidden : ∀ state, state.actualAborted = true →
+    ordinaryManualUnlockTarget state.claim state.run ≠ .none →
+    (quietNativeAbort state).noticeVisible = false
+  nativeUnlockOnce : ∀ state, state.settled = false → state.actualAborted = true →
+    ordinaryManualUnlockTarget state.claim state.run ≠ .none →
+    (settleNativeAbort state).settled = true ∧
+    (settleNativeAbort state).unlockCount = state.unlockCount + 1 ∧
+    (settleNativeAbort state).locked = false
+  nativePresentation : ∀ state,
+    (quietNativeAbort state).actualAborted = state.actualAborted ∧
+    (quietNativeAbort state).partialOutput = state.partialOutput ∧
+    (quietNativeAbort state).toolResults = state.toolResults ∧
+    (state.actualAborted = false → quietNativeAbort state = state) ∧
+    (ordinaryManualUnlockTarget state.claim state.run = .none → quietNativeAbort state = state) ∧
+    quietNativeAbort (quietNativeAbort state) = quietNativeAbort state
+  nativeSettlement : ∀ state,
+    settleNativeAbort (settleNativeAbort state) = settleNativeAbort state ∧
+    (ordinaryManualUnlockTarget state.claim state.run = .none →
+      (settleNativeAbort state).unlockCount = state.unlockCount ∧
+      (settleNativeAbort state).locked = state.locked) ∧
+    (settleNativeAbort state).actualAborted = state.actualAborted ∧
+    (settleNativeAbort state).partialOutput = state.partialOutput ∧
+    (settleNativeAbort state).toolResults = state.toolResults
+  foreignEntries : ∀ scope entry entries, entry.owner ≠ some scope →
+    (entry ∈ legacyProjection scope entries ↔ entry ∈ entries)
+  ownedResidue : ∀ scope entry entries, entry.owner = some scope →
+    entry.internalInquiryOrOwnedCancellationResidue = true → entry ∉ legacyProjection scope entries
+  recovery : ∀ history ordinary, (recover history).activeChild = none ∧
+    (recover history).resultAuthority = false ∧ (recover history).locked = false ∧
+    (recover history).retryAllowance = 0 ∧ (recover history).publication = none ∧
+    mainContextProjection ordinary history = ordinary
+
+-- Supporting proofs jointly discharge those local boundary obligations; this is not a proof of all real publication interleavings.
+theorem boundaries_are_correct : BoundaryGuarantees := by
+  exact {
+    sourceMismatch := source_mismatch_blocks_acceptance
+    ownedAudit := exact_owned_audit_keeps_source
+    foreignSource := foreign_append_blocks_source
+    exactMainTarget := ordinary_cancellation_exact
+    receiptRequired := no_receipt_no_effect
+    terminalOnly := no_intermediate_parent_effect
+    revokedPublication := revoked_has_no_publication
+    stalePublication := stale_publication_inert
+    confirmedNotRefunded := confirmed_receipt_not_refunded
+    callbackNotRefunded := callback_not_refunded
+    sharedBudget := shared_budget_unit
+    unsentRollback := fun transaction previousSpent same charged unconfirmed unapplied outcome count =>
+      unsent_continuation_rollback transaction same charged unconfirmed unapplied outcome previousSpent count
+    transactionReplay := transaction_replay_is_inert
+    callbackResume := callback_resume_costs_zero
+    nativeNoticeHidden := exact_native_abort_hides_notice
+    nativeUnlockOnce := exact_native_abort_unlocks_once
+    nativePresentation := native_abort_exact_and_control_preserved
+    nativeSettlement := native_settlement_is_once_and_fenced
+    foreignEntries := unrelated_legacy_entries_preserved
+    ownedResidue := exact_legacy_residue_removed
+    recovery := history_only_recovery }
+
+-- Top correctness combines the cancellation process and local boundaries under the explicit admitted host/runner observations.
+-- It does not certify LLM judgment, actual final provider wire payloads, hardware behavior or observed production conformance.
+theorem process_is_correct (scope : Scope) (parent : ParentState)
+    (entry : EntryObservations) (observed : admitted entry) :
+    admitted entry ∧ CancellationGuarantees scope parent ∧ BoundaryGuarantees := by
+  exact ⟨observed, cancellation_is_correct scope parent, boundaries_are_correct⟩
 
 end WatchdogUserTakeover
 
+-- Inspect the combined theorem: accepted Lean foundations are propext, Classical.choice and Quot.sound, with no custom axioms.
 #print axioms WatchdogUserTakeover.process_is_correct
 
--- The executable summary illustrates constructed lifecycle states and conditional evidence predicates, not live host execution.
-def acceptedContinue : WatchdogUserTakeover.ContinueEvidence :=
-  {
-    reasonType := .verifying
-    reasonLength := 24
-    userDecisionMade := false
-    auditStored := true
-    sharedEventStored := true
-    hookPublished := true
-    continuationDispatched := true
-  }
-
--- The executable summary demonstrates the accepted visible-stream boundary and both proved cleanup milestones.
+-- Executable examples illustrate revoked child authority, unchanged foreign main state, complete input pass-through and observed cleanup completion.
 def main : IO Unit := do
-  let environment : WatchdogUserTakeover.EnvironmentAssumptions :=
-    { uninterruptibleCleanupRuns := true,
-      abortedDecisionEnds := true,
-      userRunSettles := true }
-  let visibleDecision := WatchdogUserTakeover.decisionState true
-  let takeover := WatchdogUserTakeover.takeoverStep environment visibleDecision
-  let completed := WatchdogUserTakeover.iterate
-    (WatchdogUserTakeover.takeoverStep environment) 3 visibleDecision
+  let scope : WatchdogUserTakeover.Scope := ⟨1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11⟩
+  let parent : WatchdogUserTakeover.ParentState := ⟨.foreign 12, ["ordinary conversation"], 2, false, true⟩
+  let state := WatchdogUserTakeover.initial scope parent
   let payload : WatchdogUserTakeover.UserPayload := ⟨"Inspect image", [("image/png", "opaque bytes")]⟩
-  let delivered := WatchdogUserTakeover.iteratePayload environment 3
-    (WatchdogUserTakeover.initialPayloadState true payload)
-  IO.println s!"Text and image payload reissued once: {delivered.delivered == some payload && delivered.lifecycle.userMessageDeliveryCount == 1}"
-  IO.println s!"Decision stream may be visible before takeover: {visibleDecision.decisionStreamVisible}"
-  IO.println s!"Takeover immediately clears decision residue: {WatchdogUserTakeover.takeoverPostconditionBool takeover}"
-  IO.println s!"User work completes once with clean context: {WatchdogUserTakeover.outputPostconditionBool completed}"
-  let cancelledContinuation :=
-    WatchdogUserTakeover.runManualCancellation .continuation
-  let ordinaryUnlock := WatchdogUserTakeover.runManualCancellation .ordinary
-  let foreignUserUnlock := WatchdogUserTakeover.runContinuationAfterForeignInput
-  IO.println s!"Constructed continue evidence satisfies stored-event implications: {WatchdogUserTakeover.continueEvidenceOrderedBool acceptedContinue}"
-  IO.println s!"Manual unlock cancels an owned continuation without residue: {WatchdogUserTakeover.manualCancellationPostconditionBool true cancelledContinuation}"
-  IO.println s!"Manual unlock requests no abort for the constructed ordinary-run case: {WatchdogUserTakeover.manualCancellationPostconditionBool false ordinaryUnlock}"
-  IO.println s!"Foreign user work clears continuation ownership: {WatchdogUserTakeover.manualCancellationPostconditionBool false foreignUserUnlock}"
-  let native := WatchdogUserTakeover.completeNativeAbort true "Partial continuation"
-  IO.println s!"Native abort: final notice hidden, output kept, unlocked once: {!native.noticeVisible && native.hostAborted && native.partialOutput == "Partial continuation" && !native.locked && native.unlockCount == 1}"
+  let takeover := WatchdogUserTakeover.takeover scope payload state
+  let host : WatchdogUserTakeover.CleanupObservations := ⟨true, true⟩
+  let drained := (WatchdogUserTakeover.cleanup scope host takeover.state).state
+  let disposed := (WatchdogUserTakeover.cleanup scope host drained).state
+  IO.println s!"Private signal revokes authority before cleanup: {!takeover.state.authority}"
+  IO.println s!"Original text/images pass once; no capture/replay: {takeover.actions == [.signalChild scope.child, .drainOrQuarantineWrites scope.child, .passOriginalInput payload]}"
+  IO.println s!"Foreign main run/context/budget unchanged: {disposed.parent == parent}"
+  IO.println s!"Drain then owned disposal completes: {disposed.phase == .disposed}"
+  IO.println "Proof scope: modeled cancellation interleavings; host/source/provider observations assumed, not live I/O or LLM judgment."

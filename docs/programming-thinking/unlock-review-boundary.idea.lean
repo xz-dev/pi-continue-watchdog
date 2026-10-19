@@ -1,11 +1,11 @@
--- Std-only component model; no TypeScript refinement, privacy or complete lifecycle/history proof.
+-- Std-only process model; host/provider observations are inputs, not implementation-refinement proofs.
 import Std
 
 set_option autoImplicit false
 
 namespace UnlockReviewBoundary
 
--- Full ordered source facts, policy and provenance are supplied by the projector, not proved here.
+-- Ordered parent facts keep source roles and provenance; candidates are normalized file claims, not evidence.
 structure Fact where
   sourceId : String
   role : String
@@ -13,39 +13,55 @@ structure Fact where
   metadata : String
   deriving DecidableEq, Repr
 
+inductive Action where
+  | continueWork | unlock | waitCallback
+  deriving DecidableEq, Repr
+
 structure Candidate where
+  action : Action
   reasonType : String
   reasonContent : String
   deriving DecidableEq, Repr
 
-structure FixedState where
+structure ParentMacro where
   projectionVersion : Nat
   rubric : String
-  candidate : Candidate
   facts : List Fact
   gaps : List String
+  parentSession : String
   contextHead : Option String
   compactionBoundary : Option String
+  permitted : Bool
   deriving DecidableEq, Repr
 
--- Caller-supplied projection precondition; no historical producer/UI attestation requirement.
-structure Input where
-  fixed : FixedState
-  permittedCompleteProjection : Bool
+-- One captured owner fixes child/model/source identity. Host observations attest fences, including permitted owned audit descendants, rather than proving host behavior.
+structure Ownership where
+  child : String
+  parentSession : String
+  claim : Nat
+  cycle : Nat
+  sourceLeaf : String
+  externalGeneration : Nat
+  selectedModel : String
+  thinking : String
   deriving DecidableEq, Repr
 
-structure Request where
-  fixed : FixedState
-  splittableFacts : List Fact
+structure CurrentnessObservation where
+  sameOwner : Bool
+  sameCycle : Bool
+  sourceAncestryCurrent : Bool
+  sameSessionModelThinking : Bool
+  sameExternalGeneration : Bool
+  aggregateIdle : Bool
+  notCancelled : Bool
   deriving DecidableEq, Repr
 
-def ProjectionPrecondition (input : Input) : Prop :=
-  input.permittedCompleteProjection = true
+def current (observation : CurrentnessObservation) : Bool :=
+  observation.sameOwner && observation.sameCycle && observation.sourceAncestryCurrent &&
+  observation.sameSessionModelThinking && observation.sameExternalGeneration &&
+  observation.aggregateIdle && observation.notCancelled
 
--- Preparing preserves fixed identity; fact placement and service capacity policy do not change.
-def prepare (input : Input) : Request :=
-  { fixed := input.fixed, splittableFacts := [] }
-
+-- Service observations distinguish accepted answers from malformed, incomplete and unobserved results; transport attempts remain optional diagnostics.
 inductive NativeAcceptedAnswer where
   | supported | challenged | insufficient
   deriving DecidableEq, Repr
@@ -62,7 +78,6 @@ inductive Disposition where
   | supported | challenged | incomplete (reason : IncompleteReason)
   deriving DecidableEq, Repr
 
--- Consumed-result abstraction: malformed fields reject; unknown optional accounting cannot authorize.
 structure ServiceResult where
   stop : ServiceStop
   requiredShapeValid : Bool
@@ -73,7 +88,6 @@ structure ServiceResult where
   reportedAttempts : Option Nat
   deriving DecidableEq, Repr
 
--- Decode only native accepted observed answers, without confidence or attempt-count thresholds.
 def classify (result : ServiceResult) : Disposition :=
   match result.stop with
   | .aborted => .incomplete .aborted
@@ -90,116 +104,246 @@ def classify (result : ServiceResult) : Disposition :=
       | some .challenged => .challenged
       | some .insufficient => .incomplete .insufficient
 
--- Currentness governs publication; an incomplete result preserves the original decision.
-inductive Effect where
-  | noAction | originalUnlock | oneReconsideration
+-- Review sees only captured parent evidence and the initial candidate claim, with exact ownership association. Unavailable, inadmissible or foreign-parent snapshots fall back locally.
+structure ReviewRequest where
+  owner : Ownership
+  frozenParent : ParentMacro
+  candidateClaim : Candidate
   deriving DecidableEq, Repr
 
-def decide (current : Bool) (disposition : Disposition) : Effect :=
-  if current then
-    match disposition with
-    | .challenged => .oneReconsideration
-    | .supported | .incomplete _ => .originalUnlock
-  else .noAction
-
-inductive Phase where
-  | prepared | waiting | classified (disposition : Disposition)
-  | finished (disposition : Option Disposition) (effect : Effect)
+inductive ReviewObservation where
+  | unavailable
+  | waiting
+  | settled (result : ServiceResult)
   deriving DecidableEq, Repr
 
-structure State where
-  request : Request
+structure ReviewRun where
+  request : Option ReviewRequest
   businessCalls : Nat
-  authorizations : Nat
-  current : Bool
-  phase : Phase
+  disposition : Option Disposition
   deriving DecidableEq, Repr
 
-def initial (input : Input) : State :=
-  { request := prepare input, businessCalls := 0, authorizations := 0, current := true, phase := .prepared }
+def review (owner : Ownership) (macroSnapshot : Option ParentMacro) (candidate : Candidate)
+    (observation : ReviewObservation) : ReviewRun :=
+  match macroSnapshot with
+  | none => ⟨none, 0, some (.incomplete .error)⟩
+  | some snapshot =>
+    if !snapshot.permitted || snapshot.gaps != [] || snapshot.parentSession != owner.parentSession then
+      ⟨none, 0, some (.incomplete .insufficient)⟩
+    else match observation with
+      | .unavailable => ⟨none, 0, some (.incomplete .error)⟩
+      | .waiting => ⟨some ⟨owner, snapshot, candidate⟩, 1, none⟩
+      | .settled result => ⟨some ⟨owner, snapshot, candidate⟩, 1, some (classify result)⟩
 
--- Admission handles necessary content gaps locally; the empty-gap path waits on one business review.
-def admission (input : Input) : State :=
-  if input.fixed.gaps = [] then
-    { initial input with businessCalls := 1, phase := .waiting }
+-- Each abstract attempt resets the file and authorizes one response in the same child; the provider/host must enforce this primitive and settle or quarantine writes before reuse.
+-- Valid observations assume the existing file validator; waiting preserves pending state without assuming scheduler fairness or a wall-clock bound.
+inductive ResponseOutcome where
+  | valid (normalizedFileCandidate : Candidate)
+  | invalid
+  | executionError
+  | cancelled
+  | waiting
+  deriving DecidableEq, Repr
+
+structure AttemptObservation where
+  beforeCurrent : CurrentnessObservation
+  afterCurrent : CurrentnessObservation
+  outcome : ResponseOutcome
+  deriving DecidableEq, Repr
+
+structure AttemptAction where
+  child : String
+  resetFileTo : String
+  authorizedModelResponses : Nat
+  deriving DecidableEq, Repr
+
+inductive InquiryOutcome where
+  | valid (candidate : Candidate)
+  | formatExhausted | executionError | cancelled | pending
+  deriving DecidableEq, Repr
+
+structure InquiryRun where
+  attempts : List AttemptAction
+  outcome : InquiryOutcome
+  deriving DecidableEq, Repr
+
+def oneResponse (child : String) : AttemptAction := ⟨child, "{}", 1⟩
+
+def inquire (child : String) : Nat → (Nat → AttemptObservation) → InquiryRun
+  | 0, _ => ⟨[], .formatExhausted⟩
+  | fuel + 1, observations =>
+    let observed := observations 0
+    if !current observed.beforeCurrent then ⟨[], .cancelled⟩
+    else
+      let outcome := if current observed.afterCurrent then observed.outcome else .cancelled
+      match outcome with
+      | .invalid =>
+        let next := inquire child fuel (fun index => observations (index + 1))
+        ⟨oneResponse child :: next.attempts, next.outcome⟩
+      | .valid candidate => ⟨[oneResponse child], .valid candidate⟩
+      | .executionError => ⟨[oneResponse child], .executionError⟩
+      | .cancelled => ⟨[oneResponse child], .cancelled⟩
+      | .waiting => ⟨[oneResponse child], .pending⟩
+
+-- One private operation owns both three-response inquiries and its optional review; only an initial valid unlock can open review. Reconsideration has no review loop.
+inductive TerminalOutcome where
+  | decision (candidate : Candidate)
+  | decisionFailed | executionError | cancelled
+  deriving DecidableEq, Repr
+
+def terminalOf : InquiryOutcome → Option TerminalOutcome
+  | .valid candidate => some (.decision candidate)
+  | .formatExhausted => some .decisionFailed
+  | .executionError => some .executionError
+  | .cancelled => some .cancelled
+  | .pending => none
+
+structure Operation where
+  owner : Ownership
+  frozenParent : Option ParentMacro
+  qualifiedFullFork : Bool
+  reviewEnabled : Bool
+  deriving DecidableEq, Repr
+
+structure Observations where
+  initial : Nat → AttemptObservation
+  replacement : Nat → AttemptObservation
+  review : ReviewObservation
+  afterReviewCurrent : CurrentnessObservation
+  afterCleanupCurrent : CurrentnessObservation
+
+structure PrivateRun where
+  initial : InquiryRun
+  review : Option ReviewRun
+  reconsideration : Option InquiryRun
+  terminal : Option TerminalOutcome
+  deriving DecidableEq, Repr
+
+def unlockCandidate (candidate : Candidate) : Bool :=
+  match candidate.action with
+  | .continueWork => false
+  | .unlock | .waitCallback => true
+
+def localRun (operation : Operation) (observations : Observations) : PrivateRun :=
+  if !operation.qualifiedFullFork then
+    ⟨⟨[], .executionError⟩, none, none, some .executionError⟩
   else
-    { initial input with phase := .classified (.incomplete .insufficient) }
+    let initial := inquire operation.owner.child 3 observations.initial
+    match initial.outcome with
+    | .valid candidate =>
+      if unlockCandidate candidate && operation.reviewEnabled then
+        let report := review operation.owner operation.frozenParent candidate observations.review
+        if !current observations.afterReviewCurrent then
+          ⟨initial, some report, none, some .cancelled⟩
+        else match report.disposition with
+          | none => ⟨initial, some report, none, none⟩
+          | some .challenged =>
+            let replacement := inquire operation.owner.child 3 observations.replacement
+            ⟨initial, some report, some replacement, terminalOf replacement.outcome⟩
+          | some .supported | some (.incomplete _) =>
+            ⟨initial, some report, none, some (.decision candidate)⟩
+      else ⟨initial, none, none, some (.decision candidate)⟩
+    | other => ⟨initial, none, none, terminalOf other⟩
 
-def Unfinished (phase : Phase) : Prop :=
-  match phase with
-  | .finished _ _ => False
-  | _ => True
+def run (operation : Operation) (observations : Observations) : PrivateRun :=
+  let result := localRun operation observations
+  if current observations.afterCleanupCurrent then result
+  else { result with terminal := some .cancelled }
 
-def Finished (phase : Phase) : Prop :=
-  ∃ disposition effect, phase = .finished disposition effect
+-- Main receives only the terminal outcome, not private attempts or intermediate candidates; origin and trace invariants constrain that handoff.
+def terminalHandoff (result : PrivateRun) : Option TerminalOutcome := result.terminal
 
--- Call bounds count business reviews, not provider attempts. Waiting remains externally unbounded.
-inductive Step (input : Input) : State → State → Prop where
-  | start (permitted : ProjectionPrecondition input) (clear : input.fixed.gaps = []) :
-    Step input (initial input)
-      { request := prepare input, businessCalls := 1, authorizations := 0, current := true, phase := .waiting }
-  | rejectGaps (necessary : input.fixed.gaps ≠ []) :
-    Step input (initial input)
-      { request := prepare input, businessCalls := 0, authorizations := 0, current := true,
-        phase := .classified (.incomplete .insufficient) }
-  | stall (request : Request) (calls : Nat) (current : Bool) :
-    Step input { request, businessCalls := calls, authorizations := 0, current, phase := .waiting }
-      { request, businessCalls := calls, authorizations := 0, current, phase := .waiting }
-  | receive (request : Request) (calls : Nat) (current live : Bool) (result : ServiceResult) :
-    Step input { request, businessCalls := calls, authorizations := 0, current, phase := .waiting }
-      { request, businessCalls := calls, authorizations := 0, current := current && live,
-        phase := .classified (classify result) }
-  | publish (request : Request) (calls : Nat) (current live : Bool) (disposition : Disposition) :
-    Step input { request, businessCalls := calls, authorizations := 0, current, phase := .classified disposition }
-      { request, businessCalls := calls, authorizations := if current && live then 1 else 0, current := current && live,
-        phase := .finished (some disposition) (decide (current && live) disposition) }
-  | escape (state : State) (pending : Unfinished state.phase) :
-    Step input state { state with current := false, phase := .finished none .noAction }
-  | late (request : Request) (calls authorizations : Nat) (current : Bool)
-      (disposition : Option Disposition) (effect : Effect) :
-    Step input { request, businessCalls := calls, authorizations, current, phase := .finished disposition effect }
-      { request, businessCalls := calls, authorizations, current, phase := .finished disposition effect }
+def CandidateOrigin (result : PrivateRun) (candidate : Candidate) : Prop :=
+  (result.reconsideration = none ∧ result.initial.outcome = .valid candidate) ∨
+  ∃ replacement, result.reconsideration = some replacement ∧ replacement.outcome = .valid candidate
 
--- Reachable traces preserve fixed facts, at-most-once authorization, and zero dispatch for necessary gaps.
-inductive Reachable (input : Input) : State → Prop where
-  | initial : Reachable input (initial input)
-  | advance {before after : State} : Reachable input before → Step input before after →
-    Reachable input after
+def allAttempts (result : PrivateRun) : List AttemptAction :=
+  result.initial.attempts ++ (result.reconsideration.map InquiryRun.attempts).getD []
 
-def FixedOnce (input : Input) (state : State) : Prop :=
-  state.request.fixed = input.fixed ∧ state.request.splittableFacts = []
+def InquiryInvariant (child : String) (fuel : Nat) (result : InquiryRun) : Prop :=
+  result.attempts.length ≤ fuel ∧ ∀ attempt ∈ result.attempts, attempt = oneResponse child
 
-def CallsConsistent (state : State) : Prop :=
-  match state.phase with
-  | .prepared => state.businessCalls = 0
-  | .waiting => state.businessCalls = 1
-  | .classified disposition => state.businessCalls = 1 ∨
-      (state.businessCalls = 0 ∧ disposition = .incomplete .insufficient)
-  | .finished _ _ => state.businessCalls ≤ 1
+def RunInvariant (operation : Operation) (result : PrivateRun) : Prop :=
+  InquiryInvariant operation.owner.child 3 result.initial ∧
+  (∀ replacement ∈ result.reconsideration,
+    InquiryInvariant operation.owner.child 3 replacement) ∧
+  (∀ report ∈ result.review, report.businessCalls ≤ 1 ∧
+    ∃ candidate, result.initial.outcome = .valid candidate ∧
+      unlockCandidate candidate = true ∧ operation.reviewEnabled = true ∧
+      ∀ request ∈ report.request, request.owner = operation.owner ∧
+        some request.frozenParent = operation.frozenParent ∧ request.candidateClaim = candidate ∧
+        request.frozenParent.permitted = true ∧ request.frozenParent.gaps = [] ∧
+        request.frozenParent.parentSession = operation.owner.parentSession) ∧
+  (result.reconsideration.isSome = true →
+    ∃ report, result.review = some report ∧ report.disposition = some .challenged)
 
-def NoCallsWithGaps (state : State) : Prop :=
-  state.request.fixed.gaps ≠ [] → state.businessCalls = 0
+-- Parent accounting models the net state after the existing publication/rollback protocol, assuming truthful correlated receipts and currentness. Callback suspension spends the same budget but is not continuation publication.
+inductive ReceiptObservation where
+  | confirmed | absent | unknown | busyBeforeStart
+  deriving DecidableEq, Repr
 
-def Postcondition (state : State) : Prop :=
-  match state.phase with
-  | .finished none effect => effect = .noAction ∧ state.current = false
-  | .finished (some disposition) effect => effect = decide state.current disposition
-  | _ => True
+inductive Effect where
+  | continueMain | unlock | suspendCallback
+  deriving DecidableEq, Repr
 
-def Invariant (input : Input) (state : State) : Prop :=
-  FixedOnce input state ∧ state.businessCalls ≤ 1 ∧ CallsConsistent state ∧ Postcondition state ∧
-  state.authorizations ≤ 1 ∧ (Unfinished state.phase → state.authorizations = 0) ∧ NoCallsWithGaps state
+structure ParentState where
+  current : Bool
+  terminalApplied : Bool
+  budgetUsed : Nat
+  budgetLimit : Nat
+  callbackSuspended : Bool
+  locked : Bool
+  effect : Option Effect
+  deriving DecidableEq, Repr
 
--- Fixed request identity changes only when input identity changes.
-theorem prepare_identity (left right : Input) :
-    prepare left = prepare right ↔ left.fixed = right.fixed := by
-  constructor
-  · intro equality
-    exact congrArg Request.fixed equality
-  · intro equality
-    simp [prepare, equality]
+def accept (state : ParentState) (terminal : Option TerminalOutcome)
+    (receipt : ReceiptObservation) : ParentState :=
+  if !state.current || !state.locked || state.terminalApplied then state
+  else match terminal with
+    | some (.decision candidate) =>
+      match candidate.action with
+      | .continueWork =>
+        if receipt == .confirmed && state.budgetUsed < state.budgetLimit then
+          { state with
+            terminalApplied := true
+            budgetUsed := state.budgetUsed + 1
+            effect := some .continueMain }
+        else state
+      | .waitCallback =>
+        if state.budgetUsed < state.budgetLimit then
+          { state with
+            terminalApplied := true
+            budgetUsed := state.budgetUsed + 1
+            callbackSuspended := true
+            effect := some .suspendCallback }
+        else state
+      | .unlock =>
+        { state with terminalApplied := true, locked := false, effect := some .unlock }
+    | _ => state
 
--- Challenge authorization needs a native accepted answer and complete observation, not an attempt count.
+-- Apply only the terminal handoff; cancellation revokes authority, optional audits are non-gating, and recovery restores history without live resources.
+def applyTerminal (state : ParentState) (result : PrivateRun)
+    (receipt : ReceiptObservation) : ParentState := accept state (terminalHandoff result) receipt
+
+def cancel (state : ParentState) : ParentState := { state with current := false }
+
+def audit (_persisted : Bool) (state : ParentState) : ParentState := state
+
+structure HistoryRecovery where
+  history : List Disposition
+  parent : ParentState
+  activeChild : Option Ownership
+  temporaryFileAuthority : Bool
+  pendingResult : Option TerminalOutcome
+  deriving DecidableEq, Repr
+
+def recoverHistory (history : List Disposition) : HistoryRecovery :=
+  ⟨history, ⟨false, false, 0, 0, false, false, none⟩, none, false, none⟩
+
+def mainModelContextAfter (_result : PrivateRun) (parentContext : List Fact) : List Fact :=
+  parentContext
+
+-- Accepted observed challenges, inquiry preservation and frozen review requests establish local safety independently of LLM judgment quality.
 def AcceptedChallenge (result : ServiceResult) : Prop :=
   result.stop = .stop ∧ result.requiredShapeValid = true ∧
   result.optionalAccountingAdmissible = true ∧ result.requiredUnresolved = false ∧
@@ -218,159 +362,394 @@ theorem challenge_requires_accepted_observation (result : ServiceResult)
       simp [classify, AcceptedChallenge] at challenged ⊢
 
 theorem optional_attempt_count_does_not_authorize (result : ServiceResult) (attempts : Option Nat) :
-    classify { result with reportedAttempts := attempts } = classify result := by
-  rfl
+    classify { result with reportedAttempts := attempts } = classify result := by rfl
 
--- Initialization and every transition preserve the boundary invariant.
-theorem initial_invariant (input : Input) : Invariant input (initial input) := by
-  simp [Invariant, FixedOnce, CallsConsistent, Postcondition, Unfinished, NoCallsWithGaps, initial, prepare]
+theorem inquiry_invariant (child : String) (fuel : Nat) (observations : Nat → AttemptObservation) :
+    InquiryInvariant child fuel (inquire child fuel observations) := by
+  induction fuel generalizing observations with
+  | zero => simp [inquire, InquiryInvariant]
+  | succ fuel induction =>
+    have smaller := induction (fun index => observations (index + 1))
+    simp only [inquire]
+    split
+    · simp [InquiryInvariant]
+    · split <;> simp_all [InquiryInvariant, List.mem_cons]
+      omega
 
-theorem step_preserves_invariant {input : Input} {before after : State}
-    (valid : Invariant input before) (step : Step input before after) : Invariant input after := by
-  cases step <;> simp_all [Invariant, FixedOnce, CallsConsistent, Postcondition, Unfinished, NoCallsWithGaps, initial, prepare]
-  all_goals first
-    | (split <;> simp_all)
-    | (apply Classical.byContradiction; intro gaps
-       rcases valid with ⟨⟨fixed, _⟩, _, calls, noCalls⟩
-       have zero := noCalls (by simpa [fixed] using gaps)
-       omega)
+theorem review_bound_and_frozen (owner : Ownership) (snapshot : Option ParentMacro) (candidate : Candidate)
+    (observed : ReviewObservation) :
+    (review owner snapshot candidate observed).businessCalls ≤ 1 ∧
+    ∀ request ∈ (review owner snapshot candidate observed).request,
+      request.owner = owner ∧ some request.frozenParent = snapshot ∧ request.candidateClaim = candidate ∧
+      request.frozenParent.permitted = true ∧ request.frozenParent.gaps = [] ∧
+      request.frozenParent.parentSession = owner.parentSession := by
+  cases snapshot with
+  | none => simp [review]
+  | some snapshot =>
+    simp only [review]
+    split
+    · simp
+    · cases observed <;> simp_all
 
-theorem reachable_invariant (input : Input) (state : State) (reachable : Reachable input state) :
-    Invariant input state := by
-  induction reachable with
-  | initial => exact initial_invariant input
-  | advance previous step induction => exact step_preserves_invariant induction step
+theorem local_run_invariant (operation : Operation) (observations : Observations) :
+    RunInvariant operation (localRun operation observations) := by
+  have first := inquiry_invariant operation.owner.child 3 observations.initial
+  have second := inquiry_invariant operation.owner.child 3 observations.replacement
+  simp only [localRun]
+  split
+  · simp [RunInvariant, InquiryInvariant]
+  · split
+    · rename_i candidate valid
+      split
+      · rename_i eligible
+        have both : unlockCandidate candidate = true ∧ operation.reviewEnabled = true := by
+          simpa using eligible
+        have unlock := both.1
+        have report := review_bound_and_frozen operation.owner operation.frozenParent candidate observations.review
+        have reportValid : (review operation.owner operation.frozenParent candidate observations.review).businessCalls ≤ 1 ∧
+            ∃ claim, (inquire operation.owner.child 3 observations.initial).outcome = .valid claim ∧
+              unlockCandidate claim = true ∧ operation.reviewEnabled = true ∧
+              ∀ request ∈ (review operation.owner operation.frozenParent candidate observations.review).request,
+                request.owner = operation.owner ∧
+                some request.frozenParent = operation.frozenParent ∧ request.candidateClaim = claim ∧
+                request.frozenParent.permitted = true ∧ request.frozenParent.gaps = [] ∧
+                request.frozenParent.parentSession = operation.owner.parentSession :=
+          ⟨report.1, candidate, valid, unlock, both.2, report.2⟩
+        split
+        · simpa [RunInvariant] using And.intro first reportValid
+        · split <;> simp_all [RunInvariant]
+      · simpa [RunInvariant] using first
+    · simpa [RunInvariant] using first
 
--- Both admission branches are reachable; necessary gaps never dispatch and publish only through currentness.
-theorem admission_is_step (input : Input) (permitted : ProjectionPrecondition input) :
-    Step input (initial input) (admission input) := by
-  by_cases clear : input.fixed.gaps = []
-  · simpa [admission, clear, initial] using Step.start permitted clear
-  · simpa [admission, clear, initial] using Step.rejectGaps clear
+theorem run_invariant (operation : Operation) (observations : Observations) :
+    RunInvariant operation (run operation observations) := by
+  have valid := local_run_invariant operation observations
+  unfold run
+  split <;> exact valid
 
-theorem gaps_are_zero_call_incomplete (input : Input) (necessary : input.fixed.gaps ≠ []) :
-    (admission input).businessCalls = 0 ∧
-    (admission input).phase = .classified (.incomplete .insufficient) := by
-  simp [admission, necessary, initial]
+theorem at_most_six_same_child_responses (operation : Operation) (observations : Observations) :
+    (allAttempts (run operation observations)).length ≤ 6 ∧
+    ∀ attempt ∈ allAttempts (run operation observations),
+      attempt.child = operation.owner.child ∧ attempt.resetFileTo = "{}" ∧
+      attempt.authorizedModelResponses = 1 := by
+  have valid := run_invariant operation observations
+  have firstBound := valid.1.1
+  rcases resultEq : (run operation observations).reconsideration with _ | replacement
+  · simp only [allAttempts, resultEq, Option.map_none, Option.getD_none, List.append_nil]
+    constructor
+    · omega
+    · intro attempt present
+      have same := valid.1.2 attempt present
+      simp [same, oneResponse]
+  · have second := valid.2.1 replacement (by simp [resultEq])
+    have secondBound := second.1
+    simp only [allAttempts, resultEq, Option.map_some, Option.getD_some, List.length_append]
+    constructor
+    · omega
+    · intro attempt present
+      rcases List.mem_append.mp present with first | later
+      · simp [valid.1.2 attempt first, oneResponse]
+      · simp [second.2 attempt later, oneResponse]
 
-theorem necessary_gaps_never_dispatch (input : Input) (state : State)
-    (reachable : Reachable input state) (necessary : input.fixed.gaps ≠ []) :
-    state.businessCalls = 0 := by
-  have valid := reachable_invariant input state reachable
-  exact valid.2.2.2.2.2.2 (by simpa [valid.1.1] using necessary)
+theorem stale_cleanup_cannot_return_candidate (operation : Operation) (observations : Observations)
+    (stale : current observations.afterCleanupCurrent = false) :
+    (run operation observations).terminal = some .cancelled := by simp [run, stale]
 
-theorem gap_admission_publication (input : Input) (necessary : input.fixed.gaps ≠ []) (live : Bool) :
-    Step input (admission input)
-      { request := prepare input, businessCalls := 0, authorizations := if live then 1 else 0,
-        current := live, phase := .finished (some (.incomplete .insufficient))
-          (decide live (.incomplete .insufficient)) } := by
-  simpa [admission, necessary, initial] using
-    Step.publish (input := input) (prepare input) 0 true live (.incomplete .insufficient)
+theorem stale_parent_cannot_act (state : ParentState) (terminal : Option TerminalOutcome)
+    (receipt : ReceiptObservation) (stale : state.current = false) :
+    accept state terminal receipt = state := by simp [accept, stale]
 
--- Incomplete current results retain the original; stale publications cannot act.
-theorem finished_outcome_is_currentness_guarded (input : Input) (state : State)
-    (reachable : Reachable input state) (disposition : Disposition) (effect : Effect)
-    (finished : state.phase = .finished (some disposition) effect) :
-    effect = decide state.current disposition := by
-  have invariant := reachable_invariant input state reachable
-  simpa [Postcondition, finished] using invariant.2.2.2.1
+theorem terminal_callback_is_inert (state : ParentState) (terminal : Option TerminalOutcome)
+    (receipt : ReceiptObservation) (applied : state.terminalApplied = true) :
+    accept state terminal receipt = state := by simp [accept, applied]
 
-theorem current_incomplete_preserves_original (reason : IncompleteReason) :
-    decide true (.incomplete reason) = .originalUnlock := by rfl
+theorem no_receipt_no_continue_charge (state : ParentState) (candidate : Candidate)
+    (receipt : ReceiptObservation) (continuation : candidate.action = .continueWork)
+    (unconfirmed : receipt ≠ .confirmed) :
+    accept state (some (.decision candidate)) receipt = state := by
+  simp [accept, continuation, unconfirmed]
 
-theorem stale_cannot_act (disposition : Disposition) :
-    decide false disposition = .noAction := by rfl
+theorem nondecision_has_no_effect (state : ParentState) (outcome : InquiryOutcome)
+    (notValid : ∀ candidate, outcome ≠ .valid candidate) (receipt : ReceiptObservation) :
+    accept state (terminalOf outcome) receipt = state := by
+  cases outcome <;> simp_all [terminalOf, accept]
 
--- Once finished, repeated terminal callbacks cannot add actions or authorizations.
-inductive Steps (input : Input) : State → State → Prop where
-  | refl (state : State) : Steps input state state
-  | next {before middle after : State} : Step input before middle → Steps input middle after →
-    Steps input before after
+theorem final_shared_budget_bound (state : ParentState) (terminal : Option TerminalOutcome)
+    (receipt : ReceiptObservation) :
+    (accept state terminal receipt).budgetUsed ≤ state.budgetUsed + 1 := by
+  simp only [accept]
+  repeat' split
+  all_goals simp_all <;> omega
 
-theorem finished_step_is_inert {input : Input} {before after : State}
-    (finished : Finished before.phase) (step : Step input before after) : after = before := by
-  rcases finished with ⟨disposition, effect, phase⟩
-  cases step <;> simp_all [initial, Unfinished]
+theorem parent_context_isolated (result : PrivateRun) (parentContext : List Fact) :
+    mainModelContextAfter result parentContext = parentContext := by rfl
 
-theorem finished_trace_is_inert {input : Input} {before after : State}
-    (trace : Steps input before after) : Finished before.phase → after = before := by
-  induction trace with
-  | refl => intro _; rfl
-  | next step _ induction =>
-    intro finished
-    have same := finished_step_is_inert finished step
-    exact (induction (by simpa [same] using finished)).trans same
+theorem no_authority_from_audit_or_recovery (state : ParentState) (persisted : Bool)
+    (history : List Disposition) :
+    audit persisted state = state ∧ (recoverHistory history).history = history ∧
+    (recoverHistory history).parent.current = false ∧
+    (recoverHistory history).parent.locked = false ∧
+    (recoverHistory history).parent.effect = none ∧
+    (recoverHistory history).activeChild = none ∧
+    (recoverHistory history).temporaryFileAuthority = false ∧
+    (recoverHistory history).pendingResult = none := by simp [audit, recoverHistory]
 
--- Progress after an external terminal result is conditional, never a total external-LLM wait bound.
-def TerminalProgress (input : Input) (request : Request) (calls : Nat)
-    (current observedLive publishLive : Bool) (result : ServiceResult) : Prop :=
-  ∃ middle final, Step input { request, businessCalls := calls, authorizations := 0, current, phase := .waiting } middle ∧
-    Step input middle final ∧ middle.phase = .classified (classify result) ∧
-    final.phase = .finished (some (classify result))
-      (decide ((current && observedLive) && publishLive) (classify result)) ∧
-    final.current = ((current && observedLive) && publishLive) ∧
-    final.businessCalls = calls ∧ Finished final.phase
+-- Conditional progress assumes the scheduler/provider/service supply settled observations; absent settlement remains pending. No real provider termination or hardware behavior is proved.
+def ResponsesSettle (observations : Nat → AttemptObservation) : Prop :=
+  ∀ index, (observations index).outcome ≠ .waiting
 
-theorem terminal_result_conditional_progress (input : Input) (request : Request) (calls : Nat)
-    (current observedLive publishLive : Bool) (result : ServiceResult) :
-    TerminalProgress input request calls current observedLive publishLive result := by
-  refine ⟨_, _, Step.receive request calls current observedLive result,
-    Step.publish request calls (current && observedLive) publishLive (classify result),
-    rfl, rfl, rfl, rfl, ?_⟩
-  exact ⟨some (classify result), decide ((current && observedLive) && publishLive) (classify result), rfl⟩
+def ExternalSettlements (observations : Observations) : Prop :=
+  ResponsesSettle observations.initial ∧ ResponsesSettle observations.replacement ∧
+    observations.review ≠ .waiting
 
-theorem immediate_escape (input : Input) (state : State) (pending : Unfinished state.phase) :
-    ∃ final, Step input state final ∧ Finished final.phase ∧ final.current = false ∧
-      final.businessCalls = state.businessCalls := by
-  exact ⟨_, Step.escape state pending, ⟨none, .noAction, rfl⟩, rfl, rfl⟩
+theorem inquiry_conditional_termination (child : String) (fuel : Nat)
+    (observations : Nat → AttemptObservation) (settled : ResponsesSettle observations) :
+    (inquire child fuel observations).outcome ≠ .pending := by
+  induction fuel generalizing observations with
+  | zero => simp [inquire]
+  | succ fuel induction =>
+    have later : ResponsesSettle (fun index => observations (index + 1)) :=
+      fun index => settled (index + 1)
+    have next := induction (fun index => observations (index + 1)) later
+    have own := settled 0
+    by_cases before : current (observations 0).beforeCurrent = true
+    · by_cases after : current (observations 0).afterCurrent = true
+      · cases response : (observations 0).outcome <;> simp_all [inquire]
+      · simp [inquire, before, after]
+    · simp [inquire, before]
 
--- Combined component correctness includes gap admission, safety, conditional progress and terminal inertness.
-theorem process_is_correct (input : Input) (permitted : ProjectionPrecondition input) :
-    Step input (initial input) (admission input) ∧
-    (∀ state, Reachable input state → Invariant input state) ∧
-    (∀ other, prepare input = prepare other ↔ input.fixed = other.fixed) ∧
+theorem review_conditional_termination (owner : Ownership) (snapshot : Option ParentMacro) (candidate : Candidate)
+    (observation : ReviewObservation) (settled : observation ≠ .waiting) :
+    (review owner snapshot candidate observation).disposition ≠ none := by
+  cases snapshot with
+  | none => simp [review]
+  | some snapshot =>
+    simp only [review]
+    split
+    · simp
+    · cases observation <;> simp_all
+
+theorem terminal_of_none_iff (outcome : InquiryOutcome) :
+    terminalOf outcome ≠ none ↔ outcome ≠ .pending := by
+  cases outcome <;> simp [terminalOf]
+
+theorem run_conditional_termination (operation : Operation) (observations : Observations)
+    (settled : ExternalSettlements observations) :
+    (run operation observations).terminal ≠ none := by
+  have first := inquiry_conditional_termination operation.owner.child 3 observations.initial settled.1
+  have second := inquiry_conditional_termination operation.owner.child 3 observations.replacement settled.2.1
+  simp only [run]
+  split
+  · simp only [localRun]
+    split
+    · simp
+    · split
+      · rename_i candidate valid
+        have report := review_conditional_termination operation.owner operation.frozenParent candidate observations.review settled.2.2
+        split
+        · split
+          · simp
+          · split <;> simp_all [terminal_of_none_iff]
+        · simp
+      · change terminalOf (inquire operation.owner.child 3 observations.initial).outcome ≠ none
+        exact (terminal_of_none_iff _).2 first
+  · simp
+
+-- Fallback retains only a still-current original; final callback accounting and repeated acceptance cannot add a second effect.
+theorem incomplete_preserves_current_original (operation : Operation) (observations : Observations)
+    (candidate : Candidate) (reason : IncompleteReason)
+    (qualified : operation.qualifiedFullFork = true)
+    (initialValid : (inquire operation.owner.child 3 observations.initial).outcome = .valid candidate)
+    (eligible : unlockCandidate candidate = true) (enabled : operation.reviewEnabled = true)
+    (incomplete : (review operation.owner operation.frozenParent candidate observations.review).disposition =
+      some (.incomplete reason))
+    (reviewCurrent : current observations.afterReviewCurrent = true)
+    (cleanupCurrent : current observations.afterCleanupCurrent = true) :
+    (run operation observations).terminal = some (.decision candidate) ∧
+    (run operation observations).reconsideration = none := by
+  simp [run, localRun, qualified, initialValid, eligible, enabled, incomplete, reviewCurrent, cleanupCurrent]
+
+theorem callback_final_effect (state : ParentState) (candidate : Candidate) (receipt : ReceiptObservation)
+    (live : state.current = true) (locked : state.locked = true)
+    (fresh : state.terminalApplied = false) (budget : state.budgetUsed < state.budgetLimit)
+    (callback : candidate.action = .waitCallback) :
+    (accept state (some (.decision candidate)) receipt).budgetUsed = state.budgetUsed + 1 ∧
+    (accept state (some (.decision candidate)) receipt).callbackSuspended = true ∧
+    (accept state (some (.decision candidate)) receipt).locked = true ∧
+    (accept state (some (.decision candidate)) receipt).terminalApplied = true := by
+  simp [accept, live, locked, fresh, budget, callback]
+
+theorem cancelled_parent_stays_inert (state : ParentState) (terminal : Option TerminalOutcome)
+    (receipt : ReceiptObservation) : accept (cancel state) terminal receipt = cancel state := by
+  simp [cancel, accept]
+
+theorem acceptance_idempotent (state : ParentState) (terminal : Option TerminalOutcome)
+    (receipt : ReceiptObservation) :
+    accept (accept state terminal receipt) terminal receipt = accept state terminal receipt := by
+  simp only [accept]
+  repeat' split
+  all_goals simp_all <;> omega
+
+-- Fence completeness, candidate provenance and review guards prevent stale or superseded claims from becoming terminal authority.
+theorem current_requires_every_fence (observation : CurrentnessObservation)
+    (live : current observation = true) :
+    observation.sameOwner = true ∧ observation.sameCycle = true ∧
+    observation.sourceAncestryCurrent = true ∧ observation.sameSessionModelThinking = true ∧
+    observation.sameExternalGeneration = true ∧ observation.aggregateIdle = true ∧
+    observation.notCancelled = true := by
+  simpa only [current, Bool.and_eq_true, and_assoc] using live
+
+theorem terminal_of_decision_iff (outcome : InquiryOutcome) (candidate : Candidate) :
+    terminalOf outcome = some (.decision candidate) ↔ outcome = .valid candidate := by
+  cases outcome <;> simp [terminalOf]
+
+theorem local_final_candidate_origin (operation : Operation) (observations : Observations)
+    (candidate : Candidate)
+    (accepted : (localRun operation observations).terminal = some (.decision candidate)) :
+    CandidateOrigin (localRun operation observations) candidate := by
+  simp only [localRun] at accepted ⊢
+  split
+  · simp_all
+  · split
+    · split
+      · split
+        · simp_all
+        · split <;> simp_all [CandidateOrigin, terminal_of_decision_iff]
+      · simp_all [CandidateOrigin]
+    · simp_all [terminal_of_decision_iff]
+
+theorem final_candidate_origin (operation : Operation) (observations : Observations)
+    (candidate : Candidate)
+    (accepted : terminalHandoff (run operation observations) = some (.decision candidate)) :
+    CandidateOrigin (run operation observations) candidate := by
+  by_cases live : current observations.afterCleanupCurrent = true
+  · simp only [terminalHandoff, run, live, ite_true] at accepted ⊢
+    exact local_final_candidate_origin operation observations candidate accepted
+  · simp [terminalHandoff, run, live] at accepted
+
+theorem supported_preserves_current_original (operation : Operation) (observations : Observations)
+    (candidate : Candidate) (qualified : operation.qualifiedFullFork = true)
+    (initialValid : (inquire operation.owner.child 3 observations.initial).outcome = .valid candidate)
+    (eligible : unlockCandidate candidate = true) (enabled : operation.reviewEnabled = true)
+    (supported : (review operation.owner operation.frozenParent candidate observations.review).disposition =
+      some .supported)
+    (reviewCurrent : current observations.afterReviewCurrent = true)
+    (cleanupCurrent : current observations.afterCleanupCurrent = true) :
+    (run operation observations).terminal = some (.decision candidate) ∧
+    (run operation observations).reconsideration = none := by
+  simp [run, localRun, qualified, initialValid, eligible, enabled, supported, reviewCurrent, cleanupCurrent]
+
+theorem necessary_gaps_never_dispatch (owner : Ownership) (snapshot : ParentMacro)
+    (candidate : Candidate) (observation : ReviewObservation) (gaps : snapshot.gaps ≠ []) :
+    (review owner (some snapshot) candidate observation).businessCalls = 0 ∧
+    (review owner (some snapshot) candidate observation).disposition = some (.incomplete .insufficient) := by
+  simp [review, gaps]
+
+theorem disabled_review_never_reconsiders (operation : Operation) (observations : Observations)
+    (disabled : operation.reviewEnabled = false) :
+    (run operation observations).review = none ∧
+    (run operation observations).reconsideration = none := by
+  simp only [run, localRun]
+  repeat' split
+  all_goals simp_all
+
+-- Combined correctness covers finite observed workflow, bounded same-child actions, initial-only frozen review, terminal provenance, guarded effects, isolation and history-only recovery.
+-- Truthful projection/validation/fence/receipt observations and enforcement of abstract response/write actions remain scope assumptions, not conclusions about final wire payloads.
+theorem process_is_correct (operation : Operation) (observations : Observations) :
+    RunInvariant operation (run operation observations) ∧
+    ((allAttempts (run operation observations)).length ≤ 6 ∧
+      ∀ attempt ∈ allAttempts (run operation observations),
+        attempt.child = operation.owner.child ∧ attempt.resetFileTo = "{}" ∧
+        attempt.authorizedModelResponses = 1) ∧
     (∀ result, classify result = .challenged → AcceptedChallenge result) ∧
-    (∀ request calls current observedLive publishLive result,
-      TerminalProgress input request calls current observedLive publishLive result) ∧
-    (∀ state, Unfinished state.phase → ∃ final, Step input state final ∧ Finished final.phase ∧
-      final.current = false ∧ final.businessCalls = state.businessCalls) ∧
-    (∀ before after, Steps input before after → Finished before.phase → after = before) := by
-  exact ⟨admission_is_step input permitted, reachable_invariant input, prepare_identity input,
-    challenge_requires_accepted_observation, terminal_result_conditional_progress input, immediate_escape input,
-    fun _ _ trace finished => finished_trace_is_inert trace finished⟩
+    (∀ state terminal receipt, state.current = false → accept state terminal receipt = state) ∧
+    (∀ state terminal receipt, state.terminalApplied = true → accept state terminal receipt = state) ∧
+    (∀ state candidate receipt, candidate.action = .continueWork → receipt ≠ .confirmed →
+      accept state (some (.decision candidate)) receipt = state) ∧
+    (∀ state terminal receipt, (accept state terminal receipt).budgetUsed ≤ state.budgetUsed + 1) ∧
+    (∀ parentContext, mainModelContextAfter (run operation observations) parentContext = parentContext) ∧
+    (ExternalSettlements observations → (run operation observations).terminal ≠ none) ∧
+    (∀ candidate, terminalHandoff (run operation observations) = some (.decision candidate) →
+      CandidateOrigin (run operation observations) candidate) ∧
+    (∀ state persisted history, audit persisted state = state ∧
+      (recoverHistory history).history = history ∧
+      (recoverHistory history).parent.current = false ∧
+      (recoverHistory history).parent.locked = false ∧
+      (recoverHistory history).parent.effect = none ∧
+      (recoverHistory history).activeChild = none ∧
+      (recoverHistory history).temporaryFileAuthority = false ∧
+      (recoverHistory history).pendingResult = none) := by
+  exact ⟨run_invariant operation observations, at_most_six_same_child_responses operation observations,
+    challenge_requires_accepted_observation, stale_parent_cannot_act, terminal_callback_is_inert,
+    no_receipt_no_continue_charge, final_shared_budget_bound,
+    parent_context_isolated (run operation observations), run_conditional_termination operation observations,
+    final_candidate_origin operation observations, no_authority_from_audit_or_recovery⟩
+
+-- Kernel-checked finite examples exercise six responses, original fallback, pending review, cancellation, exhaustion, no second review and shared callback accounting.
+def demoLive : CurrentnessObservation := ⟨true, true, true, true, true, true, true⟩
+
+def demoCandidate (action : Action) : Candidate := ⟨action, "configured-reason", "normalized claim"⟩
+
+def demoOperation : Operation :=
+  { owner := ⟨"sole-child", "parent", 7, 4, "source-leaf", 2, "provider/model", "selected"⟩
+    frozenParent := some ⟨3, "review rubric", [], [], "parent", some "source-leaf", none, true⟩
+    qualifiedFullFork := true
+    reviewEnabled := true }
+
+def demoResponses (action : Action) (index : Nat) : AttemptObservation :=
+  ⟨demoLive, demoLive, if index < 2 then .invalid else .valid (demoCandidate action)⟩
+
+def demoChallenge : ServiceResult :=
+  ⟨.stop, true, true, false, true, some .challenged, some 9⟩
+
+def demoObservations : Observations :=
+  ⟨demoResponses .unlock, demoResponses .continueWork, .settled demoChallenge, demoLive, demoLive⟩
+
+def demoRun : PrivateRun := run demoOperation demoObservations
+
+def demoParent : ParentState := ⟨true, false, 2, 5, false, true, none⟩
+
+example : (allAttempts demoRun).length = 6 ∧
+    demoRun.terminal = some (.decision (demoCandidate .continueWork)) ∧
+    (demoRun.review.map ReviewRun.businessCalls) = some 1 := by decide
+
+example : (accept demoParent demoRun.terminal .confirmed).budgetUsed = 3 ∧
+    (accept demoParent demoRun.terminal .absent) = demoParent ∧
+    (accept demoParent demoRun.terminal .unknown) = demoParent ∧
+    (accept demoParent demoRun.terminal .busyBeforeStart) = demoParent := by decide
+
+example :
+    (run demoOperation { demoObservations with review := .unavailable }).terminal =
+      some (.decision (demoCandidate .unlock)) ∧
+    (run demoOperation { demoObservations with review := .waiting }).terminal = none ∧
+    (run demoOperation { demoObservations with
+      afterReviewCurrent := { demoLive with notCancelled := false } }).terminal = some .cancelled := by decide
+
+example : (inquire "sole-child" 3 (fun _ => ⟨demoLive, demoLive, .invalid⟩)).outcome = .formatExhausted ∧
+    (inquire "sole-child" 3 (fun _ => ⟨demoLive, demoLive, .executionError⟩)).attempts.length = 1 := by decide
+
+example :
+    (run demoOperation { demoObservations with replacement := demoResponses .unlock }).terminal =
+      some (.decision (demoCandidate .unlock)) ∧
+    ((run demoOperation { demoObservations with replacement := demoResponses .unlock }).review.map
+      ReviewRun.businessCalls) = some 1 ∧
+    (run demoOperation { demoObservations with
+      replacement := fun _ => ⟨demoLive, demoLive, .invalid⟩ }).terminal = some .decisionFailed := by decide
+
+example :
+    (accept demoParent (some (.decision (demoCandidate .waitCallback))) .unknown).budgetUsed = 3 ∧
+    (accept demoParent (some (.decision (demoCandidate .waitCallback))) .unknown).callbackSuspended = true ∧
+    (accept demoParent (some (.decision (demoCandidate .waitCallback))) .unknown).locked = true := by decide
 
 end UnlockReviewBoundary
 
--- Inspect trusted foundations of final declarations; no custom axioms or unchecked proofs.
+-- Inspect foundations of the top theorem; no project-specific assumptions are introduced as axioms.
 #print axioms UnlockReviewBoundary.process_is_correct
-#print axioms UnlockReviewBoundary.finished_outcome_is_currentness_guarded
-#print axioms UnlockReviewBoundary.optional_attempt_count_does_not_authorize
-#print axioms UnlockReviewBoundary.current_incomplete_preserves_original
-#print axioms UnlockReviewBoundary.stale_cannot_act
-#print axioms UnlockReviewBoundary.gaps_are_zero_call_incomplete
-#print axioms UnlockReviewBoundary.necessary_gaps_never_dispatch
-#print axioms UnlockReviewBoundary.gap_admission_publication
 
--- Deterministic stdout illustrates consumed failures and zero-call necessary-gap admission.
+-- Deterministic computation and stdout illustrate the bounded workflow and net receipt accounting, without filesystem or provider effects.
 def main : IO Unit := do
-  let overflow : UnlockReviewBoundary.ServiceResult :=
-    { stop := .capacityError, requiredShapeValid := false, optionalAccountingAdmissible := true,
-      requiredUnresolved := false, completeObservation := false, acceptedAnswer := none,
-      reportedAttempts := some 0 }
-  let unobserved : UnlockReviewBoundary.ServiceResult :=
-    { overflow with stop := .stop, requiredShapeValid := true, acceptedAnswer := some .challenged }
-  IO.println s!"Capacity result: {repr (UnlockReviewBoundary.classify overflow)}"
-  IO.println s!"Missing observation: {repr (UnlockReviewBoundary.classify unobserved)}"
-  IO.println s!"Current incomplete: {repr (UnlockReviewBoundary.decide true (.incomplete .error))}; stale: {repr (UnlockReviewBoundary.decide false .supported)}"
-  let withGap : UnlockReviewBoundary.Input :=
-    { fixed :=
-        { projectionVersion := 3
-          rubric := "fixed policy"
-          candidate := { reasonType := "JOB_DONE", reasonContent := "reported done" }
-          facts := []
-          gaps := ["unsupported-content"]
-          contextHead := none
-          compactionBoundary := none }
-      permittedCompleteProjection := true }
-  IO.println s!"Necessary gap: calls={(UnlockReviewBoundary.admission withGap).businessCalls}, phase={repr (UnlockReviewBoundary.admission withGap).phase}"
-  IO.println "Proved: fixed facts retained once; at most one business review; necessary gaps dispatch zero calls; accepted observed challenge only; current-original incomplete fallback; stale inert; progress conditional on terminal service result, not a total external wait bound."
+  let result := UnlockReviewBoundary.demoRun
+  IO.println s!"Challenged initial unlock: responses={(UnlockReviewBoundary.allAttempts result).length}, review calls={repr (result.review.map UnlockReviewBoundary.ReviewRun.businessCalls)}, final={repr result.terminal}"
+  IO.println s!"Shared budget: confirmed={(UnlockReviewBoundary.accept UnlockReviewBoundary.demoParent result.terminal .confirmed).budgetUsed}; absent/net unchanged={(UnlockReviewBoundary.accept UnlockReviewBoundary.demoParent result.terminal .absent).budgetUsed}"
+  IO.println "Proved: same child; reset {}; one abstract response per attempt; three per inquiry; at most six total; initial-only review; final-only effects; stale and repeated callbacks inert; termination conditional on external settlements."
+  IO.println "Scope assumptions: truthful host currentness/projection/validation/receipt observations; enforced provider/write boundary and draining; finite observed actions, not actual I/O, LLM quality, hardware, or final wire payload correctness."

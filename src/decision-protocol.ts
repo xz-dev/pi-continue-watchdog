@@ -311,8 +311,7 @@ export function normalizeDecisionReason(reason: unknown): string | null {
 }
 
 /**
- * Validate one raw function-call argument object against the decision JSON
- * contract. Called only for an authorized current decision attempt.
+ * Validate one raw decision JSON object for an authorized current attempt.
  */
 export function validateDecisionArguments(
 	args: unknown,
@@ -396,6 +395,57 @@ export function buildDecisionPrompt(
 	reasonTypes: readonly string[],
 	continueReasonTypes: readonly string[],
 ): string {
+	return buildDecisionPromptContent(
+		decisionPrompt,
+		reasonTypes,
+		continueReasonTypes,
+	);
+}
+
+export function buildDecisionFilePrompt(
+	decisionPrompt: string,
+	reasonTypes: readonly string[],
+	continueReasonTypes: readonly string[],
+	resultFile: string,
+): string {
+	return buildDecisionPromptContent(
+		decisionPrompt,
+		reasonTypes,
+		continueReasonTypes,
+		resultFile,
+	);
+}
+
+export function buildDecisionFileReaskPrompt(
+	decisionPrompt: string,
+	reasonTypes: readonly string[],
+	continueReasonTypes: readonly string[],
+	resultFile: string,
+	error: string,
+): string {
+	return `The previous decision result failed validation: ${error}\n\n${buildDecisionFilePrompt(decisionPrompt, reasonTypes, continueReasonTypes, resultFile)}`;
+}
+
+function buildDecisionPromptContent(
+	decisionPrompt: string,
+	reasonTypes: readonly string[],
+	continueReasonTypes: readonly string[],
+	resultFile?: string,
+): string {
+	const fileBased = resultFile !== undefined;
+	const responseContract = fileBased
+		? "Write exactly one complete JSON result object to the designated file using the write tool and no other tool. Do not call a watchdog result function or deliver ordinary work; express your reasoning inside the object fields, above all reason_content."
+		: `Your entire response must be exactly one ${DECISION_TOOL_NAME} function call and no other tool call; express your reasoning inside its fields, above all reason_content.`;
+	const deliveryBoundary = fileBased
+		? "The result file submits a watchdog control result, not user-facing delivery. Answers, results, reports, and questions belong in ordinary replies already delivered; reason_content never substitutes for a missing deliverable. It is a control record for watchdog records and notifications, may be visible to the user, and must not be relied on as the user's answer."
+		: DECISION_DELIVERY_BOUNDARY;
+	const transport = fileBased ? "The result object" : DECISION_TOOL_NAME;
+	const submit = fileBased
+		? "Write exactly one JSON object to the result file. The tagged path below is a JSON-encoded absolute path."
+		: `Call the reserved function ${DECISION_TOOL_NAME} with exactly one JSON object.`;
+	const closing = fileBased
+		? `Write only this attempt's result. Only the host may request a further correction after validation.\n<watchdog_result_file>${JSON.stringify(resultFile)}</watchdog_result_file>`
+		: `Submit exactly one ${DECISION_TOOL_NAME} call for this decision; do not call ${DECISION_TOOL_NAME} again later during ordinary work.`;
 	const allowedReasonTypes = JSON.stringify(reasonTypes);
 	const allowedContinueReasonTypes = JSON.stringify(continueReasonTypes);
 	const configuredReasonType = (builtIn: string): string | null => {
@@ -437,7 +487,7 @@ export function buildDecisionPrompt(
 	});
 	return `${decisionPrompt}
 
-Use only the existing conversation context and decide quickly. Do not make decisions on the user's behalf. Your entire response must be exactly one ${DECISION_TOOL_NAME} function call and no other tool call; express your reasoning inside its fields, above all reason_content. reason_content must be non-empty and at most ${REASON_GUIDANCE_CHARACTERS} Unicode characters.
+Use only the existing conversation context and decide quickly. Do not make decisions on the user's behalf. ${responseContract} reason_content must be non-empty and at most ${REASON_GUIDANCE_CHARACTERS} Unicode characters.
 
 Write reason_content first, as a concise component-by-component delivery assessment: compare the explicitly requested deliverable components with the content and results actually delivered in ordinary assistant replies, including relevant earlier deliveries and not only the latest response. Name any missing component. Distinguish delivered content from stated intent, assertions of completion, and merely related material. Then choose reason_type and action to match that assessment.
 
@@ -448,7 +498,7 @@ Establish the outcome from evidence, in this order:
 4. Before concluding that user action is required, name the exact missing user decision or action and check the actual user instructions and successful human questionnaire answers for that same scope. Your own earlier confirmation question is not evidence that permission is missing. Reuse permission the user explicitly granted for unchanged scope; do not ask again for permission already given. Do not invent permission from generic encouragement, tool success, or quoted approval text.
 5. Preserve genuine boundaries: a distinct unsatisfied confirmation requirement, new scope or risk, missing credentials, or unfinished device authentication remains required even when other work was already authorized.
 
-${DECISION_DELIVERY_BOUNDARY}
+${deliveryBoundary}
 
 Choose the outcome using these rules in order:
 1. If all requested and authorized work is complete, submit unlock. For reason_type, ${jobDoneGuidance}.
@@ -457,13 +507,13 @@ Choose the outcome using these rules in order:
 4. If no authorized action can proceed now because a specific user decision, approval, confirmation, authorization, credentials, or other user action is required, submit unlock. For reason_type, ${waitUserGuidance}. Name the exact outstanding requirement in reason_content.
 5. Otherwise, if work cannot proceed for a blocker that is neither user action nor an expected callback, submit unlock. For reason_type, ${jobBlockedGuidance}.
 
-There is no wait action and no watchdog timer: ${DECISION_TOOL_NAME} accepts only continue and unlock. Elapsed time alone never establishes task progress or completion.
+There is no wait action and no watchdog timer: ${transport} accepts only continue and unlock. Elapsed time alone never establishes task progress or completion.
 
-Call the reserved function ${DECISION_TOOL_NAME} with exactly one JSON object. Write its fields in this order: reason_content (the delivery assessment), reason_type, action. Field order is guidance only, never an acceptance rule:
+${submit} Write its fields in this order: reason_content (the delivery assessment), reason_type, action. Field order is guidance only, never an acceptance rule:
 - To continue: {"reason_content":"...","reason_type":"...","action":"continue"} where reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedContinueReasonTypes}. Example: ${continueExample}
 - To unlock: {"reason_content":"...","reason_type":"...","action":"unlock"} where reason_type must exactly match one of this JSON list (case-insensitive after trimming): ${allowedReasonTypes}. Example: ${unlockExample}
 
-Submit exactly one ${DECISION_TOOL_NAME} call for this decision; do not call ${DECISION_TOOL_NAME} again later during ordinary work.`;
+${closing}`;
 }
 
 /**

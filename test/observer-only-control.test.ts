@@ -444,10 +444,9 @@ test("first config diagnostic notify demotion drops control before later diagnos
 	assert.deepEqual(headless.notifications, [
 		{ message: "first diagnostic", level: "warning" },
 	]);
-	// The reserved decision function is session-scoped (registered once at config commit in a
-	// root process); a synchronous demotion afterwards keeps the inert tool
-	// registered but stops every further control-plane effect.
-	assert.deepEqual(headless.registeredTools, ["cw"]);
+	// Private decisions register no parent result tool; demotion must still
+	// stop every further control-plane effect.
+	assert.deepEqual(headless.registeredTools, []);
 	assert.deepEqual(headless.activeToolSets, []);
 	assert.deepEqual(headless.sentMessages, []);
 	assert.equal(headless.clock.records.length, 0);

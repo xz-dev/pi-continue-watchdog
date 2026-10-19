@@ -1,0 +1,47 @@
+## 1. Establish the private runtime and compatibility gate
+
+- [x] 1.1 Map the confirmed rules and proposed acceptance scenarios to the existing runtime and packed fixtures, keeping any new product assumptions explicit; verify the map covers all seven capability deltas without treating a green test as human acceptance or altering `PLAN/provider-retry-accounting.md`.
+- [x] 1.2 Prepare a project-owned, version/content-pinned pi-subagents patch exposing an instance-local private child runner with no public extension initialization; verify a focused contract probe creates and disposes a distinct child without adding tools, commands, RPC listeners, user-agent discovery, or global factory overrides.
+- [x] 1.3 Prove the patched runner's real single-response boundary on the user-approved stock-Pi `1.3.0` SDK/TUI baseline with the minimum support declaration raised accordingly, including completion of its admitted write and prevention of native success/error follow-ups; verify deterministic provider traces show one response per attempt and record a concrete blocker rather than upgrading a global host, silently changing the selected project baseline again, or passing an unenforced `maxTurns` field.
+- [x] 1.4 Include the exact dependency reference and patch in the watchdog's package-local install/build path; verify a clean packed install works without the developer checkout, global plugin mutation, suppressed peer failures, or a public pi-subagents installation.
+
+## 2. Deliver one valid private file decision
+
+- [x] 2.1 Extend an existing acceptance fixture to expose the unmet valid-result behavior at session/provider/publication boundaries before production changes; verify it distinguishes main-session inquiry traffic from a separate child and does not fail merely from a missing import or broken fixture.
+- [x] 2.2 Capture and fork the qualified parent's effective active-branch context, provider/model, thinking, and compatible system/tool state using the patched runtime; verify compaction, exclusions, old watchdog folds, source supplement placement, non-default active model, and full-fork failure without fresh/pruned fallback.
+- [x] 2.3 Add the private temporary-file transport under `/var/tmp/`, host initialization to `{}`, exact-path regular-file checks, and the restricted writer; verify a valid result succeeds while alternate paths, symlinks, duplicate/mixed writes, ordinary work, and stdout-only JSON cannot submit a decision or cause side effects.
+- [x] 2.4 Decode the file with the existing pure decision rules and connect one terminal result to current controller/publication behavior; verify mixed-case values, matched configured identity, action-specific reasons, extra fields, property order, and Unicode bounds remain compatible, and that continue/unlock publication needs no main-model rewrite.
+
+## 3. Keep bounded correction inside the original child
+
+- [ ] 3.1 Drive invalid-then-valid results in the existing runtime fixture before implementing correction; verify the expected criterion requires one child identity, local concrete error feedback, file reset between attempts, and one outer terminal handoff.
+- [x] 3.2 Implement the same-child format loop with at most three consumed responses per inquiry and one response plus admitted write per attempt; verify missing fields, untouched `{}`, malformed/non-object JSON, forbidden tool batches, and invalid actions are corrected locally without another fork or post-tool response.
+- [x] 3.3 Preserve failure/accounting distinctions and terminal cleanup; verify three invalid responses produce one `DECISION_FAILED` and no fourth request or continuation charge, while cancellation, stale ownership, provider failure, and host-file setup/read errors do not become fabricated format errors or silently trigger the old transport.
+
+## 4. Preserve cancellation, currentness, and activity ownership
+
+- [x] 4.1 Bind private child cancellation to existing manual unlock, takeover, branch/session replacement, ownership loss, external activity, and shutdown handling; verify cancellation targets that child rather than an unrelated main run and preserves complete ordinary user input without queue replay.
+- [x] 4.2 Separate owned private generation/write activity from the existing external-agent idle generation and guard the captured source ancestry across owned audit appends; verify no self-invalidation or duplicate inquiry occurs, while genuine external activity and non-owned source changes still discard stale results.
+- [x] 4.3 Revoke result authority before awaiting shutdown, drain or quarantine late writes, and make cleanup idempotent; verify cancellation during generation/write, late valid files, repeated terminal callbacks, and session replacement cannot change a later cycle or reuse its result path.
+- [x] 4.4 Preserve cause-specific abort behavior and existing main controls; verify manual unlock/shortcut cancellation of the private operation, directed native foreground cancellation where delivered, ordinary main/continuation Esc behavior, actual aborted outcomes, quiet internal presentation, and unchanged handling of non-abort errors.
+
+## 5. Retain optional review, reconsideration, and budgets
+
+- [x] 5.1 Keep a valid initial unlock candidate inside the pending private operation while invoking the existing review adapter with a frozen permitted parent snapshot; verify disabled/unavailable/incomplete/supported review behavior and that private prompt, retry, write, path, and thinking content never enter the external macro evidence.
+- [x] 5.2 Route the one definite challenge and its concrete feedback to a reconsideration inquiry in that same child, resetting the file and retaining its separate three-response allowance; verify a changed or repeated unlock is not reviewed again, no intermediate main-model turn occurs, and no logical decision exceeds two inquiries or six consumed responses.
+- [x] 5.3 Preserve final-effect accounting and callback semantics through current publication guards; verify `continue` and `unlock`/`WAIT_CALLBACK` each spend only their existing final unit, actual unlock and all format/review work spend none, callback suspension stays quiet, and publication failure follows existing rollback behavior.
+- [x] 5.4 Cancel pending review and reconsideration under the same operation identity; verify late service success, incomplete fallback, correction, and optional audit failure cannot resurrect an old candidate, relock new work, add a model response, or create an independent storage gate.
+
+## 6. Retire public submission while keeping historical recovery
+
+- [x] 6.1 Remove new watchdog result-tool registration and main-session inquiry/correction dispatch after the private vertical slices pass; verify standalone and public-pi-subagents co-installation traces add no watchdog `cw`, structured-output tool, public subagent surface, or private main/summary messages, and leave a foreign `cw` owner untouched.
+- [x] 6.2 Persist only versioned context-excluded source/child/attempt associations and safe diagnostics through existing native audit/publication paths; verify a reopened main session reconstructs history without temporary files or child transcripts and never restores live result authority, retries, locks, or publication.
+- [x] 6.3 Keep legacy inquiry/function folding, cancelled-record handling, and native-summary projection as read-only compatibility; verify old persisted sessions, compaction, branch summaries, rewind/fork ancestry, unknown metadata, and sibling records remain safe without re-registering result functions or rewriting history.
+
+## 7. Complete cross-cutting verification and documentation
+
+Publication clarification from the user: this is a live Git package updated on `master`, with no tag or GitHub Release. Human product acceptance in 7.3 is explicitly deferred until after publication and does not gate that update. The unrecovered original chronology in 3.1 remains a process gap; current behavior has an explicitly retrospective correction-disabled red/current green, not fabricated historical execution.
+
+- [x] 7.1 Update `README.md`, behavior/architecture documentation, and affected `docs/programming-thinking/*.idea.lean` models for the accepted transport and process changes; verify the exact changed Lean files typecheck/run with the prescribed proof checks and report any unavailable semantic-reader gate without claiming unproved host behavior.
+- [x] 7.2 Run the expanded existing focused/runtime and clean packed scenarios, then `npm run check` and `npm run test:e2e`; verify intentional-break sensitivity for the new response cap, same-child retry, stale-file guard, and registration isolation, and retain a concise requirement-to-command/result ledger including any blocked compatibility or integration gates.
+- [ ] 7.3 Demonstrate the standalone/co-installed foreground behavior, actual terminal-result presentation, responsive cancellation, legacy recovery, and unchanged budget/callback/review outcomes for human acceptance; verify the report separates implemented behavior, automated evidence, manual checks, and remaining risks, without treating cache hits as a correctness gate or publishing/committing without a separate request.

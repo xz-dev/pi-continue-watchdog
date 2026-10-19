@@ -1,0 +1,29 @@
+{
+  "version": "0.79.0",
+  "commit": "1008e5993e90fcf13b815c97c15a0c54f7f6f116",
+  "sources": {
+    "src/runs/shared/child-session.ts": {
+      "sha256": "e8b47992f6e77351cef82516fd68eec96f7093803848973e42c9fa5f1f9220ef",
+      "replacements": [
+        {
+          "from": "export interface ChildSessionLaunch {\n\tcwd: string;",
+          "to": "export interface ChildSessionLaunch {\n\tcwd: string;\n\tagentDir?: string;"
+        },
+        {
+          "from": "const agentDir = getAgentDir();",
+          "to": "const agentDir = launch.agentDir ?? getAgentDir();"
+        },
+        {
+          "from": "pinChildCacheRetention(session.agent);",
+          "to": "pinChildCacheRetention(session.agent);\n\t\t\t\tsession.setAutoCompactionEnabled(false);\n\t\t\t\tsession.setAutoRetryEnabled(false);"
+        }
+      ]
+    },
+    "src/runs/shared/subagent-prompt-runtime.ts": {
+      "sha256": "3752489a6176a985a01320060fffead426ddb8f2565d4e78e781928b7651661f"
+    },
+    "src/shared/fork-context.ts": {
+      "sha256": "65e2bf06e569f3dde47a57224a4af8e8c81de41e8267c0935964e8fda08777ed"
+    }
+  }
+}
