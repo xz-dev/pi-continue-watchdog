@@ -32,4 +32,23 @@
 - [x] 4.2 Run the complete existing `npm run check` and `npm run test:e2e` plus relevant intentional-break controls; verify actual fresh counts, no weakened compaction/receipt/cancellation assertions and separate new evidence from the archived 569/62 baseline.
   - Evidence: fresh npm run check passes (569/569). Fresh npm run test:e2e: packed 43/43, cross-process 1/1, native-summary 18/18 = 62/62. No test assertions were weakened; only fixture pins and paths changed.
 - [ ] 4.3 Run stock-host PTY controls with `gpt-6-luna` and installed dual-watchdog/public-subagent/foreign-tool cases; verify exact-child aborted outcome, ordinary main controls, selected session, callback/budget semantics and unchanged public registration.
+  - Partial evidence (open): an isolated PTY smoke of pushed cac4be1 on Pi 1.3.0-xz with `openai-api-extension/gpt-6-luna` was recorded in `/var/tmp/cw-tui-38b9b163/REPORT.md`.
+    - The Git install with Pi's command under `allow-git=root` prepared runtime 1008e599 with no EALLOWGIT and no install-scripts warning.
+    - Startup loaded the watchdog with no load error.
+    - The main session files contain no result-file text, no `cw` tool call and no prompt leak.
+    - A real Escape during the private run aborted the exact child (`stopReason: "aborted"`) and produced exactly one unlock.
+    - Every private decision child in that isolated home ended `Connection error.`. The ablation `/var/tmp/cw-tui-38b9b163/ABLATION.md` showed the user-accepted 72e9d10 failing identically, back to back, so this is an environment effect and not a regression.
+    - Still open: a successful decision outcome in a faithful host, and the dual-watchdog, public-subagent and foreign-tool cases, which wait for Reflect adoption.
 - [ ] 4.4 Record conformance results, dependency identity, remaining risks and rollback instructions for review; verify only separately authorized commits/pushes or publication actions occur and no runtime fallback or old-file authority is introduced.
+  - Interim record (open until 4.3 closes):
+    - **Dependency identity.**
+      - `pi-extension-utils` is pinned to `github:xz-dev/pi-extension-utils#371d47f594b21c75fe82eab95078e71165774199`.
+      - The root runtime `private-inquiry-subagents-runtime` is pinned to `nicobailon/pi-subagents#1008e5993e90fcf13b815c97c15a0c54f7f6f116` (0.79.0, prepared by the utils postinstall).
+      - `allowScripts` approves only that exact utils commit. The repo `.npmrc` stays `allow-git=root`.
+    - **Authorized pushes.** Adoption commit cac4be1 was pushed fast-forward to master and CI run 39283256323 succeeded. Commits are unsigned per the user's instruction.
+    - **No fallback.** No local executor, patch, bundled runtime or old result-file authority remains.
+    - **Risks.**
+      - Later utils commits (47c4122..46d2a4c) only fix Windows CI. They make private inquiry fail closed on win32 and leave Linux/macOS behavior identical. Continue stays on 371d47f.
+      - A nested Pi that inherits `PI_EXTENSION_UTILS_PROCESS_DOMAIN`/`PI_CONTINUE_WATCHDOG_ROOT_PID` joins the parent's domain as a child (observed in the TUI smoke). This is pre-existing and not changed here.
+      - Seven dependency alerts are still untriaged.
+    - **Rollback.** Reinstall the user-accepted 72e9d10, or archive commit 42387d7, which bundles its own runtime. No data migration is involved; legacy and native records stay readable by both.
