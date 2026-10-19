@@ -57,7 +57,7 @@
     "private-inquiry-subagents-runtime": "git+https://github.com/nicobailon/pi-subagents.git#1008e5993e90fcf13b815c97c15a0c54f7f6f116"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.12",
+    "@biomejs/biome": "^2.5.15",
     "@earendil-works/pi-ai": "1.3.0",
     "@earendil-works/pi-coding-agent": "1.3.0",
     "@earendil-works/pi-tui": "1.3.0",
