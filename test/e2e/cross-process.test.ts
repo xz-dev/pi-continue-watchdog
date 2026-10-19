@@ -172,7 +172,23 @@ async function makePackedFixture(
 	assert.deepEqual(installedManifest.pi?.extensions, ["./src/extension.ts"]);
 	assert.equal(
 		installedManifest.dependencies?.["pi-extension-utils"],
-		"git+https://github.com/xz-dev/pi-extension-utils.git#210f84e",
+		JSON.parse(await readFile(join(repoRoot, "package.json"), "utf8"))
+			.dependencies["pi-extension-utils"],
+	);
+	// The fixture installs with --ignore-scripts; run the shared runtime's
+	// own preparation exactly as a production postinstall would.
+	await execFileAsync(
+		process.execPath,
+		[
+			join(
+				installRoot,
+				"node_modules",
+				"pi-extension-utils",
+				"scripts",
+				"prepare-private-runtime.mjs",
+			),
+		],
+		{ cwd: installRoot, timeout: 30_000 },
 	);
 	const utilsPackage = join(installRoot, "node_modules", "pi-extension-utils");
 	const utilsManifest = JSON.parse(

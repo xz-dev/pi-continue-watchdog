@@ -19,11 +19,11 @@ import {
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
 import {
 	createWatchdogRuntime,
 	type WatchdogForkInput,
-} from "watchdog-subagents-runtime/watchdog-runtime";
+} from "private-inquiry-subagents-runtime/watchdog-runtime";
+import { Type } from "typebox";
 
 import {
 	DECISION_MESSAGE_TYPE,
@@ -197,6 +197,7 @@ async function createFixture(
 				agentDir: childAgentDir,
 				resultFile,
 				model: `${model.provider}/${model.id}:${created.session.thinkingLevel}`,
+				retryPolicy: "disabled",
 				...overrides,
 			}),
 	};
@@ -221,7 +222,7 @@ test("private full fork owns a separate session without registering parent tools
 	const metadata = JSON.parse(
 		await readFile(
 			new URL(
-				"../node_modules/watchdog-subagents-runtime/package.json",
+				"../node_modules/private-inquiry-subagents-runtime/package.json",
 				import.meta.url,
 			),
 			"utf8",

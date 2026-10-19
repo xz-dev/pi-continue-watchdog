@@ -66,7 +66,7 @@ A terminal ordinary main error unlocks immediately; an actual main abort keeps i
 
 ## Pinned private runtime and patch
 
-The package bundles `watchdog-subagents-runtime`, an alias pinned to pi-subagents `0.79.0` at `1008e5993e90fcf13b815c97c15a0c54f7f6f116`, with `patches/pi-subagents-0.79.0/` and `scripts/prepare-private-runtime.mjs`.
+The private runtime is owned by the shared `pi-extension-utils/private-inquiry` entry, which pins pi-subagents `0.79.0` at `1008e5993e90fcf13b815c97c15a0c54f7f6f116` (private name `private-inquiry-subagents-runtime`) with its `patches/pi-subagents-0.79.0/` and `scripts/prepare-private-runtime.mjs`. Continue keeps only its policy adapter in `src/private-decision.ts` (decision validator, unlock-only review, `watchdog_result_file`/`decision.json` naming, disabled child auto-retry) and declares the runtime spec as a direct dependency so `allow-git=root` installs it.
 
 Preparation verifies package identity/version and expected upstream source hashes before applying replacements. It refuses a linked/shared runtime target. Each changed file is written to a new inode and atomically renamed within the package-local dependency, avoiding mutation of shared package-manager hardlinks. This is per-file atomic replacement, not a claim of a transaction across all files. The prepared dependency exposes only `./watchdog-runtime` and removes its public Pi extension manifest.
 

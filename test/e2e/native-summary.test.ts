@@ -294,6 +294,21 @@ async function makePackedFixture(t: TestContext): Promise<PackedFixture> {
 	const manifest = JSON.parse(
 		await readFile(join(repoRoot, "package.json"), "utf8"),
 	) as { name: string };
+	// The fixture installs with --ignore-scripts; run the shared runtime's
+	// own preparation exactly as a production postinstall would.
+	await execFileAsync(
+		process.execPath,
+		[
+			join(
+				installRoot,
+				"node_modules",
+				"pi-extension-utils",
+				"scripts",
+				"prepare-private-runtime.mjs",
+			),
+		],
+		{ cwd: installRoot, timeout: 30_000 },
+	);
 	const packageDir = join(installRoot, "node_modules", manifest.name);
 
 	// Probe extension: records the public preparation objects, applies the

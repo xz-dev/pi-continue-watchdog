@@ -25,7 +25,7 @@ import {
 	type InquiryFoldMessage,
 } from "pi-extension-utils/pi-inquiry";
 import { PreemptTakeover } from "pi-extension-utils/preempt-takeover";
-import { createWatchdogRuntime } from "watchdog-subagents-runtime/watchdog-runtime";
+import { createWatchdogRuntime } from "private-inquiry-subagents-runtime/watchdog-runtime";
 
 import {
 	type ActivityGeneration,

@@ -184,6 +184,13 @@ async function makePackedFixture(
 	};
 	assert.deepEqual(installedManifest.pi?.extensions, ["./src/extension.ts"]);
 	const utilsPackage = join(installRoot, "node_modules", "pi-extension-utils");
+	// The fixture installs with --ignore-scripts; run the shared runtime's
+	// own preparation exactly as a production postinstall would.
+	await execFileAsync(
+		process.execPath,
+		[join(utilsPackage, "scripts", "prepare-private-runtime.mjs")],
+		{ cwd: utilsPackage, timeout: 30_000 },
+	);
 	const utilsManifest = JSON.parse(
 		await readFile(join(utilsPackage, "package.json"), "utf8"),
 	) as { name?: string; bin?: Record<string, string> };
@@ -1193,9 +1200,9 @@ test("packed independent public pi-subagents keeps its surface and cannot select
 		const privateManifest = JSON.parse(
 			await readFile(
 				join(
-					fixture.packageDir,
+					fixture.installRoot,
 					"node_modules",
-					"watchdog-subagents-runtime",
+					"private-inquiry-subagents-runtime",
 					"package.json",
 				),
 				"utf8",
@@ -2744,18 +2751,11 @@ test("packed private runtime creates a full fork without a developer checkout or
 	timeout: 180_000,
 }, async (t) => {
 	const fixture = await makePackedFixture(t, { includeWatchdog: false });
-	await execFileAsync(
-		process.execPath,
-		["scripts/prepare-private-runtime.mjs"],
-		{
-			cwd: fixture.packageDir,
-			timeout: 30_000,
-		},
-	);
+	// Prepared by the shared runtime's own script in makePackedFixture.
 	const privateDir = join(
-		fixture.packageDir,
+		fixture.installRoot,
 		"node_modules",
-		"watchdog-subagents-runtime",
+		"private-inquiry-subagents-runtime",
 	);
 	const metadata = JSON.parse(
 		await readFile(join(privateDir, "package.json"), "utf8"),
@@ -2780,7 +2780,7 @@ test("packed private runtime creates a full fork without a developer checkout or
 		probePath,
 		`
 import { mkdir, writeFile } from "node:fs/promises";
-import { createWatchdogRuntime } from "watchdog-subagents-runtime/watchdog-runtime";
+import { createWatchdogRuntime } from "private-inquiry-subagents-runtime/watchdog-runtime";
 export default function (pi) {
   pi.on("session_start", async (_event, ctx) => {
     const runtime = createWatchdogRuntime();

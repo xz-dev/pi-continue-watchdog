@@ -6,7 +6,7 @@ import type {
 	WatchdogChildSession,
 	WatchdogForkInput,
 	WatchdogRuntime,
-} from "watchdog-subagents-runtime/watchdog-runtime";
+} from "private-inquiry-subagents-runtime/watchdog-runtime";
 
 import {
 	type PrivateDecisionOptions,
