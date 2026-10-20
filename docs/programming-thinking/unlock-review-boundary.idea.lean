@@ -61,7 +61,9 @@ def current (observation : CurrentnessObservation) : Bool :=
   observation.sameSessionModelThinking && observation.sameExternalGeneration &&
   observation.aggregateIdle && observation.notCancelled
 
--- Service observations distinguish accepted answers from malformed, incomplete and unobserved results; transport attempts remain optional diagnostics.
+-- Service results distinguish accepted final answers from malformed, errored and aborted results.
+-- Version two removed transport-observation completeness and unresolved tracking:
+-- acceptance is the strict final-answer contract alone.
 inductive NativeAcceptedAnswer where
   | supported | challenged | insufficient
   deriving DecidableEq, Repr
@@ -71,7 +73,7 @@ inductive ServiceStop where
   deriving DecidableEq, Repr
 
 inductive IncompleteReason where
-  | error | aborted | malformed | unresolved | unobserved | insufficient
+  | error | aborted | malformed | insufficient
   deriving DecidableEq, Repr
 
 inductive Disposition where
@@ -81,11 +83,8 @@ inductive Disposition where
 structure ServiceResult where
   stop : ServiceStop
   requiredShapeValid : Bool
-  optionalAccountingAdmissible : Bool
-  requiredUnresolved : Bool
-  completeObservation : Bool
+  requiredDropped : Bool
   acceptedAnswer : Option NativeAcceptedAnswer
-  reportedAttempts : Option Nat
   deriving DecidableEq, Repr
 
 def classify (result : ServiceResult) : Disposition :=
@@ -94,10 +93,9 @@ def classify (result : ServiceResult) : Disposition :=
   | .capacityError | .deadline | .inactivity | .error => .incomplete .error
   | .malformed => .incomplete .malformed
   | .stop =>
-    if !(result.requiredShapeValid && result.optionalAccountingAdmissible) then
+    if !result.requiredShapeValid then
       .incomplete .malformed
-    else if result.requiredUnresolved then .incomplete .unresolved
-    else if !result.completeObservation then .incomplete .unobserved
+    else if result.requiredDropped then .incomplete .insufficient
     else match result.acceptedAnswer with
       | none => .incomplete .malformed
       | some .supported => .supported
@@ -343,26 +341,20 @@ def recoverHistory (history : List Disposition) : HistoryRecovery :=
 def mainModelContextAfter (_result : PrivateRun) (parentContext : List Fact) : List Fact :=
   parentContext
 
--- Accepted observed challenges, inquiry preservation and frozen review requests establish local safety independently of LLM judgment quality.
+-- Accepted challenges, inquiry preservation and frozen review requests establish local safety independently of LLM judgment quality.
 def AcceptedChallenge (result : ServiceResult) : Prop :=
   result.stop = .stop ∧ result.requiredShapeValid = true ∧
-  result.optionalAccountingAdmissible = true ∧ result.requiredUnresolved = false ∧
-  result.completeObservation = true ∧ result.acceptedAnswer = some .challenged
+  result.requiredDropped = false ∧ result.acceptedAnswer = some .challenged
 
-theorem challenge_requires_accepted_observation (result : ServiceResult)
+theorem challenge_requires_valid_final_answer (result : ServiceResult)
     (challenged : classify result = .challenged) : AcceptedChallenge result := by
-  rcases result with ⟨transportStop, shape, accounting, unresolved, observation, answer, attempts⟩
+  rcases result with ⟨transportStop, shape, dropped, answer⟩
   cases answer with
   | none =>
-    cases transportStop <;> cases shape <;> cases accounting <;> cases unresolved <;>
-      cases observation <;> simp [classify] at challenged
+    cases transportStop <;> cases shape <;> cases dropped <;> simp [classify] at challenged
   | some answer =>
-    cases answer <;> cases transportStop <;> cases shape <;> cases accounting <;>
-      cases unresolved <;> cases observation <;>
+    cases answer <;> cases transportStop <;> cases shape <;> cases dropped <;>
       simp [classify, AcceptedChallenge] at challenged ⊢
-
-theorem optional_attempt_count_does_not_authorize (result : ServiceResult) (attempts : Option Nat) :
-    classify { result with reportedAttempts := attempts } = classify result := by rfl
 
 theorem inquiry_invariant (child : String) (fuel : Nat) (observations : Nat → AttemptObservation) :
     InquiryInvariant child fuel (inquire child fuel observations) := by
@@ -680,7 +672,7 @@ theorem process_is_correct (operation : Operation) (observations : Observations)
       (recoverHistory history).temporaryFileAuthority = false ∧
       (recoverHistory history).pendingResult = none) := by
   exact ⟨run_invariant operation observations, at_most_six_same_child_responses operation observations,
-    challenge_requires_accepted_observation, stale_parent_cannot_act, terminal_callback_is_inert,
+    challenge_requires_valid_final_answer, stale_parent_cannot_act, terminal_callback_is_inert,
     no_receipt_no_continue_charge, final_shared_budget_bound,
     parent_context_isolated (run operation observations), run_conditional_termination operation observations,
     final_candidate_origin operation observations, no_authority_from_audit_or_recovery⟩
@@ -700,7 +692,7 @@ def demoResponses (action : Action) (index : Nat) : AttemptObservation :=
   ⟨demoLive, demoLive, if index < 2 then .invalid else .valid (demoCandidate action)⟩
 
 def demoChallenge : ServiceResult :=
-  ⟨.stop, true, true, false, true, some .challenged, some 9⟩
+  ⟨.stop, true, false, some .challenged⟩
 
 def demoObservations : Observations :=
   ⟨demoResponses .unlock, demoResponses .continueWork, .settled demoChallenge, demoLive, demoLive⟩

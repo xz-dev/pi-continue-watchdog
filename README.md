@@ -39,13 +39,14 @@ Versioned context-excluded native JSONL entries associate source identities/view
 
 ### Unlock review
 
-Review is on by default (`unlockReviewEnabled: true`). A valid initial AI `unlock`, including a callback candidate, uses an already-loaded [`pi-llm-as-jev`](https://github.com/xz-dev/pi-llm-as-jev) review-v1 service when available. The watchdog does not install it, choose a fallback provider or resolve its credentials. `continue`, invalid results, manual unlock, abort and terminal-error unlock are not reviewed.
+Review is on by default (`unlockReviewEnabled: true`). A valid initial AI `unlock`, including a callback candidate, uses an already-loaded [`pi-llm-as-jev`](https://github.com/xz-dev/pi-llm-as-jev) version-two `judge()` service when available. The watchdog does not install it, choose a fallback provider or resolve its credentials. `continue`, invalid results, manual unlock, abort and terminal-error unlock are not reviewed.
 
 - **Input:** freeze the owning main session's complete effective conversation, not the child's private retries. Include full public text, labelled summaries, tool name/call/status only (no arguments/output), and `ask_user_question` question/answer text. Exclude owned controls, thinking and context-excluded bash. Known provider secrets are redacted by the service. This macro evidence is not the bounded 8,000-code-point supplement.
 - **Supported:** release the original candidate through normal currentness/publication guards.
 - **Incomplete:** missing/incompatible service, known input gaps, error, timeout, overflow, unsupported content or insufficient evidence warn and release the still-current original candidate **unreviewed**, never as approval. Missing/incompatible service warns once per runtime; other skips warn each time. No watchdog review timer is added; service-owned timeouts apply.
 - **Challenged:** append opinion-not-evidence feedback to the same child and allow one reconsideration inquiry. Apply its terminal result normally, with no second review. Format corrections and reconsideration spend no continuation units.
-- **Escape/history:** takeover, manual unlock, abort and lifecycle/currentness loss cancel review. Append review diagnostics to native JSONL best-effort; reopening reads history and never resumes review.
+- **Acceptance:** only a live `stop` result whose required answer is present, correctly typed (`choice`) and a legal `supported`/`challenged`/`insufficient_evidence` label counts; dropped or missing required answers never become a challenge. Transport-attempt observations no longer exist and are not required or fabricated.
+- **Escape/history:** takeover, manual unlock, abort and lifecycle/currentness loss cancel review. Append review disposition, service identity and optional backend-reported usage to native JSONL best-effort; reopening reads history and never resumes review.
 
 Review is a second opinion, not proof of completion or a fix for false continuations.
 
