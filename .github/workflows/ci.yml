@@ -31,19 +31,28 @@ jobs:
           node --input-type=module -e 'import("pi-extension-utils/process-domain").then((module) => { if (typeof module.openProcessDomain !== "function") process.exit(1); })'
           # The private runtime must be prepared by the utils postinstall.
           node -e 'const p=require("./node_modules/private-inquiry-subagents-runtime/package.json"); if (!p.exports?.["./watchdog-runtime"]) process.exit(1)'
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.3
-      - name: Verify Bun Git-clone install (standalone Pi's package manager)
+      - name: Install the released standalone Pi exactly as users get it
         run: |
-          # The xz-dev standalone Pi installs Git packages with embedded Bun 1.4.3
-          # (`install --omit=dev --omit=peer`), which blocks untrusted dependency
-          # scripts. Without trustedDependencies the utils postinstall never ran and
-          # the extension failed to load (d7edcc8).
-          install_root="$(mktemp -d)"
-          git clone --local . "$install_root/pi-continue-watchdog"
-          cd "$install_root/pi-continue-watchdog"
-          bun install --omit=dev --omit=peer 2>&1 | tee "$install_root/bun.log"
-          if grep -qi "blocked" "$install_root/bun.log"; then echo "::error::Bun blocked a dependency install script"; exit 1; fi
-          node -e 'const p=require("./node_modules/private-inquiry-subagents-runtime/package.json"); if (!p.exports?.["./watchdog-runtime"]) { console.error("private runtime not prepared"); process.exit(1) }'
-          test -f node_modules/private-inquiry-subagents-runtime/src/api/watchdog-runtime.ts
+          # The xz-dev standalone Pi installs Git packages with its embedded Bun, which
+          # blocks untrusted dependency scripts. npm-only checks passed d7edcc8, which
+          # then failed to load for users. Verify the release checksum, then install
+          # this commit with the real binary.
+          release=xz-v1.3.0-xz.339.1.g12ba93b4
+          dir="$RUNNER_TEMP/pi-release"
+          mkdir -p "$dir" && cd "$dir"
+          gh release download "$release" -R xz-dev/pi -p pi-linux-x64-gnu-baseline.zip -p SHA256SUMS
+          grep ' pi-linux-x64-gnu-baseline.zip$' SHA256SUMS | sha256sum -c -
+          unzip -q pi-linux-x64-gnu-baseline.zip
+          ./pi --version
+          echo "PI_BIN=$dir/pi" >> "$GITHUB_ENV"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Real pi install and load of this commit (clean agent dir, git+sh only)
+        run: |
+          # Serve this exact commit from a local Git daemon; Pi installs Git sources by URL.
+          root="$RUNNER_TEMP/git-serve"
+          mkdir -p "$root/ci/pi-continue-watchdog"
+          git clone --bare --quiet . "$root/ci/pi-continue-watchdog/.git"
+          git daemon --reuseaddr --base-path="$root" --export-all --port=19418 --listen=127.0.0.1 --detach --pid-file="$RUNNER_TEMP/git-daemon.pid"
+          for i in $(seq 1 20); do git ls-remote git://127.0.0.1:19418/ci/pi-continue-watchdog >/dev/null 2>&1 && break; sleep 0.5; done
+          HOME="$(mktemp -d)" scripts/pi-install-smoke.sh "git:git://127.0.0.1:19418/ci/pi-continue-watchdog@$(git rev-parse HEAD)"
