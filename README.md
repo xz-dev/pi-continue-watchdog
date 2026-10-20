@@ -109,7 +109,10 @@ For development in a writable checkout:
 ```sh
 npm run check      # lint + typecheck + unit tests + build
 npm run test:e2e   # packed-Pi, cross-process and native-summary integration suites
+scripts/pi-install-smoke.sh git:github.com/xz-dev/pi-continue-watchdog <sha>  # real `pi install` + load, clean agent dir
 ```
+
+Run the install smoke on the exact pushed commit before release. The packed suites install with npm and `--ignore-scripts`, so they cannot see how the user's Pi installs. The xz-dev standalone Pi uses embedded Bun, which runs the utils preparation only because of `trustedDependencies`; npm runs it because of `allowScripts`.
 
 **Automated gates passed on frozen source.** `npm run check` passed lint, typecheck, **569 unit tests** and build. `npm run test:e2e` passed **62 cases**: 43 packed, one cross-process and 18 native-summary cases, with no skips or cancellations. This includes independently installed public pi-subagents, foreign `cw` ownership, and the concurrent empty-message ownership fix preserved from `master`. Four affected Lean files typechecked and ran with Lean `4.35.0`, without warnings or proof placeholders; their claims cover abstract models, not host refinement. Four normal-versus-mutated controls detected broken response bounds, child reuse, stale-file rejection and registration isolation.
 
