@@ -44,7 +44,7 @@ jobs:
             assert.equal(JSON.parse(fs.readFileSync("package.json")).private, true);
             console.log(pack.filename, pack.integrity, pack.files.length);
           '
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: git-source-package
           path: ${{ runner.temp }}/pi-continue-watchdog-*.tgz
