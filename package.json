@@ -68,8 +68,5 @@
   },
   "allowScripts": {
     "github:xz-dev/pi-extension-utils#371d47f594b21c75fe82eab95078e71165774199": true
-  },
-  "trustedDependencies": [
-    "pi-extension-utils"
-  ]
+  }
 }

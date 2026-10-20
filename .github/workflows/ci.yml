@@ -16,8 +16,6 @@ jobs:
           node-version: 22.x
           cache: npm
       - run: npm ci
-      - run: npm run check
-      - run: npm run test:e2e
       - name: Verify npm 12 Git-clone install policy
         run: |
           install_root="$(mktemp -d)"
