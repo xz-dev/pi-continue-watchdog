@@ -110,6 +110,7 @@ import {
 	buildUnlockReviewProjection,
 	buildUnlockReviewRequest,
 	discoverUnlockReviewService,
+	type JudgeUsage,
 	type ReviewServiceLike,
 	runUnlockReview,
 	UNLOCK_REVIEW_PROJECTION_VERSION,
@@ -269,14 +270,12 @@ export interface UnlockReviewRecord {
 	readonly model?: string;
 	readonly sourceHeadId?: string;
 	readonly gaps?: number;
-	readonly attemptCount?: number;
-	readonly observationCoverage?: "complete" | "unavailable";
-	readonly usage?: {
-		readonly inputTokens: number;
-		readonly outputTokens: number;
-		readonly costUsd: number;
-		readonly missing: number;
-	};
+	/**
+	 * Backend-reported terminal-attempt usage forwarded by the version-two
+	 * service. Absent stays absent: never a complete-operation charge or
+	 * zero-cost claim.
+	 */
+	readonly usage?: JudgeUsage;
 	readonly errorMessage?: string;
 	readonly contextOverflow?: boolean;
 	/** Exchange id of the replacement inquiry a challenge opened, once known. */
@@ -1568,12 +1567,6 @@ export function createDecisionRuntime(
 				? {}
 				: { sourceHeadId: projection.sourceHeadId }),
 			...(projection.gaps.length === 0 ? {} : { gaps: projection.gaps.length }),
-			...(report.attemptCount === undefined
-				? {}
-				: { attemptCount: report.attemptCount }),
-			...(report.observationCoverage === undefined
-				? {}
-				: { observationCoverage: report.observationCoverage }),
 			...(report.usage === undefined ? {} : { usage: report.usage }),
 			...(report.errorMessage === undefined
 				? {}
@@ -2097,8 +2090,6 @@ export function createDecisionRuntime(
 									: {}),
 								backend: report.backend,
 								model: report.model,
-								attemptCount: report.attemptCount,
-								observationCoverage: report.observationCoverage,
 								usage: report.usage,
 							});
 							return report.outcome.kind === "challenged"

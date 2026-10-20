@@ -20,8 +20,8 @@ import {
 } from "../src/hub.js";
 import type {
 	JudgeRequest,
-	ReviewResult,
-	ReviewService,
+	JudgeResult,
+	JudgmentService,
 } from "../src/judgment-client.js";
 import type { ProcessDomainCoordinator } from "../src/process-domain.js";
 import {
@@ -80,10 +80,19 @@ class FakeClock implements RuntimeClock {
 
 type Handler = (event: never, ctx: ExtensionContext) => unknown;
 
+const FIXTURE_USAGE = {
+	input: 10,
+	output: 5,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 15,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.001 },
+};
+
 function reviewResult(
 	choice: string,
-	overrides: Partial<ReviewResult> = {},
-): ReviewResult {
+	overrides: Partial<JudgeResult> = {},
+): JudgeResult {
 	return {
 		answers: {
 			[UNLOCK_REVIEW_QUESTION_ID]: {
@@ -97,29 +106,7 @@ function reviewResult(
 		backend: "classifier",
 		model: "typesafe/jev-1.13",
 		stopReason: "stop",
-		reuse: { hits: 0, joined: 0, sent: 1 },
-		progress: { stages: [] },
-		diagnostics: {
-			attempts: [
-				{
-					id: "fixture#1",
-					ordinal: 1,
-					phase: "end",
-					outcome: "response",
-					inputTokens: 10,
-					outputTokens: 5,
-					costUsd: 0.001,
-				},
-			],
-			attemptCount: 1,
-			usage: {
-				inputTokens: { knownSum: 10, missing: 0 },
-				outputTokens: { knownSum: 5, missing: 0 },
-				costUsd: { knownSum: 0.001, missing: 0 },
-			},
-			observationCoverage: "complete",
-		},
-		unresolved: [],
+		usage: FIXTURE_USAGE,
 		...overrides,
 	};
 }
@@ -189,7 +176,7 @@ afterEach(async () => {
 
 function createHarness(options?: {
 	readonly config?: Partial<ContinueWatchdogConfig>;
-	readonly reviewResult?: () => Promise<ReviewResult>;
+	readonly reviewResult?: () => Promise<JudgeResult>;
 	readonly reviewDelay?: boolean;
 	readonly processDomain?: ProcessDomainCoordinator;
 	readonly hooks?: HarnessHooks;
@@ -236,16 +223,9 @@ function createHarness(options?: {
 	const signals: (AbortSignal | undefined)[] = [];
 	const pendingResolvers: Array<() => void> = [];
 
-	const reviewService: ReviewService = {
-		version: 1,
-		reviewVersion: 1,
-		judge: async () => {
-			throw new Error("judge must not be called");
-		},
-		availability: async () => {
-			throw new Error("availability probe must not be called");
-		},
-		review: async (req, opts) => {
+	const reviewService: JudgmentService = {
+		version: 2,
+		judge: async (req, opts) => {
 			reviewCalls.push(req);
 			harness.reviewPending = true;
 			signals.push(opts?.signal);
@@ -264,6 +244,9 @@ function createHarness(options?: {
 			} finally {
 				harness.reviewPending = false;
 			}
+		},
+		availability: async () => {
+			throw new Error("availability probe must not be called");
 		},
 	};
 
@@ -663,7 +646,7 @@ test("reviewed unlock publishes user-ready without waiting for another settle or
 			label: "incomplete (service error)",
 			result: () => Promise.reject(new Error("service down")),
 		},
-	] satisfies Array<{ label: string; result: () => Promise<ReviewResult> }>) {
+	] satisfies Array<{ label: string; result: () => Promise<JudgeResult> }>) {
 		const hooks: string[] = [];
 		const harness = createHarness({
 			config: ENABLED,
@@ -757,6 +740,44 @@ test("enabled with no jev service: warns, skips review, and unlocks normally", a
 		(record.data as { incompleteReason?: string }).incompleteReason,
 		"unavailable",
 	);
+});
+
+test("v1 discovery remains incomplete and releases only the current original unlock", async () => {
+	const key = Symbol.for("pi-llm-as-jev:service");
+	const registry = globalThis as Record<symbol, unknown>;
+	const previous = Object.getOwnPropertyDescriptor(registry, key);
+	let calls = 0;
+	Object.defineProperty(registry, key, {
+		configurable: true,
+		value: {
+			version: 1,
+			judge: async () => {
+				calls++;
+				throw new Error("Incompatible service must not run");
+			},
+		},
+	});
+	try {
+		const harness = createHarness({ config: ENABLED, noInjectedService: true });
+		await harness.openDecision();
+		await harness.settle(harness.answer());
+		await flush(harness);
+		assert.equal(calls, 0);
+		assert.equal(harness.controller.snapshot.locked, false);
+		assert.equal(harness.driver.children.length, 1);
+		const record = harness.entries.find(
+			(e) => e.type === UNLOCK_REVIEW_ENTRY_TYPE,
+		);
+		assert.ok(record);
+		assert.equal((record.data as { outcome?: string }).outcome, "incomplete");
+		assert.equal(
+			(record.data as { incompleteReason?: string }).incompleteReason,
+			"incompatible",
+		);
+	} finally {
+		if (previous === undefined) delete registry[key];
+		else Object.defineProperty(registry, key, previous);
+	}
 });
 
 test("service error and abort map to incomplete, never approval", async () => {
@@ -1054,11 +1075,11 @@ test("manual unlock aborts an unbounded in-flight review; late settle is inert",
 	// immediately via the lifecycle-linked AbortController, and a late
 	// settlement callback must never publish, relock, or charge.
 	const abortStates: boolean[] = [];
-	let resolveReview: ((result: ReviewResult) => void) | undefined;
+	let resolveReview: ((result: JudgeResult) => void) | undefined;
 	const harness = createHarness({
 		config: ENABLED,
 		reviewResult: () =>
-			new Promise<ReviewResult>((resolve) => {
+			new Promise<JudgeResult>((resolve) => {
 				resolveReview = resolve;
 			}),
 	});
@@ -1975,25 +1996,31 @@ test("F4 runtime: captured whole ordered fixed snapshot survives overflow fallba
 
 for (const kind of [
 	"null",
-	"missing-unresolved",
-	"unobserved",
-	"bad-usage",
+	"missing-answer",
+	"dropped-answer",
+	"wrong-type",
 	"overflow",
 ] as const) {
 	test(`F7 runtime: ${kind} falls back to current original unlock once`, async () => {
 		const payload =
 			kind === "null"
 				? null
-				: kind === "missing-unresolved"
-					? { ...reviewResult("challenged"), unresolved: undefined }
-					: kind === "unobserved"
-						? { ...reviewResult("challenged"), diagnostics: undefined }
-						: kind === "bad-usage"
+				: kind === "missing-answer"
+					? { ...reviewResult("challenged"), answers: {} }
+					: kind === "dropped-answer"
+						? {
+								...reviewResult("challenged"),
+								answers: {},
+								dropped: [UNLOCK_REVIEW_QUESTION_ID],
+							}
+						: kind === "wrong-type"
 							? {
 									...reviewResult("challenged"),
-									diagnostics: {
-										...reviewResult("challenged").diagnostics,
-										usage: null,
+									answers: {
+										[UNLOCK_REVIEW_QUESTION_ID]: {
+											type: "bool",
+											probability: 1,
+										},
 									},
 								}
 							: reviewResult("supported", {
@@ -2002,7 +2029,7 @@ for (const kind of [
 									contextOverflow: true,
 								});
 		const harness = createHarness({
-			reviewResult: async () => payload as ReviewResult,
+			reviewResult: async () => payload as JudgeResult,
 		});
 		await harness.openDecision();
 		await harness.settle(harness.answer("Original still-current unlock."));
@@ -2032,7 +2059,7 @@ for (const cancel of ["manual", "restart"] as const) {
 	test(`F7 runtime: late malformed result after ${cancel} cannot affect replacement`, async () => {
 		const harness = createHarness({
 			reviewDelay: true,
-			reviewResult: async () => null as unknown as ReviewResult,
+			reviewResult: async () => null as unknown as JudgeResult,
 		});
 		await harness.openDecision();
 		await harness.settle(harness.answer());
@@ -2055,45 +2082,24 @@ for (const cancel of ["manual", "restart"] as const) {
 	});
 }
 
-test("review association record carries service identity and accounting", async () => {
+test("review association record carries service identity and scoped usage", async () => {
 	const harness = createHarness({
 		config: ENABLED,
 		reviewResult: async () =>
 			reviewResult("supported", {
-				diagnostics: {
-					attempts: [
-						{
-							id: "fixture#1",
-							ordinal: 1,
-							phase: "end",
-							outcome: "response",
-							inputTokens: 100,
-							outputTokens: 0,
-							costUsd: 0.01,
-						},
-						{
-							id: "fixture#2",
-							ordinal: 2,
-							phase: "end",
-							outcome: "response",
-							inputTokens: 0,
-							outputTokens: 50,
-						},
-						{
-							id: "fixture#3",
-							ordinal: 3,
-							phase: "end",
-							outcome: "response",
-							costUsd: 0,
-						},
-					],
-					attemptCount: 3,
-					usage: {
-						inputTokens: { knownSum: 100, missing: 1 },
-						outputTokens: { knownSum: 50, missing: 1 },
-						costUsd: { knownSum: 0.01, missing: 1 },
+				usage: {
+					input: 100,
+					output: 50,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 150,
+					cost: {
+						input: 0.01,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						total: 0.01,
 					},
-					observationCoverage: "complete",
 				},
 			}),
 	});
@@ -2119,8 +2125,14 @@ test("review association record carries service identity and accounting", async 
 		(association.data as { exchangeId: string }).exchangeId,
 	);
 	assert.equal(data?.model, "typesafe/jev-1.13");
-	assert.equal(data?.attemptCount, 3);
-	assert.equal((data?.usage as { missing?: number })?.missing, 3);
+	assert.deepEqual(data?.usage, {
+		input: 100,
+		output: 50,
+		totalTokens: 150,
+		costTotal: 0.01,
+	});
+	assert.equal(Object.hasOwn(data, "attemptCount"), false);
+	assert.equal(Object.hasOwn(data, "observationCoverage"), false);
 });
 
 test("review freezes parent macro evidence before private correction/reconsideration traffic", async () => {

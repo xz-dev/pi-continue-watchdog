@@ -10,7 +10,7 @@
  *   name/call/status envelopes and ask_user_question public reply text. No
  *   excerpt bound, last-N suffix, cropping, or prior-opinion substitution.
  * - `buildUnlockReviewRequest` / `runUnlockReview` wrap the vendored
- *   review-v1 client: one stable Choice question, no `timeoutMs`, no
+ *   version-two client: one stable Choice question through `judge()`, no
  *   consumer outer timer, no auto-install or fallback.
  */
 
@@ -31,8 +31,7 @@ import {
 	getJudgmentService,
 	type JsonObject,
 	type JudgeRequest,
-	type ReviewService,
-	type ReviewUsageField,
+	type JudgmentService,
 } from "./judgment-client.js";
 
 /** Bump when the macro projection layout or rubric identity changes. */
@@ -446,9 +445,7 @@ export type UnlockReviewIncompleteReason =
 	| "error"
 	| "aborted"
 	| "insufficient-evidence"
-	| "malformed"
-	| "unresolved"
-	| "unobserved";
+	| "malformed";
 
 export type UnlockReviewOutcome =
 	| { readonly kind: "supported" }
@@ -463,30 +460,26 @@ export interface UnlockReviewReport {
 	/** Selected backend/model when the service reported them. */
 	readonly backend?: string;
 	readonly model?: string;
-	/** Service-observed transport attempts; absent means accounting unknown. */
-	readonly attemptCount?: number;
-	readonly observationCoverage?: "complete" | "unavailable";
-	readonly usage?: {
-		readonly inputTokens: number;
-		readonly outputTokens: number;
-		readonly costUsd: number;
-		/** Sum of per-field missing observation counts, not distinct attempts. */
-		readonly missing: number;
-	};
+	/**
+	 * Backend-reported usage for the terminal attempt only, forwarded
+	 * verbatim. Absent stays absent: it is never a complete-operation charge
+	 * and never reported as zero.
+	 */
+	readonly usage?: JudgeUsage;
 	readonly errorMessage?: string;
 	readonly contextOverflow?: boolean;
 }
 
-/** The review-v1 members the watchdog consumes, structural not nominal. */
-export type ReviewServiceLike = Pick<ReviewService, "review">;
+/** The version-two members the watchdog consumes, structural not nominal. */
+export type ReviewServiceLike = Pick<JudgmentService, "judge">;
 
 /**
- * Call-time discovery of the already-loaded review service. No availability
- * probe, no install, no HTTP or model fallback: absence and version mismatch
- * are returned, never thrown.
+ * Call-time discovery of the already-loaded version-two judgment service. No
+ * availability probe, no install, no HTTP or model fallback: absence and
+ * version mismatch are returned, never thrown.
  */
 export function discoverUnlockReviewService():
-	| { readonly status: "available"; readonly service: ReviewService }
+	| { readonly status: "available"; readonly service: JudgmentService }
 	| { readonly status: "unavailable" | "incompatible" } {
 	let candidate: ReturnType<typeof getJudgmentService>;
 	try {
@@ -495,67 +488,53 @@ export function discoverUnlockReviewService():
 		return { status: "unavailable" };
 	}
 	if (candidate === undefined) return { status: "unavailable" };
-	const review = candidate as Partial<ReviewService>;
 	if (
-		candidate.version === 1 &&
-		review.reviewVersion === 1 &&
-		typeof review.review === "function"
+		candidate.version === 2 &&
+		typeof (candidate as Partial<JudgmentService>).judge === "function"
 	) {
-		return { status: "available", service: review as ReviewService };
+		return { status: "available", service: candidate };
 	}
 	return { status: "incompatible" };
 }
 
-function isUsageField(value: unknown): value is ReviewUsageField {
-	return (
-		isObject(value) &&
-		typeof value.knownSum === "number" &&
-		Number.isFinite(value.knownSum) &&
-		value.knownSum >= 0 &&
-		typeof value.missing === "number" &&
-		Number.isSafeInteger(value.missing) &&
-		value.missing >= 0
-	);
+/** Terminal-attempt backend usage totals reported by the service. */
+export interface JudgeUsage {
+	readonly input: number;
+	readonly output: number;
+	readonly totalTokens: number;
+	readonly costTotal: number;
 }
 
-function usageTotals(value: unknown): UnlockReviewReport["usage"] {
+/**
+ * Forwarded backend usage, kept under its own scope. Anything that is not a
+ * well-formed usage object stays absent rather than becoming zero or
+ * malformed.
+ */
+function scopedUsage(value: unknown): JudgeUsage | undefined {
 	if (!isObject(value)) return undefined;
-	const { inputTokens, outputTokens, costUsd } = value;
+	const { input, output, totalTokens, cost } = value;
 	if (
-		!isUsageField(inputTokens) ||
-		!isUsageField(outputTokens) ||
-		!isUsageField(costUsd)
+		typeof input !== "number" ||
+		!Number.isFinite(input) ||
+		typeof output !== "number" ||
+		!Number.isFinite(output) ||
+		typeof totalTokens !== "number" ||
+		!Number.isFinite(totalTokens) ||
+		!isObject(cost) ||
+		typeof cost.total !== "number" ||
+		!Number.isFinite(cost.total)
 	)
 		return undefined;
-	const missing = inputTokens.missing + outputTokens.missing + costUsd.missing;
-	if (!Number.isSafeInteger(missing)) return undefined;
-	return {
-		inputTokens: inputTokens.knownSum,
-		outputTokens: outputTokens.knownSum,
-		costUsd: costUsd.knownSum,
-		missing,
-	};
+	return { input, output, totalTokens, costTotal: cost.total };
 }
 
 function diagnosticsOf(
 	result: Record<string, unknown>,
 ): Partial<UnlockReviewReport> {
-	const diagnostics = isObject(result.diagnostics)
-		? result.diagnostics
-		: undefined;
-	const usage = usageTotals(diagnostics?.usage);
+	const usage = scopedUsage(result.usage);
 	return {
 		...(typeof result.backend === "string" ? { backend: result.backend } : {}),
 		...(typeof result.model === "string" ? { model: result.model } : {}),
-		...(typeof diagnostics?.attemptCount === "number" &&
-		Number.isSafeInteger(diagnostics.attemptCount) &&
-		diagnostics.attemptCount >= 0
-			? { attemptCount: diagnostics.attemptCount }
-			: {}),
-		...(diagnostics?.observationCoverage === "complete" ||
-		diagnostics?.observationCoverage === "unavailable"
-			? { observationCoverage: diagnostics.observationCoverage }
-			: {}),
 		...(usage === undefined ? {} : { usage }),
 		...(typeof result.errorMessage === "string"
 			? { errorMessage: result.errorMessage }
@@ -574,7 +553,7 @@ function incomplete(
 	};
 }
 
-/** One business call; service-owned bounds and accepted answers, guarded decode. */
+/** One business call; strict final-answer acceptance, guarded decode. */
 export async function runUnlockReview(
 	service: ReviewServiceLike,
 	request: JudgeRequest,
@@ -583,20 +562,20 @@ export async function runUnlockReview(
 	try {
 		if (Array.isArray(request.state.gaps) && request.state.gaps.length > 0)
 			return incomplete(signal.aborted ? "aborted" : "insufficient-evidence");
-		const result: unknown = await service.review(request, { signal });
+		const result: unknown = await service.judge(request, { signal });
 		if (signal.aborted) return incomplete("aborted", result);
 		if (!isObject(result)) return incomplete("malformed");
 		if (result.stopReason === "aborted") return incomplete("aborted", result);
 		if (result.stopReason === "error" || result.contextOverflow === true)
 			return incomplete("error", result);
 		if (result.stopReason !== "stop") return incomplete("malformed", result);
-		if (!Array.isArray(result.unresolved))
-			return incomplete("malformed", result);
-		for (const id of result.unresolved) {
+		// A dropped required id is an explicit decline, never a challenge.
+		if (!Array.isArray(result.dropped)) return incomplete("malformed", result);
+		for (const id of result.dropped) {
 			if (typeof id !== "string") return incomplete("malformed", result);
 		}
-		if (result.unresolved.includes(UNLOCK_REVIEW_QUESTION_ID))
-			return incomplete("unresolved", result);
+		if (result.dropped.includes(UNLOCK_REVIEW_QUESTION_ID))
+			return incomplete("insufficient-evidence", result);
 		if (
 			!isObject(result.answers) ||
 			!Object.hasOwn(result.answers, UNLOCK_REVIEW_QUESTION_ID)
@@ -604,24 +583,6 @@ export async function runUnlockReview(
 			return incomplete("malformed", result);
 		const answer = result.answers[UNLOCK_REVIEW_QUESTION_ID];
 		if (!isObject(answer) || answer.type !== "choice")
-			return incomplete("malformed", result);
-		const diagnostics = result.diagnostics;
-		if (
-			!isObject(diagnostics) ||
-			diagnostics.observationCoverage !== "complete"
-		)
-			return incomplete("unobserved", result);
-		if (
-			diagnostics.attemptCount !== undefined &&
-			(typeof diagnostics.attemptCount !== "number" ||
-				!Number.isSafeInteger(diagnostics.attemptCount) ||
-				diagnostics.attemptCount < 0)
-		)
-			return incomplete("malformed", result);
-		if (
-			diagnostics.usage !== undefined &&
-			usageTotals(diagnostics.usage) === undefined
-		)
 			return incomplete("malformed", result);
 		if (answer.choice === "supported" || answer.choice === "challenged") {
 			return { outcome: { kind: answer.choice }, ...diagnosticsOf(result) };

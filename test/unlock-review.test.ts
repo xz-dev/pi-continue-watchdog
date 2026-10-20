@@ -15,8 +15,8 @@ import {
 } from "../src/context-fold.js";
 import type {
 	JudgeRequest,
-	ReviewResult,
-	ReviewService,
+	JudgeResult,
+	JudgmentService,
 } from "../src/judgment-client.js";
 import {
 	buildUnlockReviewProjection,
@@ -674,16 +674,21 @@ test("discovery is absent/incompatible/available without probes", async (t) => {
 	});
 	delete globals[key];
 	assert.equal(discoverUnlockReviewService().status, "unavailable");
-	globals[key] = { version: 1, judge: async () => ({}) };
-	assert.equal(discoverUnlockReviewService().status, "incompatible");
-	const service: ReviewService = {
+	globals[key] = {
 		version: 1,
+		judge: async () => ({}),
 		reviewVersion: 1,
+		review: async () => ({}),
+	};
+	assert.equal(discoverUnlockReviewService().status, "incompatible");
+	globals[key] = { version: 2 };
+	assert.equal(discoverUnlockReviewService().status, "incompatible");
+	const service: JudgmentService = {
+		version: 2,
 		judge: async () => {
 			throw new Error("unexpected");
 		},
 		availability: async () => ({}),
-		review: async () => ({}) as never,
 	};
 	globals[key] = service;
 	const found = discoverUnlockReviewService();
@@ -693,7 +698,16 @@ test("discovery is absent/incompatible/available without probes", async (t) => {
 
 // ---------- review outcomes ----------
 
-function reviewResult(overrides: Partial<ReviewResult> = {}): ReviewResult {
+const FIXTURE_USAGE = {
+	input: 10,
+	output: 5,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 15,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.001 },
+};
+
+function reviewResult(overrides: Partial<JudgeResult> = {}): JudgeResult {
 	return {
 		answers: {
 			[UNLOCK_REVIEW_QUESTION_ID]: {
@@ -707,29 +721,7 @@ function reviewResult(overrides: Partial<ReviewResult> = {}): ReviewResult {
 		backend: "classifier",
 		model: "typesafe/jev-1.13",
 		stopReason: "stop",
-		reuse: { hits: 0, joined: 0, sent: 1 },
-		progress: { stages: [] },
-		diagnostics: {
-			attempts: [
-				{
-					id: "fixture#1",
-					ordinal: 1,
-					phase: "end",
-					outcome: "response",
-					inputTokens: 10,
-					outputTokens: 5,
-					costUsd: 0.001,
-				},
-			],
-			attemptCount: 1,
-			usage: {
-				inputTokens: { knownSum: 10, missing: 0 },
-				outputTokens: { knownSum: 5, missing: 0 },
-				costUsd: { knownSum: 0.001, missing: 0 },
-			},
-			observationCoverage: "complete",
-		},
-		unresolved: [],
+		usage: FIXTURE_USAGE,
 		...overrides,
 	};
 }
@@ -738,9 +730,9 @@ function fakeService(
 	handler: (
 		req: JudgeRequest,
 		opts: { signal?: AbortSignal },
-	) => Promise<ReviewResult>,
+	) => Promise<JudgeResult>,
 ): {
-	service: ReviewService;
+	service: JudgmentService;
 	calls: JudgeRequest[];
 	signals: (AbortSignal | undefined)[];
 } {
@@ -750,18 +742,14 @@ function fakeService(
 		calls,
 		signals,
 		service: {
-			version: 1,
-			reviewVersion: 1,
-			judge: async () => {
-				throw new Error("judge must not be called");
-			},
-			availability: async () => {
-				throw new Error("availability probe must not be called");
-			},
-			review: async (req, opts) => {
+			version: 2,
+			judge: async (req, opts) => {
 				calls.push(req);
 				signals.push(opts?.signal);
 				return handler(req, opts ?? {});
+			},
+			availability: async () => {
+				throw new Error("availability probe must not be called");
 			},
 		},
 	};
@@ -784,10 +772,15 @@ test("supported and challenged map to outcomes; signal is forwarded, no timeoutM
 	assert.equal(report.outcome.kind, "supported");
 	assert.equal(report.backend, "classifier");
 	assert.equal(report.model, "typesafe/jev-1.13");
-	assert.equal(report.attemptCount, 1);
+	assert.deepEqual(report.usage, {
+		input: 10,
+		output: 5,
+		totalTokens: 15,
+		costTotal: 0.001,
+	});
 	assert.equal(calls.length, 1);
 	assert.equal(signals[0], controller.signal);
-	assert.ok(!("timeoutMs" in (calls[0] as unknown as Record<string, unknown>)));
+	assert.deepEqual(Object.keys(calls[0] ?? {}).sort(), ["questions", "state"]);
 
 	const challenged = fakeService(async () =>
 		reviewResult({
@@ -809,7 +802,7 @@ test("supported and challenged map to outcomes; signal is forwarded, no timeoutM
 	assert.equal(report2.outcome.kind, "challenged");
 });
 
-test("error, aborted, insufficient, malformed, unresolved and unobserved are incomplete", async () => {
+test("error, aborted, insufficient and malformed are incomplete", async () => {
 	const request = buildUnlockReviewRequest(
 		{
 			projectionVersion: UNLOCK_REVIEW_PROJECTION_VERSION,
@@ -820,7 +813,7 @@ test("error, aborted, insufficient, malformed, unresolved and unobserved are inc
 		},
 		{ action: "unlock", reasonType: "JOB_DONE", reason: "done" },
 	);
-	const run = async (result: Partial<ReviewResult>) => {
+	const run = async (result: Partial<JudgeResult>) => {
 		const { service } = fakeService(async () => reviewResult(result));
 		return runUnlockReview(service, request, new AbortController().signal);
 	};
@@ -847,26 +840,13 @@ test("error, aborted, insufficient, malformed, unresolved and unobserved are inc
 	if (insufficient.outcome.kind === "incomplete")
 		assert.equal(insufficient.outcome.reason, "insufficient-evidence");
 	assert.equal((await run({ answers: {} })).outcome.kind, "incomplete");
-	const unresolved = await run({
-		unresolved: [UNLOCK_REVIEW_QUESTION_ID],
+	// A dropped required answer is a declared decline, not a challenge.
+	const dropped = await run({
+		dropped: [UNLOCK_REVIEW_QUESTION_ID],
 		answers: {},
 	});
-	if (unresolved.outcome.kind === "incomplete")
-		assert.equal(unresolved.outcome.reason, "unresolved");
-	const unobserved = await run({
-		diagnostics: {
-			attempts: [],
-			attemptCount: 0,
-			usage: {
-				inputTokens: { knownSum: 0, missing: 1 },
-				outputTokens: { knownSum: 0, missing: 1 },
-				costUsd: { knownSum: 0, missing: 1 },
-			},
-			observationCoverage: "unavailable",
-		},
-	});
-	if (unobserved.outcome.kind === "incomplete")
-		assert.equal(unobserved.outcome.reason, "unobserved");
+	if (dropped.outcome.kind === "incomplete")
+		assert.equal(dropped.outcome.reason, "insufficient-evidence");
 	const thrown = fakeService(async () => {
 		throw new Error("boom");
 	});
@@ -878,23 +858,9 @@ test("error, aborted, insufficient, malformed, unresolved and unobserved are inc
 	assert.equal(report.outcome.kind, "incomplete");
 });
 
-test("missing usage is not reported as zero cost", async () => {
+test("missing usage stays absent and is never reported as zero", async () => {
 	const { service } = fakeService(async () =>
-		reviewResult({
-			diagnostics: {
-				attempts: [
-					{ id: "fixture#1", ordinal: 1, phase: "end", outcome: "response" },
-					{ id: "fixture#2", ordinal: 2, phase: "end", outcome: "response" },
-				],
-				attemptCount: 2,
-				usage: {
-					inputTokens: { knownSum: 0, missing: 2 },
-					outputTokens: { knownSum: 0, missing: 2 },
-					costUsd: { knownSum: 0, missing: 2 },
-				},
-				observationCoverage: "complete",
-			},
-		}),
+		reviewResult({ usage: undefined }),
 	);
 	const report = await runUnlockReview(
 		service,
@@ -910,8 +876,8 @@ test("missing usage is not reported as zero cost", async () => {
 		),
 		new AbortController().signal,
 	);
-	assert.equal(report.usage?.missing, 6);
-	assert.equal(report.attemptCount, 2);
+	assert.equal(report.outcome.kind, "supported");
+	assert.equal(report.usage, undefined);
 });
 
 test("F7: malformed result and missing observation capability never reject or authorize", async () => {
@@ -933,11 +899,10 @@ test("F7: malformed result and missing observation capability never reject or au
 		{},
 		{ ...accepted, stopReason: undefined },
 		{ ...accepted, stopReason: "unknown" },
-		{ ...accepted, unresolved: undefined },
-		{ ...accepted, unresolved: null },
-		{ ...accepted, unresolved: "none" },
-		{ ...accepted, unresolved: [7] },
-		{ ...accepted, unresolved: new Array(1) },
+		{ ...accepted, dropped: undefined },
+		{ ...accepted, dropped: null },
+		{ ...accepted, dropped: "none" },
+		{ ...accepted, dropped: [7] },
 		{ ...accepted, answers: null },
 		{ ...accepted, answers: {} },
 		{
@@ -946,42 +911,13 @@ test("F7: malformed result and missing observation capability never reject or au
 				[UNLOCK_REVIEW_QUESTION_ID]: { type: "choice", choice: "unknown" },
 			},
 		},
-		{ ...accepted, unresolved: [UNLOCK_REVIEW_QUESTION_ID] },
 		{ ...accepted, contextOverflow: true },
 		{ ...accepted, answers: [] },
 		{ ...accepted, answers: { [UNLOCK_REVIEW_QUESTION_ID]: null } },
-		{ ...accepted, diagnostics: undefined },
-		{ ...accepted, diagnostics: null },
-		{ ...accepted, diagnostics: 3 },
-		{ ...accepted, diagnostics: { ...accepted.diagnostics, attemptCount: -1 } },
 		{
 			...accepted,
-			diagnostics: { ...accepted.diagnostics, observationCoverage: undefined },
-		},
-		{
-			...accepted,
-			diagnostics: { ...accepted.diagnostics, observationCoverage: "partial" },
-		},
-		{ ...accepted, diagnostics: { ...accepted.diagnostics, usage: null } },
-		{ ...accepted, diagnostics: { ...accepted.diagnostics, usage: {} } },
-		{
-			...accepted,
-			diagnostics: {
-				...accepted.diagnostics,
-				usage: {
-					...accepted.diagnostics.usage,
-					inputTokens: { knownSum: "10", missing: 0 },
-				},
-			},
-		},
-		{
-			...accepted,
-			diagnostics: {
-				...accepted.diagnostics,
-				usage: {
-					...accepted.diagnostics.usage,
-					costUsd: { knownSum: Number.NaN, missing: 0 },
-				},
+			answers: {
+				[UNLOCK_REVIEW_QUESTION_ID]: { type: "bool", probability: 1 },
 			},
 		},
 	];
@@ -996,7 +932,7 @@ test("F7: malformed result and missing observation capability never reject or au
 		{ action: "unlock", reasonType: "JOB_DONE", reason: "done" },
 	);
 	for (const value of cases) {
-		const fake = fakeService(async () => value as ReviewResult);
+		const fake = fakeService(async () => value as JudgeResult);
 		const report = await runUnlockReview(
 			fake.service,
 			request,
@@ -1011,7 +947,7 @@ test("F7: malformed result and missing observation capability never reject or au
 	}
 	const throwing = {
 		...accepted,
-		get unresolved(): string[] {
+		get dropped(): string[] {
 			throw new Error("decode getter failed");
 		},
 	};
@@ -1027,7 +963,7 @@ test("F7: malformed result and missing observation capability never reject or au
 	);
 });
 
-test("F7: affirmative observation permits cache-hit zero and leaves absent accounting unknown", async () => {
+test("F7: absent usage stays unknown and zero-confidence native answers remain accepted", async () => {
 	const request = buildUnlockReviewRequest(
 		{
 			projectionVersion: UNLOCK_REVIEW_PROJECTION_VERSION,
@@ -1038,40 +974,15 @@ test("F7: affirmative observation permits cache-hit zero and leaves absent accou
 		},
 		{ action: "unlock", reasonType: "JOB_DONE", reason: "done" },
 	);
-	const zero = reviewResult({
-		reuse: { hits: 1, joined: 0, sent: 0 },
-		diagnostics: {
-			attempts: [],
-			attemptCount: 0,
-			observationCoverage: "complete",
-			usage: {
-				inputTokens: { knownSum: 0, missing: 0 },
-				outputTokens: { knownSum: 0, missing: 0 },
-				costUsd: { knownSum: 0, missing: 0 },
-			},
-		},
-	});
-	const cache = await runUnlockReview(
-		fakeService(async () => zero).service,
-		request,
-		new AbortController().signal,
-	);
-	assert.equal(cache.outcome.kind, "supported");
-	assert.equal(cache.attemptCount, 0);
-	const absent = {
-		...zero,
-		diagnostics: { observationCoverage: "complete" },
-	} as ReviewResult;
+	const absent = reviewResult({ usage: undefined });
 	const unknown = await runUnlockReview(
 		fakeService(async () => absent).service,
 		request,
 		new AbortController().signal,
 	);
 	assert.equal(unknown.outcome.kind, "supported");
-	assert.equal(unknown.attemptCount, undefined);
 	assert.equal(unknown.usage, undefined);
-	const nativeAccepted = {
-		...zero,
+	const nativeAccepted = reviewResult({
 		answers: {
 			[UNLOCK_REVIEW_QUESTION_ID]: {
 				type: "choice" as const,
@@ -1080,7 +991,7 @@ test("F7: affirmative observation permits cache-hit zero and leaves absent accou
 				probabilities: {},
 			},
 		},
-	};
+	});
 	assert.equal(
 		(
 			await runUnlockReview(
@@ -1126,16 +1037,6 @@ test("F4: bounded offline capacity fixture receives whole fixed state or returns
 					answers: {},
 					contextOverflow: true,
 					errorMessage: "Fixed state cannot fit fixture capacity",
-					diagnostics: {
-						attempts: [],
-						attemptCount: 0,
-						observationCoverage: "complete",
-						usage: {
-							inputTokens: { knownSum: 0, missing: 0 },
-							outputTokens: { knownSum: 0, missing: 0 },
-							costUsd: { knownSum: 0, missing: 0 },
-						},
-					},
 				});
 			}
 			transports.push(actual.state);

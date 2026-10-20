@@ -4,6 +4,10 @@ on:
   push:
     branches: [master]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -16,8 +20,35 @@ jobs:
           node-version: 22.x
           cache: npm
       - run: npm ci
+      - name: Fetch and identify the independent service master
+        run: |
+          git clone --depth 1 --branch master https://github.com/xz-dev/pi-llm-as-jev.git "$RUNNER_TEMP/judgment"
+          git -C "$RUNNER_TEMP/judgment" rev-parse HEAD
+          npm ci --prefix "$RUNNER_TEMP/judgment"
+          cmp src/judgment-client.ts "$RUNNER_TEMP/judgment/client/judgment-client.ts"
+          echo "PI_JUDGMENT_SOURCE=$RUNNER_TEMP/judgment" >> "$GITHUB_ENV"
+          cd "$RUNNER_TEMP/judgment"
+          node --import tsx --input-type=module -e 'import assert from "node:assert/strict"; import {createJudgmentService} from "./src/service.ts"; const s=createJudgmentService({}); assert.equal(s.version,2); assert.equal(s.capacityVersion,2)'
       - run: npm run check
       - run: npm run test:e2e
+      - name: Verify Git-source package contents
+        run: |
+          npm pack --json --pack-destination "$RUNNER_TEMP" > "$RUNNER_TEMP/package.json"
+          node --input-type=module -e '
+            import fs from "node:fs";
+            import assert from "node:assert/strict";
+            const [pack] = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/package.json"));
+            const files = new Set(pack.files.map(f => f.path));
+            for (const file of ["src/extension.ts", "src/unlock-review.ts", "src/judgment-client.ts", "README.md"]) assert(files.has(file), file);
+            for (const file of files) assert(!/^(test\/|PLAN\/|\.serena\/)/.test(file), file);
+            assert.equal(JSON.parse(fs.readFileSync("package.json")).private, true);
+            console.log(pack.filename, pack.integrity, pack.files.length);
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: git-source-package
+          path: ${{ runner.temp }}/pi-continue-watchdog-*.tgz
+          if-no-files-found: error
       - name: Verify npm 12 Git-clone install policy
         run: |
           install_root="$(mktemp -d)"
@@ -44,6 +75,7 @@ jobs:
           grep ' pi-linux-x64-gnu-baseline.zip$' SHA256SUMS | sha256sum -c -
           unzip -q pi-linux-x64-gnu-baseline.zip
           ./pi --version
+          sha256sum ./pi
           echo "PI_BIN=$dir/pi" >> "$GITHUB_ENV"
         env:
           GH_TOKEN: ${{ github.token }}
