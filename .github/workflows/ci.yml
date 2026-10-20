@@ -29,3 +29,21 @@ jobs:
           # into a forbidden child-install CLI policy.
           NPM_CONFIG_CACHE="$install_root/npm-cache" npx --yes npm@12.0.2 install --omit=dev --no-audit --no-fund
           node --input-type=module -e 'import("pi-extension-utils/process-domain").then((module) => { if (typeof module.openProcessDomain !== "function") process.exit(1); })'
+          # The private runtime must be prepared by the utils postinstall.
+          node -e 'const p=require("./node_modules/private-inquiry-subagents-runtime/package.json"); if (!p.exports?.["./watchdog-runtime"]) process.exit(1)'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+      - name: Verify Bun Git-clone install (standalone Pi's package manager)
+        run: |
+          # The xz-dev standalone Pi installs Git packages with embedded Bun 1.4.3
+          # (`install --omit=dev --omit=peer`), which blocks untrusted dependency
+          # scripts. Without trustedDependencies the utils postinstall never ran and
+          # the extension failed to load (d7edcc8).
+          install_root="$(mktemp -d)"
+          git clone --local . "$install_root/pi-continue-watchdog"
+          cd "$install_root/pi-continue-watchdog"
+          bun install --omit=dev --omit=peer 2>&1 | tee "$install_root/bun.log"
+          if grep -qi "blocked" "$install_root/bun.log"; then echo "::error::Bun blocked a dependency install script"; exit 1; fi
+          node -e 'const p=require("./node_modules/private-inquiry-subagents-runtime/package.json"); if (!p.exports?.["./watchdog-runtime"]) { console.error("private runtime not prepared"); process.exit(1) }'
+          test -f node_modules/private-inquiry-subagents-runtime/src/api/watchdog-runtime.ts
