@@ -114,7 +114,7 @@ function reviewResult(
 interface HarnessHooks {
 	readonly onAppend?: (type: string, data: unknown, harness: Harness) => void;
 	readonly onContext?: (harness: Harness) => void;
-	readonly onWidget?: (value: unknown, harness: Harness) => void;
+	readonly onRender?: (harness: Harness) => void;
 	readonly onBranch?: (harness: Harness) => void;
 }
 
@@ -338,7 +338,25 @@ function createHarness(options?: {
 				notifications.push({ message, level });
 			},
 			setWidget(_key: string, value: unknown): void {
-				options?.hooks?.onWidget?.(value, harness);
+				if (
+					typeof value !== "function" ||
+					options?.hooks?.onRender === undefined
+				)
+					return;
+				const factory = value as (
+					tui: { requestRender(): void },
+					theme: {
+						fg(color: string, text: string): string;
+						bg(color: string, text: string): string;
+					},
+				) => unknown;
+				factory(
+					{ requestRender: () => options.hooks?.onRender?.(harness) },
+					{
+						fg: (_color, text) => text,
+						bg: (_color, text) => text,
+					},
+				);
 			},
 		},
 		abort(): void {
@@ -403,7 +421,11 @@ function createHarness(options?: {
 				suppressNotify: true,
 			});
 			runtime.reconcileIdle();
-			clock.fire(clock.records.length - 1);
+			clock.fire(
+				clock.records.findLastIndex(
+					(record) => !record.cleared && record.delayMs === 10_000,
+				),
+			);
 			for (let turn = 0; turn < 2000; turn += 1) {
 				if (
 					driver.awaitingResponse ||
@@ -1554,12 +1576,8 @@ test("F3-B2 postcommit: UI BUSY retains accepted continuation until real idle", 
 	const harness = createHarness({
 		reviewResult: async () => reviewResult("challenged"),
 		hooks: {
-			onWidget: (value, h) => {
-				if (
-					!fired &&
-					value === undefined &&
-					h.controller.snapshot.attempt === 1
-				) {
+			onRender: (h) => {
+				if (!fired && h.controller.snapshot.attempt === 1) {
 					fired = true;
 					h.pendingMessages = true;
 				}
@@ -1634,12 +1652,8 @@ test("F3-B2 postcommit: a second readiness race refunds reapply without replacin
 	const harness = createHarness({
 		reviewResult: async () => reviewResult("challenged"),
 		hooks: {
-			onWidget: (value, h) => {
-				if (
-					!uiBusy &&
-					value === undefined &&
-					h.controller.snapshot.attempt === 1
-				) {
+			onRender: (h) => {
+				if (!uiBusy && h.controller.snapshot.attempt === 1) {
 					uiBusy = true;
 					h.pendingMessages = true;
 				}
@@ -1758,12 +1772,8 @@ for (const cancel of [
 		const harness = createHarness({
 			reviewResult: async () => reviewResult("challenged"),
 			hooks: {
-				onWidget: (value, h) => {
-					if (
-						!fired &&
-						value === undefined &&
-						h.controller.snapshot.attempt === 1
-					) {
+				onRender: (h) => {
+					if (!fired && h.controller.snapshot.attempt === 1) {
 						fired = true;
 						h.pendingMessages = true;
 					}

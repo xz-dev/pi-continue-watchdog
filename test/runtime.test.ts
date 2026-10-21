@@ -47,6 +47,7 @@ import {
 	createObservableAgentHub,
 	type HubAttachment,
 } from "../src/hub.js";
+import type { PrivateDecisionOptions } from "../src/private-decision.js";
 import {
 	type DomainFence,
 	type DomainSnapshot,
@@ -101,6 +102,10 @@ class FakeClock implements RuntimeClock {
 	}
 
 	now(): number {
+		return this.currentTimeMs;
+	}
+
+	monotonicNow(): number {
 		return this.currentTimeMs;
 	}
 
@@ -352,6 +357,7 @@ function createHarness(options?: {
 	readonly hub?: ReturnType<typeof createObservableAgentHub>;
 	readonly clock?: FakeClock;
 	readonly sessionId?: string;
+	readonly attachmentInstance?: import("../src/hub.js").HubAttachmentInstance;
 	readonly nativeAbortGate?: boolean;
 	readonly nativeAutoLock?: boolean;
 	readonly config?: Partial<ContinueWatchdogConfig>;
@@ -372,6 +378,7 @@ function createHarness(options?: {
 	readonly mode?: "tui" | "rpc" | "json" | "print";
 	readonly onNotify?: (message: string) => void;
 	readonly onWidget?: (key: string, value: unknown) => void;
+	readonly executePrivateDecision?: typeof import("../src/private-decision.js").runPrivateDecision;
 	readonly processDomain?: ProcessDomainCoordinator;
 	readonly isIdle?: () => boolean;
 	readonly reviewService?: import("../src/unlock-review.js").ReviewServiceLike;
@@ -609,14 +616,16 @@ function createHarness(options?: {
 		hub,
 		processDomain: options?.processDomain,
 		fatalExit: options?.fatalExit,
-		attachmentInstance: createHubAttachmentInstance(),
+		attachmentInstance:
+			options?.attachmentInstance ?? createHubAttachmentInstance(),
 		controllerHolder: holder,
 		injectedController: true,
 		initialConfig: config,
 		clock,
 		createExchangeId: () => "exchange-1",
 		reviewService: options?.reviewService,
-		executePrivateDecision: privateDriver.execute,
+		executePrivateDecision:
+			options?.executePrivateDecision ?? privateDriver.execute,
 	});
 	if (options?.nativeAbortGate) {
 		registerMainAbortUnlock(pi, {
@@ -806,9 +815,19 @@ async function startIdle(harness: Harness): Promise<void> {
 	await harness.fire("session_start", { type: "session_start" });
 }
 
-function mountStateStatusWidget(harness: Harness): {
+function mountStateStatusWidget(
+	harness: Harness,
+	options?: {
+		readonly onRender?: () => void;
+		readonly theme?: {
+			fg(color: string, text: string): string;
+			bg(color: string, text: string): string;
+		};
+	},
+): {
 	readonly renderRequests: () => number;
 	render(width: number): string[];
+	dispose(): void;
 } {
 	const registration = [...harness.widgets]
 		.reverse()
@@ -825,14 +844,15 @@ function mountStateStatusWidget(harness: Harness): {
 			fg(color: string, text: string): string;
 			bg(color: string, text: string): string;
 		},
-	) => { render(width: number): string[] };
+	) => { render(width: number): string[]; dispose(): void };
 	const component = factory(
 		{
 			requestRender(): void {
 				renderRequests += 1;
+				options?.onRender?.();
 			},
 		},
-		{
+		options?.theme ?? {
 			fg: (_color, text) => text,
 			bg: (_color, text) => text,
 		},
@@ -840,6 +860,7 @@ function mountStateStatusWidget(harness: Harness): {
 	return {
 		renderRequests: () => renderRequests,
 		render: (width) => component.render(width),
+		dispose: () => component.dispose(),
 	};
 }
 
@@ -1656,9 +1677,10 @@ test("state row ticks the countdown and switches to asking once the decision ope
 	// Fence expiry opens the decision; the row switches to "asking".
 	harness.clock.fire(graceTimer);
 	await harness.startDecision();
-	assert.deepEqual(widget.render(120), [
-		"Continue Watchdog | idle (enabled · alt+u unlock) | asking",
-	]);
+	assert.match(
+		widget.render(160).join(""),
+		/idle.*enabled.*alt\+u unlock.*asking.*waiting for model.*0s.*1\/3/,
+	);
 
 	await harness.runtime.shutdown();
 });
@@ -1707,11 +1729,551 @@ test("state row is absent outside an interactive root TUI", async () => {
 	await headless.runtime.shutdown();
 });
 
+test("private progress row covers admission and idle-parent setup/model elapsed without a second panel", async () => {
+	let release = () => {};
+	const setup = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let harness: Harness;
+	harness = createHarness({
+		config: { unlockShortcut: "ctrl+x" },
+		executePrivateDecision: async (options) => {
+			await setup;
+			return harness.privateDriver.execute(options);
+		},
+	});
+	try {
+		await startIdle(harness);
+		await harness.openDecision({ start: false });
+		const colors: string[] = [];
+		const widget = mountStateStatusWidget(harness, {
+			theme: {
+				fg: (color, text) => {
+					colors.push(color);
+					return text;
+				},
+				bg: (color, text) => {
+					colors.push(color);
+					return text;
+				},
+			},
+		});
+		const admitted = widget.render(180).join("").trimEnd();
+		assert.match(admitted, /preparing.*0s/);
+		assert.match(admitted, /idle.*enabled.*ctrl\+x unlock/);
+		assert.equal(harness.widgetPlacements.size, 1);
+		assert.equal(
+			harness.widgets.some(
+				(widget) => widget.key === "pi-continue-watchdog:status",
+			),
+			false,
+		);
+		assert.deepEqual(colors.slice(-2).sort(), ["accent", "toolPendingBg"]);
+		const entries = harness.entries.length;
+		const requests = widget.renderRequests();
+		harness.clock.advance(17_000);
+		const tick = harness.clock.records.length - 1;
+		assert.equal(harness.clock.records[tick].delayMs, 1000);
+		assert.equal(harness.clock.records[tick].unrefCount, 1);
+		harness.clock.fire(tick);
+		assert.match(widget.render(180).join(""), /preparing.*18s/);
+		assert.ok(widget.renderRequests() > requests);
+		assert.equal(harness.entries.length, entries);
+		assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
+		release();
+		await harness.startDecision();
+		assert.match(widget.render(180).join(""), /waiting for model.*18s.*1\/3/);
+		harness.clock.fire(harness.clock.records.length - 1);
+		assert.match(widget.render(180).join(""), /waiting for model.*19s/);
+		const modelEntries = harness.entries.length;
+		const notifications = harness.notifications.length;
+		for (let second = 0; second < 60; second += 1) {
+			harness.clock.fire(harness.clock.records.length - 1);
+		}
+		assert.match(widget.render(180).join(""), /waiting for model.*79s/);
+		assert.equal(harness.entries.length, modelEntries);
+		assert.equal(harness.notifications.length, notifications);
+		assert.equal(harness.sent.length, 0);
+		await settleResponse(harness, harness.answerUnlock());
+		assert.match(widget.render(180).join(""), /idle \(disabled\)/);
+		assert.equal(colors.at(-1), "dim");
+		assert.equal(harness.clock.records.at(-1)?.cleared, true);
+	} finally {
+		release();
+	}
+});
+
+test("private progress row keeps correction 2/3 and publication on one elapsed origin", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	await harness.openDecision();
+	const frames: string[] = [];
+	const widget = mountStateStatusWidget(harness, {
+		onRender: () => frames.push(widget.render(200).join("")),
+	});
+	harness.clock.advance(18_000);
+	await settleResponse(harness, harness.answerInvalid("private invalid body"));
+	assert.match(
+		widget.render(200).join(""),
+		/correcting.*waiting for model.*18s.*2\/3/,
+	);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 1);
+	assert.ok(frames.some((frame) => frame.includes("validating")));
+	assert.equal(
+		frames.some((frame) => frame.includes("private invalid body")),
+		false,
+	);
+	await settleResponse(harness, harness.answerContinue());
+	assert.ok(
+		frames.some(
+			(frame) => frame.includes("publishing") && frame.includes("18s"),
+		),
+	);
+	assert.equal(harness.privateDriver.children[0].prompts.length, 2);
+	assert.equal(harness.triggeredTurns, 1);
+	assert.equal(harness.controller.snapshot.attempt, 1);
+	assert.doesNotMatch(
+		widget.render(200).join(""),
+		/waiting for model|publishing|correcting/,
+	);
+});
+
+test("private progress row retires a failed continuation send during BUSY without stopping the next countdown", async () => {
+	let deferred = false;
+	let sends = 0;
+	const hooks: string[] = [];
+	let harness: Harness;
+	harness = createHarness({
+		onHook: (name) => hooks.push(name),
+		onSend(message) {
+			if (
+				parseDecisionFoldDetails(message.details)?.watchdogOutcome ===
+				"continue"
+			) {
+				sends += 1;
+				harness.pendingMessages = true;
+				return new Error("continuation send failed while busy");
+			}
+			return undefined;
+		},
+	});
+	await startIdle(harness);
+	await harness.openDecision();
+	const colors: string[] = [];
+	const widget = mountStateStatusWidget(harness, {
+		onRender() {
+			if (!deferred && harness.controller.snapshot.attempt === 1) {
+				deferred = true;
+				harness.pendingMessages = true;
+			}
+		},
+		theme: {
+			fg: (color, text) => {
+				colors.push(color);
+				return text;
+			},
+			bg: (color, text) => {
+				colors.push(color);
+				return text;
+			},
+		},
+	});
+	await settleResponse(harness, harness.answerContinue());
+	assert.equal(deferred, true, "BUSY defers only after the accepted commit");
+	assert.equal(harness.privateDriver.current?.settled, true);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(sends, 0);
+	assert.match(widget.render(200).join(""), /publishing.*1\/3/);
+	assert.deepEqual(colors.slice(-2).sort(), ["accent", "toolPendingBg"]);
+	const tick = harness.clock.records.at(-1);
+	assert.ok(tick);
+	assert.equal(tick.delayMs, 1000);
+	assert.equal(tick.cleared, false, "pending publication still needs progress");
+
+	harness.pendingMessages = false;
+	await settleOnly(harness);
+	assert.equal(sends, 1);
+	assert.equal(harness.controller.snapshot.attempt, 0, "failed send refunded");
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.triggeredTurns, 0);
+	assert.deepEqual(hooks, []);
+	assert.doesNotMatch(
+		widget.render(200).join(""),
+		/publishing|waiting for model/,
+	);
+	assert.equal(colors.at(-1), "dim");
+	assert.equal(tick.cleared, true, "retired publication releases private tick");
+	const requests = widget.renderRequests();
+	const timers = harness.clock.records.length;
+	tick.callback();
+	assert.equal(widget.renderRequests(), requests);
+	assert.equal(harness.clock.records.length, timers);
+
+	harness.pendingMessages = false;
+	await settleOnly(harness);
+	harness.runtime.reconcileIdle();
+	assert.match(widget.render(200).join(""), /asking in 10s/);
+	assert.doesNotMatch(widget.render(200).join(""), /publishing/);
+	const countdown = harness.clock.records.findLast(
+		(record) => !record.cleared && record.delayMs === 10_000,
+	);
+	assert.ok(countdown, "ordinary idle fence remains armed");
+	const display = harness.clock.records.findLastIndex(
+		(record) => !record.cleared && record.delayMs === 1000,
+	);
+	assert.ok(display >= 0, "ordinary countdown retains its display tick");
+	harness.clock.fire(display);
+	assert.match(widget.render(200).join(""), /asking in 9s/);
+	assert.equal(countdown.cleared, false);
+	assert.equal(sends, 1, "retired continuation is not retried");
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.privateDriver.operations.length, 1);
+});
+
+test("private progress row stays live in idle-root review and labels one reconsideration", async () => {
+	let release = () => {};
+	const review = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let reviews = 0;
+	const harness = createHarness({
+		config: { unlockReviewEnabled: true },
+		reviewService: {
+			async judge() {
+				reviews += 1;
+				await review;
+				return {
+					answers: {
+						unlock_supported: {
+							type: "choice",
+							choice: "challenged",
+							probabilities: {},
+							confidence: 1,
+						},
+					},
+					dropped: [],
+					backend: "classifier",
+					model: "test",
+					stopReason: "stop",
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							total: 0,
+						},
+					},
+				};
+			},
+		},
+	});
+	try {
+		await startIdle(harness);
+		await harness.openDecision();
+		const widget = mountStateStatusWidget(harness);
+		harness.privateDriver.respond(harness.answerUnlock());
+		await waitFor(() => reviews === 1, "expected optional review");
+		assert.match(widget.render(200).join(""), /reviewing.*0s.*1\/3/);
+		assert.match(widget.render(200).join(""), /idle.*enabled/);
+		const entries = harness.entries.length;
+		harness.clock.advance(17_000);
+		harness.clock.fire(harness.clock.records.length - 1);
+		assert.match(widget.render(200).join(""), /reviewing.*18s/);
+		assert.equal(harness.entries.length, entries);
+		assert.equal(harness.streaming, false);
+		release();
+		await waitFor(
+			() =>
+				harness.privateDriver.children[0].prompts.length === 2 &&
+				harness.privateDriver.awaitingResponse,
+			"expected reconsideration",
+		);
+		assert.match(
+			widget.render(200).join(""),
+			/reconsidering.*waiting for model.*18s.*1\/3/,
+		);
+		await settleResponse(harness, harness.answerInvalid());
+		assert.match(
+			widget.render(200).join(""),
+			/reconsidering.*correcting.*18s.*2\/3/,
+		);
+		await settleResponse(harness, harness.answerUnlock());
+		assert.equal(reviews, 1);
+		assert.equal(harness.privateDriver.children.length, 1);
+		assert.equal(harness.privateDriver.children[0].prompts.length, 3);
+		assert.doesNotMatch(widget.render(200).join(""), /reviewing|reconsidering/);
+		assert.equal(harness.clock.records.at(-1)?.cleared, true);
+	} finally {
+		release();
+	}
+});
+
+test("private progress row prioritizes stage across resize and redraws current theme", async () => {
+	const harness = createHarness({ config: { unlockShortcut: "ctrl+x" } });
+	await startIdle(harness);
+	let light = false;
+	const colors: string[] = [];
+	const widget = mountStateStatusWidget(harness, {
+		theme: {
+			fg: (color, text) => {
+				colors.push(color);
+				return `\u001b[${light ? 30 : 97}m${text}\u001b[39m`;
+			},
+			bg: (color, text) => {
+				colors.push(color);
+				return `\u001b[${light ? 47 : 40}m${text}\u001b[49m`;
+			},
+		},
+	});
+	await harness.startUnrelatedRun();
+	widget.render(180);
+	assert.equal(colors.at(-1), "dim", "root activity is not private work");
+	harness.streaming = false;
+	await settleOnly(harness);
+	harness.runtime.reconcileIdle();
+	const grace = harness.clock.records.findLastIndex(
+		(record) => !record.cleared && record.delayMs === 10_000,
+	);
+	harness.clock.fire(grace);
+	await harness.startDecision();
+	const wide = stripVTControlCharacters(widget.render(200).join("")).trimEnd();
+	assert.match(wide, /ctrl\+x unlock/);
+	assert.match(wide, /waiting for model.*1\/3/);
+	assert.match(
+		stripVTControlCharacters(widget.render(32).join("")),
+		/^CW.*waiting for model/,
+	);
+	for (const width of [1, 5, 14, 32, 60, 100, 200]) {
+		const lines = widget.render(width);
+		assert.equal(lines.length, 1);
+		assert.ok(visibleWidth(lines[0]) <= width);
+	}
+	const dark = widget.render(200).join("");
+	light = true;
+	const bright = widget.render(200).join("");
+	assert.notEqual(dark, bright);
+	assert.equal(stripVTControlCharacters(bright).trimEnd(), wide);
+	assert.ok(colors.includes("accent"));
+	assert.ok(colors.includes("toolPendingBg"));
+});
+
+test("private progress row fences cancellation drain, stale callbacks and successor elapsed", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	await harness.openDecision();
+	const widget = mountStateStatusWidget(harness);
+	const old = harness.privateDriver.current;
+	assert.ok(old);
+	let release = () => {};
+	const drain = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	try {
+		harness.privateDriver.respond({
+			write: JSON.stringify(continueArgs()),
+			hold: drain,
+		});
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
+		await harness.unlock();
+		assert.match(widget.render(200).join(""), /cancelling/);
+		harness.clock.advance(17_000);
+		harness.clock.fire(harness.clock.records.length - 1);
+		assert.match(widget.render(200).join(""), /cancelling.*18s/);
+		harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+			suppressNotify: true,
+		});
+		const grace = harness.clock.records.findLastIndex(
+			(record) => !record.cleared && record.delayMs === 10_000,
+		);
+		harness.clock.fire(grace);
+		await waitFor(
+			() =>
+				harness.privateDriver.operations.length === 2 &&
+				harness.privateDriver.awaitingResponse,
+			"expected successor operation",
+		);
+		const successor = widget.render(200).join("");
+		assert.match(successor, /waiting for model.*0s.*1\/3/);
+		old.options.onProgress?.({
+			stage: "correcting",
+			inquiry: "initial",
+			attempt: 3,
+			limit: 3,
+		});
+		release();
+		await old.result;
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
+		assert.equal(widget.render(200).join(""), successor);
+		await settleResponse(harness, harness.answerUnlock());
+		const requests = widget.renderRequests();
+		for (const timer of harness.clock.records) timer.callback();
+		assert.equal(
+			widget.renderRequests(),
+			requests,
+			"retired ticks cannot redraw or restart",
+		);
+		assert.doesNotMatch(
+			widget.render(200).join(""),
+			/cancelling|waiting for model/,
+		);
+		assert.equal(harness.aborts, 0);
+	} finally {
+		release();
+	}
+});
+
+test("private progress elapsed uses monotonic time, not wall-clock jumps or callback count", async () => {
+	const clock = new FakeClock();
+	const monotonic = clock.now.bind(clock);
+	let wallOffset = 0;
+	clock.now = () => monotonic() + wallOffset;
+	const harness = createHarness({ clock });
+	await startIdle(harness);
+	await harness.openDecision();
+	const widget = mountStateStatusWidget(harness);
+	wallOffset = -60_000;
+	clock.advance(17_000);
+	clock.fire(clock.records.length - 1);
+	assert.match(widget.render(180).join(""), /waiting for model.*18s/);
+	wallOffset = 120_000;
+	clock.advance(4_000);
+	clock.fire(clock.records.length - 1);
+	assert.match(widget.render(180).join(""), /waiting for model.*23s/);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	assert.equal(harness.controller.snapshot.invalidDecisionAttempts, 0);
+	await settleResponse(harness, harness.answerUnlock());
+	assert.equal(clock.records.at(-1)?.cleared, true);
+});
+
+test("private progress setup failure clears highlight and fences late observations", async () => {
+	let reject = (_error: Error) => {};
+	const setup = new Promise<never>((_resolve, fail) => {
+		reject = fail;
+	});
+	let operation: PrivateDecisionOptions | undefined;
+	const harness = createHarness({
+		executePrivateDecision: (options) => {
+			operation = options;
+			return setup;
+		},
+	});
+	try {
+		await startIdle(harness);
+		await harness.openDecision({ start: false });
+		const widget = mountStateStatusWidget(harness);
+		assert.match(widget.render(180).join(""), /preparing/);
+		reject(new Error("setup failed"));
+		await waitFor(
+			() => !harness.controller.snapshot.locked,
+			"setup failure did not settle",
+		);
+		assert.doesNotMatch(
+			widget.render(180).join(""),
+			/preparing|cancelling|waiting for model/,
+		);
+		assert.equal(harness.clock.records.at(-1)?.cleared, true);
+		operation?.onProgress?.({
+			stage: "waiting for model",
+			inquiry: "initial",
+			attempt: 1,
+			limit: 3,
+		});
+		assert.doesNotMatch(widget.render(180).join(""), /waiting for model/);
+		assert.equal(harness.triggeredTurns, 0);
+	} finally {
+		reject(new Error("cleanup"));
+	}
+});
+
+test("private progress display failures cannot change validation or accepted publication", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	await harness.openDecision();
+	const widget = mountStateStatusWidget(harness, {
+		onRender: () => {
+			throw new Error("redraw unavailable");
+		},
+		theme: {
+			fg: () => {
+				throw new Error("theme unavailable");
+			},
+			bg: () => {
+				throw new Error("theme unavailable");
+			},
+		},
+	});
+	assert.deepEqual(widget.render(180), []);
+	harness.clock.fire(harness.clock.records.length - 1);
+	await settleResponse(harness, harness.answerInvalid());
+	await settleResponse(harness, harness.answerUnlock());
+	assert.equal(harness.privateDriver.children[0].prompts.length, 2);
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(
+		harness.entries.filter(
+			(entry) => entry.type === "pi-continue-watchdog:ai-unlock",
+		).length,
+		1,
+	);
+	assert.equal(
+		harness.entries.some(
+			(entry) => entry.type === "pi-continue-watchdog:status",
+		),
+		false,
+	);
+	assert.equal(harness.clock.records.at(-1)?.cleared, true);
+});
+
+for (const replacement of ["session", "owner", "shutdown"] as const) {
+	test(`private progress scope clears on ${replacement} replacement and stale component disposal is inert`, async () => {
+		const attachmentInstance = createHubAttachmentInstance();
+		const harness = createHarness({ attachmentInstance });
+		await startIdle(harness);
+		await harness.openDecision();
+		const oldWidget = mountStateStatusWidget(harness);
+		const widget = mountStateStatusWidget(harness);
+		oldWidget.dispose();
+		assert.match(widget.render(180).join(""), /waiting for model/);
+		const old = harness.privateDriver.current;
+		assert.ok(old);
+		if (replacement === "session") {
+			Object.assign(harness.ctx.sessionManager, {
+				getSessionId: () => "replacement",
+			});
+			await harness.fire("session_start", { type: "session_start" });
+		} else if (replacement === "owner") {
+			const owner = harness.hub.bind({
+				instance: attachmentInstance,
+				sessionId: "main",
+				hasUI: true,
+			}).attachment;
+			harness.hub.detach(owner);
+		} else {
+			await harness.runtime.shutdown();
+		}
+		assert.deepEqual(widget.render(180), []);
+		assert.equal(harness.clock.records.at(-1)?.cleared, true);
+		old.options.onProgress?.({
+			stage: "correcting",
+			inquiry: "initial",
+			attempt: 3,
+			limit: 3,
+		});
+		assert.deepEqual(widget.render(180), []);
+		assert.equal(harness.controller.snapshot.attempt, 0);
+	});
+}
+
 test("private completion publishes canonical continuation without parent model decision turn", async () => {
 	const harness = createHarness();
 	await startIdle(harness);
 	await harness.openDecision();
-	assert.equal(harness.widgets.at(-1)?.key, "pi-continue-watchdog:status");
+	assert.equal(harness.widgets.at(-1)?.key, "pi-continue-watchdog:state");
 	assert.notEqual(harness.widgets.at(-1)?.value, undefined);
 	assert.equal(harness.streaming, false);
 	assert.equal(harness.sent.length, 0);
@@ -1741,10 +2303,15 @@ test("private completion publishes canonical continuation without parent model d
 		),
 		false,
 	);
-	assert.deepEqual(harness.widgets.at(-1), {
-		key: "pi-continue-watchdog:status",
-		value: undefined,
-	});
+	assert.equal(harness.widgetPlacements.size, 1);
+	assert.equal(
+		harness.widgetPlacements.has("pi-continue-watchdog:state"),
+		true,
+	);
+	assert.equal(
+		harness.widgetPlacements.has("pi-continue-watchdog:status"),
+		false,
+	);
 });
 
 test("inquiry prompt carries the bounded source view and marker review metadata", async () => {
@@ -5293,6 +5860,91 @@ async function suspendForCallback(harness: Harness): Promise<void> {
 const CALLBACK_REASONS = {
 	reasonTypes: ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED", "WAIT_CALLBACK"],
 };
+
+test("private progress row retires WAIT_CALLBACK publication when ordinary work resumes", async () => {
+	const hooks: string[] = [];
+	const harness = createHarness({
+		config: CALLBACK_REASONS,
+		omitPersistedEntryTypes: ["pi-continue-watchdog:ai-unlock"],
+		onHook: (name) => hooks.push(name),
+	});
+	await startIdle(harness);
+	await harness.openDecision();
+	const colors: string[] = [];
+	const widget = mountStateStatusWidget(harness, {
+		theme: {
+			fg: (color, text) => {
+				colors.push(color);
+				return text;
+			},
+			bg: (color, text) => {
+				colors.push(color);
+				return text;
+			},
+		},
+	});
+	await settleResponse(
+		harness,
+		harness.answerUnlock("Waiting for the callback.", "WAIT_CALLBACK"),
+	);
+	assert.equal(harness.privateDriver.current?.settled, true);
+	assert.equal(harness.controller.snapshot.callbackSuspended, true);
+	assert.equal(harness.controller.snapshot.attempt, 1);
+	assert.match(widget.render(200).join(""), /publishing.*1\/3/);
+	assert.deepEqual(colors.slice(-2).sort(), ["accent", "toolPendingBg"]);
+	const sent = harness.sent.length;
+	assert.equal(sent, 1, "only the remove-fold persisted; status is pending");
+	assert.deepEqual(hooks, []);
+	const tick = harness.clock.records.at(-1);
+	assert.ok(tick);
+	assert.equal(tick.delayMs, 1000);
+	assert.equal(tick.cleared, false);
+
+	await harness.startUnrelatedRun();
+	assert.equal(harness.controller.snapshot.callbackSuspended, false);
+	assert.equal(harness.controller.snapshot.locked, true);
+	assert.equal(harness.controller.snapshot.attempt, 1, "resume costs no unit");
+	assert.match(widget.render(200).join(""), /running.*root/);
+	assert.doesNotMatch(
+		widget.render(200).join(""),
+		/publishing|waiting for model/,
+	);
+	assert.equal(colors.at(-1), "dim");
+	assert.equal(tick.cleared, true, "root work needs no private display tick");
+	const requests = widget.renderRequests();
+	const timers = harness.clock.records.length;
+	tick.callback();
+	assert.equal(widget.renderRequests(), requests);
+	assert.equal(harness.clock.records.length, timers);
+
+	harness.streaming = false;
+	await settleOnly(harness);
+	await settleOnly(harness);
+	harness.runtime.reconcileIdle();
+	assert.match(widget.render(200).join(""), /asking in 10s/);
+	assert.doesNotMatch(widget.render(200).join(""), /publishing/);
+	assert.ok(
+		harness.clock.records.some(
+			(record) => !record.cleared && record.delayMs === 10_000,
+		),
+		"ordinary idle fence remains armed",
+	);
+	assert.equal(harness.controller.snapshot.attempt, 1);
+	assert.equal(
+		harness.sent.length,
+		sent,
+		"retired publication is not replayed",
+	);
+	assert.deepEqual(hooks, [], "retired waiting signal is not emitted");
+	assert.equal(harness.triggeredTurns, 0);
+	assert.equal(harness.privateDriver.operations.length, 1);
+	assert.equal(
+		harness.entries.some(
+			(entry) => entry.type === "pi-continue-watchdog:ai-unlock",
+		),
+		false,
+	);
+});
 
 test("manual unlock and actual ordinary work end callback suspension", async () => {
 	const manual = createHarness({ config: CALLBACK_REASONS });

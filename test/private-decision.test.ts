@@ -188,6 +188,66 @@ const VALID_UNLOCK =
 const VALID_CONTINUE =
 	'{"action":"continue","reason_type":" verifying ","reason_content":"Run tests."}';
 
+test("private progress observes validation and authorized correction without raw content", async (t) => {
+	const { runtime, children } = createFakeRuntime(t, ({ responseIndex }) =>
+		responseIndex === 1
+			? { write: "private malformed text" }
+			: { write: VALID_CONTINUE },
+	);
+	const stages: unknown[] = [];
+	const result = await runPrivateDecision(
+		baseOptions(runtime, {
+			onProgress: (event) => stages.push(event),
+		}),
+	);
+	assert.equal(result.kind, "decision");
+	assert.deepEqual(stages, [
+		{ stage: "waiting for model", inquiry: "initial", attempt: 1, limit: 3 },
+		{ stage: "validating", inquiry: "initial", attempt: 1, limit: 3 },
+		{ stage: "correcting", inquiry: "initial", attempt: 2, limit: 3 },
+		{ stage: "waiting for model", inquiry: "initial", attempt: 2, limit: 3 },
+		{ stage: "validating", inquiry: "initial", attempt: 2, limit: 3 },
+	]);
+	assert.equal(children[0].prompts.length, 2);
+	assert.equal(
+		JSON.stringify(stages).includes("private malformed text"),
+		false,
+	);
+});
+
+test("private progress keeps reconsideration allowance independent and observers nonthrowing", async (t) => {
+	const { runtime, children } = createFakeRuntime(t, ({ responseIndex }) => ({
+		write:
+			responseIndex === 1
+				? VALID_UNLOCK
+				: responseIndex === 2
+					? "{}"
+					: VALID_CONTINUE,
+	}));
+	const stages: Array<{ inquiry: string; attempt: number; stage: string }> = [];
+	const result = await runPrivateDecision(
+		baseOptions(runtime, {
+			review: async () => "challenge",
+			onProgress: (event) => {
+				stages.push({ ...event });
+				throw new Error("display unavailable");
+			},
+		}),
+	);
+	assert.equal(result.kind, "decision");
+	assert.deepEqual(
+		stages
+			.filter((event) => event.stage === "waiting for model")
+			.map((event) => [event.inquiry, event.attempt]),
+		[
+			["initial", 1],
+			["reconsideration", 1],
+			["reconsideration", 2],
+		],
+	);
+	assert.equal(children[0].prompts.length, 3);
+});
+
 test("one valid file response returns a terminal decision and cleans up", async (t) => {
 	const fixture = createFakeRuntime(t, () => ({
 		write: VALID_CONTINUE,

@@ -47,6 +47,14 @@ export const RESULT_DIR_PREFIX = join(
 export type PrivateDecisionObservation =
 	PrivateInquiryObservation<ValidDecision>;
 
+/** Content-free display observation; result attempts are not transport retries. */
+export interface PrivateDecisionProgress {
+	readonly stage: "waiting for model" | "validating" | "correcting";
+	readonly inquiry: "initial" | "reconsideration";
+	readonly attempt: number;
+	readonly limit: number;
+}
+
 /** Terminal result of one logical private decision. */
 export type PrivateDecisionResult = PrivateInquiryResult<ValidDecision>;
 
@@ -97,6 +105,8 @@ export interface PrivateDecisionOptions {
 	 * change decision accounting.
 	 */
 	readonly onResponse?: (observation: PrivateDecisionObservation) => void;
+	/** Optional human-only observation. Failure cannot affect execution. */
+	readonly onProgress?: (progress: PrivateDecisionProgress) => void;
 	/**
 	 * Optional lifecycle notification invoked once immediately before the
 	 * first authorized prompt of each inquiry, after the child exists. A
@@ -116,9 +126,100 @@ export interface PrivateDecisionOptions {
 export function runPrivateDecision(
 	options: PrivateDecisionOptions,
 ): Promise<PrivateDecisionResult> {
-	const { reasonTypes, continueReasonTypes, review, fork, ...rest } = options;
+	const {
+		reasonTypes,
+		continueReasonTypes,
+		review,
+		fork,
+		runtime,
+		onProgress,
+		onStarted,
+		correction,
+		...rest
+	} = options;
+	let inquiry: PrivateDecisionProgress["inquiry"] = "initial";
+	let attempt = 1;
+	const observe = (stage: PrivateDecisionProgress["stage"]): void => {
+		try {
+			onProgress?.({
+				stage,
+				inquiry,
+				attempt,
+				limit: DECISION_INVALID_ATTEMPT_LIMIT,
+			});
+		} catch {
+			// Display failure never changes validation, requests or accounting.
+		}
+	};
+	const observedRuntime: PrivateRuntime =
+		onProgress === undefined
+			? runtime
+			: {
+					async fork(input) {
+						const child = await runtime.fork(input);
+						return {
+							get sessionId() {
+								return child.sessionId;
+							},
+							get sessionFile() {
+								return child.sessionFile;
+							},
+							get modelId() {
+								return child.modelId;
+							},
+							get messages() {
+								return child.messages;
+							},
+							get inheritedProvider() {
+								return child.inheritedProvider;
+							},
+							get attemptError() {
+								return child.attemptError;
+							},
+							get helperCalls() {
+								return child.helperCalls;
+							},
+							async prompt(text) {
+								observe("waiting for model");
+								const startIndex = child.messages.length;
+								await child.prompt(text);
+								try {
+									const response = child.messages
+										.slice(startIndex)
+										.findLast((message) => message.role === "assistant");
+									if (
+										response?.role === "assistant" &&
+										response.stopReason !== "error" &&
+										response.stopReason !== "aborted"
+									) {
+										observe("validating");
+									}
+								} catch {
+									// The shared core remains the only authority on terminal outcomes.
+								}
+							},
+							abort: () => child.abort(),
+							dispose: () => child.dispose(),
+							subscribe: (listener) => child.subscribe(listener),
+						};
+					},
+					dispose: () => runtime.dispose(),
+				};
 	return runPrivateInquiry<ValidDecision>({
 		...rest,
+		runtime: observedRuntime,
+		onStarted: (event) => {
+			inquiry = event.inquiry;
+			attempt = 1;
+			// Unlike progress, a throwing onStarted must still prevent the prompt.
+			onStarted?.(event);
+		},
+		correction: (error, file) => {
+			const text = correction(error, file);
+			attempt += 1;
+			observe("correcting");
+			return text;
+		},
 		// Continue disables the child's native auto-retry: a provider error is
 		// one typed execution failure, never a silent retry.
 		fork: { ...fork, retryPolicy: "disabled" },

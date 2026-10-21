@@ -87,7 +87,10 @@ import type {
 	HubMainClaim,
 	ObservableAgentHub,
 } from "./hub.js";
-import { runPrivateDecision } from "./private-decision.js";
+import {
+	type PrivateDecisionProgress,
+	runPrivateDecision,
+} from "./private-decision.js";
 import {
 	type DomainFence,
 	isProcessDomainFatalError,
@@ -140,6 +143,8 @@ export interface RuntimeClock {
 	setTimeout(callback: () => void, delayMs: number): RuntimeTimerHandle;
 	clearTimeout(handle: RuntimeTimerHandle): void;
 	now?(): number;
+	/** Display elapsed time only; never used by accounting or scheduling. */
+	monotonicNow?(): number;
 }
 
 const nodeClock: RuntimeClock = {
@@ -147,9 +152,9 @@ const nodeClock: RuntimeClock = {
 	clearTimeout: (handle) =>
 		clearTimeout(handle as ReturnType<typeof setTimeout>),
 	now: () => Date.now(),
+	monotonicNow: () => performance.now(),
 };
 
-const WATCHDOG_STATUS_WIDGET_KEY = "pi-continue-watchdog:status";
 const WATCHDOG_STATE_WIDGET_KEY = "pi-continue-watchdog:state";
 
 /** Context-excluded persisted metadata for one model decision response. */
@@ -188,6 +193,23 @@ interface ActiveDecision {
 	readonly domainFence: DomainFence;
 	privateRun?: {
 		readonly abort: AbortController;
+		readonly progress: {
+			readonly admittedAt: number;
+			readonly lifecycle: number;
+			readonly ownerSessionId: string;
+			stage:
+				| PrivateDecisionProgress["stage"]
+				| "preparing"
+				| "reviewing"
+				| "publishing"
+				| "cancelling";
+			inquiry?: PrivateDecisionProgress["inquiry"];
+			attempt?: number;
+			limit?: number;
+		};
+		started: boolean;
+		drained: boolean;
+		stopProgress?: () => void;
 		completed: boolean;
 		isCurrent?: () => boolean;
 		sessionId?: string;
@@ -529,6 +551,8 @@ export function createDecisionRuntime(
 ): DecisionRuntime {
 	const clock = options.clock ?? nodeClock;
 	const now = (): number => clock.now?.() ?? Date.now();
+	const elapsedNow = (): number =>
+		clock.monotonicNow?.() ?? clock.now?.() ?? performance.now();
 	const createExchangeId = options.createExchangeId ?? randomUUID;
 	const loadConfig = options.loadConfig ?? loadRuntimeConfig;
 	const injectedController = options.injectedController
@@ -639,11 +663,10 @@ export function createDecisionRuntime(
 	/** Retry exhaustion is persisted once per lock cycle, even across re-entrant activity. */
 	let exhaustionEventPublished = false;
 	let exhaustionEventPublicationInFlight = false;
-	let activeStatus: WatchdogStatusEntry | null = null;
-	let statusTui: { requestRender(): void } | null = null;
-	let statusWidgetRegistered = false;
+	let visiblePrivateDecision: ActiveDecision | null = null;
 	let stateStatusTui: { requestRender(): void } | null = null;
 	let stateStatusWidgetRegistered = false;
+	let stateStatusWidgetOwner: object | null = null;
 	/** Distinguishes this runtime's synchronous hub report from child reports. */
 	let publishingOwnHubObservation = false;
 
@@ -680,12 +703,55 @@ export function createDecisionRuntime(
 			: null;
 	};
 
+	const privateProgressVisible = (active: ActiveDecision): boolean => {
+		try {
+			const progress = active.privateRun?.progress;
+			return (
+				visiblePrivateDecision === active &&
+				progress !== undefined &&
+				progress.lifecycle === lifecycleGeneration &&
+				owns(active.claim) &&
+				progress.ownerSessionId ===
+					sessionContext?.sessionManager.getSessionId()
+			);
+		} catch {
+			return false;
+		}
+	};
+
+	const privateStatusProjection = (): {
+		readonly stage: string;
+		readonly elapsedSeconds: number;
+		readonly attempt: number | undefined;
+		readonly limit: number | undefined;
+	} | null => {
+		const active = visiblePrivateDecision;
+		if (active === null || !privateProgressVisible(active)) return null;
+		const progress = active.privateRun?.progress;
+		if (progress === undefined) return null;
+		const reconsidering =
+			progress.inquiry === "reconsideration" && progress.stage !== "cancelling";
+		const correcting =
+			progress.attempt !== undefined &&
+			progress.attempt > 1 &&
+			progress.stage === "waiting for model";
+		return {
+			stage: `${reconsidering ? "reconsidering · " : ""}${correcting ? "correcting · " : ""}${progress.stage}`,
+			elapsedSeconds: Math.floor(
+				Math.max(0, elapsedNow() - progress.admittedAt) / 1000,
+			),
+			attempt: progress.attempt,
+			limit: progress.limit,
+		};
+	};
+
 	const stateStatusProjection = (): {
 		readonly activity: "idle" | "running";
 		readonly enabled: boolean;
 		readonly rootRunning: boolean;
 		readonly busySubagents: number;
 		readonly decision: "asking" | { readonly askInMs: number } | null;
+		readonly progress: ReturnType<typeof privateStatusProjection>;
 	} | null => {
 		const ctx = sessionContext;
 		const claim = getMainClaim();
@@ -729,6 +795,7 @@ export function createDecisionRuntime(
 			rootRunning,
 			busySubagents,
 			decision,
+			progress: privateStatusProjection(),
 		};
 	};
 
@@ -778,14 +845,36 @@ export function createDecisionRuntime(
 				? " · /unlock-continue-watchdog"
 				: ` · ${config.unlockShortcut} unlock`
 			: "";
-		const full = `Continue Watchdog | ${status.activity} (${status.enabled ? "enabled" : "disabled"}${unlockHint}) | ${third}`;
-		const compact = `CW | ${status.activity === "running" ? "run" : "idle"}/${status.enabled ? "on" : "off"} | ${thirdCompact}`;
-		const line = visibleWidth(full) <= safeWidth ? full : compact;
-		return [truncateToWidth(theme.fg("dim", line), safeWidth)];
+		const progress = status.progress;
+		const detail =
+			progress === null
+				? ""
+				: `${progress.stage} · ${progress.elapsedSeconds}s${progress.attempt === undefined || progress.limit === undefined ? "" : ` · attempt ${progress.attempt}/${progress.limit}`}`;
+		const full = `Continue Watchdog | ${status.activity} (${status.enabled ? "enabled" : "disabled"}${unlockHint}) | ${third}${progress === null ? "" : ` | ${detail}`}`;
+		const controls = `${status.activity === "running" ? "run" : "idle"}/${status.enabled ? "on" : "off"} | ${thirdCompact}`;
+		const compact =
+			progress === null ? `CW | ${controls}` : `CW | ${detail} | ${controls}`;
+		const line =
+			[full, compact].find((line) => visibleWidth(line) <= safeWidth) ??
+			(progress === null ? compact : `CW | ${detail}`);
+		const clipped = truncateToWidth(line, safeWidth);
+		return [
+			progress === null
+				? theme.fg("dim", clipped)
+				: theme.bg(
+						"toolPendingBg",
+						theme.fg(
+							"accent",
+							clipped +
+								" ".repeat(Math.max(0, safeWidth - visibleWidth(clipped))),
+						),
+					),
+		];
 	};
 
 	const clearStateStatus = (): void => {
 		const ctx = sessionContext;
+		stateStatusWidgetOwner = null;
 		if (
 			ctx !== null &&
 			stateStatusWidgetRegistered &&
@@ -804,146 +893,139 @@ export function createDecisionRuntime(
 
 	let stateStatusTick: RuntimeTimerHandle | null = null;
 	const stopStateStatusTick = (): void => {
-		if (stateStatusTick !== null) clock.clearTimeout(stateStatusTick);
+		const handle = stateStatusTick;
 		stateStatusTick = null;
+		if (handle !== null) clock.clearTimeout(handle);
 	};
-	const stateStatusCountdownActive = (): boolean =>
-		stateStatusTui !== null && stateStatusProjection()?.decision != null;
+	const stateStatusTickNeeded = (): boolean => {
+		const status = stateStatusProjection();
+		return (
+			stateStatusTui !== null &&
+			status !== null &&
+			(status.progress !== null ||
+				(status.decision !== null && status.decision !== "asking"))
+		);
+	};
 	const scheduleStateStatusTick = (): void => {
-		if (stateStatusTick !== null) return;
-		const handle = clock.setTimeout(function tick(): void {
+		if (stateStatusTick !== null || !stateStatusTickNeeded()) return;
+		const handle = clock.setTimeout(() => {
+			// A cleared tick delivered late cannot redraw or restart a successor.
+			if (stateStatusTick !== handle) return;
 			stateStatusTick = null;
-			stateStatusTui?.requestRender();
-			if (stateStatusCountdownActive()) {
-				stateStatusTick = clock.setTimeout(tick, 1000);
-				if (
-					"unref" in stateStatusTick &&
-					typeof stateStatusTick.unref === "function"
-				) {
-					stateStatusTick.unref();
-				}
-			}
+			refreshStateStatus();
 		}, 1000);
 		stateStatusTick = handle;
-		if ("unref" in handle && typeof handle.unref === "function") {
-			handle.unref();
-		}
+		handle.unref?.();
 	};
 
 	const refreshStateStatus = (): void => {
-		const ctx = sessionContext;
-		if (
-			stateStatusProjection() === null ||
-			ctx === null ||
-			typeof ctx.ui.setWidget !== "function"
-		) {
-			stopStateStatusTick();
-			clearStateStatus();
-			return;
-		}
-		if (stateStatusCountdownActive()) scheduleStateStatusTick();
-		else stopStateStatusTick();
-		if (!stateStatusWidgetRegistered) {
-			try {
+		try {
+			const ctx = sessionContext;
+			if (
+				stateStatusProjection() === null ||
+				ctx === null ||
+				typeof ctx.ui.setWidget !== "function"
+			) {
+				clearStateStatus();
+				return;
+			}
+			if (stateStatusTickNeeded()) scheduleStateStatusTick();
+			else stopStateStatusTick();
+			if (!stateStatusWidgetRegistered) {
 				ctx.ui.setWidget(
 					WATCHDOG_STATE_WIDGET_KEY,
 					(tui, theme) => {
+						const owner = {};
+						stateStatusWidgetOwner = owner;
 						stateStatusTui = tui;
+						scheduleStateStatusTick();
 						return {
-							render: (width: number) => renderStateStatus(width, theme),
+							render: (width: number) => {
+								try {
+									return stateStatusWidgetOwner === owner
+										? renderStateStatus(width, theme)
+										: [];
+								} catch {
+									return [];
+								}
+							},
 							invalidate() {},
 							dispose() {
+								if (stateStatusWidgetOwner !== owner) return;
+								stateStatusWidgetOwner = null;
 								stateStatusTui = null;
 								stateStatusWidgetRegistered = false;
+								stopStateStatusTick();
 							},
 						};
 					},
 					{ placement: "belowEditor" },
 				);
 				stateStatusWidgetRegistered = true;
-			} catch {
-				stateStatusWidgetRegistered = false;
-				stateStatusTui = null;
+				return;
 			}
-			return;
+			stateStatusTui?.requestRender();
+		} catch {
+			// Widgets and redraws are observations, never decision failures.
 		}
-		stateStatusTui?.requestRender();
 	};
 
-	const renderLiveStatus = (
-		width: number,
-		theme: ExtensionContext["ui"]["theme"],
-	): string[] => {
-		const status = activeStatus;
-		if (status === null) return [];
-		const safeWidth = Math.max(1, Math.floor(width));
-		const styleLine = (content: string): string => {
-			const clipped = visibleWidth(content) <= safeWidth ? content : "…";
-			const padding = " ".repeat(
-				Math.max(0, safeWidth - visibleWidth(clipped)),
-			);
-			return theme.bg("toolPendingBg", clipped + padding);
-		};
-		const detail = `Attempt ${status.cycleId} · waiting for model`;
-		return [
-			styleLine(""),
-			styleLine(` ${theme.fg("accent", "Continue watchdog checking")} `),
-			styleLine(` ${theme.fg("toolOutput", detail)} `),
-			styleLine(""),
-		];
+	const finishPrivateProgress = (active: ActiveDecision): void => {
+		active.privateRun?.stopProgress?.();
+		if (visiblePrivateDecision !== active) return;
+		visiblePrivateDecision = null;
+		refreshStateStatus();
 	};
 
-	const showLiveStatus = (status: WatchdogStatusEntry): string | null => {
-		activeStatus = status;
-		const ctx = sessionContext;
-		if (ctx === null || !ctx.hasUI || typeof ctx.ui.setWidget !== "function") {
-			return null;
+	const observePrivateProgress = (
+		active: ActiveDecision,
+		progress:
+			| Pick<NonNullable<ActiveDecision["privateRun"]>["progress"], "stage">
+			| PrivateDecisionProgress,
+	): void => {
+		try {
+			const operation = active.privateRun;
+			if (
+				operation === undefined ||
+				active.invalidated ||
+				operation.abort.signal.aborted ||
+				!privateProgressVisible(active)
+			)
+				return;
+			Object.assign(operation.progress, progress);
+			refreshStateStatus();
+		} catch {
+			// A display observation cannot acquire or revoke result authority.
 		}
-		if (!statusWidgetRegistered) {
-			try {
-				ctx.ui.setWidget(
-					WATCHDOG_STATUS_WIDGET_KEY,
-					(tui, theme) => {
-						statusTui = tui;
-						return {
-							render: (width: number) => renderLiveStatus(width, theme),
-							invalidate() {},
-							dispose() {
-								statusTui = null;
-								statusWidgetRegistered = false;
-							},
-						};
-					},
-					{ placement: "belowEditor" },
-				);
-				statusWidgetRegistered = true;
-			} catch (error) {
-				statusWidgetRegistered = false;
-				statusTui = null;
-				return originalErrorMessage(error);
-			}
-			return null;
-		}
-		statusTui?.requestRender();
-		return null;
 	};
 
-	const clearLiveStatus = (): void => {
-		activeStatus = null;
-		const ctx = sessionContext;
+	const retirePrivateProgress = (active: ActiveDecision | null): void => {
+		if (active === null || visiblePrivateDecision !== active) return;
+		const operation = active.privateRun;
 		if (
-			ctx !== null &&
-			statusWidgetRegistered &&
-			typeof ctx.ui.setWidget === "function"
+			operation?.started &&
+			!operation.drained &&
+			operation.abort.signal.aborted &&
+			privateProgressVisible(active)
 		) {
-			try {
-				ctx.ui.setWidget(WATCHDOG_STATUS_WIDGET_KEY, undefined);
-			} catch {
-				// A stale host may reject cleanup during shutdown or demotion.
-			}
+			operation.progress.stage = "cancelling";
+			refreshStateStatus();
+		} else {
+			finishPrivateProgress(active);
 		}
-		statusWidgetRegistered = false;
-		statusTui = null;
+	};
+
+	const admitPrivateProgress = (active: ActiveDecision): void => {
+		const operation = active.privateRun;
+		if (operation === undefined) return;
+		if (visiblePrivateDecision !== null)
+			finishPrivateProgress(visiblePrivateDecision);
+		visiblePrivateDecision = active;
+		const onAbort = (): void => retirePrivateProgress(active);
+		operation.abort.signal.addEventListener("abort", onAbort, { once: true });
+		operation.stopProgress = () =>
+			operation.abort.signal.removeEventListener("abort", onAbort);
+		refreshStateStatus();
 	};
 
 	const appendStatus = (status: WatchdogStatusEntry): boolean => {
@@ -957,13 +1039,6 @@ export function createDecisionRuntime(
 			return false;
 		}
 	};
-
-	const checkingStatus = (active: ActiveDecision): WatchdogStatusEntry => ({
-		kind: "checking",
-		exchangeId: active.exchangeId,
-		cycleId: active.protocol.currentCycleId,
-		message: "Continue watchdog checking",
-	});
 
 	const retainInquiryCleanup = (
 		active: ActiveDecision,
@@ -1004,6 +1079,7 @@ export function createDecisionRuntime(
 	 * Does not change controller lock/cycle accounting.
 	 */
 	const clearOperationalPendingWork = (): void => {
+		const displayed = visiblePrivateDecision;
 		const previousPublicationCycle = publicationCycle;
 		publicationCycle += 1;
 		pendingUnlockReview?.abort.abort();
@@ -1045,7 +1121,7 @@ export function createDecisionRuntime(
 		capturedDecisionResponse = null;
 		pendingFinalization = null;
 		pendingContinuationPublication = null;
-		clearLiveStatus();
+		retirePrivateProgress(displayed);
 		// Human/abort unlock must not inherit automatic terminal publication intent.
 		pendingUnlock = null;
 		exhaustionEventPublished = false;
@@ -1337,7 +1413,7 @@ export function createDecisionRuntime(
 		const controller = options.controllerHolder.controller;
 		capturedDecisionResponse = null;
 		pendingFinalization = null;
-		clearLiveStatus();
+		retirePrivateProgress(active);
 		if (controller !== null) {
 			applyTransition(
 				controller.invalidateDecision(active.decisionId),
@@ -1842,6 +1918,7 @@ export function createDecisionRuntime(
 		const operation = active.privateRun;
 		const controller = options.controllerHolder.controller;
 		if (operation === undefined || controller === null) return;
+		operation.started = true;
 		const sourceSession = ctx.sessionManager.getSessionId();
 		const sourceLeaf = ctx.sessionManager.getLeafId();
 		const sourceModel =
@@ -1972,6 +2049,9 @@ export function createDecisionRuntime(
 						file,
 						error,
 					),
+				onProgress: (progress) => {
+					if (current()) observePrivateProgress(active, progress);
+				},
 				onStarted: ({ inquiry, sessionId }) => {
 					if (!current()) return;
 					if (
@@ -2062,6 +2142,7 @@ export function createDecisionRuntime(
 								settled: false,
 							};
 							pendingUnlockReview = state;
+							observePrivateProgress(active, { stage: "reviewing" });
 							const report = await runUnlockReview(
 								discovery.service,
 								buildUnlockReviewRequest(macro, {
@@ -2098,6 +2179,7 @@ export function createDecisionRuntime(
 						}
 					: undefined,
 			});
+			operation.drained = true;
 			if (!scopeCurrent()) {
 				if (
 					activeDecision === active &&
@@ -2167,6 +2249,19 @@ export function createDecisionRuntime(
 				message: "Private decision execution failed; no outcome was accepted.",
 			});
 			silentlyAbandonDecision();
+		} finally {
+			operation.drained = true;
+			if (
+				operation.abort.signal.aborted ||
+				active.invalidated ||
+				!privateProgressVisible(active) ||
+				(activeDecision !== active &&
+					pendingFinalization?.active !== active &&
+					pendingContinuationPublication?.active !== active &&
+					pendingTerminalPublication?.active !== active)
+			) {
+				finishPrivateProgress(active);
+			}
 		}
 	};
 
@@ -2253,7 +2348,18 @@ export function createDecisionRuntime(
 			exchangeId,
 			claim,
 			domainFence,
-			privateRun: { abort: new AbortController(), completed: false },
+			privateRun: {
+				abort: new AbortController(),
+				completed: false,
+				started: false,
+				drained: false,
+				progress: {
+					admittedAt: elapsedNow(),
+					lifecycle: lifecycleGeneration,
+					ownerSessionId: sessionContext?.sessionManager.getSessionId() ?? "",
+					stage: "preparing",
+				},
+			},
 			inquiry: createInquiryRuntime(DECISION_INQUIRY_NAMESPACE, {
 				inquiryId: exchangeId,
 			}).attempt(protocol.currentCycleId),
@@ -2284,6 +2390,7 @@ export function createDecisionRuntime(
 			protocol,
 		};
 		activeDecision = active;
+		admitPrivateProgress(active);
 		try {
 			if (!stillOwns()) {
 				silentlyAbandonDecision();
@@ -2291,18 +2398,6 @@ export function createDecisionRuntime(
 			}
 			if (!allIdleForClaim(claim)) {
 				deferDecisionOnBusy(active);
-				return;
-			}
-			const status = checkingStatus(active);
-			const widgetError = showLiveStatus(status);
-			if (widgetError !== null) {
-				appendStatus({
-					kind: "other-error",
-					exchangeId: active.exchangeId,
-					cycleId: active.protocol.currentCycleId,
-					message: widgetError,
-				});
-				silentlyAbandonDecision();
 				return;
 			}
 			if (!allIdleForClaim(claim)) {
@@ -2932,7 +3027,7 @@ export function createDecisionRuntime(
 		capturedDecisionResponse = null;
 		decisionAssistantToSplice = null;
 		pendingFinalization = null;
-		clearLiveStatus();
+		retirePrivateProgress(active);
 		applyTransition(
 			controller.invalidateDecision(active.decisionId),
 			undefined,
@@ -3064,6 +3159,7 @@ export function createDecisionRuntime(
 							: snapshot.exhausted);
 		if (!terminalCurrent || !sharedPublicationCurrent(pending.publication)) {
 			pendingTerminalPublication = null;
+			if (pending.active !== undefined) finishPrivateProgress(pending.active);
 			return;
 		}
 		if (
@@ -3093,6 +3189,7 @@ export function createDecisionRuntime(
 			if (pendingTerminalPublication !== pending) return;
 		}
 		pendingTerminalPublication = null;
+		if (pending.active !== undefined) finishPrivateProgress(pending.active);
 		if (pending.values.STOP_KIND === "EXHAUSTED")
 			exhaustionEventPublished = true;
 		else pendingUnlock = pending.values;
@@ -3266,6 +3363,7 @@ export function createDecisionRuntime(
 				customType: CONTINUATION_MESSAGE_TYPE,
 				content: pending.body,
 			});
+			finishPrivateProgress(pending.active);
 		}
 		if (
 			!owns(pending.active.claim) ||
@@ -3336,6 +3434,7 @@ export function createDecisionRuntime(
 			if (pendingContinuationPublication === pending) {
 				pendingContinuationPublication = null;
 				pending.active.invalidated = true;
+				finishPrivateProgress(pending.active);
 				if (selfRunFor(pending.active)) selfDecisionRun = { kind: "none" };
 			}
 			return false;
@@ -3388,6 +3487,7 @@ export function createDecisionRuntime(
 				pendingContinuationPublication = null;
 				watchdogOwnedRun = null;
 				pending.active.invalidated = true;
+				finishPrivateProgress(pending.active);
 				if (!allIdleForClaim(pending.active.claim)) return false;
 				if (
 					!owns(pending.active.claim) ||
@@ -3443,6 +3543,13 @@ export function createDecisionRuntime(
 				!owns(pending.active.claim)
 			)
 				return false;
+			try {
+				// Publication receipt affects display only; existing outcome authority
+				// and hooks still settle through confirmContinuationPublication.
+				if (receipt() === true) finishPrivateProgress(pending.active);
+			} catch {
+				// An unavailable receipt is not proof of completion.
+			}
 			reconcileIdle();
 			return true;
 		} finally {
@@ -3577,6 +3684,7 @@ export function createDecisionRuntime(
 						settled: false,
 					};
 					pendingUnlockReview = reviewState;
+					observePrivateProgress(active, { stage: "reviewing" });
 					void (async () => {
 						const report = await runUnlockReview(
 							discovery.service,
@@ -3621,25 +3729,6 @@ export function createDecisionRuntime(
 			deferDecisionOnBusy(active);
 			return false;
 		}
-		// Invalid re-asks have re-entrant status/UI work before dispatch. Keep the
-		// plan uncommitted through that work so an aggregate-busy edge consumes no
-		// invalid-attempt budget and can be retried at the next genuine idle settle.
-		if (plan.outcome === "invalid") {
-			const status = checkingStatus(active);
-			const widgetError = showLiveStatus(status);
-			if (widgetError !== null) {
-				appendStatus({
-					kind: "other-error",
-					exchangeId: active.exchangeId,
-					cycleId,
-					message: widgetError,
-				});
-				silentlyAbandonDecision();
-				return false;
-			}
-			if (!readyToFinalize()) return false;
-		}
-
 		if (currentConsumedDecision() !== active) return false;
 		const controllerAtCommit = options.controllerHolder.controller;
 		const publicationCycleAtCommit = publicationCycle;
@@ -3731,7 +3820,7 @@ export function createDecisionRuntime(
 		}
 
 		if (stopIfStale(claim)) return false;
-		if (finalization.outcome !== "continue") clearLiveStatus();
+		observePrivateProgress(active, { stage: "publishing" });
 		if (stopIfStale(claim)) return false;
 
 		if (finalization.outcome === "decision-failed") {
@@ -3847,7 +3936,6 @@ export function createDecisionRuntime(
 			};
 			activeDecision = null;
 			capturedDecisionResponse = null;
-			clearLiveStatus();
 			return sendPendingContinuation(ctx);
 		}
 
@@ -4449,6 +4537,9 @@ export function createDecisionRuntime(
 		options.pi.on("session_start", async (_event, ctx: ExtensionContext) => {
 			unsubscribeTerminalInput?.();
 			unsubscribeTerminalInput = undefined;
+			if (visiblePrivateDecision !== null)
+				finishPrivateProgress(visiblePrivateDecision);
+			clearStateStatus();
 			++lifecycleGeneration;
 			localActivityGeneration += 1;
 			sessionContext = ctx;
@@ -4578,9 +4669,15 @@ export function createDecisionRuntime(
 			) {
 				// Actual ordinary work ends callback suspension in the same cycle
 				// (+0 units). An unpublished waiting signal is retired, never replayed.
+				const callbackDecision =
+					pendingTerminalPublication?.values.STOP_KIND === "WAIT_CALLBACK"
+						? pendingTerminalPublication.active
+						: undefined;
 				if (pendingTerminalPublication?.values.STOP_KIND === "WAIT_CALLBACK")
 					pendingTerminalPublication = null;
 				if (pendingUnlock?.STOP_KIND === "WAIT_CALLBACK") pendingUnlock = null;
+				if (callbackDecision !== undefined)
+					finishPrivateProgress(callbackDecision);
 			}
 			if (claim !== null && controller !== null) {
 				const transition = controller.ensureLocked();
