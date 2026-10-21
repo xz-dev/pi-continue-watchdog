@@ -1272,7 +1272,7 @@ test("reconsideration keeps fixed file contract and configured reason lists (F9)
 	assert.match(correction, /failed validation/i);
 	assert.match(correction, /CUSTOM_JOB_DONE_X7/);
 	assert.match(correction, /CUSTOM_WORK_REMAINS_X7/);
-	assert.ok(correction.includes(input.resultFile));
+	assert.ok(correction.includes(JSON.stringify(input.resultFile)));
 	assert.match(child.prompts[1] ?? "", /challenged/i);
 	assert.equal(harness.driver.children.length, 1);
 	await harness.settle(harness.answer("Still complete.", "CUSTOM_JOB_DONE_X7"));
