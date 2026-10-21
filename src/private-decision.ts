@@ -1,3 +1,6 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import {
 	type PrivateForkInput,
 	type PrivateInquiryObservation,
@@ -33,6 +36,12 @@ import {
 
 /** Marker element appended to every prompt carrying the actual result path. */
 export const WATCHDOG_RESULT_FILE_TAG = "watchdog_result_file";
+
+/** /var/tmp on POSIX (disk-backed); Windows has none, so its temp dir. */
+export const RESULT_DIR_PREFIX = join(
+	process.platform === "win32" ? tmpdir() : "/var/tmp",
+	"watchdog-decision-",
+);
 
 /** Safe per-response observation handed to the optional audit callback. */
 export type PrivateDecisionObservation =
@@ -117,7 +126,7 @@ export function runPrivateDecision(
 		naming: {
 			tag: WATCHDOG_RESULT_FILE_TAG,
 			fileName: "decision.json",
-			dirPrefix: "/var/tmp/watchdog-decision-",
+			dirPrefix: RESULT_DIR_PREFIX,
 		},
 		validate: (payload) => {
 			const validation = validateDecisionArguments(
