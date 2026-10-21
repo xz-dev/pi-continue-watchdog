@@ -13,6 +13,7 @@ import type {
 
 import {
 	type PrivateDecisionObservation,
+	RESULT_DIR_PREFIX,
 	runPrivateDecision,
 } from "../src/private-decision.js";
 
@@ -216,10 +217,14 @@ test("one valid file response returns a terminal decision and cleans up", async 
 	assert.ok(forkInput !== undefined);
 	const ownedDir = dirname(forkInput.resultFile);
 	// The prompt carries the actual JSON-encoded path inside the marker.
-	assert.match(
-		children[0].prompts[0],
-		/<watchdog_result_file>"\/var\/tmp\/watchdog-decision-[^"]*\/decision\.json"<\/watchdog_result_file>$/,
+	assert.ok(
+		children[0].prompts[0].endsWith(
+			`<watchdog_result_file>${JSON.stringify(forkInput.resultFile)}</watchdog_result_file>`,
+		),
 	);
+	assert.ok(forkInput.resultFile.startsWith(RESULT_DIR_PREFIX));
+	if (process.platform !== "win32")
+		assert.ok(forkInput.resultFile.startsWith("/var/tmp/watchdog-decision-"));
 	assert.equal(forkInput.resultFile.endsWith("decision.json"), true);
 	// Owned temp resources are deleted; nothing durable remains.
 	assert.equal(existsSync(ownedDir), false);
