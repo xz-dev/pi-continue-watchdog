@@ -42,21 +42,6 @@ A supported review SHALL release the original candidate to existing commit and p
 - **THEN** the review is incomplete (malformed), never a challenge or approval
 - **AND** a dropped required id is recorded as insufficient evidence; either way the still-current original candidate follows the incomplete-review policy
 
-### Requirement: Final judgment replaces transport accounting as the acceptance condition
-The watchdog SHALL accept a review outcome only from a live `stop` result whose required answer is present, correctly typed (`choice`) and one of the legal `supported`/`challenged`/`insufficient_evidence` labels, with the required id absent from `dropped` and `contextOverflow` not set. It SHALL NOT require `reviewVersion`, `unresolved`, checkpoint progress, `observationCoverage`, attempt counts or any transport-observation completeness. Removed observation completeness SHALL NOT be replaced by a fabricated successful-observation marker; a missing or absent usage report SHALL remain absent and SHALL NOT be reported as zero. Only a valid definite challenge SHALL allow the existing single semantic reconsideration; it SHALL not itself choose a replacement action or create user authority.
-
-#### Scenario: Valid challenge without attempt observations
-- **WHEN** a current version-two judgment returns the legal required `challenged` choice and no transport diagnostics
-- **THEN** watchdog permits at most its existing one reconsideration after local validation, without manufacturing observation evidence
-
-#### Scenario: Unsupported evidence or malformed result
-- **WHEN** necessary permitted facts are unavailable or the returned required answer is missing/malformed
-- **THEN** review is incomplete, not a challenge or approval, and the still-current original candidate follows existing policy
-
-#### Scenario: Cancellation wins
-- **WHEN** the user takes over or manually unlocks while judgment is pending
-- **THEN** owned work is cancelled and neither its late answer nor an incomplete-result fallback resurrects the old candidate
-
 ### Requirement: Review history and diagnostics do not create execution authority
 Each review's disposition and actual service identity SHALL be appended as one context-excluded record to the owning main session, linked to the exact local decision and private child/inquiry identity. Optional backend-reported usage SHALL keep its stated scope and absence SHALL NOT be reported as zero; a logical judgment SHALL NOT be labelled as a provider transport attempt or a billable request. No separate review database or durable file sidecar SHALL be introduced. Supported, challenged, incomplete, and stale/cancelled outcomes SHALL remain distinguishable from a published watchdog outcome. Optional diagnostic/history failures SHALL NOT relock an unlock, charge continuation budget, launch another provider call, or add an independent append-acknowledgement execution gate. Recovery SHALL restore history only, never child sessions, temporary-file authority, locks, pending calls, or automatic publication. Existing canonical-publication requirements and rollback SHALL remain unchanged. Private raw outputs, file paths, tool payloads, and thinking SHALL not be copied into these main-session review diagnostics.
 
@@ -76,3 +61,20 @@ Each review's disposition and actual service identity SHALL be appended as one c
 #### Scenario: Existing session history
 - **WHEN** a session contains old review records with transport-attempt or observation fields
 - **THEN** the upgrade leaves them intact and does not restore pending calls, checkpoints, locks or execution authority from them
+
+## ADDED Requirements
+
+### Requirement: Final judgment replaces transport accounting as the acceptance condition
+The watchdog SHALL accept a review outcome only from a live `stop` result whose required answer is present, correctly typed (`choice`) and one of the legal `supported`/`challenged`/`insufficient_evidence` labels, with the required id absent from `dropped` and `contextOverflow` not set. It SHALL NOT require `reviewVersion`, `unresolved`, checkpoint progress, `observationCoverage`, attempt counts or any transport-observation completeness. Removed observation completeness SHALL NOT be replaced by a fabricated successful-observation marker; a missing or absent usage report SHALL remain absent and SHALL NOT be reported as zero. Only a valid definite challenge SHALL allow the existing single semantic reconsideration; it SHALL not itself choose a replacement action or create user authority.
+
+#### Scenario: Valid challenge without attempt observations
+- **WHEN** a current version-two judgment returns the legal required `challenged` choice and no transport diagnostics
+- **THEN** watchdog permits at most its existing one reconsideration after local validation, without manufacturing observation evidence
+
+#### Scenario: Unsupported evidence or malformed result
+- **WHEN** necessary permitted facts are unavailable or the returned required answer is missing/malformed
+- **THEN** review is incomplete, not a challenge or approval, and the still-current original candidate follows existing policy
+
+#### Scenario: Cancellation wins
+- **WHEN** the user takes over or manually unlocks while judgment is pending
+- **THEN** owned work is cancelled and neither its late answer nor an incomplete-result fallback resurrects the old candidate
