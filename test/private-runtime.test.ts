@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
 
@@ -45,7 +46,12 @@ async function createFixture(
 	t: TestContext,
 	reply?: (request: number, resultFile: string) => AssistantMessage["content"],
 ) {
-	const root = await mkdtemp("/var/tmp/watchdog-private-runtime-");
+	const root = await mkdtemp(
+		join(
+			process.platform === "win32" ? tmpdir() : "/var/tmp",
+			"watchdog-private-runtime-",
+		),
+	);
 	let parent: AgentSession | undefined;
 	let runtime: ReturnType<typeof createWatchdogRuntime> | undefined;
 	t.after(async () => {
