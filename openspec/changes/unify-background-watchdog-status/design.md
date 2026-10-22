@@ -37,7 +37,7 @@ Alternative rejected: continuing a second panel duplicates progress and makes th
 
 Store only exact operation identity, visible owner/session scope, monotonic admission time, current phase, known inquiry/attempt metadata and safe admitted helper names on the existing active-operation state. Do not build a generic state machine, event bus or persistent progress store.
 
-The existing Continue `running/idle` and actor/countdown projection continues to describe its current ordinary activity semantics. Reflect's accounting projection remains untouched. Private progress is an additional suffix and controls highlighting; it is not inferred from `anyBusy`, elapsed accounting, enabled state, loop thresholds or the presence of a queued manual request.
+The existing Continue `running/idle` and actor/countdown projection continues to describe its current ordinary activity semantics. Reflect's accounting projection remains untouched. Private progress is an additional segment placed right after the plugin name, and it controls highlighting; it is not inferred from `anyBusy`, elapsed accounting, enabled state, loop thresholds or the presence of a queued manual request.
 
 Shared phase vocabulary and observation sources:
 
