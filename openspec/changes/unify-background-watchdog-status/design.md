@@ -72,13 +72,13 @@ Have at most one local display tick where the existing architecture permits; avo
 
 ### 6. Same responsive priorities, existing controls preserved
 
-Full width retains the existing Continue lock/key/actor or countdown text and Reflect's active/task/root/all/cooldown/queue text, with a progress suffix. Compact mode puts plugin identity and active phase before elapsed time and attempt, then fits secondary controls/counters. At extremely narrow widths, clip safely rather than promising all fields can fit. Use Pi's `visibleWidth` and `truncateToWidth`; theme formatting is applied at render time.
+Full width retains the existing Continue lock/key/actor or countdown text and Reflect's active/task/root/all/cooldown/queue text, placed after the progress segment. Both rows use one order at every width: plugin identity, active phase, elapsed time and attempt, then controls/counters (user acceptance feedback: a progress suffix on one row and a prefix on the other made it unclear where to look). Compact mode keeps that order and drops secondary controls/counters first. At extremely narrow widths, clip safely rather than promising all fields can fit. Use Pi's `visibleWidth` and `truncateToWidth`; theme formatting is applied at render time.
 
 Illustrative full-width output, not exact punctuation to snapshot-lock:
 
 ```text
-Continue Watchdog | idle (enabled · alt+u unlock) | asking | reviewing · 18s · attempt 1/3
-Reflect Watchdog | active 1m58s/2 loops · task 1m58s/20m · root 2/60 · all 2/300 | tools: read · 12s · attempt 1/3
+Continue Watchdog | reviewing · 18s · attempt 1/3 | idle (enabled · alt+u unlock) | asking
+Reflect Watchdog | tools: read · 12s · 1/3 | active 1m58s/2 loops · task 1m58s/20m · root 2/60 · all 2/300
 ```
 
 ### 7. Scope rendering independently from result authority

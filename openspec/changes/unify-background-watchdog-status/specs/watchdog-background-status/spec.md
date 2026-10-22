@@ -72,7 +72,12 @@ Under a responsive interactive host, an observed stage or terminal lifecycle cha
 - **AND** a review completion updates the row without requiring another agent event
 
 ### Requirement: Existing controls and counters survive responsive rendering
-At sufficient width, Continue SHALL retain its ordinary running/idle state, enabled/disabled state, effective configured unlock shortcut or command, and root/subagent or decision-countdown information. Reflect SHALL retain active duration/loops, task duration/limit, root/all loop budgets, cooldown and any effective pending-request cancellation hint. Both rows SHALL use the same compact-layout priorities: plugin identity and active stage first, then elapsed time and attempt, then existing controls/counters as space permits. Each SHALL render one line within available terminal columns across resize and theme changes, without mutating stored values. Omitted details SHALL reappear when width permits.
+At sufficient width, Continue SHALL retain its ordinary running/idle state, enabled/disabled state, effective configured unlock shortcut or command, and root/subagent or decision-countdown information. Reflect SHALL retain active duration/loops, task duration/limit, root/all loop budgets, cooldown and any effective pending-request cancellation hint. Both rows SHALL use the same layout order at every width: plugin identity, then the active stage, elapsed time and attempt, then existing controls/counters; full-width rows SHALL NOT place progress after the controls/counters. Compact rows keep that order and drop secondary controls/counters first as space requires. Each SHALL render one line within available terminal columns across resize and theme changes, without mutating stored values. Omitted details SHALL reappear when width permits.
+
+#### Scenario: Both rows active at full width
+- **WHEN** Continue and Reflect both show private progress at sufficient width
+- **THEN** each row shows its stage immediately after its plugin name, so both stages are vertically aligned at the start of the rows
+- **AND** the existing controls/counters follow the progress in each row
 
 #### Scenario: Narrow terminal during private work
 - **WHEN** the terminal narrows so full state and progress no longer fit
