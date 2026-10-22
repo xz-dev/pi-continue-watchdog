@@ -2191,6 +2191,75 @@ test("private progress setup failure clears highlight and fences late observatio
 	}
 });
 
+test("private progress row replaces model waiting with content-free streaming activity", async () => {
+	const secret = "watchdog-streaming-sentinel-do-not-render";
+	const harness = createHarness();
+	await startIdle(harness);
+	await harness.openDecision();
+	const widget = mountStateStatusWidget(harness);
+	assert.match(widget.render(200).join(""), /waiting for model/);
+
+	const child = harness.privateDriver.children[0];
+	assert.ok(child);
+	const emit = child.emit.bind(child);
+	const assistant = { role: "assistant" };
+	emit({ type: "message_start", message: assistant });
+	assert.match(widget.render(200).join(""), /waiting for model/);
+
+	emit({
+		type: "message_update",
+		assistantMessageEvent: { type: "thinking_delta", delta: secret },
+	});
+	// 41 chars so far (secret length) → "41" suffix, frame ⠙ (floor(41/24)=1).
+	const thinking = widget.render(200).join("");
+	assert.match(thinking, /thinking [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] 41/);
+	assert.doesNotMatch(thinking, new RegExp(secret));
+
+	emit({
+		type: "message_update",
+		assistantMessageEvent: { type: "text_delta", delta: "x".repeat(1200) },
+	});
+	const writing = widget.render(200).join("");
+	assert.match(writing, /writing/);
+	assert.match(writing, /1\.2k/);
+	assert.doesNotMatch(writing, /waiting for model/);
+	assert.doesNotMatch(writing, new RegExp(secret));
+
+	emit({ type: "message_end" });
+	assert.match(widget.render(200).join(""), /waiting for model/);
+
+	await settleResponse(harness, harness.answerInvalid());
+	const correcting = widget.render(200).join("");
+	assert.match(correcting, /correcting.*2\/3/);
+	emit({ type: "message_start", message: assistant });
+	emit({
+		type: "message_update",
+		assistantMessageEvent: { type: "text_delta", delta: "y".repeat(30) },
+	});
+	const correctingStream = widget.render(200).join("");
+	assert.match(correctingStream, /correcting/);
+	assert.match(correctingStream, /writing/);
+	assert.doesNotMatch(correctingStream, /waiting for model/);
+
+	await settleResponse(harness, harness.answerUnlock());
+	assert.doesNotMatch(
+		widget.render(200).join(""),
+		/waiting for model|thinking|writing|correcting/,
+	);
+	// Late deltas from the finished child cannot repaint.
+	emit({
+		type: "message_update",
+		assistantMessageEvent: { type: "text_delta", delta: "late" },
+	});
+	assert.doesNotMatch(widget.render(200).join(""), /writing|thinking/);
+	assert.equal(
+		JSON.stringify(
+			harness.privateDriver.operations.map((o) => o.options),
+		).includes(secret),
+		false,
+	);
+});
+
 test("private progress display failures cannot change validation or accepted publication", async () => {
 	const harness = createHarness();
 	await startIdle(harness);

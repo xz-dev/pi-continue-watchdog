@@ -47,12 +47,24 @@ export const RESULT_DIR_PREFIX = join(
 export type PrivateDecisionObservation =
 	PrivateInquiryObservation<ValidDecision>;
 
+/** Latest streamed output kind of the current private response. */
+export type PrivateDecisionStreamKind = "thinking" | "writing" | "tool call";
+
+/** Content-free streaming activity of the current private response. */
+export interface PrivateDecisionStream {
+	readonly kind: PrivateDecisionStreamKind;
+	/** Characters streamed so far in this response (delta lengths only). */
+	readonly count: number;
+}
+
 /** Content-free display observation; result attempts are not transport retries. */
 export interface PrivateDecisionProgress {
 	readonly stage: "waiting for model" | "validating" | "correcting";
 	readonly inquiry: "initial" | "reconsideration";
 	readonly attempt: number;
 	readonly limit: number;
+	/** Present while the current response streams; absent before/after it. */
+	readonly stream?: PrivateDecisionStream;
 }
 
 /** Terminal result of one logical private decision. */
@@ -139,24 +151,86 @@ export function runPrivateDecision(
 	} = options;
 	let inquiry: PrivateDecisionProgress["inquiry"] = "initial";
 	let attempt = 1;
-	const observe = (stage: PrivateDecisionProgress["stage"]): void => {
+	const observe = (
+		stage: PrivateDecisionProgress["stage"],
+		stream?: PrivateDecisionStream,
+	): void => {
 		try {
 			onProgress?.({
 				stage,
 				inquiry,
 				attempt,
 				limit: DECISION_INVALID_ATTEMPT_LIMIT,
+				...(stream === undefined ? {} : { stream }),
 			});
 		} catch {
 			// Display failure never changes validation, requests or accounting.
 		}
 	};
+	/**
+	 * Content-free streaming activity for the current private response.
+	 * Only delta kinds and lengths are read; delta text, partial content and
+	 * tool-call arguments are never observed or retained.
+	 */
+	const streamKindOf = (type: string): PrivateDecisionStreamKind | undefined =>
+		type === "thinking_delta"
+			? "thinking"
+			: type === "text_delta"
+				? "writing"
+				: type === "toolcall_delta"
+					? "tool call"
+					: undefined;
 	const observedRuntime: PrivateRuntime =
 		onProgress === undefined
 			? runtime
 			: {
 					async fork(input) {
 						const child = await runtime.fork(input);
+						let streaming: PrivateDecisionStream | null = null;
+						let observing = true;
+						// Display-only: a subscription fault leaves the child unobserved, never failed.
+						let unsubscribe: (() => void) | undefined;
+						try {
+							unsubscribe = child.subscribe((event) => {
+								try {
+									if (!observing) return;
+									if (event.type === "message_start") {
+										streaming = null;
+										observe("waiting for model");
+										return;
+									}
+									if (event.type === "message_end") {
+										if (streaming !== null) {
+											streaming = null;
+											observe("waiting for model");
+										}
+										return;
+									}
+									if (event.type !== "message_update") return;
+									const assistantEvent = event.assistantMessageEvent as
+										| { type?: unknown; delta?: unknown }
+										| undefined;
+									const kind =
+										typeof assistantEvent?.type === "string"
+											? streamKindOf(assistantEvent.type)
+											: undefined;
+									if (kind === undefined) return;
+									const deltaLength =
+										typeof assistantEvent?.delta === "string"
+											? assistantEvent.delta.length
+											: 0;
+									streaming = {
+										kind,
+										count: (streaming?.count ?? 0) + deltaLength,
+									};
+									observe("waiting for model", streaming);
+								} catch {
+									// A malformed display event never affects execution.
+								}
+							});
+						} catch {
+							unsubscribe = undefined;
+						}
 						return {
 							get sessionId() {
 								return child.sessionId;
@@ -199,7 +273,15 @@ export function runPrivateDecision(
 								}
 							},
 							abort: () => child.abort(),
-							dispose: () => child.dispose(),
+							dispose: async () => {
+								observing = false;
+								try {
+									unsubscribe?.();
+								} catch {
+									// Observer teardown cannot skip child disposal.
+								}
+								await child.dispose();
+							},
 							subscribe: (listener) => child.subscribe(listener),
 						};
 					},

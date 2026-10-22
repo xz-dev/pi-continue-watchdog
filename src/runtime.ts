@@ -89,6 +89,7 @@ import type {
 } from "./hub.js";
 import {
 	type PrivateDecisionProgress,
+	type PrivateDecisionStream,
 	runPrivateDecision,
 } from "./private-decision.js";
 import {
@@ -206,6 +207,7 @@ interface ActiveDecision {
 			inquiry?: PrivateDecisionProgress["inquiry"];
 			attempt?: number;
 			limit?: number;
+			stream?: PrivateDecisionStream;
 		};
 		started: boolean;
 		drained: boolean;
@@ -719,6 +721,12 @@ export function createDecisionRuntime(
 		}
 	};
 
+	const PRIVATE_STREAM_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+
+	/** Content-free streaming label; only kind + count reach the row. */
+	const privateStreamLabel = (stream: PrivateDecisionStream): string =>
+		`${stream.kind} ${PRIVATE_STREAM_FRAMES[Math.floor(stream.count / 24) % PRIVATE_STREAM_FRAMES.length]} ${stream.count < 1000 ? `${stream.count}` : `${(stream.count / 1000).toFixed(1)}k`}`;
+
 	const privateStatusProjection = (): {
 		readonly stage: string;
 		readonly elapsedSeconds: number;
@@ -735,8 +743,12 @@ export function createDecisionRuntime(
 			progress.attempt !== undefined &&
 			progress.attempt > 1 &&
 			progress.stage === "waiting for model";
+		const stageText =
+			progress.stage === "waiting for model" && progress.stream !== undefined
+				? privateStreamLabel(progress.stream)
+				: progress.stage;
 		return {
-			stage: `${reconsidering ? "reconsidering · " : ""}${correcting ? "correcting · " : ""}${progress.stage}`,
+			stage: `${reconsidering ? "reconsidering · " : ""}${correcting ? "correcting · " : ""}${stageText}`,
 			elapsedSeconds: Math.floor(
 				Math.max(0, elapsedNow() - progress.admittedAt) / 1000,
 			),
@@ -992,6 +1004,7 @@ export function createDecisionRuntime(
 				!privateProgressVisible(active)
 			)
 				return;
+			operation.progress.stream = undefined;
 			Object.assign(operation.progress, progress);
 			refreshStateStatus();
 		} catch {

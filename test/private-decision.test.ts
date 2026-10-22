@@ -41,6 +41,8 @@ interface FakeChild extends WatchdogChildSession {
 	readonly prompts: readonly string[];
 	readonly fileStates: readonly string[];
 	readonly aborted: boolean;
+	/** Deliver one raw child event to current subscribers (unsubscribed drops). */
+	emit(event: { type: string; [key: string]: unknown }): void;
 }
 
 /**
@@ -88,6 +90,9 @@ function createFakeRuntime(
 				disposed: false,
 				attemptError: undefined as string | undefined,
 			};
+			const subscribers = new Set<
+				(event: { type: string; [key: string]: unknown }) => void
+			>();
 			const child: FakeChild = {
 				sessionId: `private-child-${children.length + 1}`,
 				modelId: "fake/local",
@@ -143,8 +148,14 @@ function createFakeRuntime(
 					await disposeGate.hold;
 					state.disposed = true;
 				},
-				subscribe() {
-					return () => {};
+				subscribe(listener) {
+					subscribers.add(listener);
+					return () => {
+						subscribers.delete(listener);
+					};
+				},
+				emit: (event) => {
+					for (const subscriber of [...subscribers]) subscriber(event);
 				},
 			};
 			children.push(child);
@@ -246,6 +257,114 @@ test("private progress keeps reconsideration allowance independent and observers
 		],
 	);
 	assert.equal(children[0].prompts.length, 3);
+});
+
+test("private progress streams content-free output activity per response", async (t) => {
+	const secret = "watchdog-streaming-sentinel-do-not-render";
+	const { runtime, children } = createFakeRuntime(t, ({ responseIndex }) => {
+		queueMicrotask(() => {
+			const emit = children.at(-1)?.emit.bind(children.at(-1));
+			emit?.({ type: "message_start", message: { role: "assistant" } });
+			if (responseIndex === 1) {
+				emit?.({
+					type: "message_update",
+					assistantMessageEvent: { type: "thinking_delta", delta: "hmm" },
+				});
+				emit?.({
+					type: "message_update",
+					assistantMessageEvent: {
+						type: "toolcall_delta",
+						delta: "tool-arg-secret",
+					},
+				});
+				emit?.({
+					type: "message_update",
+					assistantMessageEvent: { type: "text_delta", delta: secret },
+				});
+				emit?.({
+					type: "message_update",
+					assistantMessageEvent: { type: "text_delta", delta: "x" },
+				});
+			} else {
+				emit?.({
+					type: "message_update",
+					assistantMessageEvent: { type: "text_delta", delta: "abcde" },
+				});
+			}
+			emit?.({ type: "message_end" });
+		});
+		return { write: responseIndex === 1 ? "{}" : VALID_CONTINUE };
+	});
+	const stages: Array<Record<string, unknown>> = [];
+	const result = await runPrivateDecision(
+		baseOptions(runtime, {
+			onProgress: (event) => stages.push({ ...(event as object) }),
+		}),
+	);
+	assert.equal(result.kind, "decision");
+	assert.equal(children.length, 1);
+	assert.equal(children[0].prompts.length, 2);
+
+	// First prompt: waiting, then streaming activity for the same response.
+	const stream = (stage: Record<string, unknown>) =>
+		stage.stream as { kind?: string; count?: number } | undefined;
+	const firstWaiting = stages.findIndex(
+		(stage) => stage.stage === "waiting for model" && stage.attempt === 1,
+	);
+	const firstStream = stages.findIndex(
+		(stage) => stream(stage)?.kind === "thinking" && stage.attempt === 1,
+	);
+	assert.ok(firstWaiting >= 0 && firstStream > firstWaiting);
+	// thinking_delta(3) + toolcall_delta("tool-arg-secret"=15) + text_delta(secret) + text_delta("x")
+	assert.ok(
+		stages.some(
+			(stage) =>
+				stream(stage)?.kind === "writing" &&
+				stream(stage)?.count === 3 + 15 + secret.length + 1 &&
+				stage.attempt === 1,
+		),
+	);
+	assert.ok(
+		stages.some(
+			(stage) => stream(stage)?.kind === "tool call" && stage.attempt === 1,
+		),
+	);
+	// message_end of response 1 clears the stream before validating.
+	const backToWaiting = stages.findIndex(
+		(stage, index) =>
+			index > firstStream &&
+			stage.stage === "waiting for model" &&
+			stream(stage) === undefined &&
+			stage.attempt === 1,
+	);
+	assert.ok(backToWaiting > firstStream);
+	assert.ok(
+		stages.some(
+			(stage, index) =>
+				index > backToWaiting &&
+				stage.stage === "validating" &&
+				stage.attempt === 1,
+		),
+	);
+	// Second response resets the count and returns to waiting first.
+	const secondWaiting = stages.findIndex(
+		(stage) => stage.stage === "waiting for model" && stage.attempt === 2,
+	);
+	assert.ok(secondWaiting > backToWaiting);
+	assert.ok(
+		stages.some(
+			(stage, index) =>
+				index > secondWaiting &&
+				stream(stage)?.kind === "writing" &&
+				stream(stage)?.count === 5 &&
+				stage.attempt === 2,
+		),
+	);
+	// Privacy: no streamed text, thinking or tool-call argument text leaks
+	// into any observed progress state.
+	const serialized = JSON.stringify(stages);
+	assert.equal(serialized.includes(secret), false);
+	assert.equal(serialized.includes("tool-arg-secret"), false);
 });
 
 test("one valid file response returns a terminal decision and cleans up", async (t) => {
@@ -654,6 +773,80 @@ test("a settled prompt with no own reply cannot borrow an inherited response or 
 	);
 	assert.equal(children[0].prompts.length, 1);
 });
+
+test("stream observations stop when the operation ends", async (t) => {
+	const { runtime, children } = createFakeRuntime(t, () => ({
+		write: VALID_CONTINUE,
+	}));
+	const stages: Array<Record<string, unknown>> = [];
+	const result = await runPrivateDecision(
+		baseOptions(runtime, {
+			onProgress: (event) => stages.push({ ...(event as object) }),
+		}),
+	);
+	assert.equal(result.kind, "decision");
+	const recorded = stages.length;
+	children[0]?.emit({
+		type: "message_update",
+		assistantMessageEvent: { type: "text_delta", delta: "late" },
+	});
+	await new Promise<void>((resolve) => setTimeout(resolve, 1));
+	assert.equal(stages.length, recorded, "late deltas after completion drop");
+});
+
+for (const fault of ["subscribe", "unsubscribe"] as const) {
+	test(`a throwing display ${fault} cannot change the decision or skip child cleanup`, async () => {
+		const state = { prompts: 0, disposals: 0, listeners: 0 };
+		let saved: ((event: { type: string }) => void) | undefined;
+		const runtime = {
+			async fork(input: { resultFile: string }) {
+				const messages: unknown[] = [];
+				return {
+					sessionId: "fault-child",
+					modelId: "fake/local",
+					messages,
+					async prompt() {
+						state.prompts++;
+						await writeFile(input.resultFile, VALID_CONTINUE);
+						messages.push({
+							role: "assistant",
+							content: [{ type: "text", text: "done" }],
+							stopReason: "stop",
+							timestamp: Date.now(),
+						});
+					},
+					async abort() {},
+					async dispose() {
+						state.disposals++;
+					},
+					subscribe(listener: (event: { type: string }) => void) {
+						if (fault === "subscribe") throw new Error("display subscribe");
+						saved = listener;
+						state.listeners++;
+						return () => {
+							throw new Error("display unsubscribe");
+						};
+					},
+				};
+			},
+			async dispose() {},
+		} as unknown as WatchdogRuntime;
+		const stages: unknown[] = [];
+		const result = await runPrivateDecision(
+			baseOptions(runtime, { onProgress: (event) => stages.push(event) }),
+		);
+		assert.equal(result.kind, "decision");
+		assert.equal(state.prompts, 1);
+		assert.equal(state.disposals, 1, "underlying child is always disposed");
+		const recorded = stages.length;
+		saved?.({ type: "message_start" });
+		assert.equal(
+			stages.length,
+			recorded,
+			"a saved listener is inert after cleanup",
+		);
+	});
+}
 
 test("a stale result read before a later recheck cannot commit", async (t) => {
 	let current = true;

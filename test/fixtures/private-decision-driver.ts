@@ -67,6 +67,8 @@ export interface FakeChildSession extends WatchdogChildSession {
 	readonly fileStates: readonly string[];
 	readonly aborted: boolean;
 	readonly disposed: boolean;
+	/** Deliver one raw child event to current subscribers (unsubscribed drops). */
+	emit(event: { type: string; [key: string]: unknown }): void;
 }
 
 export interface TrackedOperation {
@@ -143,6 +145,9 @@ export function createPrivateDriver(options?: {
 				disposed: false,
 				attemptError: undefined as string | undefined,
 			};
+			const subscribers = new Set<
+				(event: { type: string; [key: string]: unknown }) => void
+			>();
 			const child: FakeChildSession = {
 				sessionId: `private-child-${children.length + 1}`,
 				modelId: "fake/local",
@@ -224,8 +229,14 @@ export function createPrivateDriver(options?: {
 				async dispose() {
 					state.disposed = true;
 				},
-				subscribe() {
-					return () => {};
+				subscribe(listener) {
+					subscribers.add(listener);
+					return () => {
+						subscribers.delete(listener);
+					};
+				},
+				emit: (event) => {
+					for (const subscriber of [...subscribers]) subscriber(event);
 				},
 			};
 			children.push(child);
