@@ -44,7 +44,8 @@ Shared phase vocabulary and observation sources:
 | Phase | Actual boundary | Applies to |
 | --- | --- | --- |
 | `preparing` | admission through runtime/fork setup | both |
-| `waiting for model` | authorized prompt/request, with no admitted helper currently executing | both |
+| `waiting for model` | authorized prompt/request, with no admitted helper currently executing and no streamed output yet in the current response | both |
+| `thinking`/`writing`/`tool call` + indicator + count | official `message_update` streaming deltas (`thinking_delta`, `text_delta`, `toolcall_delta`) of the current private response; replaces `waiting for model` until that response ends | both |
 | `tools: read` (or other safe names) | official execution start/end for admitted private evidence helpers | Reflect |
 | `validating` | completed result enters existing validation | both |
 | `correcting` | invalid result and next authorized correction | both |
@@ -61,7 +62,7 @@ Use admission, `onStarted`, `onResponse`, validation, review and terminal bounda
 
 Where needed, add a local optional stage observer in Continue's adapter to bracket its existing validator and authorize-attempt boundaries; do not change the shared package API. Render callbacks must be bounded, non-throwing observations. They must not change the existing `onStarted` failure contract, swallow execution errors, trigger a prompt, or mutate candidate/outcome data. If a precise transport stage is unavailable, retain the last truthful broader stage rather than claiming an unsupported one.
 
-Count result attempts using existing inquiry metadata and invalid-result policy, not every model/helper event. Label reconsideration separately and retain the original logical operation start time across correction, review and reconsideration. Do not print helper parameters or private streaming text; whitelist tool names. When admitted helpers overlap, derive the label from the currently active admitted set rather than incorrectly returning to model waiting after the first finishes.
+Count result attempts using existing inquiry metadata and invalid-result policy, not every model/helper event. Label reconsideration separately and retain the original logical operation start time across correction, review and reconsideration. Do not print helper parameters or private streaming text; whitelist tool names. Streaming activity (user feedback after first review: show that output is flowing, not its content) reads only `assistantMessageEvent.type` and `delta.length` from the exact child's `message_update`; never `partial`, delta text or tool-call contents. Kind follows the latest delta; the count covers all streamed kinds of the current response and resets on the next assistant `message_start`; `message_end` returns to model waiting. The braille indicator frame is derived from the streamed count, so it moves only when output arrives. Redraw only when the visible label changes (kind or indicator frame, frame step every 24 characters); the existing 1s tick refreshes the count otherwise. Continue's local fork facade adds the same bounded exact-child subscription Reflect already has and removes it on dispose/failure. When admitted helpers overlap, derive the label from the currently active admitted set rather than incorrectly returning to model waiting after the first finishes.
 
 ### 5. Event-driven rendering plus an elapsed-time tick
 

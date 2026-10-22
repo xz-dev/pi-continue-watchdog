@@ -28,12 +28,17 @@ Each row SHALL use the same theme-aware active foreground/background semantics w
 - **THEN** Continue's row is highlighted and identifies review rather than implying ordinary root work
 
 ### Requirement: Progress names observed work rather than inferred completion
-An active row SHALL identify its current observed stage and total elapsed time since operation admission. Observable preparation, model waiting/generation, result validation, format correction, outcome publication and cancellation drain SHALL be represented when they occur. Admitted private evidence-tool execution SHALL identify only safe tool names. Continue SHALL additionally identify optional unlock review and the single review-triggered reconsideration when present. Unobserved phases SHALL NOT be invented; elapsed time, accounting counters and token silence SHALL NOT be treated as proof of task completion or a percentage/ETA. Brief synchronous stages SHALL update projection without requiring an artificial delay to force a frame.
+An active row SHALL identify its current observed stage and total elapsed time since operation admission. Observable preparation, model waiting/generation, result validation, format correction, outcome publication and cancellation drain SHALL be represented when they occur. Admitted private evidence-tool execution SHALL identify only safe tool names. Continue SHALL additionally identify optional unlock review and the single review-triggered reconsideration when present. While a private model request is streaming, the model-waiting stage SHALL be replaced by a content-free streaming activity label: the latest official output kind (`thinking`, `writing` or `tool call`), an indicator that advances only as streamed output arrives, and the number of characters streamed in the current response (for example `writing ⠙ 1.2k`). Before the first streamed output of a request, and after that response ends, the stage SHALL return to `waiting for model`. The activity label SHALL be derived only from official streaming delta kinds and lengths; streamed text, thinking, tool names inside the private response, tool arguments and result paths SHALL NOT be read for display, rendered or retained. Unobserved phases SHALL NOT be invented; elapsed time, accounting counters and token silence SHALL NOT be treated as proof of task completion or a percentage/ETA. Brief synchronous stages SHALL update projection without requiring an artificial delay to force a frame.
 
 #### Scenario: Long model wait
 - **WHEN** a private decision has waited 18 seconds without another observable phase change
 - **THEN** its row still identifies model waiting and shows increasing operation elapsed time
 - **AND** it does not invent completed steps or a completion estimate
+
+#### Scenario: Model streams a private response
+- **WHEN** a private model request streams thinking and then answer text
+- **THEN** the row replaces `waiting for model` with `thinking`, then `writing`, an indicator that moves only while output arrives, and a growing streamed-character count, keeping correction/reconsideration prefixes, elapsed time and attempt
+- **AND** none of the streamed text, thinking or tool-call arguments appears in the row or any retained state
 
 #### Scenario: Reflection reads evidence
 - **WHEN** a private reflection starts an admitted read helper and later returns to model generation
