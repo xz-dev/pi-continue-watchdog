@@ -862,7 +862,8 @@ export function createDecisionRuntime(
 			progress === null
 				? ""
 				: `${progress.stage} · ${progress.elapsedSeconds}s${progress.attempt === undefined || progress.limit === undefined ? "" : ` · attempt ${progress.attempt}/${progress.limit}`}`;
-		const full = `Continue Watchdog | ${status.activity} (${status.enabled ? "enabled" : "disabled"}${unlockHint}) | ${third}${progress === null ? "" : ` | ${detail}`}`;
+		// Same order as Reflect at every width: identity, progress, then controls.
+		const full = `Continue Watchdog${progress === null ? "" : ` | ${detail}`} | ${status.activity} (${status.enabled ? "enabled" : "disabled"}${unlockHint}) | ${third}`;
 		const controls = `${status.activity === "running" ? "run" : "idle"}/${status.enabled ? "on" : "off"} | ${thirdCompact}`;
 		const compact =
 			progress === null ? `CW | ${controls}` : `CW | ${detail} | ${controls}`;

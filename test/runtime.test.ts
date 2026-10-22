@@ -1678,8 +1678,8 @@ test("state row ticks the countdown and switches to asking once the decision ope
 	harness.clock.fire(graceTimer);
 	await harness.startDecision();
 	assert.match(
-		widget.render(160).join(""),
-		/idle.*enabled.*alt\+u unlock.*asking.*waiting for model.*0s.*1\/3/,
+		widget.render(160).join("").trimEnd(),
+		/^Continue Watchdog \| waiting for model · 0s · attempt 1\/3 \| idle \(enabled · alt\+u unlock\) \| asking$/,
 	);
 
 	await harness.runtime.shutdown();
@@ -2043,8 +2043,11 @@ test("private progress row prioritizes stage across resize and redraws current t
 	harness.clock.fire(grace);
 	await harness.startDecision();
 	const wide = stripVTControlCharacters(widget.render(200).join("")).trimEnd();
-	assert.match(wide, /ctrl\+x unlock/);
-	assert.match(wide, /waiting for model.*1\/3/);
+	// Same order as Reflect: identity, then progress, then existing controls.
+	assert.match(
+		wide,
+		/^Continue Watchdog \| waiting for model · \d+s · attempt 1\/3 \| idle \(enabled · ctrl\+x unlock\) \| asking$/,
+	);
 	assert.match(
 		stripVTControlCharacters(widget.render(32).join("")),
 		/^CW.*waiting for model/,
