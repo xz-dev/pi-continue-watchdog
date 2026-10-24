@@ -77,6 +77,8 @@ def qualified (source : Source) (o : Observation) : Bool :=
 structure Fork where
   child : SessionId
   resultPath : ResultPath
+  -- Exact native session JSONL locator owned by this fork child.
+  sessionFile : ResultPath
   conversation : List String
   systemState : List String
   declarations : List String
@@ -86,8 +88,10 @@ structure Fork where
   publicRegistrations : List String
   deriving DecidableEq, Repr
 
-def fullFork (source : Source) (child : SessionId) (path : ResultPath) : Fork :=
-  { child, resultPath := path, conversation := source.effectiveConversation,
+def fullFork (source : Source) (child : SessionId) (path : ResultPath)
+    (sessionFile : ResultPath) : Fork :=
+  { child, resultPath := path, sessionFile,
+    conversation := source.effectiveConversation,
     systemState := source.systemState, declarations := source.toolDeclarations,
     providerModel := source.providerModel, thinking := source.thinking,
     ambientExtensions := false, publicRegistrations := [] }
@@ -539,6 +543,22 @@ def terminalOf : AttemptOutcome → Terminal
   | .cancelled => .cancelled
   | .executionError => .executionError
 
+-- Failure-session evidence is a host-verified diagnostic input, never an execution authority.
+inductive SessionEvidence where
+  | unavailable
+  | retained (file : ResultPath)
+  deriving DecidableEq, Repr
+
+-- One bounded human-only notice: safe summary plus truthful session availability.
+structure HumanNotice where
+  summary : String
+  evidence : SessionEvidence
+  deriving DecidableEq, Repr
+
+-- Availability is a host observation at cleanup time; verified evidence can only be the exact fork's own file.
+def evidenceOf (fork : Fork) (verified : Bool) : SessionEvidence :=
+  if verified then .retained fork.sessionFile else .unavailable
+
 structure PrivateResult where
   terminal : Terminal
   attempts : List AttemptLog
@@ -546,6 +566,7 @@ structure PrivateResult where
   reviewCalls : Nat
   reconsiderations : Nat
   mainConversation : List String
+  notices : List HumanNotice
   child : SessionId
   cleanupDrained : Bool
   revokedFileAuthority : Bool
@@ -556,31 +577,36 @@ structure PrivateResult where
 
 -- Terminal handoff retains main context and selection; cleanup/currentness observations gate candidate release.
 def finish (source : Source) (fork : Fork) (result : InquiryResult)
-    (reviews reconsiderations : Nat) (afterCleanup : Observation) : PrivateResult :=
+    (reviews reconsiderations : Nat) (evidenceVerified : Bool)
+    (afterCleanup : Observation) : PrivateResult :=
   let terminal := if qualified source afterCleanup then terminalOf result.outcome else .cancelled
+  let notices := match terminal with
+    | .decisionFailed | .executionError =>
+        [{ summary := "private decision failed", evidence := evidenceOf fork evidenceVerified }]
+    | _ => []
   { terminal, attempts := result.attempts, corrections := result.corrections,
     reviewCalls := reviews, reconsiderations, mainConversation := source.effectiveConversation,
-    child := fork.child, cleanupDrained := true, revokedFileAuthority := true,
+    notices, child := fork.child, cleanupDrained := true, revokedFileAuthority := true,
     cancelledSessions := [fork.child], selectedSession := source.session, handoffs := [terminal] }
 
 def executePrivate (source : Source) (policy : Policy) (fork : Fork)
     (initial replacement : Nat → AttemptInput) (review : Review)
-    (afterReview afterCleanup : Observation) : PrivateResult :=
+    (evidenceVerified : Bool) (afterReview afterCleanup : Observation) : PrivateResult :=
   let first := runInquiry source policy fork initial 3 0
   match first.outcome with
   | .valid v =>
       if v.action == .unlock && review != .disabled then
         if !qualified source afterReview then
-          finish source fork { first with outcome := .cancelled } 1 0 afterCleanup
+          finish source fork { first with outcome := .cancelled } 1 0 evidenceVerified afterCleanup
         else if review == .challenged then
           let second := runInquiry source policy fork replacement 3 0
           finish source fork
             { second with
               attempts := first.attempts ++ second.attempts,
-              corrections := first.corrections ++ second.corrections } 1 1 afterCleanup
-        else finish source fork first 1 0 afterCleanup
-      else finish source fork first 0 0 afterCleanup
-  | _ => finish source fork first 0 0 afterCleanup
+              corrections := first.corrections ++ second.corrections } 1 1 evidenceVerified afterCleanup
+        else finish source fork first 1 0 evidenceVerified afterCleanup
+      else finish source fork first 0 0 evidenceVerified afterCleanup
+  | _ => finish source fork first 0 0 evidenceVerified afterCleanup
 
 -- Combined private traces bound six responses, one review and one reconsideration, with one terminal handoff.
 def PrivateSafe (source : Source) (fork : Fork) (r : PrivateResult) : Prop :=
@@ -590,23 +616,57 @@ def PrivateSafe (source : Source) (fork : Fork) (r : PrivateResult) : Prop :=
   r.mainConversation = source.effectiveConversation ∧ r.child = fork.child ∧
   r.cleanupDrained = true ∧ r.handoffs = [r.terminal] ∧
   r.revokedFileAuthority = true ∧ r.cancelledSessions = [fork.child] ∧
-  r.selectedSession = source.session
+  r.selectedSession = source.session ∧
+  r.notices.length ≤ 1 ∧
+  (∀ notice ∈ r.notices,
+    notice.evidence = .unavailable ∨ notice.evidence = .retained fork.sessionFile) ∧
+  ((r.terminal = .decisionFailed ∨ r.terminal = .executionError) ↔ r.notices.length = 1)
+
+-- Failure notices stay bounded to one, name only the exact fork's file, and track the failure terminal exactly.
+theorem finish_notices_are_bounded_and_exact (source : Source) (fork : Fork)
+    (r : InquiryResult) (reviews reconsiderations : Nat) (evidenceVerified : Bool)
+    (o : Observation) :
+    let t := finish source fork r reviews reconsiderations evidenceVerified o
+    t.notices.length ≤ 1 ∧
+    (∀ notice ∈ t.notices,
+      notice.evidence = .unavailable ∨ notice.evidence = .retained fork.sessionFile) ∧
+    ((t.terminal = .decisionFailed ∨ t.terminal = .executionError) ↔ t.notices.length = 1) := by
+  simp only [finish]
+  cases qualified : qualified source o with
+  | false => simp
+  | true =>
+      simp
+      cases r.outcome with
+      | valid v => simp [terminalOf]
+      | invalid e =>
+          simp [terminalOf]
+          cases evidenceVerified <;> simp [evidenceOf]
+      | cancelled => simp [terminalOf]
+      | executionError =>
+          simp [terminalOf]
+          cases evidenceVerified <;> simp [evidenceOf]
 
 theorem finish_is_safe (source : Source) (fork : Fork) (r : InquiryResult)
-    (reviews reconsiderations : Nat) (o : Observation)
+    (reviews reconsiderations : Nat) (evidenceVerified : Bool) (o : Observation)
     (allSafe : ∀ log ∈ r.attempts, AttemptSafe fork log)
     (bound : responseRequests r.attempts ≤ 6)
     (charges : formatCharges r.attempts ≤ responseRequests r.attempts)
     (reviewBound : reviews ≤ 1) (reconsiderationBound : reconsiderations ≤ reviews) :
-    PrivateSafe source fork (finish source fork r reviews reconsiderations o) := by
+    PrivateSafe source fork (finish source fork r reviews reconsiderations evidenceVerified o) := by
   exact ⟨allSafe, bound, charges, reviewBound, reconsiderationBound,
-    rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+    rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+    (finish_notices_are_bounded_and_exact source fork r reviews reconsiderations
+      evidenceVerified o).1,
+    (finish_notices_are_bounded_and_exact source fork r reviews reconsiderations
+      evidenceVerified o).2.1,
+    (finish_notices_are_bounded_and_exact source fork r reviews reconsiderations
+      evidenceVerified o).2.2⟩
 
 theorem private_execution_is_safe (source : Source) (policy : Policy) (fork : Fork)
     (initial replacement : Nat → AttemptInput) (review : Review)
-    (afterReview afterCleanup : Observation) :
+    (evidenceVerified : Bool) (afterReview afterCleanup : Observation) :
     PrivateSafe source fork
-      (executePrivate source policy fork initial replacement review afterReview afterCleanup) := by
+      (executePrivate source policy fork initial replacement review evidenceVerified afterReview afterCleanup) := by
   obtain ⟨allFirst, _, firstBound, firstCharges, _⟩ :=
     inquiry_is_safe source policy fork initial 3 0
   obtain ⟨allSecond, _, secondBound, secondCharges, _⟩ :=
@@ -616,10 +676,10 @@ theorem private_execution_is_safe (source : Source) (policy : Policy) (fork : Fo
     simp only [executePrivate, firstOutcome]
     split
     · split
-      · exact finish_is_safe source fork _ 1 0 afterCleanup allFirst (by dsimp; omega)
+      · exact finish_is_safe source fork _ 1 0 evidenceVerified afterCleanup allFirst (by dsimp; omega)
           firstCharges (by omega) (by omega)
       · split
-        · apply finish_is_safe source fork _ 1 1 afterCleanup
+        · apply finish_is_safe source fork _ 1 1 evidenceVerified afterCleanup
           · intro log member
             rcases List.mem_append.mp member with first | second
             · exact allFirst log first
@@ -630,19 +690,20 @@ theorem private_execution_is_safe (source : Source) (policy : Policy) (fork : Fo
               Nat.add_le_add firstCharges secondCharges
           · omega
           · omega
-        · exact finish_is_safe source fork _ 1 0 afterCleanup allFirst (by omega)
+        · exact finish_is_safe source fork _ 1 0 evidenceVerified afterCleanup allFirst (by omega)
             firstCharges (by omega) (by omega)
-    · exact finish_is_safe source fork _ 0 0 afterCleanup allFirst (by omega)
+    · exact finish_is_safe source fork _ 0 0 evidenceVerified afterCleanup allFirst (by omega)
         firstCharges (by omega) (by omega)
   | invalid _ | cancelled | executionError =>
       simp only [executePrivate, firstOutcome]
-      exact finish_is_safe source fork _ 0 0 afterCleanup allFirst (by omega)
+      exact finish_is_safe source fork _ 0 0 evidenceVerified afterCleanup allFirst (by omega)
         firstCharges (by omega) (by omega)
 
 theorem finish_accepts_only_valid (source : Source) (policy : Policy) (fork : Fork)
-    (r : InquiryResult) (reviews reconsiderations : Nat) (o : Observation) (v : Verdict)
+    (r : InquiryResult) (reviews reconsiderations : Nat) (evidenceVerified : Bool)
+    (o : Observation) (v : Verdict)
     (valid : ∀ candidate, r.outcome = .valid candidate → validVerdict policy candidate = true)
-    (accepted : (finish source fork r reviews reconsiderations o).terminal = .decision v) :
+    (accepted : (finish source fork r reviews reconsiderations evidenceVerified o).terminal = .decision v) :
     validVerdict policy v = true := by
   simp only [finish] at accepted
   split at accepted
@@ -654,32 +715,41 @@ theorem finish_accepts_only_valid (source : Source) (policy : Policy) (fork : Fo
 
 theorem private_accepts_only_valid (source : Source) (policy : Policy) (fork : Fork)
     (initial replacement : Nat → AttemptInput) (review : Review)
-    (afterReview afterCleanup : Observation) (v : Verdict)
+    (evidenceVerified : Bool) (afterReview afterCleanup : Observation) (v : Verdict)
     (accepted : (executePrivate source policy fork initial replacement review
-      afterReview afterCleanup).terminal = .decision v) : validVerdict policy v = true := by
+      evidenceVerified afterReview afterCleanup).terminal = .decision v) : validVerdict policy v = true := by
   have firstValid := inquiry_accepts_only_valid_candidate source policy fork initial 3 0
   have secondValid := inquiry_accepts_only_valid_candidate source policy fork replacement 3 0
   simp only [executePrivate] at accepted
   split at accepted
   · split at accepted
     · split at accepted
-      · exact finish_accepts_only_valid source policy fork _ 1 0 afterCleanup v
+      · exact finish_accepts_only_valid source policy fork _ 1 0 evidenceVerified afterCleanup v
           (by intro candidate impossible; cases impossible) accepted
       · split at accepted
-        · exact finish_accepts_only_valid source policy fork _ 1 1 afterCleanup v secondValid accepted
-        · exact finish_accepts_only_valid source policy fork _ 1 0 afterCleanup v firstValid accepted
-    · exact finish_accepts_only_valid source policy fork _ 0 0 afterCleanup v firstValid accepted
-  · exact finish_accepts_only_valid source policy fork _ 0 0 afterCleanup v firstValid accepted
+        · exact finish_accepts_only_valid source policy fork _ 1 1 evidenceVerified afterCleanup v secondValid accepted
+        · exact finish_accepts_only_valid source policy fork _ 1 0 evidenceVerified afterCleanup v firstValid accepted
+    · exact finish_accepts_only_valid source policy fork _ 0 0 evidenceVerified afterCleanup v firstValid accepted
+  · exact finish_accepts_only_valid source policy fork _ 0 0 evidenceVerified afterCleanup v firstValid accepted
 
 theorem finish_rechecks_currentness (source : Source) (fork : Fork) (r : InquiryResult)
-    (reviews reconsiderations : Nat) (o : Observation) (stale : qualified source o = false) :
-    (finish source fork r reviews reconsiderations o).terminal = .cancelled := by
+    (reviews reconsiderations : Nat) (evidenceVerified : Bool) (o : Observation)
+    (stale : qualified source o = false) :
+    (finish source fork r reviews reconsiderations evidenceVerified o).terminal = .cancelled := by
+  simp [finish, stale]
+
+-- A stale or cancelled operation emits no failure notice; retained evidence still grants no authority.
+theorem stale_terminal_emits_no_notice (source : Source) (fork : Fork) (r : InquiryResult)
+    (reviews reconsiderations : Nat) (evidenceVerified : Bool) (o : Observation)
+    (stale : qualified source o = false) :
+    (finish source fork r reviews reconsiderations evidenceVerified o).notices = [] := by
   simp [finish, stale]
 
 -- Setup refuses absent full projection, non-distinct children or unavailable private resources without fallback.
 structure Setup where
   child : SessionId
   resultPath : ResultPath
+  sessionFile : ResultPath
   fullProjectionAvailable : Bool
   freshPrivateLocation : Bool
   filesystemReady : Bool
@@ -691,26 +761,27 @@ def setupAdmitted (source : Source) (setup : Setup) : Bool :=
 
 def runOwnedDecision (source : Source) (policy : Policy) (setup : Setup)
     (initial replacement : Nat → AttemptInput) (review : Review)
-    (afterReview afterCleanup : Observation) : PrivateResult :=
-  let fork := fullFork source setup.child setup.resultPath
+    (evidenceVerified : Bool) (afterReview afterCleanup : Observation) : PrivateResult :=
+  let fork := fullFork source setup.child setup.resultPath setup.sessionFile
   if setupAdmitted source setup then
-    executePrivate source policy fork initial replacement review afterReview afterCleanup
-  else finish source fork ⟨.executionError, [], []⟩ 0 0 afterCleanup
+    executePrivate source policy fork initial replacement review evidenceVerified afterReview afterCleanup
+  else finish source fork ⟨.executionError, [], []⟩ 0 0 evidenceVerified afterCleanup
 
 theorem owned_execution_is_safe (source : Source) (policy : Policy) (setup : Setup)
     (initial replacement : Nat → AttemptInput) (review : Review)
-    (afterReview afterCleanup : Observation) :
-    PrivateSafe source (fullFork source setup.child setup.resultPath)
-      (runOwnedDecision source policy setup initial replacement review afterReview afterCleanup) := by
+    (evidenceVerified : Bool) (afterReview afterCleanup : Observation) :
+    PrivateSafe source (fullFork source setup.child setup.resultPath setup.sessionFile)
+      (runOwnedDecision source policy setup initial replacement review evidenceVerified afterReview afterCleanup) := by
   unfold runOwnedDecision
   split
-  · exact private_execution_is_safe source policy _ initial replacement review afterReview afterCleanup
+  · exact private_execution_is_safe source policy _ initial replacement review evidenceVerified afterReview afterCleanup
   · apply finish_is_safe <;> simp [responseRequests, formatCharges]
 
 theorem no_fresh_context_fallback (source : Source) (policy : Policy) (setup : Setup)
     (initial replacement : Nat → AttemptInput) (review : Review)
-    (afterReview afterCleanup : Observation) (unavailable : setup.fullProjectionAvailable = false) :
-    (runOwnedDecision source policy setup initial replacement review afterReview afterCleanup).attempts = [] := by
+    (evidenceVerified : Bool) (afterReview afterCleanup : Observation)
+    (unavailable : setup.fullProjectionAvailable = false) :
+    (runOwnedDecision source policy setup initial replacement review evidenceVerified afterReview afterCleanup).attempts = [] := by
   simp [runOwnedDecision, setupAdmitted, unavailable, finish]
 
 theorem owned_child_is_distinct (source : Source) (setup : Setup)
@@ -937,8 +1008,8 @@ def recoverHistory (entries : List MainEntry) : RecoveredHistory :=
 
 -- Main-boundary laws preserve inherited source, qualification, accounting, receipt and callback safeguards.
 theorem full_fork_preserves_effective_source (source : Source) (child : SessionId)
-    (path : ResultPath) :
-    let fork := fullFork source child path
+    (path sessionFile : ResultPath) :
+    let fork := fullFork source child path sessionFile
     fork.conversation = source.effectiveConversation ∧
     fork.systemState = source.systemState ∧ fork.declarations = source.toolDeclarations ∧
     fork.providerModel = source.providerModel ∧ fork.thinking = source.thinking ∧
@@ -1170,7 +1241,7 @@ def demoSource : Source :=
 
 def demoPolicy : Policy := ⟨["WORK_REMAINS"], ["JOB_DONE", "WAIT_CALLBACK"]⟩
 
-def demoFork : Fork := fullFork demoSource 2 99
+def demoFork : Fork := fullFork demoSource 2 99 100
 
 theorem three_invalid_responses_fail :
     let r := runInquiry demoSource demoPolicy demoFork allInvalid 3 0
@@ -1236,9 +1307,9 @@ def ProcessSafety : Prop :=
   (∀ source policy fork input, AttemptSafe fork (runAttempt source policy fork input)) ∧
   (∀ source policy fork inputs fuel index,
     InquirySafe fork fuel (runInquiry source policy fork inputs fuel index)) ∧
-  (∀ source policy fork initial replacement review afterReview afterCleanup,
+  (∀ source policy fork initial replacement review evidenceVerified afterReview afterCleanup,
     PrivateSafe source fork
-      (executePrivate source policy fork initial replacement review afterReview afterCleanup)) ∧
+      (executePrivate source policy fork initial replacement review evidenceVerified afterReview afterCleanup)) ∧
   (∀ o s p, qualified p.source o = false → commitTerminal o s p = ⟨s, p, [], false⟩) ∧
   (∀ o s p, p.acknowledged = true → commitTerminal o s p = ⟨s, p, [], false⟩) ∧
   (∀ o s p, s.attempt ≤ s.maxContinue →
@@ -1271,4 +1342,4 @@ def main : IO Unit := do
     (OfficialPiIdleInquiry.preemptOnMessageStart
       (OfficialPiIdleInquiry.classifyMessageStart true true true true) parent)
   IO.println s!"Presentation-only row keeps both ownership handlers inert: {decide (blank = parent)}"
-  IO.println "process_is_correct: modeled one-response/write join, three/six bounds, same-child correction and one reconsideration, terminal-only handoff, source guards, shared budget, receipt uncertainty, callback suspension, presentation-only ownership, history-only recovery. Host/provider boundary observations and eventual return are assumptions; no LLM-quality, hardware, or final-wire claim."
+  IO.println "process_is_correct: modeled one-response/write join, three/six bounds, same-child correction and one reconsideration, terminal-only handoff, one bounded human-only failure notice naming the exact fork's session file, source guards, shared budget, receipt uncertainty, callback suspension, presentation-only ownership, history-only recovery. Host/provider boundary observations and eventual return are assumptions; no LLM-quality, hardware, or final-wire claim."
