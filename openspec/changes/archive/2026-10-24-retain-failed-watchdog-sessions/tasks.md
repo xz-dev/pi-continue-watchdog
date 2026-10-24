@@ -12,7 +12,7 @@
 
 ## 3. Reflect companion
 
-- [x] 3.1 Complete the [Reflect companion tasks](../../../../pi-reflect-watchdog/openspec/changes/retain-failed-watchdog-sessions/tasks.md) against the same shared revision; verify returned execution failures and exhausted corrections both notify once, failure evidence stays readable, and slot release/report/continuation behavior matches the companion acceptance scenarios.
+- [x] 3.1 Complete the [Reflect companion tasks](../../../../../pi-reflect-watchdog/openspec/changes/archive/2026-10-24-retain-failed-watchdog-sessions/tasks.md) against the same shared revision; verify returned execution failures and exhausted corrections both notify once, failure evidence stays readable, and slot release/report/continuation behavior matches the companion acceptance scenarios.
 
 ## 4. Joint verification and user guidance
 

@@ -25,5 +25,5 @@ None. This adds a separate diagnostic capability without changing private decisi
 
 - Continue: `src/private-decision.ts`, terminal result handling in `src/runtime.ts`, existing private-decision/runtime tests and user documentation during implementation.
 - Shared prerequisite: `pi-extension-utils/private-inquiry` result metadata and cleanup tests; its private runtime must preserve any known fork locator across setup failure. Both consumers currently pin the same utils revision and must consume the compatible shared change.
-- Reflect companion: [proposal](../../../../pi-reflect-watchdog/openspec/changes/retain-failed-watchdog-sessions/proposal.md), its `src/extension.ts` terminal handling and existing private-reflection tests.
+- Reflect companion: [proposal](../../../../../pi-reflect-watchdog/openspec/changes/archive/2026-10-24-retain-failed-watchdog-sessions/proposal.md), its `src/extension.ts` terminal handling and existing private-reflection tests.
 - Joint tracking: [tasks](tasks.md) and [canonical contract](specs/watchdog-inquiry-diagnostics/spec.md). Completion requires shared-layer and both-consumer checks, including an integrated user-visible failure example.

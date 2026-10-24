@@ -1,6 +1,6 @@
 ## Context
 
-See [proposal](proposal.md) for motivation. This design applies to both watchdogs; Reflect's [companion design](../../../../pi-reflect-watchdog/openspec/changes/retain-failed-watchdog-sessions/design.md) describes its consumer boundary.
+See [proposal](proposal.md) for motivation. This design applies to both watchdogs; Reflect's [companion design](../../../../../pi-reflect-watchdog/openspec/changes/archive/2026-10-24-retain-failed-watchdog-sessions/design.md) describes its consumer boundary.
 
 Both consumers pin `pi-extension-utils` revision `6e7a5fe6a85ac240585427996cb1540c1e9e2ee9` and execute through `private-inquiry`. The installed private runtime already creates a native fork JSONL beneath the parent session's directory:
 
