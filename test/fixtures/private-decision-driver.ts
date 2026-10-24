@@ -109,6 +109,12 @@ export function unlockJson(
  */
 export function createPrivateDriver(options?: {
 	readonly responder?: DriverResponder;
+	/**
+	 * Native session-file locator each fake child reports, as the real
+	 * runtime does. The shared core verifies it after settlement; point it
+	 * at a real file to produce `available` evidence.
+	 */
+	readonly sessionFile?: string;
 }) {
 	const queue: Array<DriverReply | DriverResponder> = [];
 	const children: FakeChildSession[] = [];
@@ -151,7 +157,7 @@ export function createPrivateDriver(options?: {
 			const child: FakeChildSession = {
 				sessionId: `private-child-${children.length + 1}`,
 				modelId: "fake/local",
-				sessionFile: undefined,
+				sessionFile: options?.sessionFile,
 				messages,
 				get attemptError() {
 					return state.attemptError;

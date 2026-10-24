@@ -60,6 +60,8 @@ function createFakeRuntime(
 		readonly inheritedAssistant?: boolean;
 		/** Runs inside child.dispose() before it completes (e.g. abort). */
 		readonly onDispose?: () => void;
+		/** Native session locator the fake child reports to the shared core. */
+		readonly sessionFile?: string;
 	} = {},
 ) {
 	const dirs: string[] = [];
@@ -96,7 +98,7 @@ function createFakeRuntime(
 			const child: FakeChild = {
 				sessionId: `private-child-${children.length + 1}`,
 				modelId: "fake/local",
-				sessionFile: undefined,
+				sessionFile: options.sessionFile,
 				messages,
 				get attemptError() {
 					return state.attemptError;
@@ -450,6 +452,77 @@ test("three invalid responses fail once with no fourth request", async (t) => {
 	assert.match(result.error, /wait is no longer an accepted action/);
 	assert.equal(result.reconsidered, false);
 	assert.equal(children[0].prompts.length, 3);
+});
+
+test("exhausted corrections forward the verified retained session path", async (t) => {
+	const sessionFile = `${RESULT_DIR_PREFIX}evidence-${process.pid}-${Math.random().toString(36).slice(2)}.jsonl`;
+	await writeFile(sessionFile, "{}\n", { mode: 0o600 });
+	t.after(async () => {
+		await import("node:fs/promises").then((fs) =>
+			fs.rm(sessionFile, { force: true }),
+		);
+	});
+	const { runtime, children } = createFakeRuntime(
+		t,
+		() => ({ write: "not json" }),
+		{ sessionFile },
+	);
+	const result = await runPrivateDecision(baseOptions(runtime));
+	assert.equal(result.kind, "decision-failed");
+	assert.deepEqual(result.session, {
+		kind: "available",
+		path: sessionFile,
+		sessionId: children[0].sessionId,
+	});
+});
+
+test("execution error forwards the verified retained session path", async (t) => {
+	const sessionFile = `${RESULT_DIR_PREFIX}evidence-${process.pid}-${Math.random().toString(36).slice(2)}.jsonl`;
+	await writeFile(sessionFile, "{}\n", { mode: 0o600 });
+	t.after(async () => {
+		await import("node:fs/promises").then((fs) =>
+			fs.rm(sessionFile, { force: true }),
+		);
+	});
+	const { runtime, children } = createFakeRuntime(
+		t,
+		() => ({ throw: new Error("provider exploded") }),
+		{ sessionFile },
+	);
+	const result = await runPrivateDecision(baseOptions(runtime));
+	assert.equal(result.kind, "execution-error");
+	assert.deepEqual(result.session, {
+		kind: "available",
+		path: sessionFile,
+		sessionId: children[0].sessionId,
+	});
+});
+
+test("a child without a session file reports unavailable evidence", async (t) => {
+	const { runtime } = createFakeRuntime(t, () => ({
+		throw: new Error("provider exploded"),
+	}));
+	const result = await runPrivateDecision(baseOptions(runtime));
+	assert.equal(result.kind, "execution-error");
+	assert.equal(result.session?.kind, "unavailable");
+	if (result.session?.kind === "unavailable")
+		assert.equal(result.session.reason, "no-session");
+});
+
+test("a missing session file never becomes a claimed saved path", async (t) => {
+	const missing = `${RESULT_DIR_PREFIX}evidence-missing-${process.pid}.jsonl`;
+	const { runtime } = createFakeRuntime(
+		t,
+		() => ({ throw: new Error("provider exploded") }),
+		{ sessionFile: missing },
+	);
+	const result = await runPrivateDecision(baseOptions(runtime));
+	assert.equal(result.kind, "execution-error");
+	assert.deepEqual(result.session, {
+		kind: "unavailable",
+		reason: "missing",
+		sessionId: result.sessionId,
+	});
 });
 
 test("malformed and non-object JSON are invalid format responses", async (t) => {

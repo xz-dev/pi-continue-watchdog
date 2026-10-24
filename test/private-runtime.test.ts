@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -30,6 +30,7 @@ import {
 	DECISION_MESSAGE_TYPE,
 	foldDecisionContext,
 } from "../src/context-fold.js";
+import { runPrivateDecision } from "../src/private-decision.js";
 
 function usage() {
 	return {
@@ -529,4 +530,56 @@ test("a result write failure stops without an automatic response", {
 	);
 	assert.equal(disturbed, true);
 	assert.equal(fixture.requests.length, 1);
+});
+
+test("a failed real private inquiry retains the exact child JSONL shown to the user", {
+	timeout: 15_000,
+}, async (t) => {
+	// Provider failure after the child begins: no streamSimple fixture means
+	// the unreachable loopback endpoint fails the real prompt (no network).
+	const fixture = await createFixture(t);
+	const parentLeaf = fixture.manager.getLeafId();
+	const parentSessionFile = fixture.manager.getSessionFile();
+	const result = await runPrivateDecision({
+		runtime: fixture.runtime,
+		fork: {
+			parent: fixture.manager,
+			parentProviderRegistry: fixture.modelRuntime,
+			cwd: fixture.root,
+			model: `${fixture.model.provider}/${fixture.model.id}:${fixture.parent.thinkingLevel}`,
+			projectContext: foldDecisionContext,
+		},
+		reasonTypes: ["JOB_DONE"],
+		continueReasonTypes: ["WORK_REMAINS"],
+		isCurrent: () => true,
+		prompt: () => "PRIVATE_INQUIRY_MARKER write the result file.",
+		correction: (error) => `PRIVATE_CORRECTION_MARKER ${error}`,
+	});
+	assert.equal(result.kind, "execution-error");
+	if (result.kind !== "execution-error") return;
+	// The human-notice contract: one verified absolute path of the exact child.
+	assert.equal(result.session?.kind, "available");
+	if (result.session?.kind !== "available") return;
+	assert.match(result.session.path, /forks.*\.jsonl$/u);
+	assert.equal(result.session.sessionId, result.sessionId);
+	assert.notEqual(result.session.path, parentSessionFile);
+	// Open the exact displayed path after cleanup: identity and private
+	// history — inherited context plus the inquiry prompt — are inspectable.
+	const retained = SessionManager.open(result.session.path);
+	const projection = retained.buildSessionProjection();
+	assert.equal(retained.getSessionId(), result.sessionId);
+	const serialized = JSON.stringify(projection.messages);
+	assert.match(serialized, /PRIVATE_INQUIRY_MARKER/);
+	assert.match(serialized, /Already authorized work/);
+	// The retained JSONL survives child disposal and temp-dir cleanup.
+	assert.equal(existsSync(result.session.path), true);
+	// Parent isolation: no private exchange landed in the parent session.
+	assert.equal(fixture.manager.getLeafId(), parentLeaf);
+	assert.equal(
+		JSON.stringify(fixture.manager.buildSessionProjection().messages).includes(
+			"PRIVATE_INQUIRY_MARKER",
+		),
+		false,
+	);
+	assert.deepEqual(fixture.parentApi.getAllTools(), fixture.parentTools);
 });

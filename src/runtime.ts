@@ -90,6 +90,7 @@ import type {
 import {
 	type PrivateDecisionProgress,
 	type PrivateDecisionStream,
+	type PrivateSessionEvidence,
 	runPrivateDecision,
 } from "./private-decision.js";
 import {
@@ -270,6 +271,11 @@ interface PendingFinalization {
 	reviewSettled?: boolean;
 	/** Terminal review disposition for audit/history; absent = not reviewed. */
 	reviewDisposition?: "supported" | "challenged" | "incomplete";
+	/**
+	 * Exact failed child's session evidence from the private inquiry result.
+	 * Undefined for non-private (main-session) decision paths.
+	 */
+	readonly session?: PrivateSessionEvidence;
 }
 
 /** One in-flight optional unlock review operation. */
@@ -525,6 +531,42 @@ function originalErrorMessage(error: unknown): string {
 	return typeof error === "string" && error.trim().length > 0
 		? error
 		: "Unknown error";
+}
+
+/**
+ * Bounded human-only second line of a terminal private-failure notice: the
+ * verified absolute retained JSONL path, or an honest unavailable/no-session
+ * reason. Never echoes provider bodies or private content.
+ */
+function privateSessionNoticeLine(
+	session: PrivateSessionEvidence | undefined,
+): string {
+	if (session?.kind === "available") {
+		return `Private session JSONL retained: ${session.path}`;
+	}
+	if (session?.kind === "unavailable" && session.reason === "no-session") {
+		return "No private session was created; nothing was retained.";
+	}
+	return `Private session evidence unavailable (${session?.kind === "unavailable" ? session.reason : "unverified"}).`;
+}
+
+/**
+ * One human-only terminal private-failure notice. A throwing host notify
+ * facility must never alter failure recovery or resource release.
+ */
+function notifyPrivateFailureEvidence(
+	ctx: ExtensionContext,
+	summary: string,
+	session: PrivateSessionEvidence | undefined,
+): void {
+	try {
+		ctx.ui.notify(
+			`Continue watchdog ${summary}\n${privateSessionNoticeLine(session)}`,
+			"warning",
+		);
+	} catch {
+		// Non-TUI hosts may reject notify; the failure path is already final.
+	}
 }
 
 /**
@@ -2207,8 +2249,21 @@ export function createDecisionRuntime(
 				deferDecisionOnBusy(active);
 				return;
 			}
-			if (result.kind === "execution-error")
+			if (result.kind === "execution-error") {
+				// Human-only retained-session diagnostic for the current failure;
+				// suppressed only when the result names a different child.
+				if (
+					operation.sessionId === undefined ||
+					result.sessionId === undefined ||
+					result.sessionId === operation.sessionId
+				)
+					notifyPrivateFailureEvidence(
+						ctx,
+						"failed: the private decision inquiry ended in an execution error.",
+						result.session,
+					);
 				throw new Error("Private decision execution failed.");
+			}
 			if (
 				!active.submitted ||
 				result.sessionId !== operation.sessionId ||
@@ -2251,6 +2306,7 @@ export function createDecisionRuntime(
 				reconsidered: result.reconsidered,
 				reviewSettled: true,
 				reviewDisposition,
+				session: result.session,
 			};
 			await deliverPending(ctx);
 			await maybePublishUserReady();
@@ -3881,11 +3937,15 @@ export function createDecisionRuntime(
 			confirmTerminalPublication();
 			if (stopIfStale(claim)) return false;
 			try {
-				ctx.ui.notify(
+				const notification =
 					finalization.notification ??
-						formatDecisionFailedNotification(
-							finalization.error ?? "Invalid decision.",
-						),
+					formatDecisionFailedNotification(
+						finalization.error ?? "Invalid decision.",
+					);
+				ctx.ui.notify(
+					pending.session === undefined
+						? notification
+						: `${notification}\n${privateSessionNoticeLine(pending.session)}`,
 					"warning",
 				);
 			} catch {

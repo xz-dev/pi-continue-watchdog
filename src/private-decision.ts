@@ -6,6 +6,7 @@ import {
 	type PrivateInquiryObservation,
 	type PrivateInquiryResult,
 	type PrivateRuntime,
+	type PrivateSessionEvidence,
 	runPrivateInquiry,
 } from "pi-extension-utils/private-inquiry";
 
@@ -69,6 +70,13 @@ export interface PrivateDecisionProgress {
 
 /** Terminal result of one logical private decision. */
 export type PrivateDecisionResult = PrivateInquiryResult<ValidDecision>;
+
+/**
+ * Truthful availability of the exact failed child's retained native JSONL,
+ * forwarded unchanged from the shared inquiry result. Diagnostic evidence
+ * only — never execution or result authority.
+ */
+export type { PrivateSessionEvidence };
 
 export interface PrivateDecisionOptions {
 	readonly runtime: PrivateRuntime;

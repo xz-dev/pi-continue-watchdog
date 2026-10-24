@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { join } from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 import { stripVTControlCharacters } from "node:util";
@@ -379,6 +381,8 @@ function createHarness(options?: {
 	readonly onNotify?: (message: string) => void;
 	readonly onWidget?: (key: string, value: unknown) => void;
 	readonly executePrivateDecision?: typeof import("../src/private-decision.js").runPrivateDecision;
+	/** Fake child's reported native session file; must exist for `available`. */
+	readonly privateSessionFile?: string;
 	readonly processDomain?: ProcessDomainCoordinator;
 	readonly isIdle?: () => boolean;
 	readonly reviewService?: import("../src/unlock-review.js").ReviewServiceLike;
@@ -422,7 +426,9 @@ function createHarness(options?: {
 	const widgets: Array<{ key: string; value: unknown }> = [];
 	const widgetPlacements = new Map<string, string | undefined>();
 	const aborts = 0;
-	const privateDriver = createPrivateDriver();
+	const privateDriver = createPrivateDriver({
+		sessionFile: options?.privateSessionFile,
+	});
 	let runtime: ReturnType<typeof createDecisionRuntime>;
 
 	const harness = {
@@ -3251,6 +3257,190 @@ test("private terminal provider error unlocks without format correction or conti
 	);
 	await settleOnly(harness);
 	assert.equal(harness.privateDriver.operations.length, 1);
+});
+
+test("private terminal provider error discloses the verified retained session path once", async (t) => {
+	const dir = await mkdtemp("/var/tmp/watchdog-evidence-");
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const sessionFile = join(dir, "child-session.jsonl");
+	await writeFile(sessionFile, "{}", { mode: 0o600 });
+	const harness = createHarness({ privateSessionFile: sessionFile });
+	await startIdle(harness);
+	await harness.openDecision();
+	await settleResponse(harness, {
+		stopReason: "error",
+		errorMessage: "Connection error with RAW_PROVIDER_BODY",
+	});
+	assert.equal(
+		(await harness.privateDriver.current?.result)?.kind,
+		"execution-error",
+	);
+	assert.equal(harness.notifications.length, 1);
+	const notice = harness.notifications[0];
+	assert.equal(notice?.level, "warning");
+	assert.match(
+		notice?.message ?? "",
+		new RegExp(
+			`^Continue watchdog failed: the private decision inquiry ended in an execution error\\.\\nPrivate session JSONL retained: ${sessionFile}$`,
+		),
+	);
+	assert.equal(notice?.message.includes("RAW_PROVIDER_BODY"), false);
+	await settleOnly(harness);
+	assert.equal(harness.notifications.length, 1);
+	assert.equal(harness.controller.snapshot.locked, false);
+});
+
+test("private execution error before any session reports no retained evidence", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	await harness.openDecision();
+	await settleResponse(harness, { throw: new Error("provider gone") });
+	assert.equal(
+		(await harness.privateDriver.current?.result)?.kind,
+		"execution-error",
+	);
+	assert.equal(harness.notifications.length, 1);
+	assert.match(
+		harness.notifications[0]?.message ?? "",
+		/No private session was created; nothing was retained\./,
+	);
+});
+
+test("private execution error with unverifiable evidence reports the bounded reason", async (t) => {
+	const dir = await mkdtemp("/var/tmp/watchdog-evidence-");
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const missing = join(dir, "deleted-session.jsonl");
+	const harness = createHarness({ privateSessionFile: missing });
+	await startIdle(harness);
+	await harness.openDecision();
+	await settleResponse(harness, { throw: new Error("provider gone") });
+	assert.equal(
+		(await harness.privateDriver.current?.result)?.kind,
+		"execution-error",
+	);
+	assert.equal(harness.notifications.length, 1);
+	assert.match(
+		harness.notifications[0]?.message ?? "",
+		/Private session evidence unavailable \(missing\)\./,
+	);
+	assert.equal(harness.notifications[0]?.message.includes(missing), false);
+});
+
+test("private decision-failed appends the retained session path to its one warning", async (t) => {
+	const dir = await mkdtemp("/var/tmp/watchdog-evidence-");
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const sessionFile = join(dir, "child-session.jsonl");
+	await writeFile(sessionFile, "{}", { mode: 0o600 });
+	const harness = createHarness({ privateSessionFile: sessionFile });
+	await startIdle(harness);
+	await harness.openDecision();
+	for (let attempt = 0; attempt < 3; attempt += 1) {
+		await settleResponse(harness, harness.answerInvalid());
+	}
+	assert.equal(harness.controller.snapshot.decisionFailed, true);
+	assert.equal(
+		(await harness.privateDriver.current?.result)?.kind,
+		"decision-failed",
+	);
+	assert.equal(harness.notifications.length, 1);
+	const notice = harness.notifications[0];
+	assert.equal(notice?.level, "warning");
+	assert.match(notice?.message ?? "", /decision failed after 3 attempts/);
+	assert.match(
+		notice?.message ?? "",
+		new RegExp(`\\nPrivate session JSONL retained: ${sessionFile}$`),
+	);
+	await settleOnly(harness);
+	assert.equal(harness.notifications.length, 1);
+	assert.equal(harness.privateDriver.children.length, 1);
+});
+
+test("failed reconsideration discloses the same single child's session", async (t) => {
+	const dir = await mkdtemp("/var/tmp/watchdog-evidence-");
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const sessionFile = join(dir, "child-session.jsonl");
+	await writeFile(sessionFile, "{}", { mode: 0o600 });
+	const harness = createHarness({
+		privateSessionFile: sessionFile,
+		config: { unlockReviewEnabled: true },
+		reviewService: {
+			async judge() {
+				return {
+					answers: {
+						unlock_supported: {
+							type: "choice",
+							choice: "challenged",
+							probabilities: {},
+							confidence: 1,
+						},
+					},
+					dropped: [],
+					backend: "classifier",
+					model: "test",
+					stopReason: "stop",
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							total: 0,
+						},
+					},
+				};
+			},
+		},
+	});
+	await startIdle(harness);
+	await harness.openDecision();
+	await settleResponse(harness, harness.answerUnlock());
+	for (let attempt = 0; attempt < 3; attempt += 1) {
+		await settleResponse(harness, harness.answerInvalid());
+	}
+	const result = await harness.privateDriver.current?.result;
+	assert.equal(result?.kind, "decision-failed");
+	if (result?.kind === "decision-failed")
+		assert.equal(result.reconsidered, true);
+	assert.equal(harness.controller.snapshot.decisionFailed, true);
+	assert.equal(harness.privateDriver.children.length, 1);
+	assert.equal(harness.privateDriver.children[0]?.prompts.length, 4);
+	assert.equal(harness.notifications.length, 1);
+	assert.match(
+		harness.notifications[0]?.message ?? "",
+		new RegExp(`\\nPrivate session JSONL retained: ${sessionFile}$`),
+	);
+});
+
+test("a session notice that cannot notify still completes failure recovery", async (t) => {
+	const dir = await mkdtemp("/var/tmp/watchdog-evidence-");
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const sessionFile = join(dir, "child-session.jsonl");
+	await writeFile(sessionFile, "{}", { mode: 0o600 });
+	const harness = createHarness({
+		privateSessionFile: sessionFile,
+		onNotify: () => {
+			throw new Error("notify exploded");
+		},
+	});
+	await startIdle(harness);
+	await harness.openDecision();
+	await settleResponse(harness, { throw: new Error("provider gone") });
+	assert.equal(
+		(await harness.privateDriver.current?.result)?.kind,
+		"execution-error",
+	);
+	assert.equal(harness.controller.snapshot.locked, false);
+	assert.equal(harness.privateDriver.children[0]?.disposed, true);
+	assert.ok(
+		harness.entries.some((entry) =>
+			JSON.stringify(entry.data).includes("Private decision execution failed"),
+		),
+	);
 });
 
 test("private invalid-file audit never retains raw malformed output", async () => {

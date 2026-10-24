@@ -53,7 +53,7 @@
     "typebox": "*"
   },
   "dependencies": {
-    "pi-extension-utils": "git+https://github.com/xz-dev/pi-extension-utils.git#1c769d8dd08570f825f8529a6f72945ac2866390",
+    "pi-extension-utils": "git+https://github.com/xz-dev/pi-extension-utils.git#412c95793335c655031040f058b55d543ae7117e",
     "private-inquiry-subagents-runtime": "git+https://github.com/nicobailon/pi-subagents.git#1008e5993e90fcf13b815c97c15a0c54f7f6f116"
   },
   "devDependencies": {
@@ -67,7 +67,7 @@
     "typescript": "^7.0.2"
   },
   "allowScripts": {
-    "github:xz-dev/pi-extension-utils#1c769d8dd08570f825f8529a6f72945ac2866390": true
+    "github:xz-dev/pi-extension-utils#412c95793335c655031040f058b55d543ae7117e": true
   },
   "trustedDependencies": [
     "pi-extension-utils"
