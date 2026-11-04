@@ -20,7 +20,7 @@ The watchdog SHALL own its decision runner independently of any public subagent 
 - **AND** the watchdog neither replaces nor registers duplicate public tools, commands, or runtime state for that extension
 
 ### Requirement: One logical decision inherits a full effective fork
-Each logical decision SHALL create one distinct child session from the owning main session's qualified active leaf. The child SHALL use the parent's current provider/model and SHALL use the parent's current thinking level capped by the effective `decisionThinkingCap`: when the cap is `inherit`, or the parent's level is at or below the cap in the order `off` < `minimal` < `low` < `medium` < `high` < `xhigh` < `max`, the child SHALL use the parent's level; otherwise the child SHALL use the cap. The cap SHALL NOT raise the child's level above the parent's level. The cap SHALL NOT change the main session's thinking level, and source-currency checks SHALL continue to compare the main session's selected thinking level. Format correction, unlock-review reconsideration and every other inquiry in the same child SHALL use that same capped level. A model that does not support the selected level SHALL be handled by the host's existing thinking-level handling; the watchdog SHALL NOT add its own provider-specific mapping. The child SHALL inherit the full effective active-branch conversation, system prompt state, and tool declarations, subject only to the host's existing compaction, exclusion, and provider-compatibility rules. Decision instructions and source supplements SHALL be appended after the inherited conversation rather than replacing it. Legacy watchdog folding SHALL apply before inherited decision input is sent. No pruned fork, recent-message suffix, alternate-model fallback, or silent fresh-context fallback SHALL substitute for an unavailable full fork. Inherited tool declarations SHALL NOT grant execution permission. The system SHALL NOT claim byte-identical final provider payloads or guaranteed cache hits across arbitrary provider serializers or third-party transformations, and SHALL NOT claim cache reuse when the capped level differs from the parent's level.
+Each logical decision SHALL create one distinct child session from the owning main session's qualified active leaf. The child SHALL use the parent's current provider/model and SHALL use the parent's current thinking level capped by the effective `decisionThinkingCap`: when the cap is `inherit`, or the parent's level is at or below the cap in the order `off` < `minimal` < `low` < `medium` < `high` < `xhigh` < `max`, the child SHALL use the parent's level; otherwise the child SHALL use the cap. The cap SHALL NOT raise the child's level above the parent's level. The cap SHALL be skipped, and the child SHALL use the parent's level unchanged, when the lowercase `provider/id` of the selected model contains any entry of the effective `decisionThinkingCapExclude` list, or when the selected model's API is `anthropic-messages`, `openai-responses`, `azure-openai-responses` or `openai-codex-responses` and the model does not declare mid-conversation effort support: only `anthropic-messages` and `openai-responses` models whose compatibility metadata sets `supportsMidConvoEffort` to `true` qualify. Models of other APIs SHALL be capped unless excluded by the list. The cap SHALL NOT change the main session's thinking level, and source-currency checks SHALL continue to compare the main session's selected thinking level. Format correction, unlock-review reconsideration and every other inquiry in the same child SHALL use that same capped level. A model that does not support the selected level SHALL be handled by the host's existing thinking-level handling; the watchdog SHALL NOT add its own provider-specific mapping. The child SHALL inherit the full effective active-branch conversation, system prompt state, and tool declarations, subject only to the host's existing compaction, exclusion, and provider-compatibility rules. Decision instructions and source supplements SHALL be appended after the inherited conversation rather than replacing it. Legacy watchdog folding SHALL apply before inherited decision input is sent. No pruned fork, recent-message suffix, alternate-model fallback, or silent fresh-context fallback SHALL substitute for an unavailable full fork. Inherited tool declarations SHALL NOT grant execution permission. The system SHALL NOT claim byte-identical final provider payloads or guaranteed cache hits across arbitrary provider serializers or third-party transformations, and SHALL NOT claim cache reuse when the capped level differs from the parent's level.
 
 #### Scenario: The main model differs from the configured default
 - **WHEN** an eligible main session uses a model other than the user's default
@@ -28,13 +28,33 @@ Each logical decision SHALL create one distinct child session from the owning ma
 - **AND** the user's selected session and main conversation remain unchanged during the decision
 
 #### Scenario: A high parent level is capped by default
-- **WHEN** no `decisionThinkingCap` is configured and the main session's thinking level is `high`, `xhigh` or `max`
+- **WHEN** no `decisionThinkingCap` is configured and the main session's thinking level is `high`, `xhigh` or `max`, and the selected model is neither excluded nor a cache-sensitive Responses/Messages model
 - **THEN** the private child uses the parent's provider/model with thinking level `medium`
 - **AND** the main session's thinking level remains unchanged
 
 #### Scenario: A parent level at or below the cap is kept
 - **WHEN** the effective cap is `medium` and the main session's thinking level is `off`, `minimal`, `low` or `medium`
 - **THEN** the private child uses the parent's level unchanged
+
+#### Scenario: A blacklisted model keeps the parent level
+- **WHEN** the effective cap is `medium`, the main session's level is `xhigh`, and the selected model `anthropic/claude-opus-4-1` contains the default exclusion entry `claude-opus-4`
+- **THEN** the private child uses thinking level `xhigh`
+
+#### Scenario: A gateway model without mid-conversation effort keeps the parent level
+- **WHEN** the effective cap is `medium`, the main session's level is `high`, and the selected model uses `openai-responses` without `supportsMidConvoEffort` set to `true`
+- **THEN** the private child uses thinking level `high`
+
+#### Scenario: A subscription Responses model keeps the parent level
+- **WHEN** the selected model uses `openai-codex-responses` or `azure-openai-responses` and the main session's level is `high`
+- **THEN** the private child uses thinking level `high`, whatever its compatibility metadata declares
+
+#### Scenario: A mid-conversation effort model is capped
+- **WHEN** the effective cap is `medium`, the main session's level is `max`, the selected model uses `anthropic-messages` or `openai-responses` with `supportsMidConvoEffort` set to `true`, and no exclusion entry matches
+- **THEN** the private child uses thinking level `medium`
+
+#### Scenario: Other APIs are capped unless excluded
+- **WHEN** the effective cap is `medium`, the main session's level is `high`, and the selected model uses `openai-completions` with no matching exclusion entry
+- **THEN** the private child uses thinking level `medium`
 
 #### Scenario: Inherit keeps the parent level
 - **WHEN** the effective cap is `inherit` and the main session's thinking level is `xhigh`

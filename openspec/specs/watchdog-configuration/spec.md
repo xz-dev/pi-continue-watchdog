@@ -15,9 +15,10 @@ The watchdog SHALL honor these configuration keys with existing per-field valida
 - `continueReasonTypes`, allowed continue types defaulting to `WORK_REMAINS` and `VERIFYING`, used by the same three surfaces;
 - `unlockShortcut`;
 - `unlockReviewEnabled`, governed by the unlock-review capability, whose existing eligibility includes the callback wire pair;
-- `decisionThinkingCap`, the highest thinking level of the private decision child, governed by the private-fork-decisions capability, defaulting to `medium`.
+- `decisionThinkingCap`, the highest thinking level of the private decision child, governed by the private-fork-decisions capability, defaulting to `medium`;
+- `decisionThinkingCapExclude`, model substrings for which the private-fork-decisions capability skips that cap, defaulting to `claude-3`, `claude-opus-4`, `claude-sonnet-4`, `claude-haiku-4`, `gpt-5`, `/o1`, `/o3` and `/o4-`.
 
-`maxContinue` SHALL be a safe integer from 1 through 10. Invalid higher-precedence values SHALL preserve valid lower-precedence values, without coercion or clamping. This setting SHALL NOT change Pi/provider transport retries, decision-format allowances, or review/reconsideration limits. `decisionThinkingCap` SHALL be exactly one of the strings `inherit`, `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`; any other value, including other letter case or surrounding whitespace, SHALL be diagnosed and SHALL preserve the valid lower-precedence value. `decisionThinkingCap` SHALL NOT change the main session's thinking level. Existing prompt length, nonblank reason-list validation, normalization, safe fallback, and diagnostics SHALL remain unchanged. `idleDelaySeconds` SHALL remain accepted for compatibility without altering the fixed fence. No duration setting, callback-specific budget, or template language SHALL replace retired timed waits. Configured prompt text SHALL NOT bypass runtime authorization or restore acceptance of the wait action. Effective reason types SHALL appear using their configured spellings as enum values in the public `cw` schema without explanatory field descriptions. Schema generation, argument preparation, and runtime validation SHALL use the same effective reason configuration; the schema SHALL NOT freeze built-in types while validation accepts a different loaded configuration.
+`maxContinue` SHALL be a safe integer from 1 through 10. Invalid higher-precedence values SHALL preserve valid lower-precedence values, without coercion or clamping. This setting SHALL NOT change Pi/provider transport retries, decision-format allowances, or review/reconsideration limits. `decisionThinkingCap` SHALL be exactly one of the strings `inherit`, `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`; any other value, including other letter case or surrounding whitespace, SHALL be diagnosed and SHALL preserve the valid lower-precedence value. `decisionThinkingCap` SHALL NOT change the main session's thinking level. `decisionThinkingCapExclude` SHALL be an array whose entries are strings that are nonblank after trimming; entries SHALL be trimmed and compared case-insensitively as substrings of the lowercase `provider/id`. A valid list, including an empty list, SHALL replace the default; an empty list disables exclusion. A non-array, or an array with any non-string or blank entry, SHALL be diagnosed and SHALL preserve the valid lower-precedence value. Existing prompt length, nonblank reason-list validation, normalization, safe fallback, and diagnostics SHALL remain unchanged. `idleDelaySeconds` SHALL remain accepted for compatibility without altering the fixed fence. No duration setting, callback-specific budget, or template language SHALL replace retired timed waits. Configured prompt text SHALL NOT bypass runtime authorization or restore acceptance of the wait action. Effective reason types SHALL appear using their configured spellings as enum values in the public `cw` schema without explanatory field descriptions. Schema generation, argument preparation, and runtime validation SHALL use the same effective reason configuration; the schema SHALL NOT freeze built-in types while validation accepts a different loaded configuration.
 
 #### Scenario: Default plugin allowance
 - **WHEN** no valid `maxContinue` is configured
@@ -67,6 +68,20 @@ The watchdog SHALL honor these configuration keys with existing per-field valida
 - **GIVEN** a global `decisionThinkingCap` value of `inherit`
 - **WHEN** trusted project configuration supplies `High`, `" medium"`, `none`, `true` or a number
 - **THEN** the invalid value is diagnosed and the effective cap remains `inherit`
+
+#### Scenario: Default exclusion list
+- **WHEN** no valid `decisionThinkingCapExclude` is configured
+- **THEN** the effective list is `claude-3`, `claude-opus-4`, `claude-sonnet-4`, `claude-haiku-4`, `gpt-5`, `/o1`, `/o3` and `/o4-`
+
+#### Scenario: Configured exclusion list replaces the default
+- **GIVEN** a global `decisionThinkingCapExclude` of `["gpt-5"]`
+- **WHEN** trusted project configuration supplies `[" My-Gateway/ "]` or `[]`
+- **THEN** the effective list is `["my-gateway/"]` or empty respectively
+
+#### Scenario: Invalid exclusion list
+- **GIVEN** a global `decisionThinkingCapExclude` of `["gpt-5"]`
+- **WHEN** trusted project configuration supplies `"gpt-5"`, `[""]`, `["  "]` or `["ok", 1]`
+- **THEN** the invalid value is diagnosed and the effective list remains `["gpt-5"]`
 
 ### Requirement: Removed keys produce an error diagnostic
 A configuration layer containing `maxRetries` or `jevWaitCheck` SHALL produce an error-level diagnostic naming that key as removed and without effect. `maxRetries` SHALL NOT be a compatibility alias for `maxContinue`; its diagnostic SHALL identify `maxContinue` as the replacement without echoing the removed value. Diagnostics SHALL NOT print nested values or credentials. `decisionPrompt` and `continueReasonTypes` SHALL remain active keys rather than removed keys. Other valid values SHALL still apply and extension load SHALL NOT fail. Configuration migration SHALL NOT modify credentials, environment variables, consumer settings, or user configuration files.
