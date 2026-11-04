@@ -202,6 +202,8 @@ function createHarness(options?: {
 		unlockShortcut: "alt+u",
 		unlockReviewEnabled: options?.config?.unlockReviewEnabled ?? true,
 		decisionThinkingCap: options?.config?.decisionThinkingCap ?? "medium",
+		decisionThinkingCapExclude:
+			options?.config?.decisionThinkingCapExclude ?? [],
 	};
 	const hub = createObservableAgentHub();
 	const attachmentInstance = createHubAttachmentInstance();

@@ -145,6 +145,7 @@ const CONFIG: LoadedConfig = {
 		unlockShortcut: "alt+u",
 		unlockReviewEnabled: false,
 		decisionThinkingCap: "medium" as const,
+		decisionThinkingCapExclude: [],
 	},
 	diagnostics: [],
 };

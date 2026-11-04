@@ -37,6 +37,7 @@ const TOOL_NAME = "cw";
 interface RequestRecord {
 	readonly receivedAt: number;
 	readonly model?: string;
+	readonly reasoning_effort?: string;
 	readonly messages: Array<{
 		readonly role?: string;
 		readonly content?: unknown;
@@ -282,6 +283,110 @@ function sendSse(
 	response.end("data: [DONE]\n\n");
 }
 
+interface ResponsesRequest {
+	readonly reasoning?: { readonly effort?: string };
+	readonly input: ReadonlyArray<{
+		readonly type?: string;
+		readonly role?: string;
+		readonly reasoning?: { readonly effort?: string };
+		readonly content?: unknown;
+	}>;
+}
+
+/** Minimal OpenAI Responses SSE mock: ordinary text, or the private result write. */
+async function startResponsesMockServer(
+	t: TestContext,
+): Promise<{ baseUrl: string; requests: ResponsesRequest[] }> {
+	const requests: ResponsesRequest[] = [];
+	const server = createServer((request, response) => {
+		let body = "";
+		request.setEncoding("utf8");
+		request.on("data", (chunk) => {
+			body += chunk;
+		});
+		request.on("end", () => {
+			const payload = JSON.parse(body) as ResponsesRequest;
+			requests.push(payload);
+			const text = payload.input
+				.flatMap((item) =>
+					Array.isArray(item.content)
+						? item.content.flatMap((block: { text?: unknown }) =>
+								typeof block?.text === "string" ? [block.text] : [],
+							)
+						: typeof item.content === "string"
+							? [item.content]
+							: [],
+				)
+				.join("\n");
+			const marker = [
+				...text.matchAll(
+					/<watchdog_result_file>(.*?)<\/watchdog_result_file>/gs,
+				),
+			].at(-1)?.[1];
+			const id = `resp-${requests.length}`;
+			const item =
+				marker === undefined
+					? {
+							type: "message",
+							id: `msg-${requests.length}`,
+							role: "assistant",
+							status: "completed",
+							content: [
+								{
+									type: "output_text",
+									text: "Ordinary answer.",
+									annotations: [],
+								},
+							],
+						}
+					: {
+							type: "function_call",
+							id: `fc-${requests.length}`,
+							call_id: `call-${requests.length}`,
+							name: "write",
+							status: "completed",
+							arguments: JSON.stringify({
+								path: JSON.parse(marker),
+								content: JSON.stringify({
+									action: "unlock",
+									reason_type: "JOB_DONE",
+									reason_content: "All requested work is complete.",
+								}),
+							}),
+						};
+			response.writeHead(200, { "content-type": "text/event-stream" });
+			for (const event of [
+				{ type: "response.created", response: { id } },
+				{ type: "response.output_item.added", output_index: 0, item },
+				{ type: "response.output_item.done", output_index: 0, item },
+				{
+					type: "response.completed",
+					response: {
+						id,
+						status: "completed",
+						output: [item],
+						usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+					},
+				},
+			])
+				response.write(
+					`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+				);
+			response.end();
+		});
+	});
+	server.listen(0, "127.0.0.1");
+	await once(server, "listening");
+	t.after(async () => {
+		server.closeAllConnections();
+		server.close();
+		await once(server, "close");
+	});
+	const address = server.address();
+	assert.ok(address && typeof address === "object");
+	return { baseUrl: `http://127.0.0.1:${address.port}/v1`, requests };
+}
+
 async function startMockServer(
 	t: TestContext,
 	replies: readonly MockReply[],
@@ -466,6 +571,9 @@ async function createSession(
 		readonly abortHandler?: (session: AgentSession) => void;
 		readonly additionalExtensionPaths?: string[];
 		readonly sessionManager?: SessionManager;
+		readonly reasoning?: boolean;
+		readonly api?: "openai-completions" | "openai-responses";
+		readonly compat?: Record<string, unknown>;
 	},
 ): Promise<{
 	session: AgentSession;
@@ -516,12 +624,13 @@ async function createSession(
 			name: "Watchdog E2E",
 			baseUrl,
 			apiKey: "local-only",
-			api: "openai-completions",
+			api: options?.api ?? "openai-completions",
 			models: [
 				{
 					id: "watchdog-e2e",
 					name: "Watchdog E2E",
-					reasoning: false,
+					reasoning: options?.reasoning ?? false,
+					...(options?.compat === undefined ? {} : { compat: options.compat }),
 					input: ["text"],
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 					contextWindow: options?.contextWindow ?? 4096,
@@ -916,6 +1025,108 @@ test("packed idle settlement opens one inquiry before continuation", {
 		await shutdownSession(session);
 	}
 });
+
+for (const [label, watchdogConfig, decisionEffort] of [
+	["default cap lowers", { unlockReviewEnabled: false }, "medium"],
+	[
+		"excluded model keeps",
+		{
+			unlockReviewEnabled: false,
+			decisionThinkingCapExclude: ["watchdog-e2e/"],
+		},
+		"high",
+	],
+	[
+		"inherit keeps",
+		{ unlockReviewEnabled: false, decisionThinkingCap: "inherit" },
+		"high",
+	],
+] as const) {
+	test(`packed private decision wire effort: ${label} the main level`, {
+		timeout: 300_000,
+	}, async (t) => {
+		const fixture = await makePackedFixture(t, {
+			withSemanticProbe: true,
+			watchdogConfig,
+		});
+		const { baseUrl, requests } = await startMockServer(t, [
+			{ kind: "text", text: "First ordinary answer." },
+			{ kind: "cw", action: "unlock" },
+		]);
+		const { session } = await createSession(fixture, baseUrl, {
+			reasoning: true,
+		});
+		try {
+			session.setThinkingLevel("high");
+			await session.prompt("Start the task.");
+			await waitForSessionIdle(session, 30_000, "first turn");
+			await waitFor(() => requests.length >= 2, 45_000, "decision request");
+			assert.equal(isDecisionRequest(requests[0]), false);
+			assert.equal(requests[0]?.reasoning_effort, "high");
+			assert.ok(isDecisionRequest(requests[1]), "request 2 is the inquiry");
+			assert.equal(requests[1]?.reasoning_effort, decisionEffort);
+			await waitForReady(fixture);
+			assert.equal(session.thinkingLevel, "high");
+		} finally {
+			await shutdownSession(session);
+		}
+	});
+}
+
+const lastConfigurationEffort = (request: ResponsesRequest | undefined) =>
+	request?.input.filter((item) => item.type === "configuration_update").at(-1)
+		?.reasoning?.effort;
+
+for (const [label, compat, requestEffort, childEffort] of [
+	[
+		"mid-conversation compat caps in messages",
+		{ supportsMidConvoEffort: true },
+		"medium",
+		"medium",
+	],
+	["null compat keeps the request-level", undefined, "high", undefined],
+] as const) {
+	test(`packed Responses wire effort: ${label} main level`, {
+		timeout: 300_000,
+	}, async (t) => {
+		const fixture = await makePackedFixture(t, {
+			withSemanticProbe: true,
+			watchdogConfig: { unlockReviewEnabled: false },
+		});
+		const { baseUrl, requests } = await startResponsesMockServer(t);
+		const { session } = await createSession(fixture, baseUrl, {
+			reasoning: true,
+			api: "openai-responses",
+			...(compat === undefined ? {} : { compat }),
+		});
+		try {
+			session.setThinkingLevel("high");
+			await session.prompt("Start the task.");
+			await waitForSessionIdle(session, 30_000, "first turn");
+			await waitFor(() => requests.length >= 2, 45_000, "decision request");
+			await waitForReady(fixture);
+			const [main, decision] = requests;
+			assert.match(
+				JSON.stringify(decision),
+				new RegExp(DECISION_PROMPT_MARKER),
+			);
+			if (compat === undefined) {
+				assert.equal(main?.reasoning?.effort, "high");
+				assert.equal(lastConfigurationEffort(main), undefined);
+			} else {
+				// The level travels in messages; request-level effort stays fixed.
+				assert.equal(main?.reasoning?.effort, "medium");
+				assert.equal(lastConfigurationEffort(main), "high");
+			}
+			assert.equal(decision?.reasoning?.effort, requestEffort);
+			assert.equal(decision?.reasoning?.effort, main?.reasoning?.effort);
+			assert.equal(lastConfigurationEffort(decision), childEffort);
+			assert.equal(session.thinkingLevel, "high");
+		} finally {
+			await shutdownSession(session);
+		}
+	});
+}
 
 test("packed unowned ordinary cw stays a native unknown tool and ordinary work continues", {
 	timeout: 300_000,

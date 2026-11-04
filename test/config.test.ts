@@ -10,6 +10,7 @@ import {
 	DEFAULT_CONTINUE_PROMPT,
 	DEFAULT_CONTINUE_REASON_TYPES,
 	DEFAULT_DECISION_PROMPT,
+	DEFAULT_DECISION_THINKING_CAP_EXCLUDE,
 	DEFAULT_REASON_TYPES,
 	loadConfigText,
 	MAX_CONTINUE,
@@ -17,6 +18,7 @@ import {
 	MIN_CONTINUE,
 	MIN_IDLE_DELAY_SECONDS,
 	mergeConfig,
+	skipsThinkingCap,
 	validateConfig,
 } from "../src/config.js";
 import { loadRuntimeConfig } from "../src/config-loader.js";
@@ -614,6 +616,67 @@ test("capThinkingLevel only lowers known levels to the cap", () => {
 		assert.equal(capThinkingLevel(parent, "max"), parent);
 	});
 	assert.equal(capThinkingLevel("ultra", "medium"), "ultra");
+});
+
+test("decisionThinkingCapExclude defaults, replaces, lowercases and rejects invalid lists", () => {
+	assert.deepEqual(mergeConfig().config.decisionThinkingCapExclude, [
+		"claude-3",
+		"claude-opus-4",
+		"claude-sonnet-4",
+		"claude-haiku-4",
+		"gpt-5",
+		"/o1",
+		"/o3",
+		"/o4-",
+	]);
+	const global = { decisionThinkingCapExclude: ["gpt-5"] };
+	assert.deepEqual(
+		mergeConfig(global, { decisionThinkingCapExclude: [" My-Gateway/ "] })
+			.config.decisionThinkingCapExclude,
+		["my-gateway/"],
+	);
+	assert.deepEqual(
+		mergeConfig(global, { decisionThinkingCapExclude: [] }).config
+			.decisionThinkingCapExclude,
+		[],
+	);
+	for (const invalid of ["gpt-5", [""], ["  "], ["ok", 1]]) {
+		const merged = mergeConfig(global, { decisionThinkingCapExclude: invalid });
+		assert.deepEqual(merged.config.decisionThinkingCapExclude, ["gpt-5"]);
+		assert.equal(merged.diagnostics.length, 1);
+		assert.equal(
+			merged.diagnostics[0]?.message,
+			"decisionThinkingCapExclude must be an array of nonblank strings",
+		);
+	}
+});
+
+test("skipsThinkingCap combines the blacklist with the mid-conversation compat guard", () => {
+	const list = DEFAULT_DECISION_THINKING_CAP_EXCLUDE;
+	const mid = { supportsMidConvoEffort: true };
+	const cases: Array<
+		[string, string, string, unknown, readonly string[], boolean]
+	> = [
+		["anthropic", "claude-opus-4-1", "anthropic-messages", mid, list, true],
+		["gw", "anyrouter/GPT-5.4", "openai-completions", undefined, list, true],
+		["gw", "anyrouter/o3-mini", "openai-completions", undefined, list, true],
+		["gw", "claude-opus-5-5", "openai-responses", null, list, true],
+		["gw", "claude-opus-5-5", "openai-responses", {}, list, true],
+		["openai-codex", "gpt-6-sol", "openai-codex-responses", mid, list, true],
+		["azure", "gpt-6-sol", "azure-openai-responses", mid, list, true],
+		["anthropic", "claude-opus-5-5", "anthropic-messages", mid, list, false],
+		["openai", "gpt-6-sol", "openai-responses", mid, list, false],
+		["gw", "glm-5", "openai-completions", undefined, list, false],
+		["anthropic", "claude-opus-4-1", "anthropic-messages", mid, [], false],
+		["my-gateway", "gpt-6-sol", "openai-responses", mid, ["my-gateway/"], true],
+	];
+	for (const [provider, id, api, compat, exclude, expected] of cases) {
+		assert.equal(
+			skipsThinkingCap({ provider, id, api, compat }, exclude),
+			expected,
+			`${provider}/${id} ${api}`,
+		);
+	}
 });
 
 test("unlockReviewEnabled never restores the removed jevWaitCheck key", () => {

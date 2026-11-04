@@ -11,6 +11,8 @@
  *   strings; valid lists replace the defaults.
  * - decisionPrompt and continuePrompt are non-blank bounded Unicode strings.
  * - decisionThinkingCap is exactly "inherit" or a Pi thinking level.
+ * - decisionThinkingCapExclude is an array of trim-nonblank strings (stored
+ *   trimmed and lowercased); [] is valid and disables the blacklist.
  * - jevWaitCheck and maxRetries are removed keys: each occurrence reports a
  *   named error diagnostic naming the key only (never values) and has no
  *   effect. maxRetries is not an alias for maxContinue.
@@ -85,6 +87,58 @@ export function capThinkingLevel(
 	return rank > THINKING_LEVELS.indexOf(cap) ? cap : parent;
 }
 
+/** Built-in old-model substrings whose effort changes rewrite the cached prefix. */
+export const DEFAULT_DECISION_THINKING_CAP_EXCLUDE: readonly string[] =
+	Object.freeze([
+		"claude-3",
+		"claude-opus-4",
+		"claude-sonnet-4",
+		"claude-haiku-4",
+		"gpt-5",
+		"/o1",
+		"/o3",
+		"/o4-",
+	]);
+
+/** pi-ai APIs that carry effort mid-conversation when compat allows it. */
+const MID_CONVO_EFFORT_APIS = new Set([
+	"anthropic-messages",
+	"openai-responses",
+]);
+/** Responses/Messages-family APIs whose request-level effort is part of the cached prefix. */
+const EFFORT_PREFIX_APIS = new Set([
+	...MID_CONVO_EFFORT_APIS,
+	"azure-openai-responses",
+	"openai-codex-responses",
+]);
+
+export interface ThinkingCapModel {
+	readonly provider: string;
+	readonly id: string;
+	readonly api: string;
+	readonly compat?: unknown;
+}
+
+/**
+ * True when lowering the child level would likely discard the inherited
+ * prompt cache: a blacklisted provider/id, or an effort-prefix API on which
+ * pi does not carry effort mid-conversation.
+ */
+export function skipsThinkingCap(
+	model: ThinkingCapModel,
+	exclude: readonly string[],
+): boolean {
+	const name = `${model.provider}/${model.id}`.toLowerCase();
+	if (exclude.some((entry) => name.includes(entry))) return true;
+	if (!EFFORT_PREFIX_APIS.has(model.api)) return false;
+	const midConvo =
+		typeof model.compat === "object" &&
+		model.compat !== null &&
+		(model.compat as { supportsMidConvoEffort?: unknown })
+			.supportsMidConvoEffort === true;
+	return !(MID_CONVO_EFFORT_APIS.has(model.api) && midConvo);
+}
+
 export interface ContinueWatchdogConfig {
 	/** @deprecated Accepted and preserved, but the inquiry fence is fixed at 10s. */
 	idleDelaySeconds: number;
@@ -102,6 +156,8 @@ export interface ContinueWatchdogConfig {
 	unlockReviewEnabled: boolean;
 	/** Highest thinking level of the private decision child; "inherit" disables the cap. */
 	decisionThinkingCap: DecisionThinkingCap;
+	/** Lowercase provider/id substrings for which the cap is skipped. */
+	decisionThinkingCapExclude: readonly string[];
 }
 
 export type ConfigLayer = Partial<ContinueWatchdogConfig>;
@@ -132,6 +188,7 @@ export const BUILT_IN_CONFIG: Readonly<ContinueWatchdogConfig> = Object.freeze({
 	unlockShortcut: "alt+u",
 	unlockReviewEnabled: true,
 	decisionThinkingCap: "medium",
+	decisionThinkingCapExclude: DEFAULT_DECISION_THINKING_CAP_EXCLUDE,
 });
 
 const MAX_DIAGNOSTIC_LENGTH = 240;
@@ -146,6 +203,7 @@ const KNOWN_KEYS = new Set([
 	"unlockShortcut",
 	"unlockReviewEnabled",
 	"decisionThinkingCap",
+	"decisionThinkingCapExclude",
 ]);
 
 /** Removed keys; values never load. Optional replacement hint per key. */
@@ -173,6 +231,7 @@ function copyBuiltIn(): ContinueWatchdogConfig {
 		unlockShortcut: BUILT_IN_CONFIG.unlockShortcut,
 		unlockReviewEnabled: BUILT_IN_CONFIG.unlockReviewEnabled,
 		decisionThinkingCap: BUILT_IN_CONFIG.decisionThinkingCap,
+		decisionThinkingCapExclude: [...BUILT_IN_CONFIG.decisionThinkingCapExclude],
 	};
 }
 
@@ -369,6 +428,26 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 		}
 	}
 
+	if (Object.hasOwn(input, "decisionThinkingCapExclude")) {
+		const list = input.decisionThinkingCapExclude;
+		const normalized =
+			Array.isArray(list) && list.length === 0
+				? []
+				: normalizeReasonTypes(list);
+		if (normalized) {
+			config.decisionThinkingCapExclude = normalized.map((entry) =>
+				entry.toLowerCase(),
+			);
+		} else {
+			diagnostics.push(
+				diagnostic(
+					source,
+					"decisionThinkingCapExclude must be an array of nonblank strings",
+				),
+			);
+		}
+	}
+
 	for (const key of Object.keys(input)) {
 		if (!KNOWN_KEYS.has(key) && !REMOVED_KEYS.has(key)) {
 			diagnostics.push(diagnostic(source, "ignoring unsupported keys"));
@@ -429,6 +508,11 @@ export function mergeConfig(
 		}
 		if (partial.decisionThinkingCap !== undefined) {
 			config.decisionThinkingCap = partial.decisionThinkingCap;
+		}
+		if (partial.decisionThinkingCapExclude !== undefined) {
+			config.decisionThinkingCapExclude = [
+				...partial.decisionThinkingCapExclude,
+			];
 		}
 	}
 

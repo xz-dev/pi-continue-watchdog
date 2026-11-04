@@ -42,6 +42,7 @@ import {
 	BUILT_IN_CONFIG,
 	type ContinueWatchdogConfig,
 	capThinkingLevel,
+	skipsThinkingCap,
 } from "./config.js";
 import { type LoadedConfig, loadRuntimeConfig } from "./config-loader.js";
 import {
@@ -2085,7 +2086,13 @@ export function createDecisionRuntime(
 					parentProviderRegistry: ctx.modelRegistry,
 					cwd: ctx.cwd,
 					// Only the child is capped; sourceCurrent() keeps the main level.
-					model: `${ctx.model.provider}/${ctx.model.id}:${capThinkingLevel(options.pi.getThinkingLevel(), config.decisionThinkingCap)}`,
+					// Cache-sensitive models inherit: lowering would re-bill the prefix.
+					model: `${ctx.model.provider}/${ctx.model.id}:${capThinkingLevel(
+						options.pi.getThinkingLevel(),
+						skipsThinkingCap(ctx.model, config.decisionThinkingCapExclude)
+							? "inherit"
+							: config.decisionThinkingCap,
+					)}`,
 					signal: operation.abort.signal,
 					projectContext: (messages) => foldDecisionContext(messages),
 				},

@@ -409,6 +409,8 @@ function createHarness(options?: {
 		unlockShortcut: options?.config?.unlockShortcut ?? "alt+u",
 		unlockReviewEnabled: options?.config?.unlockReviewEnabled ?? false,
 		decisionThinkingCap: options?.config?.decisionThinkingCap ?? "medium",
+		decisionThinkingCapExclude:
+			options?.config?.decisionThinkingCapExclude ?? [],
 	};
 	const hub = options?.hub ?? createObservableAgentHub();
 	const controller = createLockDecisionController(config);
@@ -1453,6 +1455,53 @@ test("private decision child thinking is capped while the main level stays", asy
 			`fake/local:${child}`,
 		);
 		assert.equal(harness.thinkingLevel, parent);
+	}
+});
+
+test("cache-sensitive models keep the main thinking level", async () => {
+	for (const [model, exclude, child] of [
+		[
+			{ provider: "gw", id: "old", api: "openai-completions" },
+			["gw/old"],
+			"high",
+		],
+		[
+			{
+				provider: "gw",
+				id: "claude-opus-5-5",
+				api: "openai-responses",
+				compat: null,
+			},
+			[],
+			"high",
+		],
+		[
+			{
+				provider: "anthropic",
+				id: "claude-opus-5-5",
+				api: "anthropic-messages",
+				compat: { supportsMidConvoEffort: true },
+			},
+			[],
+			"medium",
+		],
+	] as const) {
+		const harness = createHarness({
+			config: { decisionThinkingCapExclude: exclude },
+		});
+		(harness.ctx as unknown as { model: unknown }).model = model;
+		harness.thinkingLevel = "high";
+		await startIdle(harness);
+		harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+			suppressNotify: true,
+		});
+		harness.runtime.reconcileIdle();
+		harness.clock.fire(1);
+		await harness.startDecision();
+		assert.equal(
+			harness.privateDriver.forkInputs[0]?.model,
+			`${model.provider}/${model.id}:${child}`,
+		);
 	}
 });
 
@@ -5104,6 +5153,7 @@ test("shared hub reclaims main after UI shutdown then prefers a new UI bind", as
 		unlockShortcut: "alt+u",
 		unlockReviewEnabled: false,
 		decisionThinkingCap: "medium" as const,
+		decisionThinkingCapExclude: [],
 	};
 
 	function attach(sessionId: string, hasUI: boolean) {
@@ -5234,6 +5284,7 @@ test("effective config loads before binding is reconciled and shutdown blocks la
 			unlockShortcut: "alt+u",
 			unlockReviewEnabled: false,
 			decisionThinkingCap: "medium" as const,
+			decisionThinkingCapExclude: [],
 		},
 		diagnostics: [],
 	});
@@ -6660,6 +6711,7 @@ test("changed effective constraints reload on ownership reclaim without public d
 			unlockShortcut: "alt+u" as const,
 			unlockReviewEnabled: false,
 			decisionThinkingCap: "medium" as const,
+			decisionThinkingCapExclude: [],
 		},
 		{
 			idleDelaySeconds: 3,
@@ -6671,6 +6723,7 @@ test("changed effective constraints reload on ownership reclaim without public d
 			unlockShortcut: "alt+u" as const,
 			unlockReviewEnabled: false,
 			decisionThinkingCap: "medium" as const,
+			decisionThinkingCapExclude: [],
 		},
 	];
 	let loadCount = 0;
