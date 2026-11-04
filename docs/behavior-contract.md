@@ -81,7 +81,7 @@ Keep four counts distinct: consumed format responses (three per inquiry), recons
 
 ## Private full-fork contract
 
-Create one distinct child from the qualified main source leaf. Capture owner, main session/source ancestry, lock/publication cycle, external-activity generation, selected provider/model and thinking. The child uses that provider/model and the captured main level lowered to `decisionThinkingCap` when it is higher (`off` < `minimal` < `low` < `medium` < `high` < `xhigh` < `max`; `inherit` disables the cap; unknown levels pass through). Currency checks keep comparing the uncapped main level. Inherit the **full effective active-branch conversation**, system state and tool declarations, subject to native compaction, exclusions, legacy watchdog folding and provider compatibility. Append decision instructions and source supplement after inherited context.
+Create one distinct child from the qualified main source leaf. Capture owner, main session/source ancestry, lock/publication cycle, external-activity generation, selected provider/model and thinking. The child uses that provider/model and the captured main level lowered to `decisionThinkingCap` when it is higher (`off` < `minimal` < `low` < `medium` < `high` < `xhigh` < `max`; `inherit` disables the cap; unknown levels pass through). The cap is skipped when the lowercase `provider/id` contains a `decisionThinkingCapExclude` entry, or when the API is `anthropic-messages`/`openai-responses` without `compat.supportsMidConvoEffort === true`, or `azure-openai-responses`/`openai-codex-responses`, because a request-level effort change there invalidates the inherited prompt-cache prefix. Currency checks keep comparing the uncapped main level. Inherit the **full effective active-branch conversation**, system state and tool declarations, subject to native compaction, exclusions, legacy watchdog folding and provider compatibility. Append decision instructions and source supplement after inherited context.
 
 Do not substitute raw JSONL, a recent-message suffix, pruned history, another model or silent fresh-context fallback. Unavailable full-fork input is an execution/setup failure: no fabricated decision, format response or continuation charge. Inherit required provider registrations without rerunning ambient parent extension factories. Disable ambient child extensions, user agent discovery/defaults, public subagent configuration, skills/context-file discovery and nested watchdogs.
 
@@ -245,6 +245,7 @@ Merge built-ins < global `$PI_CODING_AGENT_DIR/pi-continue-watchdog.json` (norma
 | `unlockShortcut` | `alt+u` | Valid shortcut or `false` |
 | `unlockReviewEnabled` | `true` | Optional loaded-service review, warning/unreviewed fallback |
 | `decisionThinkingCap` | `medium` | Exactly `inherit` or a Pi thinking level; caps only the private decision child |
+| `decisionThinkingCapExclude` | `claude-3`, `claude-opus-4`, `claude-sonnet-4`, `claude-haiku-4`, `gpt-5`, `/o1`, `/o3`, `/o4-` | Trimmed nonblank strings, stored lowercase; substring of `provider/id` skips the cap; valid list (including `[]`) replaces defaults |
 | `idleDelaySeconds` | `10` | Accepted compatibility key; runtime fence always ten seconds |
 
 Exact default `decisionPrompt`:

@@ -763,7 +763,12 @@ structure Setup where
   freshPrivateLocation : Bool
   filesystemReady : Bool
   thinkingCap : String
+  -- Host observation: blacklisted or cache-sensitive model whose level change would re-bill the prefix.
+  skipThinkingCap : Bool
   deriving DecidableEq, Repr
+
+def effectiveThinkingCap (setup : Setup) : String :=
+  if setup.skipThinkingCap then "inherit" else setup.thinkingCap
 
 def setupAdmitted (source : Source) (setup : Setup) : Bool :=
   setup.child != source.session && setup.fullProjectionAvailable &&
@@ -772,7 +777,7 @@ def setupAdmitted (source : Source) (setup : Setup) : Bool :=
 def runOwnedDecision (source : Source) (policy : Policy) (setup : Setup)
     (initial replacement : Nat → AttemptInput) (review : Review)
     (evidenceVerified : Bool) (afterReview afterCleanup : Observation) : PrivateResult :=
-  let fork := fullFork source setup.thinkingCap setup.child setup.resultPath setup.sessionFile
+  let fork := fullFork source (effectiveThinkingCap setup) setup.child setup.resultPath setup.sessionFile
   if setupAdmitted source setup then
     executePrivate source policy fork initial replacement review evidenceVerified afterReview afterCleanup
   else finish source fork ⟨.executionError, [], []⟩ 0 0 evidenceVerified afterCleanup
@@ -780,7 +785,7 @@ def runOwnedDecision (source : Source) (policy : Policy) (setup : Setup)
 theorem owned_execution_is_safe (source : Source) (policy : Policy) (setup : Setup)
     (initial replacement : Nat → AttemptInput) (review : Review)
     (evidenceVerified : Bool) (afterReview afterCleanup : Observation) :
-    PrivateSafe source (fullFork source setup.thinkingCap setup.child setup.resultPath setup.sessionFile)
+    PrivateSafe source (fullFork source (effectiveThinkingCap setup) setup.child setup.resultPath setup.sessionFile)
       (runOwnedDecision source policy setup initial replacement review evidenceVerified afterReview afterCleanup) := by
   unfold runOwnedDecision
   split
@@ -1036,6 +1041,12 @@ theorem cap_never_raises_thinking (parent cap : String) :
 
 theorem inherit_keeps_thinking (parent : String) : capThinking parent "inherit" = parent := by
   simp [capThinking]
+
+theorem skipped_cap_keeps_source_thinking (source : Source) (setup : Setup)
+    (skipped : setup.skipThinkingCap = true) :
+    (fullFork source (effectiveThinkingCap setup) setup.child setup.resultPath
+      setup.sessionFile).thinking = source.thinking := by
+  simp [fullFork, effectiveThinkingCap, skipped, capThinking]
 
 theorem default_cap_lowers_high_levels :
     capThinking "high" "medium" = "medium" ∧ capThinking "xhigh" "medium" = "medium" ∧

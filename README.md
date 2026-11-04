@@ -8,7 +8,7 @@ Requires Pi **1.3.0 or later** and Node.js **22.19.0 or later**. Development and
 
 The watchdog embeds its own pinned `pi-subagents` runtime. You do **not** need to install the public pi-subagents extension. Loading the watchdog registers no `cw`, legacy unlock function, public subagent tools, delegation bridges, or agent catalog. Independently installed public extensions keep their own surfaces; the watchdog does not take over a foreign `cw`.
 
-Each logical decision owns one distinct child session and one private `/var/tmp/` result directory. The child inherits the main session's **full effective active-branch context**, system state and tool declarations, using the same selected provider/model. Its thinking level is the main session's level capped by `decisionThinkingCap` (default `medium`); the cap only lowers it and never changes the main session's level. Native compaction, exclusions, legacy watchdog folding and provider compatibility still apply. A bounded source supplement assists review; it does not replace the inherited conversation. Missing full-fork input is an execution failure, not permission to start with a suffix, another model or an empty conversation.
+Each logical decision owns one distinct child session and one private `/var/tmp/` result directory. The child inherits the main session's **full effective active-branch context**, system state and tool declarations, using the same selected provider/model. Its thinking level is the main session's level capped by `decisionThinkingCap` (default `medium`); the cap only lowers it, is skipped for cache-sensitive models (see below), and never changes the main session's level. Native compaction, exclusions, legacy watchdog folding and provider compatibility still apply. A bounded source supplement assists review; it does not replace the inherited conversation. Missing full-fork input is an execution failure, not permission to start with a suffix, another model or an empty conversation.
 
 Inherited tool declarations are not execution permissions. The child may execute only one guarded stock `write` call to its designated `decision.json` per response. Shell commands, delegation, ordinary work, other paths, duplicate writes and mixed batches are rejected before effects. The host initializes the file to exactly `{}` before every attempt and reads it only after the response and admitted write settle. Only this file supplies a decision; prose, stdout and tool results cannot substitute for it.
 
@@ -74,7 +74,8 @@ Merge built-ins, global `$PI_CODING_AGENT_DIR/pi-continue-watchdog.json` (normal
   "continueReasonTypes": ["WORK_REMAINS", "VERIFYING"],
   "unlockShortcut": "alt+u",
   "unlockReviewEnabled": true,
-  "decisionThinkingCap": "medium"
+  "decisionThinkingCap": "medium",
+  "decisionThinkingCapExclude": ["claude-3", "claude-opus-4", "claude-sonnet-4", "claude-haiku-4", "gpt-5", "/o1", "/o3", "/o4-"]
 }
 ```
 
@@ -88,11 +89,17 @@ Merge built-ins, global `$PI_CODING_AGENT_DIR/pi-continue-watchdog.json` (normal
 | `unlockShortcut` | `alt+u` | Human unlock shortcut, or `false` to disable |
 | `unlockReviewEnabled` | `true` | Optional shared review; unavailable review warns but does not block |
 | `decisionThinkingCap` | `medium` | Highest private decision thinking level: exactly `inherit`, `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`; lowers `high`+ parents to save cost and latency |
+| `decisionThinkingCapExclude` | old Claude/GPT families above | Case-insensitive substrings of `provider/id` that skip the cap; trimmed nonblank strings; a valid list replaces defaults, `[]` disables it |
 | `idleDelaySeconds` | `10` | Compatibility-only; never changes the fixed ten-second fence |
 
 Reason-list entries are trimmed and nonblank, without identifier regexes or artificial length/count caps. Matching preserves configured input identity: uppercase output does not create extra input aliases (for example, configured `ß` does not admit `SS`). Default unlock meanings: `JOB_DONE` — all work complete; `WAIT_USER` — user input/decision needed; `JOB_BLOCKED` — another concrete blocker; `WAIT_CALLBACK` — an expected external callback with no independent authorized work remaining.
 
-**Thinking cap and prompt cache.** Some providers (for example Anthropic) invalidate the cached prefix of the inherited conversation when the thinking setting changes. In long sessions a capped child can then cost more than the reasoning it saves. Set `decisionThinkingCap` to `inherit` to use the main session's level unchanged.
+**Thinking cap and prompt cache.** The child reuses the inherited conversation's prompt cache only if the level change does not rewrite the cached prefix. OpenAI documents that request-level `reasoning.effort` can rewrite hidden system instructions, and Anthropic that `output_config.effort`/thinking changes invalidate message blocks. Pi avoids this only on `openai-responses` and `anthropic-messages` models whose compat sets `supportsMidConvoEffort` (for example GPT-6 and Claude 5.x on official providers): the level travels inside the messages. Elsewhere a capped child can re-bill the whole inherited context. So the cap is skipped, and the child keeps the main level, when:
+
+- `provider/id` contains a `decisionThinkingCapExclude` entry (old model families by default; add gateway prefixes such as `my-gateway/` as needed); or
+- the API is `anthropic-messages`, `openai-responses`, `azure-openai-responses` or `openai-codex-responses` without that mid-conversation support. Gateways that report `compat: null` fall here.
+
+Other APIs stay capped unless excluded. Known gap: OpenAI ChatGPT sign-in rejects mid-conversation effort even when compat allows it; exclude such models or set `decisionThinkingCap` to `inherit`.
 
 ### Removed configuration
 
