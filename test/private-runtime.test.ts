@@ -25,7 +25,7 @@ import {
 	type WatchdogForkInput,
 } from "private-inquiry-subagents-runtime/watchdog-runtime";
 import { Type } from "typebox";
-
+import { BUILT_IN_CONFIG, capThinkingLevel } from "../src/config.js";
 import {
 	DECISION_MESSAGE_TYPE,
 	foldDecisionContext,
@@ -67,13 +67,15 @@ async function createFixture(
 	await writeFile(resultFile, "{}", { mode: 0o600 });
 	const requests: unknown[][] = [];
 	const contexts: Context[] = [];
+	const reasoning: unknown[] = [];
 	const modelRuntime = await ModelRuntime.create({ modelsPath: null });
 	modelRuntime.registerProvider("watchdog-test", {
 		baseUrl: "http://127.0.0.1:1",
 		apiKey: "unused-local-test-key",
 		api: "openai-completions",
 		streamSimple: reply
-			? (model, context) => {
+			? (model, context, options) => {
+					reasoning.push(options?.reasoning);
 					requests.push(JSON.parse(JSON.stringify(context.messages)));
 					contexts.push(JSON.parse(JSON.stringify(context)));
 					const content = reply(requests.length, resultFile);
@@ -195,6 +197,7 @@ async function createFixture(
 		resultFile,
 		requests,
 		contexts,
+		reasoning,
 		runtime: privateRuntime,
 		fork: (overrides?: Partial<WatchdogForkInput>) =>
 			privateRuntime.fork({
@@ -203,7 +206,7 @@ async function createFixture(
 				cwd: root,
 				agentDir: childAgentDir,
 				resultFile,
-				model: `${model.provider}/${model.id}:${created.session.thinkingLevel}`,
+				model: `${model.provider}/${model.id}:${capThinkingLevel(created.session.thinkingLevel, BUILT_IN_CONFIG.decisionThinkingCap)}`,
 				retryPolicy: "disabled",
 				...overrides,
 			}),
@@ -242,7 +245,7 @@ test("private full fork owns a separate session without registering parent tools
 	await fixture.runtime.dispose();
 });
 
-test("full effective fork keeps native compaction, exclusions, legacy folds and selected thinking", {
+test("full effective fork keeps native compaction, exclusions, legacy folds and capped thinking", {
 	timeout: 15_000,
 }, async (t) => {
 	const fixture = await createFixture(t, () => [
@@ -322,11 +325,25 @@ test("full effective fork keeps native compaction, exclusions, legacy folds and 
 	assert.notEqual(child.sessionId, parent.sessionId);
 	const childFile = child.sessionFile;
 	assert.ok(childFile);
+	// The fork JSONL keeps the inherited level entry; the provider request carries the capped one.
 	assert.equal(
 		SessionManager.open(childFile).buildSessionProjection().thinkingLevel,
 		"high",
 	);
+	assert.deepEqual(
+		fixture.reasoning,
+		["medium"],
+		"default cap lowers the child request",
+	);
 	assert.deepEqual(fixture.parentApi.getAllTools(), fixture.parentTools);
+	await child.dispose();
+	const inherited = await fixture.fork({
+		model: `${fixture.model.provider}/${fixture.model.id}:${capThinkingLevel(parent.thinkingLevel, "inherit")}`,
+	});
+	await inherited.prompt("INHERIT_CAP");
+	assert.deepEqual(fixture.reasoning, ["medium", "high"]);
+	assert.equal(parent.thinkingLevel, "high");
+	await inherited.dispose();
 });
 
 test("unavailable full fork rejects without a fresh-context model request", {

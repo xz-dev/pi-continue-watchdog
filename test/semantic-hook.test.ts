@@ -240,6 +240,7 @@ function createSemanticHarness(options?: {
 		],
 		unlockShortcut: options?.config?.unlockShortcut ?? "alt+u",
 		unlockReviewEnabled: options?.config?.unlockReviewEnabled ?? false,
+		decisionThinkingCap: options?.config?.decisionThinkingCap ?? "medium",
 	};
 	const hub = createObservableAgentHub();
 	const controller = createLockDecisionController(config);

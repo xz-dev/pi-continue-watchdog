@@ -38,7 +38,11 @@ import {
 	WATCHDOG_STATUS_ENTRY_TYPE,
 	type WatchdogStatusEntry,
 } from "./commands.js";
-import { BUILT_IN_CONFIG, type ContinueWatchdogConfig } from "./config.js";
+import {
+	BUILT_IN_CONFIG,
+	type ContinueWatchdogConfig,
+	capThinkingLevel,
+} from "./config.js";
 import { type LoadedConfig, loadRuntimeConfig } from "./config-loader.js";
 import {
 	CANCELLED_WATCHDOG_RUN_ERROR,
@@ -2080,7 +2084,8 @@ export function createDecisionRuntime(
 					parent: ctx.sessionManager,
 					parentProviderRegistry: ctx.modelRegistry,
 					cwd: ctx.cwd,
-					model: `${ctx.model.provider}/${ctx.model.id}:${options.pi.getThinkingLevel()}`,
+					// Only the child is capped; sourceCurrent() keeps the main level.
+					model: `${ctx.model.provider}/${ctx.model.id}:${capThinkingLevel(options.pi.getThinkingLevel(), config.decisionThinkingCap)}`,
 					signal: operation.abort.signal,
 					projectContext: (messages) => foldDecisionContext(messages),
 				},

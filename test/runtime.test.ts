@@ -408,6 +408,7 @@ function createHarness(options?: {
 		],
 		unlockShortcut: options?.config?.unlockShortcut ?? "alt+u",
 		unlockReviewEnabled: options?.config?.unlockReviewEnabled ?? false,
+		decisionThinkingCap: options?.config?.decisionThinkingCap ?? "medium",
 	};
 	const hub = options?.hub ?? createObservableAgentHub();
 	const controller = createLockDecisionController(config);
@@ -1427,6 +1428,32 @@ test("idle arms one unref timer and opens one isolated private decision", async 
 	assert.equal(harness.triggeredTurns, 0);
 	assert.equal(harness.sent.length, 0);
 	assert.deepEqual(harness.registeredTools, []);
+});
+
+test("private decision child thinking is capped while the main level stays", async () => {
+	for (const [cap, parent, child] of [
+		[undefined, "high", "medium"],
+		[undefined, "max", "medium"],
+		[undefined, "low", "low"],
+		["inherit", "xhigh", "xhigh"],
+	] as const) {
+		const harness = createHarness(
+			cap === undefined ? undefined : { config: { decisionThinkingCap: cap } },
+		);
+		harness.thinkingLevel = parent;
+		await startIdle(harness);
+		harness.runtime.applyTransition(harness.controller.lock(), undefined, {
+			suppressNotify: true,
+		});
+		harness.runtime.reconcileIdle();
+		harness.clock.fire(1);
+		await harness.startDecision();
+		assert.equal(
+			harness.privateDriver.forkInputs[0]?.model,
+			`fake/local:${child}`,
+		);
+		assert.equal(harness.thinkingLevel, parent);
+	}
 });
 
 test("trigger status reports real grace and active private state without mutation", async () => {
@@ -5076,6 +5103,7 @@ test("shared hub reclaims main after UI shutdown then prefers a new UI bind", as
 		continueReasonTypes: ["WORK_REMAINS", "VERIFYING"],
 		unlockShortcut: "alt+u",
 		unlockReviewEnabled: false,
+		decisionThinkingCap: "medium" as const,
 	};
 
 	function attach(sessionId: string, hasUI: boolean) {
@@ -5205,6 +5233,7 @@ test("effective config loads before binding is reconciled and shutdown blocks la
 			continueReasonTypes: ["WORK_REMAINS", "VERIFYING"],
 			unlockShortcut: "alt+u",
 			unlockReviewEnabled: false,
+			decisionThinkingCap: "medium" as const,
 		},
 		diagnostics: [],
 	});
@@ -6630,6 +6659,7 @@ test("changed effective constraints reload on ownership reclaim without public d
 			continueReasonTypes: ["WORK_REMAINS"],
 			unlockShortcut: "alt+u" as const,
 			unlockReviewEnabled: false,
+			decisionThinkingCap: "medium" as const,
 		},
 		{
 			idleDelaySeconds: 3,
@@ -6640,6 +6670,7 @@ test("changed effective constraints reload on ownership reclaim without public d
 			continueReasonTypes: ["verifying"],
 			unlockShortcut: "alt+u" as const,
 			unlockReviewEnabled: false,
+			decisionThinkingCap: "medium" as const,
 		},
 	];
 	let loadCount = 0;

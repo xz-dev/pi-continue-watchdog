@@ -144,6 +144,7 @@ const CONFIG: LoadedConfig = {
 		continueReasonTypes: ["WORK_REMAINS", "VERIFYING"],
 		unlockShortcut: "alt+u",
 		unlockReviewEnabled: false,
+		decisionThinkingCap: "medium" as const,
 	},
 	diagnostics: [],
 };

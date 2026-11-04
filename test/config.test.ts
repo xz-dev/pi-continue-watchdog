@@ -6,6 +6,7 @@ import test, { type TestContext } from "node:test";
 
 import {
 	BUILT_IN_CONFIG,
+	capThinkingLevel,
 	DEFAULT_CONTINUE_PROMPT,
 	DEFAULT_CONTINUE_REASON_TYPES,
 	DEFAULT_DECISION_PROMPT,
@@ -568,6 +569,51 @@ test("unlockReviewEnabled defaults to true, accepts booleans, and layers like ot
 		{ unlockReviewEnabled: true },
 	);
 	assert.equal(projectEnables.config.unlockReviewEnabled, true);
+});
+
+test("decisionThinkingCap defaults to medium, accepts exact levels, and layers like other keys", () => {
+	assert.equal(BUILT_IN_CONFIG.decisionThinkingCap, "medium");
+	assert.equal(mergeConfig().config.decisionThinkingCap, "medium");
+	assert.equal(
+		mergeConfig(
+			{ decisionThinkingCap: "low" },
+			{ decisionThinkingCap: "inherit" },
+		).config.decisionThinkingCap,
+		"inherit",
+	);
+	for (const invalid of ["High", " medium", "none", true, 3, null]) {
+		const merged = mergeConfig(
+			{ decisionThinkingCap: "inherit" },
+			{ decisionThinkingCap: invalid },
+		);
+		assert.equal(merged.config.decisionThinkingCap, "inherit");
+		assert.equal(merged.diagnostics.length, 1);
+		assert.equal(merged.diagnostics[0]?.source, "project");
+		assert.match(
+			merged.diagnostics[0]?.message ?? "",
+			/^decisionThinkingCap must be one of/,
+		);
+	}
+});
+
+test("capThinkingLevel only lowers known levels to the cap", () => {
+	const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+	const underMedium = [
+		"off",
+		"minimal",
+		"low",
+		"medium",
+		"medium",
+		"medium",
+		"medium",
+	];
+	levels.forEach((parent, i) => {
+		assert.equal(capThinkingLevel(parent, "medium"), underMedium[i]);
+		assert.equal(capThinkingLevel(parent, "inherit"), parent);
+		assert.equal(capThinkingLevel(parent, "off"), "off");
+		assert.equal(capThinkingLevel(parent, "max"), parent);
+	});
+	assert.equal(capThinkingLevel("ultra", "medium"), "ultra");
 });
 
 test("unlockReviewEnabled never restores the removed jevWaitCheck key", () => {

@@ -10,6 +10,7 @@
  * - reasonTypes and continueReasonTypes are nonempty arrays of trim-nonblank
  *   strings; valid lists replace the defaults.
  * - decisionPrompt and continuePrompt are non-blank bounded Unicode strings.
+ * - decisionThinkingCap is exactly "inherit" or a Pi thinking level.
  * - jevWaitCheck and maxRetries are removed keys: each occurrence reports a
  *   named error diagnostic naming the key only (never values) and has no
  *   effect. maxRetries is not an alias for maxContinue.
@@ -51,6 +52,39 @@ export const MIN_CONTINUE = 1;
  */
 export const MAX_CONTINUE = 10;
 
+/** Pi thinking levels, lowest first. */
+export const THINKING_LEVELS = Object.freeze([
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+] as const);
+
+export type DecisionThinkingCap = "inherit" | (typeof THINKING_LEVELS)[number];
+
+function isDecisionThinkingCap(value: unknown): value is DecisionThinkingCap {
+	return (
+		value === "inherit" ||
+		(THINKING_LEVELS as readonly unknown[]).includes(value)
+	);
+}
+
+/**
+ * Private decision child level: the parent level lowered to the cap, never
+ * raised. An unknown parent level passes through unchanged.
+ */
+export function capThinkingLevel(
+	parent: string,
+	cap: DecisionThinkingCap,
+): string {
+	if (cap === "inherit") return parent;
+	const rank = (THINKING_LEVELS as readonly string[]).indexOf(parent);
+	return rank > THINKING_LEVELS.indexOf(cap) ? cap : parent;
+}
+
 export interface ContinueWatchdogConfig {
 	/** @deprecated Accepted and preserved, but the inquiry fence is fixed at 10s. */
 	idleDelaySeconds: number;
@@ -66,6 +100,8 @@ export interface ContinueWatchdogConfig {
 	unlockShortcut: string | false;
 	/** Third-party review of AI unlock decisions; default on, skipped with a warning when unavailable. */
 	unlockReviewEnabled: boolean;
+	/** Highest thinking level of the private decision child; "inherit" disables the cap. */
+	decisionThinkingCap: DecisionThinkingCap;
 }
 
 export type ConfigLayer = Partial<ContinueWatchdogConfig>;
@@ -95,6 +131,7 @@ export const BUILT_IN_CONFIG: Readonly<ContinueWatchdogConfig> = Object.freeze({
 	continueReasonTypes: DEFAULT_CONTINUE_REASON_TYPES,
 	unlockShortcut: "alt+u",
 	unlockReviewEnabled: true,
+	decisionThinkingCap: "medium",
 });
 
 const MAX_DIAGNOSTIC_LENGTH = 240;
@@ -108,6 +145,7 @@ const KNOWN_KEYS = new Set([
 	"continueReasonTypes",
 	"unlockShortcut",
 	"unlockReviewEnabled",
+	"decisionThinkingCap",
 ]);
 
 /** Removed keys; values never load. Optional replacement hint per key. */
@@ -134,6 +172,7 @@ function copyBuiltIn(): ContinueWatchdogConfig {
 		continueReasonTypes: [...BUILT_IN_CONFIG.continueReasonTypes],
 		unlockShortcut: BUILT_IN_CONFIG.unlockShortcut,
 		unlockReviewEnabled: BUILT_IN_CONFIG.unlockReviewEnabled,
+		decisionThinkingCap: BUILT_IN_CONFIG.decisionThinkingCap,
 	};
 }
 
@@ -316,6 +355,20 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 		}
 	}
 
+	if (Object.hasOwn(input, "decisionThinkingCap")) {
+		const cap = input.decisionThinkingCap;
+		if (isDecisionThinkingCap(cap)) {
+			config.decisionThinkingCap = cap;
+		} else {
+			diagnostics.push(
+				diagnostic(
+					source,
+					`decisionThinkingCap must be one of inherit, ${THINKING_LEVELS.join(", ")}`,
+				),
+			);
+		}
+	}
+
 	for (const key of Object.keys(input)) {
 		if (!KNOWN_KEYS.has(key) && !REMOVED_KEYS.has(key)) {
 			diagnostics.push(diagnostic(source, "ignoring unsupported keys"));
@@ -373,6 +426,9 @@ export function mergeConfig(
 		}
 		if (partial.unlockReviewEnabled !== undefined) {
 			config.unlockReviewEnabled = partial.unlockReviewEnabled;
+		}
+		if (partial.decisionThinkingCap !== undefined) {
+			config.decisionThinkingCap = partial.decisionThinkingCap;
 		}
 	}
 
