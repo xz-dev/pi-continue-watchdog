@@ -88,12 +88,21 @@ structure Fork where
   publicRegistrations : List String
   deriving DecidableEq, Repr
 
-def fullFork (source : Source) (child : SessionId) (path : ResultPath)
+-- The child thinking level is the main level lowered to the configured cap, never raised; unknown levels pass through.
+def thinkingLevels : List String := ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+
+def thinkingRank (level : String) : Nat := thinkingLevels.idxOf level
+
+def capThinking (parent cap : String) : String :=
+  if cap != "inherit" && thinkingLevels.contains parent && thinkingLevels.contains cap &&
+      thinkingRank cap < thinkingRank parent then cap else parent
+
+def fullFork (source : Source) (cap : String) (child : SessionId) (path : ResultPath)
     (sessionFile : ResultPath) : Fork :=
   { child, resultPath := path, sessionFile,
     conversation := source.effectiveConversation,
     systemState := source.systemState, declarations := source.toolDeclarations,
-    providerModel := source.providerModel, thinking := source.thinking,
+    providerModel := source.providerModel, thinking := capThinking source.thinking cap,
     ambientExtensions := false, publicRegistrations := [] }
 
 -- Attempt inputs distinguish forbidden effects, decoded files, cancellation and host/provider failures.
@@ -753,6 +762,7 @@ structure Setup where
   fullProjectionAvailable : Bool
   freshPrivateLocation : Bool
   filesystemReady : Bool
+  thinkingCap : String
   deriving DecidableEq, Repr
 
 def setupAdmitted (source : Source) (setup : Setup) : Bool :=
@@ -762,7 +772,7 @@ def setupAdmitted (source : Source) (setup : Setup) : Bool :=
 def runOwnedDecision (source : Source) (policy : Policy) (setup : Setup)
     (initial replacement : Nat → AttemptInput) (review : Review)
     (evidenceVerified : Bool) (afterReview afterCleanup : Observation) : PrivateResult :=
-  let fork := fullFork source setup.child setup.resultPath setup.sessionFile
+  let fork := fullFork source setup.thinkingCap setup.child setup.resultPath setup.sessionFile
   if setupAdmitted source setup then
     executePrivate source policy fork initial replacement review evidenceVerified afterReview afterCleanup
   else finish source fork ⟨.executionError, [], []⟩ 0 0 evidenceVerified afterCleanup
@@ -770,7 +780,7 @@ def runOwnedDecision (source : Source) (policy : Policy) (setup : Setup)
 theorem owned_execution_is_safe (source : Source) (policy : Policy) (setup : Setup)
     (initial replacement : Nat → AttemptInput) (review : Review)
     (evidenceVerified : Bool) (afterReview afterCleanup : Observation) :
-    PrivateSafe source (fullFork source setup.child setup.resultPath setup.sessionFile)
+    PrivateSafe source (fullFork source setup.thinkingCap setup.child setup.resultPath setup.sessionFile)
       (runOwnedDecision source policy setup initial replacement review evidenceVerified afterReview afterCleanup) := by
   unfold runOwnedDecision
   split
@@ -1007,14 +1017,30 @@ def recoverHistory (entries : List MainEntry) : RecoveredHistory :=
   ⟨entries, none, none, false, 0, false⟩
 
 -- Main-boundary laws preserve inherited source, qualification, accounting, receipt and callback safeguards.
-theorem full_fork_preserves_effective_source (source : Source) (child : SessionId)
+theorem full_fork_preserves_effective_source (source : Source) (cap : String) (child : SessionId)
     (path sessionFile : ResultPath) :
-    let fork := fullFork source child path sessionFile
+    let fork := fullFork source cap child path sessionFile
     fork.conversation = source.effectiveConversation ∧
     fork.systemState = source.systemState ∧ fork.declarations = source.toolDeclarations ∧
-    fork.providerModel = source.providerModel ∧ fork.thinking = source.thinking ∧
+    fork.providerModel = source.providerModel ∧ fork.thinking = capThinking source.thinking cap ∧
     fork.ambientExtensions = false ∧ fork.publicRegistrations = [] := by
   simp [fullFork]
+
+theorem cap_never_raises_thinking (parent cap : String) :
+    capThinking parent cap = parent ∨
+      (capThinking parent cap = cap ∧ thinkingRank cap < thinkingRank parent) := by
+  unfold capThinking
+  split
+  · next h => simp only [Bool.and_eq_true, decide_eq_true_eq] at h; exact .inr ⟨rfl, h.2⟩
+  · exact .inl rfl
+
+theorem inherit_keeps_thinking (parent : String) : capThinking parent "inherit" = parent := by
+  simp [capThinking]
+
+theorem default_cap_lowers_high_levels :
+    capThinking "high" "medium" = "medium" ∧ capThinking "xhigh" "medium" = "medium" ∧
+      capThinking "max" "medium" = "medium" ∧ capThinking "low" "medium" = "low" := by
+  decide
 
 theorem main_activity_cancels_fence (s : RuntimeState) (label : String) :
     (reportMain label false s).fenceRemaining = none := by
@@ -1241,7 +1267,7 @@ def demoSource : Source :=
 
 def demoPolicy : Policy := ⟨["WORK_REMAINS"], ["JOB_DONE", "WAIT_CALLBACK"]⟩
 
-def demoFork : Fork := fullFork demoSource 2 99 100
+def demoFork : Fork := fullFork demoSource "medium" 2 99 100
 
 theorem three_invalid_responses_fail :
     let r := runInquiry demoSource demoPolicy demoFork allInvalid 3 0

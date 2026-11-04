@@ -8,7 +8,7 @@ Requires Pi **1.3.0 or later** and Node.js **22.19.0 or later**. Development and
 
 The watchdog embeds its own pinned `pi-subagents` runtime. You do **not** need to install the public pi-subagents extension. Loading the watchdog registers no `cw`, legacy unlock function, public subagent tools, delegation bridges, or agent catalog. Independently installed public extensions keep their own surfaces; the watchdog does not take over a foreign `cw`.
 
-Each logical decision owns one distinct child session and one private `/var/tmp/` result directory. The child inherits the main session's **full effective active-branch context**, system state and tool declarations, using the same selected provider/model and thinking setting. Native compaction, exclusions, legacy watchdog folding and provider compatibility still apply. A bounded source supplement assists review; it does not replace the inherited conversation. Missing full-fork input is an execution failure, not permission to start with a suffix, another model or an empty conversation.
+Each logical decision owns one distinct child session and one private `/var/tmp/` result directory. The child inherits the main session's **full effective active-branch context**, system state and tool declarations, using the same selected provider/model. Its thinking level is the main session's level capped by `decisionThinkingCap` (default `medium`); the cap only lowers it and never changes the main session's level. Native compaction, exclusions, legacy watchdog folding and provider compatibility still apply. A bounded source supplement assists review; it does not replace the inherited conversation. Missing full-fork input is an execution failure, not permission to start with a suffix, another model or an empty conversation.
 
 Inherited tool declarations are not execution permissions. The child may execute only one guarded stock `write` call to its designated `decision.json` per response. Shell commands, delegation, ordinary work, other paths, duplicate writes and mixed batches are rejected before effects. The host initializes the file to exactly `{}` before every attempt and reads it only after the response and admitted write settle. Only this file supplies a decision; prose, stdout and tool results cannot substitute for it.
 
@@ -73,7 +73,8 @@ Merge built-ins, global `$PI_CODING_AGENT_DIR/pi-continue-watchdog.json` (normal
   "reasonTypes": ["JOB_DONE", "WAIT_USER", "JOB_BLOCKED", "WAIT_CALLBACK"],
   "continueReasonTypes": ["WORK_REMAINS", "VERIFYING"],
   "unlockShortcut": "alt+u",
-  "unlockReviewEnabled": true
+  "unlockReviewEnabled": true,
+  "decisionThinkingCap": "medium"
 }
 ```
 
@@ -86,9 +87,12 @@ Merge built-ins, global `$PI_CODING_AGENT_DIR/pi-continue-watchdog.json` (normal
 | `continueReasonTypes` | `WORK_REMAINS`, `VERIFYING` | Allowed continue types; a valid list replaces defaults |
 | `unlockShortcut` | `alt+u` | Human unlock shortcut, or `false` to disable |
 | `unlockReviewEnabled` | `true` | Optional shared review; unavailable review warns but does not block |
+| `decisionThinkingCap` | `medium` | Highest private decision thinking level: exactly `inherit`, `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`; lowers `high`+ parents to save cost and latency |
 | `idleDelaySeconds` | `10` | Compatibility-only; never changes the fixed ten-second fence |
 
 Reason-list entries are trimmed and nonblank, without identifier regexes or artificial length/count caps. Matching preserves configured input identity: uppercase output does not create extra input aliases (for example, configured `ß` does not admit `SS`). Default unlock meanings: `JOB_DONE` — all work complete; `WAIT_USER` — user input/decision needed; `JOB_BLOCKED` — another concrete blocker; `WAIT_CALLBACK` — an expected external callback with no independent authorized work remaining.
+
+**Thinking cap and prompt cache.** Some providers (for example Anthropic) invalidate the cached prefix of the inherited conversation when the thinking setting changes. In long sessions a capped child can then cost more than the reasoning it saves. Set `decisionThinkingCap` to `inherit` to use the main session's level unchanged.
 
 ### Removed configuration
 

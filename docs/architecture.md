@@ -112,7 +112,7 @@ Before/after asynchronous boundaries and before commit, currentness includes:
 - exact elected-main claim and controller identity;
 - runtime/lifecycle, lock cycle and external-activity generations;
 - source session and active source ancestry;
-- same selected provider/model and thinking setting;
+- same selected main provider/model and uncapped main thinking setting;
 - correct child/inquiry identifiers and a live cancellation signal;
 - aggregate idle, no pending messages and current process-domain confirmation at finalization.
 
