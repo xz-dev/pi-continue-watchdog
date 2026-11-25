@@ -1026,6 +1026,75 @@ test("packed idle settlement opens one inquiry before continuation", {
 	}
 });
 
+test("packed continuation handoff clears private progress while main stays busy", {
+	timeout: 300_000,
+}, async (t) => {
+	const fixture = await makePackedFixture(t);
+	const { baseUrl, requests } = await startMockServer(t, [
+		{ kind: "text", text: "First ordinary answer." },
+		{ kind: "cw", action: "continue", reasonType: "WORK_REMAINS" },
+		{ kind: "delayed", text: "Main continuation is still running." },
+	]);
+	let widget: { render(width: number): string[]; dispose?(): void } | undefined;
+	const renderRow = () => widget?.render(200).join("").trimEnd() ?? "";
+	let sawPrivateProgress = false;
+	const uiContext = createRpcUiContext();
+	uiContext.setWidget = (key, content) => {
+		if (key !== "pi-continue-watchdog:state") return;
+		widget?.dispose?.();
+		widget = undefined;
+		if (typeof content !== "function") return;
+		widget = content(
+			{
+				requestRender() {
+					sawPrivateProgress ||= /attempt 1\/3/.test(renderRow());
+				},
+			} as Parameters<typeof content>[0],
+			{
+				fg: (_color: string, text: string) => text,
+				bg: (_color: string, text: string) => text,
+			} as Parameters<typeof content>[1],
+		);
+	};
+	const { session } = await createSession(fixture, baseUrl, {
+		uiContext,
+		abortHandler: () => {},
+	});
+	try {
+		await session.prompt("Start the task.");
+		await waitFor(() => requests.length >= 3, 45_000, "held continuation");
+		assert.equal(session.isStreaming, true, "main request is still open");
+		assert.ok(sawPrivateProgress, "the private inquiry used this widget");
+		const row = renderRow();
+		assert.match(row, /Continue Watchdog \| running \(enabled/);
+		assert.doesNotMatch(row, /publishing|attempt|\d+s/);
+		const folds = session.sessionManager
+			.getBranch()
+			.filter(
+				(entry) =>
+					entry.type === "custom_message" &&
+					entry.customType === "pi-continue-watchdog:inquiry-fold" &&
+					(entry.details as { watchdogOutcome?: string } | undefined)
+						?.watchdogOutcome === "continue",
+			);
+		assert.equal(folds.length, 1);
+		assert.equal(requests.length, 3);
+		assert.equal(isDecisionRequest(requests[1]), true);
+		assert.equal(isDecisionRequest(requests[2]), false);
+		assert.equal(
+			requests[2].messages.filter((message) =>
+				contentText(message).includes(
+					"Continue watchdog · continue · WORK_REMAINS",
+				),
+			).length,
+			1,
+		);
+		t.diagnostic(`Observed during open main stream: ${row}`);
+	} finally {
+		await shutdownSession(session);
+	}
+});
+
 for (const [label, watchdogConfig, decisionEffort] of [
 	["default cap lowers", { unlockReviewEnabled: false }, "medium"],
 	[

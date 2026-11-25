@@ -1920,6 +1920,130 @@ test("private progress row keeps correction 2/3 and publication on one elapsed o
 	);
 });
 
+test("system bookkeeping before continuation handoff retires private progress while main stays busy", async () => {
+	const hooks: string[] = [];
+	let receiptReadable = true;
+	const harness = createHarness({
+		omitPersistedEvent: (kind) => kind === "continue",
+		onHook: (name) => hooks.push(name),
+		onReadBranch() {
+			if (!receiptReadable) throw new Error("branch temporarily unreadable");
+		},
+	});
+	await startIdle(harness);
+	const widget = mountStateStatusWidget(harness);
+	const fold = await startAcceptedContinuation(harness, false);
+	assert.match(widget.render(200).join(""), /publishing.*1\/3.*running/);
+
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: { role: "system", content: "System prompt", timestamp: 1 },
+	});
+	assert.match(widget.render(200).join(""), /publishing/);
+	const continuation = {
+		type: "message_start",
+		message: { role: "custom", ...fold.message, timestamp: 2 },
+	};
+	const renders = widget.renderRequests();
+	await harness.fire("message_start", continuation);
+	assert.doesNotMatch(widget.render(200).join(""), /publishing|\d+s|1\/3/);
+	assert.match(widget.render(200).join(""), /running \(enabled/);
+	assert.ok(widget.renderRequests() > renders);
+	assert.equal(harness.streaming, true);
+	assert.equal(harness.aborts, 0);
+	receiptReadable = false;
+	await harness.fire("context", { type: "context", messages: [] });
+	assert.deepEqual(hooks, [], "starting the turn is not a durable receipt");
+	assert.equal(harness.controller.snapshot.attempt, 1);
+	assert.equal(harness.triggeredTurns, 1);
+
+	receiptReadable = true;
+	harness.branch.push({
+		id: "continuation-receipt",
+		type: "custom_message",
+		customType: fold.message.customType,
+		details: fold.message.details,
+	});
+	await harness.fire("context", { type: "context", messages: [] });
+	await harness.fire("context", { type: "context", messages: [] });
+	assert.deepEqual(hooks, ["watchdog-continued"]);
+	assert.equal(harness.controller.snapshot.attempt, 1);
+	assert.equal(harness.triggeredTurns, 1);
+	await harness.unlock();
+	assert.equal(harness.aborts, 1, "the exact continuation is still owned");
+});
+
+test("continuation receipt can retire progress before the correlated main start", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	const widget = mountStateStatusWidget(harness);
+	const fold = await startAcceptedContinuation(harness, false);
+	assert.doesNotMatch(widget.render(200).join(""), /publishing|1\/3/);
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: { role: "custom", ...fold.message, timestamp: 1 },
+	});
+	await harness.unlock();
+	assert.equal(harness.aborts, 1);
+});
+
+test("unrelated main work retires obsolete publication without adopting the run", async () => {
+	const hooks: string[] = [];
+	const harness = createHarness({
+		omitPersistedEvent: (kind) => kind === "continue",
+		onHook: (name) => hooks.push(name),
+	});
+	await startIdle(harness);
+	const widget = mountStateStatusWidget(harness);
+	const fold = await startAcceptedContinuation(harness, false);
+	assert.match(widget.render(200).join(""), /publishing/);
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: { role: "user", content: [text("My next task")], timestamp: 1 },
+	});
+	assert.doesNotMatch(widget.render(200).join(""), /publishing|1\/3/);
+	assert.match(widget.render(200).join(""), /running \(enabled/);
+	await harness.unlock();
+	assert.equal(harness.aborts, 0);
+
+	harness.streaming = false;
+	await settleOnly(harness);
+	await harness.openDecision();
+	const successorProgress = widget.render(200).join("");
+	assert.match(successorProgress, /waiting for model/);
+	harness.branch.push({
+		id: "late-superseded-receipt",
+		type: "custom_message",
+		customType: fold.message.customType,
+		details: fold.message.details,
+	});
+	await harness.fire("context", { type: "context", messages: [] });
+	assert.equal(widget.render(200).join(""), successorProgress);
+	assert.deepEqual(hooks, []);
+	assert.equal(harness.triggeredTurns, 1);
+	assert.equal(harness.controller.snapshot.attempt, 0);
+	await harness.unlock();
+});
+
+test("mismatched continuation cycle cannot acquire main run ownership", async () => {
+	const harness = createHarness();
+	await startIdle(harness);
+	const fold = await startAcceptedContinuation(harness, false);
+	const details = parseDecisionFoldDetails(fold.message.details);
+	assert.ok(details);
+	await harness.fire("message_start", {
+		type: "message_start",
+		message: {
+			role: "custom",
+			...fold.message,
+			details: { ...details, attempt: details.attempt + 1 },
+			timestamp: 1,
+		},
+	});
+	await harness.unlock();
+	assert.equal(harness.aborts, 0);
+});
+
 test("private progress row retires a failed continuation send during BUSY without stopping the next countdown", async () => {
 	let deferred = false;
 	let sends = 0;

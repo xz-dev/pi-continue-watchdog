@@ -448,6 +448,31 @@ theorem ordinary_cancellation_exact (scope owner : Scope) (identity : Nat) :
       (foreignUserTakesContinuation (.ownedContinuation scope) identity) = .none := by
   simp [ordinaryManualUnlockTarget, foreignUserTakesContinuation]
 
+-- This projection owns only the visible progress, not the publication transaction or main-run authority.
+-- Its input is a classified host observation; the runtime must verify the scope before producing it.
+inductive ContinuationDisplayObservation where
+  | hostSystem
+  | matchingStart (scope : Scope)
+  | durableReceipt (scope : Scope)
+  | ownershipLost (scope : Scope)
+
+def observeContinuationDisplay (current : Option Scope)
+    (observation : ContinuationDisplayObservation) : Option Scope :=
+  match observation with
+  | .hostSystem => current
+  | .matchingStart scope | .durableReceipt scope | .ownershipLost scope =>
+      if current = some scope then none else current
+
+-- Neither system bookkeeping nor stale receipt callbacks keep or clear the wrong progress row.
+theorem exact_start_retires_before_receipt (scope : Scope) :
+    observeContinuationDisplay
+      (observeContinuationDisplay (some scope) .hostSystem) (.matchingStart scope) = none := by
+  simp [observeContinuationDisplay]
+
+theorem late_receipt_keeps_successor_display (old successor : Scope) (different : successor ≠ old) :
+    observeContinuationDisplay (some successor) (.durableReceipt old) = some successor := by
+  simp [observeContinuationDisplay, different]
+
 -- Terminality, normalized validation and confirmed parent receipts are explicit boundary observations, never inferred from a readable private result file.
 -- A transaction is the authoritative owned publication state; replay uses its updated charge/application flags, not a reconstructed old snapshot.
 inductive Outcome where

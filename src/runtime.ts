@@ -3420,6 +3420,7 @@ export function createDecisionRuntime(
 			watchdogOwnedRun.cycleId !== pending.cycleId
 		) {
 			pendingContinuationPublication = null;
+			finishPrivateProgress(pending.active);
 			return;
 		}
 		const confirmed = pending.confirmed();
@@ -3436,6 +3437,7 @@ export function createDecisionRuntime(
 				}
 				retainInquiryCleanup(pending.active);
 				retryInquiryCleanup();
+				finishPrivateProgress(pending.active);
 			}
 			return;
 		}
@@ -4505,22 +4507,30 @@ export function createDecisionRuntime(
 			watchdogOwnedRun = null;
 		}
 		if (ownedRun?.phase === "pending-start") {
+			// Host system bookkeeping can precede the actual continuation input.
+			if (message?.role === "system") return;
 			const fold =
 				message?.role === "custom" &&
 				message?.customType === DECISION_FOLD_MESSAGE_TYPE
 					? parseDecisionFoldDetails(message.details)
 					: undefined;
-			if (
+			const matches =
 				fold?.inquiryId === ownedRun.exchangeId &&
 				fold.attempt === ownedRun.cycleId &&
 				fold.watchdogOutcome === "continue" &&
 				fold.replacement?.customType === CONTINUATION_MESSAGE_TYPE &&
-				owns(ownedRun.claim)
+				owns(ownedRun.claim);
+			if (matches) ownedRun.phase = "running";
+			else watchdogOwnedRun = null;
+			const pending = pendingContinuationPublication;
+			if (
+				pending?.active.exchangeId === ownedRun.exchangeId &&
+				pending.cycleId === ownedRun.cycleId
 			) {
-				ownedRun.phase = "running";
-				return;
+				// End display at handoff or loss of correlation; the receipt is separate.
+				finishPrivateProgress(pending.active);
 			}
-			watchdogOwnedRun = null;
+			if (matches) return;
 		}
 		const active = activeDecision;
 		if (active === null || active.invalidated || !owns(active.claim)) return;
