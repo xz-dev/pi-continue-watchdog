@@ -21,6 +21,8 @@ Continue and Reflect SHALL each present live background progress in their existi
 ### Requirement: Highlight means owned background work
 Each row SHALL use the same theme-aware active foreground/background semantics while its own background operation is pending, including preparation, review and cancellation drain. A non-active row SHALL return to its existing muted presentation. Ordinary root/subagent activity, enabled state, cooldown and a pending manual request SHALL NOT alone activate the private-operation highlight. An explicit stage label SHALL accompany the color so the indication remains understandable without color. The highlight SHALL end when the exact operation settles or loses its visible session/owner scope.
 
+For an accepted Continue decision, observation of either the exact published continuation on the current branch or the matching continuation starting in the owning main session SHALL end the private publication display immediately, without waiting for that main run to settle. The stage, private elapsed time, attempt counter and highlight SHALL disappear together; ordinary activity and unlock controls SHALL remain. Ending the display SHALL NOT itself acknowledge durable publication, spend or refund a unit, emit a hook, authorize an abort, or cause another send.
+
 #### Scenario: Root works without a private inquiry
 - **WHEN** the root is running and Continue is enabled but no private Continue decision exists
 - **THEN** Continue retains its ordinary activity and unlock information without an active private-operation highlight
@@ -28,6 +30,21 @@ Each row SHALL use the same theme-aware active foreground/background semantics w
 #### Scenario: Root is idle during review
 - **WHEN** the root is idle and Continue awaits its optional unlock review
 - **THEN** Continue's row is highlighted and identifies review rather than implying ordinary root work
+
+#### Scenario: System bookkeeping precedes the matching continuation
+- **WHEN** the main run starts, a host system message precedes the matching continuation, and the main run remains busy after accepting that continuation
+- **THEN** the row no longer shows `publishing`, its timer or its attempt counter once the matching handoff is observed, before the main run settles or any further tool call is required
+- **AND** the watchdog remains enabled, the main run continues, and exactly one continuation is delivered and charged under the existing publication rules
+
+#### Scenario: The continuation starts before the durable receipt is readable
+- **WHEN** the owning main session starts the exact continuation but its branch receipt is not yet readable
+- **THEN** the row ends the private stage without claiming durable publication or retrying the send
+- **AND** a later matching receipt follows the existing confirmation rules at most once, without restoring old progress
+
+#### Scenario: An unrelated user starts instead
+- **WHEN** unrelated user work takes over before the expected handoff and the pending publication loses ownership
+- **THEN** the obsolete private progress clears, without adopting or aborting the user's run
+- **AND** neither busy status nor clearing the row counts as a receipt, triggers a resend or emits a continuation hook
 
 ### Requirement: Progress names observed work rather than inferred completion
 An active row SHALL identify its current observed stage and total elapsed time since operation admission. Observable preparation, model waiting/generation, result validation, format correction, outcome publication and cancellation drain SHALL be represented when they occur. Admitted private evidence-tool execution SHALL identify only safe tool names. Continue SHALL additionally identify optional unlock review and the single review-triggered reconsideration when present. While a private model request is streaming, the model-waiting stage SHALL be replaced by a content-free streaming activity label: the latest official output kind (`thinking`, `writing` or `tool call`), an indicator that advances only as streamed output arrives, and the number of characters streamed in the current response (for example `writing ⠙ 1.2k`). Before the first streamed output of a request, and after that response ends, the stage SHALL return to `waiting for model`. The activity label SHALL be derived only from official streaming delta kinds and lengths; streamed text, thinking, tool names inside the private response, tool arguments and result paths SHALL NOT be read for display, rendered or retained. Unobserved phases SHALL NOT be invented; elapsed time, accounting counters and token silence SHALL NOT be treated as proof of task completion or a percentage/ETA. Brief synchronous stages SHALL update projection without requiring an artificial delay to force a frame.
